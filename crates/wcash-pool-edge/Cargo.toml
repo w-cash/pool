@@ -1,0 +1,21 @@
+[package]
+name = "wcash-pool-edge"
+description = "Bounded ZIP-301 connection runtime for the Wcash merged-mining pool"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+wcash-pool-backend-client = { path = "../wcash-pool-backend-client" }
+wcash-pool-core = { path = "../wcash-pool-core" }
+wcash-pool-protocol = { path = "../wcash-pool-protocol" }
+
+[lints]
+workspace = true

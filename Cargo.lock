@@ -547,6 +547,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wcash-pool-edge"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "thiserror",
+ "tokio",
+ "uuid",
+ "wcash-pool-backend-client",
+ "wcash-pool-core",
+ "wcash-pool-protocol",
+]
+
+[[package]]
 name = "wcash-pool-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [

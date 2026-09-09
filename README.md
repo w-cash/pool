@@ -23,9 +23,10 @@ is unavailable or its identity is inconsistent.
 
 | Area | Current phase-0 state |
 | --- | --- |
-| Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs with deterministic positive and negative tests |
+| Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs with exact dual-chain reward and reversible winner-lifecycle events plus deterministic positive and negative tests |
 | Pool policy | In-memory session ordering, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff with inactivity easing |
 | Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetime anchors, submitted-header-time preservation, and a fenced core-to-backend share path tested against local mock peers |
+| Miner edge | Listener-free bounded actors for connection admission, request rate, authorization tickets, immutable per-session jobs, global job fanout, and serialized Wolf share submission; no TCP/TLS stream driver or credential implementation |
 | Service process | Readiness-only command; no miner or administrative listener |
 | Persistence and money | No PostgreSQL projection, balance ledger, maturity tracking, payout engine, wallet integration, or signing |
 | Wolf integration | The matching backend-v1 Unix-socket server and durable replay journal are not implemented in wolf |

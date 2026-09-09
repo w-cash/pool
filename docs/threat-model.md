@@ -6,11 +6,12 @@
 
 Implemented controls are limited to strict bounded wire codecs, redacted
 secret-bearing debug output, endian-distinct target types, in-memory
-session/job/nonce/vardiff policy, and a timeout-bounded Unix backend client
-tested with local mock peers. There is no public listener, authentication
-provider, durable pool database, payout code, wallet, deployment, or live-node
-test. Every operational control below remains a release requirement unless it
-is explicitly identified as implemented.
+session/job/nonce/vardiff policy, finite listener-free connection actors, and a
+timeout-bounded Unix backend client tested with local mock peers. There is no
+stream driver, public listener, authentication implementation, idle backend
+event pump, durable pool database, payout code, wallet, deployment, or
+live-node test. Every operational control below remains a release requirement
+unless it is explicitly identified as implemented.
 
 ## Assets
 
@@ -68,6 +69,9 @@ Implemented policy keeps Wolf's immutable backend generation and lifetime
 separate from each session's assigned share target. A submission is evaluated
 against that exact assignment, not the miner's claimed difficulty or another
 session's target.
+Per-session advertised lineage prevents a coalesced activation, local expiry,
+or hard retirement from incorrectly reusing `clean_jobs=false`; grace-eligible
+assignments remain available only for bounded late-share validation.
 Unknown, retired, cross-session, and wrong-network identifiers must fail
 closed. End-to-end enforcement still depends on the missing wolf backend-v1
 server and service integration.
@@ -163,11 +167,23 @@ unknown result to reconcile, never evidence of failure.
 
 ### Chain reorganizations and immature rewards
 
-The future accounting engine must keep blocks and credits immature for a
-configured confirmation policy. Reorganizations must produce explicit
-reversing entries; history is not edited in place. Parent and child maturity
-are tracked independently, and payouts cannot spend unconfirmed or
-unreconciled balances. No accounting or payout implementation exists today.
+Every job and winning-share receipt binds independent Wcash and Zcash reward
+amounts and maturity requirements. The backend journal must then emit typed
+observed, orphaned, and matured transitions keyed by the exact share, job,
+chain, block hash, and height. Observation and maturity bind a same-snapshot
+best-chain tip and exact confirmation depth. The pool must not infer any of
+these monetary facts from job closure, candidate booleans, wall-clock age, or
+an unauthenticated node query.
+
+The future accounting engine keeps blocks and credits immature until the typed
+maturity event. Reorganizations produce explicit reversing entries; history is
+not edited in place. Maturity is spendability policy, not proof-of-work
+finality, so a deep reorganization after maturity remains a valid orphan
+transition and can reverse a paid reward into debt or an operator loss.
+Consequently wolf must retain durable post-maturity observation state. Parent
+and child maturity are tracked independently, and payouts cannot spend
+unconfirmed or unreconciled balances. No accounting or payout implementation
+exists today.
 
 ### Credential and payout compromise
 

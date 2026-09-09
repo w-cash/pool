@@ -1,7 +1,8 @@
 # Testnet roadmap
 
 > **Current state: phase-0 libraries only, not deployable.** Strict protocol,
-> in-memory policy, and Unix backend-client primitives exist. There is no
+> in-memory policy, Unix backend-client, and listener-free miner-edge actors
+> exist. There is no
 > public miner listener, compatible wolf backend-v1 server, integrated
 > accepted-share path, PostgreSQL projection, payout engine, production image,
 > or Wcash/Zcash endpoint. Passing source CI does not make this pool Testnet-
@@ -52,15 +53,19 @@ Required wolf gates:
   ID, and the complete capability set;
 - immutable jobs binding a unique job ID, exact 108-byte parent header input,
   explicit Wcash and Zcash predecessors, endian-typed targets, both heights,
-  maximum age, and snapshot remaining lifetime;
+  each chain's exact positive reward and maturity requirement, maximum age,
+  and snapshot remaining lifetime;
 - independently validated Zcash proposal attestation before a job is released;
 - share submission bound to the exact job, pool-authenticated account and
   worker, issued target, exact submitted header time, full nonce, and raw
   Equihash solution, with Wolf requiring time equality against the frozen job;
 - stable share IDs and exact-retry receipts, with accepted-share attribution
-  and both winner outboxes durable before acknowledgement;
+  and both winner outboxes durable before acknowledgement; winner receipts
+  replace booleans with zero-to-two canonical descriptors binding chain, block,
+  coinbase transaction, reward, and maturity;
 - an atomic current/recent snapshot followed by authoritative job activation,
-  invalidation, generation-closure, and share-commit events;
+  invalidation, generation-closure, share-commit, winner-observed,
+  winner-orphaned, and winner-matured events;
 - one stable, contiguous, replayable journal sequence with bounded ReadEvents
   pages and fail-closed stream identity;
 - a separate replay connection that closes any accounting gap through the
@@ -71,7 +76,8 @@ Required wolf gates:
 - bounded live health heartbeats (or a dedicated event reader) that continuously
   drain queued events and fail closed on a gap;
 - crash recovery that preserves decoded/in-flight submissions and pending
-  Wcash or Zcash winners, plus health reporting for both outboxes;
+  Wcash or Zcash winners, retains observation after maturity for deep-reorg
+  reversal, and reports health for both outboxes;
 - fixed cross-repository golden frames and a compatibility document tied to an
   exact wolf commit.
 
@@ -92,6 +98,10 @@ Deliverables:
   the global backend-generation lifetime;
 - conservative vardiff with minimum/maximum bounds and no influence on network
   targets, including a bounded inactivity tick for zero-share workers;
+- replay-aware share timing so an idempotent backend receipt cannot count twice
+  toward a miner's vardiff estimate;
+- a stream-level pause or disconnect when the last advertised job retires and
+  no replacement is immediately available;
 - a durable external lease authority for non-zero nonce namespaces and cursors;
 - rate limits before expensive parsing, hashing, or backend work;
 - deterministic protocol transcripts for supported ASIC behavior.
@@ -99,9 +109,11 @@ Deliverables:
 Exit gate: truncation, oversize, trailing-data, slow-client, flood, replay,
 wrong-session, wrong-job, and disconnect races are covered without live nodes.
 
-Current note: deterministic codec and in-memory session/job/vardiff tests cover
-only the library layer. There is no socket listener, TLS termination,
-credential lookup, connection scheduler, or certified ASIC transcript yet.
+Current note: deterministic codec, bounded connection/session actors, global
+job fanout, request limiting, cancellation-safe submission serialization, and
+in-memory job/vardiff tests cover only the library layer. There is no stream
+driver, socket listener, TLS termination, credential implementation, idle
+backend heartbeat, durable nonce lease, or certified ASIC transcript yet.
 
 ## Phase 3 — End-to-end job and share lifecycle
 

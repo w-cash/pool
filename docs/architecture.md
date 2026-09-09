@@ -56,6 +56,7 @@ This is the target flow. No executable currently composes these steps.
 | wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v1 request, response, event, target-endian and identity types; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | TCP/TLS listener, connection deadlines, rate limits, worker database, ASIC interoperability certification |
 | wcash-pool-core | In-memory session ordering, immutable worker binding, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, authoritative current/recent lifetime, bounded non-resurrectable generation tombstones, in-flight retirement fences, target policy, and integer vardiff including inactivity easing | Durable nonce-lease orchestration, durable generation-ID history, runtime composition, database persistence, crash recovery, network I/O, consensus validation |
 | wcash-pool-backend-client | Timeout-bounded Unix-socket connection, strict handshake and identity checks, request correlation, job snapshot/event replay, transport-branded lifetime anchors, exact submitted header time, a core-validated share adapter that owns the admission fence through backend I/O, branded share commits, health checks, and bounded unsolicited-event buffering | A compatible wolf server, cryptographic remote-peer authentication, production integration |
+| wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization interface, immutable session assignments, target-before-notify ordering, bounded global job fanout, cancellation-safe serialized Wolf submissions, and fail-closed interleaved event application | TCP/TLS stream driver, authorization implementation, idle backend heartbeat, durable nonce leasing, accounting event sink, public listener, certified ASIC transcript |
 | wcash-poold | A machine-readable readiness command that exits not-ready | Serve command, miner/admin/metrics listeners, configuration, database, wallet, payout loop, deployment |
 | Accounting | Protocol receipts and event shapes only | PostgreSQL schema and projector, balances, maturity, fees, rounding, reorg reversal, payouts |
 | Operations | Hermetic source checks and test scaffolding | Container image, manifests, monitoring, backups, runbooks, private soak, public endpoint |
@@ -90,8 +91,9 @@ existing consensus coordinator and durable winner state.
   followed by only later events on the same connection.
 - Each JobDescriptor must be created by wolf and bind the exact 108 pre-nonce
   parent header bytes, explicit Wcash and Zcash predecessor hashes, separate
-  little-endian Wcash and Zcash network targets, both heights, a unique job ID,
-  and a bounded maximum age.
+  little-endian Wcash and Zcash network targets, both heights, each chain's
+  exact positive pool-recipient reward in zatoshi, each chain's immutable
+  maturity requirement, a unique job ID, and a bounded maximum age.
 - Snapshot current and recent entries must report remaining accept_for_ms from
   wolf's monotonic lease state. Reconnect must not restart a job's lifetime.
 - JobActivated, JobInvalidated, and GenerationClosed events are authoritative.
@@ -116,12 +118,24 @@ existing consensus coordinator and durable winner state.
   durable storage before returning ShareCommitted or publishing its matching
   ShareCommitted journal event. A timeout remains unknown until replay or
   reconciliation proves the outcome.
+- The immutable receipt contains zero, one, or two exact winner descriptors in
+  canonical Wcash-then-Zcash order. Each descriptor binds chain, block hash,
+  height, coinbase transaction ID, positive pool reward, and maturity
+  requirement. A Zcash winner hash must equal the validated parent-header hash.
+  Boolean candidate flags are insufficient evidence for accounting.
+- The lower-level client submission API returns an explicitly unverified commit.
+  Only `submit_prepared_share` can produce `VerifiedShareCommit`: before creating
+  that brand it checks every winner's chain-specific height, reward, and
+  maturity against the exact generation retained by `SubmissionContext`. Any
+  mismatch poisons the backend connection and releases the admission fence
+  without exposing branded success.
 
 ### Durable replay journal
 
 - One stable journal_stream defines one non-reusable, contiguous event_seq
   namespace. The journal must persist job activation, invalidation, closure,
-  and accepted-share events and recover them after a crash.
+  accepted-share, winner-observed, winner-orphaned, and winner-matured events
+  and recover them after a crash.
 - ReadEvents(after_event_seq, limit) must return a bounded contiguous page
   beginning at after_event_seq plus one, or an empty page with an unchanged
   cursor. A gap, duplicate sequence with different bytes, rollback, or stream
@@ -150,6 +164,13 @@ existing consensus coordinator and durable winner state.
 - Candidate receipts must be durable before acknowledgement, and wolf must
   retain and retry pending block submissions independently of the pool
   connection. HealthStatus must expose pending Wcash and Zcash winner pressure.
+- Winner lifecycle events repeat the immutable winner facts and identify the
+  originating share and job. Observation and maturity events bind an exact
+  best-chain tip and a confirmation count equal to
+  `tip_height - winner_height + 1`; maturity additionally meets the winner's
+  advertised chain-specific threshold. An orphan event binds the replacement
+  best-chain tip. `GenerationClosed` closes share admission only and is never
+  block acceptance, reward maturity, or payout evidence.
 - Crash recovery, torn-tail handling, fsync ordering, journal locking, bounded
   growth or explicit rotation, and exact-retry behavior need deterministic
   wolf tests. Cross-repository golden frames must pin the pool and wolf to the
@@ -177,8 +198,20 @@ submitted header time, nonce profile, assigned target, and current/recent
 lifetime match that immutable session state. Authorization and cheap policy
 rejection happen before wolf is asked to verify Equihash.
 
+Each session separately tracks the jobs its miner was allowed to retain across
+`clean_jobs=false` notifications. A non-clean replacement is emitted only when
+that session still has advertised work which is locally admissible and the
+global stream has not hard-retired any cached job. A clean notification clears
+the advertised lineage, but it does not discard authoritative assignments that
+remain in Wolf's bounded grace window; those assignments can still validate
+shares already in flight. If an activation was skipped or old work expired
+while queued, the next notification is forced clean.
+
 The current repository implements these state machines as libraries. It does
-not implement the listener, credential store, or their orchestration.
+not implement the stream driver, listener, credential store, or their
+orchestration. Per-session vardiff changes are installed on the next fresh Wolf
+generation; changing a target on an already advertised immutable generation
+would require a separate miner-facing job identifier and is not emulated.
 
 Retired generation IDs remain as bounded in-memory tombstones so reconnects
 cannot reintroduce an old ID with a fresh lifetime. Exhausting that bound stops
@@ -204,9 +237,24 @@ then resumes credit or payout processing. Conflicting bytes for an existing
 key, a cursor ahead of wolf, or an unexplained identity change halts new work
 and requires operator reconciliation.
 
-Balances, reward maturity, reorg reversals, fees, rounding, and payout batches
-belong to a separate append-only pool ledger derived from those receipts.
-That ledger and its database schema have not been implemented.
+The projector cross-checks every winner's height, reward, and maturity against
+its JobActivated descriptor. A reward becomes spendable only from a matching
+WinnerMatured event, never from a candidate flag, submission RPC response,
+GenerationClosed, or locally sampled tip. WinnerMatured is not finality: a
+later deep reorganization can emit WinnerOrphaned and must create reversing
+ledger entries. Wolf must therefore retain enough durable winner history to
+observe reorgs after maturity rather than deleting all tracking at the
+maturity threshold.
+
+The current listener-free share actor drains live backend events into the
+in-memory job registry so job sequencing cannot silently lag behind a share
+response. It does not persist accounting or winner events. A deployment must
+independently replay and transactionally project every journal sequence; it
+must never advance a durable accounting cursor from the in-memory job registry.
+
+Balances, fees, rounding, and payout batches belong to a separate append-only
+pool ledger derived from those events. That ledger and its database schema
+have not been implemented.
 
 ## Failure behavior
 

@@ -2,6 +2,7 @@
 members = [
     "crates/wcash-pool-backend-client",
     "crates/wcash-pool-core",
+    "crates/wcash-pool-edge",
     "crates/wcash-pool-protocol",
     "crates/wcash-poold",
 ]
