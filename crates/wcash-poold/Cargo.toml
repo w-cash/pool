@@ -1,0 +1,16 @@
+[package]
+name = "wcash-poold"
+description = "Miner-facing service for Wcash and Zcash merged mining"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "wcash-pool-core"
+description = "Mining session, job lifecycle, and vardiff policy for Wcash"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+wcash-pool-protocol = { path = "../wcash-pool-protocol" }
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

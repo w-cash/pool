@@ -1,0 +1,20 @@
+[package]
+name = "wcash-pool-backend-client"
+description = "Timeout-bounded Unix-socket transport for the Wcash mining backend"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wcash-pool-core = { path = "../wcash-pool-core" }
+wcash-pool-protocol = { path = "../wcash-pool-protocol" }
+
+[lints]
+workspace = true
