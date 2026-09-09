@@ -2,11 +2,10 @@
 
 > **Current state: phase-0 libraries only, not deployable.** Strict protocol,
 > in-memory policy, Unix backend-client, and listener-free miner-edge actors
-> exist. There is no
-> public miner listener, compatible wolf backend-v1 server, integrated
-> accepted-share path, PostgreSQL projection, payout engine, production image,
-> or Wcash/Zcash endpoint. Passing source CI does not make this pool Testnet-
-> or production-ready.
+> exist. There is no public miner listener, compatible wolf backend-v1 server,
+> service-composed accepted-share path, PostgreSQL projection, payout engine,
+> production image, or Wcash/Zcash endpoint. Passing source CI does not make
+> this pool Testnet- or production-ready.
 
 | Phase | Current status |
 | --- | --- |
@@ -52,17 +51,26 @@ Required wolf gates:
   instance and journal stream, Wcash and Zcash genesis identities, Wcash chain
   ID, and the complete capability set;
 - immutable jobs binding a unique job ID, exact 108-byte parent header input,
-  explicit Wcash and Zcash predecessors, endian-typed targets, both heights,
-  each chain's exact positive reward and maturity requirement, maximum age,
-  and snapshot remaining lifetime;
+  proof-independent Wcash candidate hash, explicit Wcash and Zcash
+  predecessors, the Wcash candidate and Zcash parent coinbase transaction IDs,
+  endian-typed targets, both heights, each chain's exact positive reward and
+  maturity requirement, maximum age, and snapshot remaining lifetime;
 - independently validated Zcash proposal attestation before a job is released;
 - share submission bound to the exact job, pool-authenticated account and
   worker, issued target, exact submitted header time, full nonce, and raw
   Equihash solution, with Wolf requiring time equality against the frozen job;
-- stable share IDs and exact-retry receipts, with accepted-share attribution
-  and both winner outboxes durable before acknowledgement; winner receipts
-  replace booleans with zero-to-two canonical descriptors binding chain, block,
-  coinbase transaction, reward, and maturity;
+- stable share IDs computed as SHA-256 over
+  `"wcash-pool/share-id/v1" || job_id || time || nonce || solution`, plus
+  exact-retry receipts; identity and target remain an immutable attribution
+  fingerprint committed by the domain-separated canonical attribution ID, so
+  changing either for the same proof is rejected rather than credited twice;
+- canonical SHA-256d parent hashes over the exact
+  `header_input || nonce || fd4005 || solution`, independently recomputed by
+  the pool client before a backend response can become a branded commit;
+- accepted-share attribution and both winner outboxes durable before
+  acknowledgement; receipts bind the exact job and parent header hash, while
+  winner descriptors bind chain, block, coinbase transaction, reward, and
+  maturity back to the originating job;
 - an atomic current/recent snapshot followed by authoritative job activation,
   invalidation, generation-closure, share-commit, winner-observed,
   winner-orphaned, and winner-matured events;
@@ -71,13 +79,23 @@ Required wolf gates:
 - a separate replay connection that closes any accounting gap through the
   atomic subscription-snapshot watermark before credit or payout resumes;
 - conservative pre-I/O monotonic anchoring for snapshot and live relative
-  lifetimes, using the implemented transport-to-core adapter, with historical
-  replay events unable to renew a job lease;
+  lifetimes, including a prior-exchange lower bound for events prequeued during
+  socket idle time, with historical replay events unable to renew a job lease;
 - bounded live health heartbeats (or a dedicated event reader) that continuously
   drain queued events and fail closed on a gap;
+- response flushing: before `HealthStatus`, wolf sends every missing live event
+  contiguously through that response's watermark; before a fresh
+  `ShareCommitted`, it sends the exact matching receipt/job/identity/target
+  event at a sequence newer than the pre-request cursor; the pool client rejects
+  and poisons unflushed or crossed responses;
 - crash recovery that preserves decoded/in-flight submissions and pending
   Wcash or Zcash winners, retains observation after maturity for deep-reorg
   reversal, and reports health for both outboxes;
+- reconnect recovery through the existing process-global JobRouter so local
+  deadlines, terminal generation tombstones, and watermark history cannot be
+  reset by constructing a replacement router;
+- a durable projected-receipt lookup which turns a cache-miss historical replay
+  into a verified result only after every receipt byte and attribution key match;
 - fixed cross-repository golden frames and a compatibility document tied to an
   exact wolf commit.
 
@@ -94,12 +112,18 @@ Deliverables:
   implemented; listener integration pending);
 - TLS, subscription, authorization, worker identity, clean disconnect, and
   backpressure;
+- exact login binding: until aliases are explicitly represented, authentication
+  succeeds only when its canonical login byte-for-byte matches the authorized
+  ZIP-301 login, which every share must repeat;
 - immutable per-session job assignment and share difficulty, separated from
   the global backend-generation lifetime;
 - conservative vardiff with minimum/maximum bounds and no influence on network
   targets, including a bounded inactivity tick for zero-share workers;
 - replay-aware share timing so an idempotent backend receipt cannot count twice
   toward a miner's vardiff estimate;
+- process-global generation suspension before terminal backend results are
+  exposed, including backend/event-stream failure, unhealthy responses,
+  cancellation, panic, and shutdown;
 - a stream-level pause or disconnect when the last advertised job retires and
   no replacement is immediately available;
 - a durable external lease authority for non-zero nonce namespaces and cursors;
@@ -110,10 +134,11 @@ Exit gate: truncation, oversize, trailing-data, slow-client, flood, replay,
 wrong-session, wrong-job, and disconnect races are covered without live nodes.
 
 Current note: deterministic codec, bounded connection/session actors, global
-job fanout, request limiting, cancellation-safe submission serialization, and
-in-memory job/vardiff tests cover only the library layer. There is no stream
-driver, socket listener, TLS termination, credential implementation, idle
-backend heartbeat, durable nonce lease, or certified ASIC transcript yet.
+job fanout and suspension, exact-login policy, replay-aware vardiff, request
+limiting, cancellation-safe submission serialization, and in-memory tests cover
+only the library layer. There is no stream driver, socket listener, TLS
+termination, credential implementation, idle backend heartbeat, durable nonce
+lease, or certified ASIC transcript yet.
 
 ## Phase 3 — End-to-end job and share lifecycle
 
@@ -125,6 +150,8 @@ Deliverables:
 - exact durable mapping from accepted backend receipt to worker attribution;
 - child-only, parent-only, both-target, ordinary share, invalid proof, and
   ambiguous transport outcomes;
+- cross-generation, crossed-nonce, crossed-solution, candidate-hash, coinbase,
+  stable-share-ID, and parent-header-hash substitution failures;
 - graceful shutdown and restart reconciliation;
 - durable journal-scoped generation-ID history beyond the deliberately bounded
   in-memory tombstones, without ever reclaiming capacity by forgetting safety

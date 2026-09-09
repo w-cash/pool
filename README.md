@@ -23,13 +23,13 @@ is unavailable or its identity is inconsistent.
 
 | Area | Current phase-0 state |
 | --- | --- |
-| Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs with exact dual-chain reward and reversible winner-lifecycle events plus deterministic positive and negative tests |
-| Pool policy | In-memory session ordering, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff with inactivity easing |
-| Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetime anchors, submitted-header-time preservation, and a fenced core-to-backend share path tested against local mock peers |
-| Miner edge | Listener-free bounded actors for connection admission, request rate, authorization tickets, immutable per-session jobs, global job fanout, and serialized Wolf share submission; no TCP/TLS stream driver or credential implementation |
+| Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs; jobs bind the Wcash candidate hash and both chains' coinbase transaction IDs; canonical parent-header and stable share-ID derivations, exact dual-chain reward facts, and reversible winner-lifecycle events have deterministic positive and negative tests |
+| Pool policy | In-memory session ordering with exact authorized-login reuse, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff that excludes idempotently replayed receipts |
+| Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetimes, submitted-header-time preservation, canonical proof/receipt/attribution binding, live response-watermark flush enforcement, bounded all-event sequence and share-identity evidence, and a fenced core-to-backend share path tested against local mock peers |
+| Miner edge | Listener-free bounded actors for connection admission, request rate, authorization tickets, immutable per-session jobs, global job fanout, serialized Wolf share submission, and global fail-closed suspension on terminal backend-stream failure; no TCP/TLS stream driver or credential implementation |
 | Service process | Readiness-only command; no miner or administrative listener |
 | Persistence and money | No PostgreSQL projection, balance ledger, maturity tracking, payout engine, wallet integration, or signing |
-| Wolf integration | The matching backend-v1 Unix-socket server and durable replay journal are not implemented in wolf |
+| Wolf integration | The matching backend-v1 Unix-socket server, durable replay journal, and response-watermark event-flush contract are not implemented in wolf |
 | Operations | No production container, deployment manifests, public endpoint, private soak, or release readiness |
 
 The next blocking change is the wolf backend and journal contract described in

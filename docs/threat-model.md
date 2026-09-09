@@ -5,8 +5,9 @@
 > current repository with miners or funds.
 
 Implemented controls are limited to strict bounded wire codecs, redacted
-secret-bearing debug output, endian-distinct target types, in-memory
-session/job/nonce/vardiff policy, finite listener-free connection actors, and a
+secret-bearing debug output, endian-distinct target types, exact job/proof
+receipt bindings, in-memory session/job/nonce/vardiff policy, global
+generation suspension, finite listener-free connection actors, and a
 timeout-bounded Unix backend client tested with local mock peers. There is no
 stream driver, public listener, authentication implementation, idle backend
 event pump, durable pool database, payout code, wallet, deployment, or
@@ -69,12 +70,23 @@ Implemented policy keeps Wolf's immutable backend generation and lifetime
 separate from each session's assigned share target. A submission is evaluated
 against that exact assignment, not the miner's claimed difficulty or another
 session's target.
+Each generation also binds the proof-independent Wcash candidate hash and the
+Wcash candidate and Zcash parent coinbase transaction IDs. A receipt must repeat
+the exact job ID; a Wcash winner and either chain's winner coinbase must match
+those frozen facts. Reusing an ID with changed candidate bytes is a protocol
+conflict.
 Per-session advertised lineage prevents a coalesced activation, local expiry,
 or hard retirement from incorrectly reusing `clean_jobs=false`; grace-eligible
 assignments remain available only for bounded late-share validation.
 Unknown, retired, cross-session, and wrong-network identifiers must fail
 closed. End-to-end enforcement still depends on the missing wolf backend-v1
 server and service integration.
+
+The authentication result is also session state, not a hint. Until an explicit
+alias set exists, its canonical login must byte-for-byte equal the login in the
+successful ZIP-301 authorization, and every submitted share must repeat that
+exact login. A normalized or substituted login is rejected rather than silently
+mapped to another account or worker.
 
 The current core retains bounded terminal generation tombstones and rejects ID
 resurrection, descriptor substitution, and same-watermark role changes. It
@@ -94,13 +106,26 @@ but deliberately does not claim to provide that external lease authority.
 
 ### Replay and duplicate credit
 
-Wolf must derive a stable share identity from the immutable job and canonical
-submission, including its exact submitted header time, and bind it to worker
-attribution in its durable journal. Repeating the exact submission must return
-the byte-identical prior receipt without creating another journal event, credit,
-or block submission. Only the response envelope is marked replayed.
+Wolf must derive the stable share identity as SHA-256 over
+`"wcash-pool/share-id/v1" || job_id || time || nonce || solution`, then bind it
+to worker identity and assigned target in its durable journal and receipt using
+the domain-separated canonical attribution ID. Identity and target are
+deliberately not part of the proof ID: changing either for the same proof is an
+`AttributionConflict`. Repeating the exact proof and attribution
+must return the byte-identical prior receipt without creating another journal
+event, credit, or block submission. Only the response envelope is marked
+replayed.
 Connection-local request IDs correlate responses only; neither they nor the
 replay marker are durable accounting keys.
+An idempotently replayed receipt remains a successful miner response, but the
+implemented connection actor excludes it from vardiff timing samples. Otherwise
+one proof retried many times could manipulate the worker's future share target.
+That success requires the exact commit event to remain queued or in the bounded
+connection-local observed-event cache. While retained, all event kinds reserve
+their sequence and the same stable share ID cannot be re-journaled with changed
+receipt bytes or a new sequence. After reconnect or cache eviction, the full
+receipt remains reconciliation-pending until the durable projector confirms it;
+the current code intentionally cannot brand or acknowledge that historical replay.
 
 In-memory duplicate filters are an optimization only. Correctness comes from
 wolf's stable durable receipt and from transactional uniqueness on
@@ -116,12 +141,21 @@ project that complete interval; ReadEvents is intentionally unavailable after
 a connection enters live subscription mode. Historical JobActivated events do
 not renew acceptance leases, and every relative live or snapshot lifetime is
 anchored before transport so delay cannot make work valid longer than wolf did.
+For live events the client carries forward the prior successful exchange's
+request-start anchor; an activation that waited in the socket during an idle
+period therefore loses that idle time rather than gaining a fresh lease.
 
 The current client queues unsolicited live events only while completing
 bounded requests. Until a dedicated reader exists, the runtime must send
-periodic health requests and drain that queue. Failing to do so is an
-accounting-omission risk and must stop new work rather than permit payout from
-an incomplete projection.
+periodic health requests and drain that queue. Before `HealthStatus`, wolf must
+send every missing live event contiguously through the response watermark on the
+same connection. Before a fresh `ShareCommitted` response, it must deliver the
+exact matching share event, including receipt, job, immutable worker identity,
+and issued target. The client rejects an unflushed future sequence, a fresh
+receipt that does not advance, or any different event at the claimed sequence.
+These are accounting-omission and attribution risks, not health signals. Any
+such failure globally suspends generation admission and notifies both
+established and future miner sessions to close.
 
 ### Rotation races and withheld late shares
 
@@ -150,6 +184,12 @@ job.
 
 No success string, HTTP status, or template-provider response is sufficient by
 itself. Structured outcomes and exact identifiers are required.
+Before exposing a branded commit, the pool client independently recomputes the
+stable share ID and SHA-256d parent hash over
+`header_input || nonce || fd4005 || solution`, then checks receipt job identity,
+Wcash candidate hash, both coinbase IDs, and reward facts against the retained
+generation. A mismatch poisons the backend connection rather than degrading to
+an unverified credit.
 
 ### Crash, retry, and partial-write corruption
 
@@ -165,15 +205,24 @@ Tests terminate processes after each durable step, corrupt or truncate copies
 of state, repeat messages, and verify conservation of balances. A timeout is an
 unknown result to reconcile, never evidence of failure.
 
+The implemented share router globally suspends generation admission before it
+exposes a terminal backend or event-stream result. Its cancellation and panic
+guards suspend before queued callers lose their response channels, and normal
+shutdown suspends before closing the queue. Suspension retains immutable job
+tombstones and already-held admission guards but rejects every new share and
+notifies both existing and later miner sessions to close.
+
 ### Chain reorganizations and immature rewards
 
-Every job and winning-share receipt binds independent Wcash and Zcash reward
-amounts and maturity requirements. The backend journal must then emit typed
-observed, orphaned, and matured transitions keyed by the exact share, job,
-chain, block hash, and height. Observation and maturity bind a same-snapshot
-best-chain tip and exact confirmation depth. The pool must not infer any of
-these monetary facts from job closure, candidate booleans, wall-clock age, or
-an unauthenticated node query.
+Every job and winning-share receipt binds the exact generation, the
+proof-independent Wcash candidate hash, the Wcash candidate and Zcash parent
+coinbase transaction IDs, and independent Wcash and Zcash reward amounts and
+maturity requirements. The backend journal must then emit typed observed,
+orphaned, and matured transitions keyed by the exact share, job, chain, block
+hash, and height. Observation and maturity bind a same-snapshot best-chain tip
+and exact confirmation depth. The pool must not infer any of these monetary
+facts from job closure, candidate booleans, wall-clock age, or an
+unauthenticated node query.
 
 The future accounting engine keeps blocks and credits immature until the typed
 maturity event. Reorganizations produce explicit reversing entries; history is
