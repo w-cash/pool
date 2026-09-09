@@ -15,8 +15,9 @@ use wcash_pool_core::{
     VardiffConfig, VardiffController, VardiffError,
 };
 use wcash_pool_protocol::{
-    encode_zip301_message, Hex1344, Hex4, NonceSuffix, ProtocolError, Zip301Id, Zip301Notify,
-    Zip301Request, Zip301ServerMessage,
+    canonical_attribution_id, canonical_share_id, encode_zip301_message, Hex1344, Hex4,
+    NonceSuffix, ProtocolError, ShareReceipt, Zip301Id, Zip301Notify, Zip301Request,
+    Zip301ServerMessage,
 };
 
 use crate::rate_limit::RequestRateLimiter;
@@ -131,7 +132,22 @@ struct PendingShareState {
     response_id: Option<Zip301IdIndex>,
     target: TargetBinding,
     admitted_at_ms: u64,
-    accepted: Option<bool>,
+    vardiff_sample: Option<bool>,
+    expected_job_id: [u8; 32],
+    expected_share_id: [u8; 32],
+    expected_attribution_id: [u8; 32],
+}
+
+impl PendingShareState {
+    fn matches_receipt(&self, receipt: &ShareReceipt) -> bool {
+        receipt.job_id.as_bytes() == &self.expected_job_id
+            && receipt.share_id.as_bytes() == &self.expected_share_id
+            && receipt.attribution_id.as_bytes() == &self.expected_attribution_id
+    }
+}
+
+const fn counts_toward_vardiff(replayed: bool) -> bool {
+    !replayed
 }
 
 struct SubmittedWork {
@@ -324,12 +340,24 @@ impl ConnectionActor {
         let response_id = self.take_response_id(expected.1)?;
         match result {
             Ok(worker) => {
-                self.session.complete_authorization(worker)?;
-                self.queue(Zip301ServerMessage::Boolean {
-                    id: response_id,
-                    result: true,
-                })?;
-                self.synchronize_current_job()?;
+                // ZIP-301 repeats the authorized login on every share. Until the
+                // authentication interface carries an explicit alias set, accepting
+                // a different canonical login here would make authorization appear
+                // successful while every subsequent share fails `LoginMismatch`.
+                if worker.canonical_login() == ticket.worker {
+                    self.session.complete_authorization(worker)?;
+                    self.queue(Zip301ServerMessage::Boolean {
+                        id: response_id,
+                        result: true,
+                    })?;
+                    self.synchronize_current_job()?;
+                } else {
+                    self.session.reject_authorization()?;
+                    self.queue_error(
+                        response_id,
+                        MinerError::new(MinerErrorCode::Unauthorized, "unauthorized", true),
+                    )?;
+                }
             }
             Err(AuthenticationError::Denied) => {
                 self.session.reject_authorization()?;
@@ -363,10 +391,23 @@ impl ConnectionActor {
             self.close();
             return Err(ConnectionActorError::CompletionTicketMismatch);
         }
-        let accepted = result.is_ok();
+        let completion_matches = match (self.pending_shares.get(&ticket.ticket), &result) {
+            (Some(pending), Ok(commit)) if pending.vardiff_sample.is_none() => {
+                pending.matches_receipt(commit.receipt())
+            }
+            (Some(pending), Err(_)) => pending.vardiff_sample.is_none(),
+            _ => false,
+        };
+        if !completion_matches {
+            self.close();
+            return Err(ConnectionActorError::CompletionTicketMismatch);
+        }
+        let vardiff_sample = result
+            .as_ref()
+            .is_ok_and(|verified| counts_toward_vardiff(verified.replayed()));
         let response_index = match self.pending_shares.get_mut(&ticket.ticket) {
-            Some(pending) if pending.accepted.is_none() => {
-                pending.accepted = Some(accepted);
+            Some(pending) if pending.vardiff_sample.is_none() => {
+                pending.vardiff_sample = Some(vardiff_sample);
                 pending.response_id.take()
             }
             Some(_) | None => {
@@ -395,11 +436,18 @@ impl ConnectionActor {
                     MinerError::new(MinerErrorCode::Other, "service busy", false),
                 )?;
             }
+            Err(ShareRouterError::ReplayRequiresProjection { .. }) => {
+                self.queue_error(
+                    response_id,
+                    MinerError::new(MinerErrorCode::Other, "share reconciliation pending", false),
+                )?;
+            }
             Err(
                 ShareRouterError::Unavailable
                 | ShareRouterError::JobStreamUnusable
                 | ShareRouterError::TaskFailed
                 | ShareRouterError::BackendNotLive
+                | ShareRouterError::BackendConnectionMismatch
                 | ShareRouterError::InvalidQueueCapacity { .. },
             ) => {
                 self.queue_error(
@@ -428,6 +476,12 @@ impl ConnectionActor {
                 let current = self.router.current_generation()?;
                 if current.as_ref().map(BackendGeneration::id) == Some(generation.id()) {
                     self.announce_generation(generation.as_ref(), clean_jobs)?;
+                } else if clean_jobs {
+                    // A slow actor can observe a clean activation only after the
+                    // global router has advanced again. Preserve that discarded
+                    // boundary so the next current generation cannot be announced
+                    // as compatible with miner work from the old lineage.
+                    self.advertised_lineage.clear();
                 }
             }
             JobUpdate::Retired { job_id } => {
@@ -548,6 +602,16 @@ impl ConnectionActor {
             Err(error) => return Err(error.into()),
         };
         let target = target.ok_or(ConnectionActorError::MissingAssignment(job_id))?;
+        let expected_job_id = *context.job_id().as_bytes();
+        let expected_share_id = *canonical_share_id(
+            &context.job_id(),
+            context.time(),
+            context.nonce(),
+            context.solution(),
+        )
+        .as_bytes();
+        let expected_attribution_id =
+            *canonical_attribution_id(context.identity(), context.target_le())?.as_bytes();
         let response_id = self.store_response_id(id)?;
         let ticket = self.allocate_ticket()?;
         self.pending_shares.insert(
@@ -556,7 +620,10 @@ impl ConnectionActor {
                 response_id: Some(response_id),
                 target,
                 admitted_at_ms: now_ms,
-                accepted: None,
+                vardiff_sample: None,
+                expected_job_id,
+                expected_share_id,
+                expected_attribution_id,
             },
         );
         self.timing_order.push_back(ticket);
@@ -581,10 +648,10 @@ impl ConnectionActor {
             let Some(ticket) = self.timing_order.front().copied() else {
                 return Ok(());
             };
-            let Some(accepted) = self
+            let Some(vardiff_sample) = self
                 .pending_shares
                 .get(&ticket)
-                .and_then(|pending| pending.accepted)
+                .and_then(|pending| pending.vardiff_sample)
             else {
                 return Ok(());
             };
@@ -593,7 +660,7 @@ impl ConnectionActor {
                 .remove(&ticket)
                 .ok_or(ConnectionActorError::CompletionTicketMismatch)?;
             self.timing_order.pop_front();
-            if accepted {
+            if vardiff_sample {
                 if let Some(vardiff) = self.vardiff.as_mut() {
                     let _ = vardiff.observe_share(pending.target, pending.admitted_at_ms)?;
                 }
@@ -824,7 +891,9 @@ mod tests {
     use wcash_pool_core::{
         GenerationRegistryConfig, NonceNamespaceLease, NonceProfile, TargetBounds,
     };
-    use wcash_pool_protocol::{AcceptableJob, Hex108, Hex32, JobDescriptor, TargetLe};
+    use wcash_pool_protocol::{
+        AcceptableJob, BackendEvent, Hex108, Hex32, JobDescriptor, TargetLe,
+    };
 
     fn descriptor(id: u8) -> JobDescriptor {
         let mut header = [id; 108];
@@ -833,9 +902,12 @@ mod tests {
         header[100..104].copy_from_slice(&[1, 2, 3, id]);
         JobDescriptor {
             job_id: Hex32::new([id; 32]),
+            wcash_candidate_hash_le: Hex32::new([5; 32]),
             header_input: Hex108::new(header),
             wcash_previous_hash_le: Hex32::new([id.wrapping_add(2); 32]),
             zcash_previous_hash_le: Hex32::new([id.wrapping_add(1); 32]),
+            wcash_coinbase_txid_le: Hex32::new([6; 32]),
+            zcash_coinbase_txid_le: Hex32::new([7; 32]),
             wcash_target_le: TargetLe::new([3; 32]),
             zcash_target_le: TargetLe::new([4; 32]),
             wcash_height: 10,
@@ -993,6 +1065,61 @@ mod tests {
     }
 
     #[test]
+    fn authorization_rejects_an_unannounced_canonical_login_change() {
+        let mut actor = actor(8);
+        actor
+            .handle_request(
+                Zip301Request::Subscribe {
+                    id: Zip301Id::Number(1),
+                    params: Vec::new(),
+                },
+                0,
+            )
+            .expect("subscribe succeeds");
+        let action = actor
+            .handle_request(
+                Zip301Request::Authorize {
+                    id: Zip301Id::Number(2),
+                    worker: "account.rig".to_owned(),
+                    password: "x".to_owned(),
+                },
+                1,
+            )
+            .expect("authorization begins")
+            .expect("authorization action exists");
+        let ConnectionAction::Authenticate(ticket) = action else {
+            unreachable!("fixture must request authorization")
+        };
+
+        actor
+            .complete_authorization(
+                ticket,
+                Ok(AuthenticatedWorker::new(
+                    Uuid::from_u128(2),
+                    Uuid::from_u128(3),
+                    "different.rig",
+                )
+                .expect("worker identity is valid")),
+            )
+            .expect("mismatch is returned as a uniform denial");
+
+        assert!(actor.is_closed());
+        assert!(matches!(
+            actor.pop_outbound(),
+            Some(Zip301ServerMessage::Subscribed { .. })
+        ));
+        assert!(matches!(
+            actor.pop_outbound(),
+            Some(Zip301ServerMessage::Error {
+                code,
+                message,
+                ..
+            }) if code == MinerErrorCode::Unauthorized.as_i32() && message == "unauthorized"
+        ));
+        assert!(actor.pop_outbound().is_none());
+    }
+
+    #[test]
     fn changed_vardiff_binding_is_not_retrofitted_to_same_generation() {
         let mut actor = actor(8);
         authorize(&mut actor);
@@ -1052,6 +1179,65 @@ mod tests {
         assert!(actor.assignments.contains_key(&fourth.id()));
         assert!(!actor.advertised_lineage.contains(&second.id()));
         assert!(actor.advertised_lineage.contains(&fourth.id()));
+    }
+
+    #[test]
+    fn skipped_clean_activation_forces_the_next_current_notification_clean() {
+        let mut actor = actor(16);
+        authorize(&mut actor);
+        while actor.pop_outbound().is_some() {}
+        assert!(!actor.advertised_lineage.is_empty());
+
+        let second_descriptor = descriptor(2);
+        let second = BackendGeneration::from_descriptor(second_descriptor.clone())
+            .expect("second descriptor is valid");
+        actor
+            .router
+            .apply_event_for_test(
+                &BackendEvent::JobActivated {
+                    event_seq: 2,
+                    job: second_descriptor.clone(),
+                },
+                0,
+            )
+            .expect("changed-tip activation succeeds");
+
+        let mut third_descriptor = descriptor(3);
+        third_descriptor.wcash_previous_hash_le = second_descriptor.wcash_previous_hash_le.clone();
+        third_descriptor.zcash_previous_hash_le = second_descriptor.zcash_previous_hash_le.clone();
+        let mut third_header = *third_descriptor.header_input.as_bytes();
+        third_header[4..36].copy_from_slice(second_descriptor.zcash_previous_hash_le.as_bytes());
+        third_descriptor.header_input = Hex108::new(third_header);
+        let third = BackendGeneration::from_descriptor(third_descriptor.clone())
+            .expect("third descriptor is valid");
+        actor
+            .router
+            .apply_event_for_test(
+                &BackendEvent::JobActivated {
+                    event_seq: 3,
+                    job: third_descriptor,
+                },
+                0,
+            )
+            .expect("same-tip replacement succeeds");
+
+        // The actor handles the changed-tip activation after the router already
+        // moved to its same-tip successor, so the second generation is skipped.
+        actor
+            .apply_job_update(JobUpdate::Activated {
+                generation: Box::new(second),
+                clean_jobs: true,
+            })
+            .expect("skipped clean boundary is retained");
+        assert!(actor.advertised_lineage.is_empty());
+
+        actor
+            .apply_job_update(JobUpdate::Activated {
+                generation: Box::new(third),
+                clean_jobs: false,
+            })
+            .expect("current replacement is announced");
+        assert!(pop_notify(&mut actor).clean_jobs);
     }
 
     #[test]
@@ -1211,7 +1397,10 @@ mod tests {
                 response_id: None,
                 target,
                 admitted_at_ms: 10,
-                accepted: None,
+                vardiff_sample: None,
+                expected_job_id: [1; 32],
+                expected_share_id: [2; 32],
+                expected_attribution_id: [3; 32],
             },
         );
         actor.pending_shares.insert(
@@ -1220,7 +1409,10 @@ mod tests {
                 response_id: None,
                 target,
                 admitted_at_ms: 20,
-                accepted: Some(true),
+                vardiff_sample: Some(true),
+                expected_job_id: [4; 32],
+                expected_share_id: [5; 32],
+                expected_attribution_id: [6; 32],
             },
         );
         actor.timing_order.extend([10, 11]);
@@ -1233,12 +1425,81 @@ mod tests {
             .pending_shares
             .get_mut(&10)
             .expect("earlier share exists")
-            .accepted = Some(true);
+            .vardiff_sample = Some(true);
         actor
             .drain_completed_timing()
             .expect("timestamps are observed in admission order");
         assert!(actor.pending_shares.is_empty());
         assert!(actor.timing_order.is_empty());
         assert!(!actor.is_closed());
+    }
+
+    #[test]
+    fn replayed_completion_is_excluded_from_vardiff_timing() {
+        assert!(!counts_toward_vardiff(true));
+        assert!(counts_toward_vardiff(false));
+
+        let mut actor = actor(8);
+        authorize(&mut actor);
+        while actor.pop_outbound().is_some() {}
+        let target = actor.binding().expect("vardiff is active");
+        let mut expected = actor.vardiff.clone().expect("vardiff controller exists");
+        actor.pending_shares.insert(
+            10,
+            PendingShareState {
+                response_id: None,
+                target,
+                admitted_at_ms: 10,
+                vardiff_sample: Some(counts_toward_vardiff(true)),
+                expected_job_id: [1; 32],
+                expected_share_id: [2; 32],
+                expected_attribution_id: [3; 32],
+            },
+        );
+        actor.timing_order.push_back(10);
+        actor
+            .drain_completed_timing()
+            .expect("replay completion drains without sampling");
+
+        let actual_update = actor
+            .vardiff
+            .as_mut()
+            .expect("vardiff controller remains active")
+            .tick(100_001)
+            .expect("clock advances");
+        let expected_update = expected.tick(100_001).expect("reference clock advances");
+        assert_eq!(actual_update, expected_update);
+        assert_eq!(
+            actor.vardiff.as_ref().map(VardiffController::binding),
+            Some(expected.binding())
+        );
+    }
+
+    #[test]
+    fn pending_ticket_requires_its_exact_backend_receipt_identity() {
+        let target = actor(8).policy.initial_target;
+        let bounds =
+            TargetBounds::new(target, target, ShareTarget::MAX).expect("fixture bounds are valid");
+        let state = PendingShareState {
+            response_id: None,
+            target: TargetBinding::new(1, ShareTarget::MAX, bounds)
+                .expect("fixture target is valid"),
+            admitted_at_ms: 0,
+            vardiff_sample: None,
+            expected_job_id: [1; 32],
+            expected_share_id: [2; 32],
+            expected_attribution_id: [3; 32],
+        };
+        let mut receipt = ShareReceipt {
+            event_seq: 1,
+            job_id: Hex32::new([1; 32]),
+            share_id: Hex32::new([2; 32]),
+            attribution_id: Hex32::new([3; 32]),
+            parent_hash_le: Hex32::new([4; 32]),
+            winners: Vec::new(),
+        };
+        assert!(state.matches_receipt(&receipt));
+        receipt.share_id = Hex32::new([9; 32]);
+        assert!(!state.matches_receipt(&receipt));
     }
 }

@@ -25,9 +25,12 @@ fn job(byte: u8) -> JobDescriptor {
     header[100..104].copy_from_slice(&1_725_000_000u32.to_le_bytes());
     JobDescriptor {
         job_id: fixed(byte),
+        wcash_candidate_hash_le: fixed(0x61),
         header_input: Hex108::new(header),
         wcash_previous_hash_le: fixed(byte.wrapping_add(1)),
         zcash_previous_hash_le: fixed(byte),
+        wcash_coinbase_txid_le: fixed(0x62),
+        zcash_coinbase_txid_le: fixed(0x63),
         wcash_target_le: fixed(0x7f).into(),
         zcash_target_le: fixed(0x3f).into(),
         wcash_height: 11,
@@ -427,6 +430,103 @@ fn backend_jobs_and_zip301_notifications_share_strict_v4_header_checks() -> Test
 }
 
 #[test]
+fn canonical_proof_hashes_match_cross_repository_vectors_and_bind_every_input() -> TestResult {
+    let header = Hex108::new([0x11; 108]);
+    let nonce = Hex32::new([0x22; 32]);
+    let solution = Hex1344::new([0x33; 1_344]);
+    let parent_hash = canonical_parent_header_hash_le(&header, &nonce, &solution);
+    assert_eq!(
+        parent_hash,
+        Hex32::parse("8d42e485a3444c07a081813db898515845997c2cf4eb1681c0225d384582f8e5")?
+    );
+
+    let mut changed_header = *header.as_bytes();
+    changed_header[107] ^= 1;
+    assert_ne!(
+        canonical_parent_header_hash_le(&Hex108::new(changed_header), &nonce, &solution),
+        parent_hash
+    );
+    let mut changed_nonce = *nonce.as_bytes();
+    changed_nonce[31] ^= 1;
+    assert_ne!(
+        canonical_parent_header_hash_le(&header, &Hex32::new(changed_nonce), &solution),
+        parent_hash
+    );
+    let mut changed_solution = *solution.as_bytes();
+    changed_solution[1_343] ^= 1;
+    assert_ne!(
+        canonical_parent_header_hash_le(&header, &nonce, &Hex1344::new(changed_solution)),
+        parent_hash
+    );
+
+    let job_id = Hex32::new([0x44; 32]);
+    let time = Hex4::new([1, 2, 3, 4]);
+    let share_id = canonical_share_id(&job_id, &time, &nonce, &solution);
+    assert_eq!(
+        share_id,
+        Hex32::parse("6df9286f48e118ce8a008ed2f75dc8198ac5bb66685cd0bf7b216eb334b4a4d8")?
+    );
+
+    let mut changed_job_id = *job_id.as_bytes();
+    changed_job_id[0] ^= 1;
+    assert_ne!(
+        canonical_share_id(&Hex32::new(changed_job_id), &time, &nonce, &solution),
+        share_id
+    );
+    let mut changed_time = *time.as_bytes();
+    changed_time[0] ^= 1;
+    assert_ne!(
+        canonical_share_id(&job_id, &Hex4::new(changed_time), &nonce, &solution),
+        share_id
+    );
+    assert_ne!(
+        canonical_share_id(&job_id, &time, &Hex32::new(changed_nonce), &solution),
+        share_id
+    );
+    assert_ne!(
+        canonical_share_id(&job_id, &time, &nonce, &Hex1344::new(changed_solution)),
+        share_id
+    );
+
+    let worker = identity();
+    let target_le: TargetLe = fixed(0x54).into();
+    let attribution_id = canonical_attribution_id(&worker, &target_le)?;
+    assert_eq!(
+        attribution_id,
+        Hex32::parse("4e960daa071f86897d12be9e20592c45ff970355ce2519587dac460db586b1dd")?
+    );
+
+    for changed_identity in [
+        WorkerIdentity {
+            account_id: uuid(3),
+            ..worker.clone()
+        },
+        WorkerIdentity {
+            worker_id: uuid(4),
+            ..worker.clone()
+        },
+        WorkerIdentity {
+            label: "account.rig-02".to_owned(),
+            ..worker.clone()
+        },
+        WorkerIdentity {
+            label: "account.rig-010".to_owned(),
+            ..worker.clone()
+        },
+    ] {
+        assert_ne!(
+            canonical_attribution_id(&changed_identity, &target_le)?,
+            attribution_id
+        );
+    }
+    assert_ne!(
+        canonical_attribution_id(&worker, &fixed(0x55).into())?,
+        attribution_id
+    );
+    Ok(())
+}
+
+#[test]
 fn large_submit_request_round_trips_and_debug_is_redacted() -> TestResult {
     let request = BackendRequest::SubmitShare {
         version: 1,
@@ -452,8 +552,9 @@ fn large_submit_request_round_trips_and_debug_is_redacted() -> TestResult {
 }
 
 #[test]
-fn worker_identity_and_worker_bearing_backend_debug_are_redacted() {
+fn worker_identity_and_worker_bearing_backend_debug_are_redacted() -> TestResult {
     let worker = identity();
+    let target_le: TargetLe = fixed(0x34).into();
     assert_eq!(
         format!("{worker:?}"),
         "WorkerIdentity { account_id: \"[REDACTED]\", worker_id: \"[REDACTED]\", label: \"[REDACTED]\" }"
@@ -462,13 +563,15 @@ fn worker_identity_and_worker_bearing_backend_debug_are_redacted() {
     let event = BackendEvent::ShareCommitted {
         receipt: ShareReceipt {
             event_seq: 1,
+            job_id: fixed(0x33),
             share_id: fixed(0x31),
+            attribution_id: canonical_attribution_id(&worker, &target_le)?,
             parent_hash_le: fixed(0x32),
             winners: Vec::new(),
         },
         job_id: fixed(0x33),
         identity: worker,
-        target_le: fixed(0x34).into(),
+        target_le,
     };
     let event_debug = format!("{event:?}");
     assert!(event_debug.contains("identity: \"[REDACTED]\""));
@@ -500,6 +603,7 @@ fn worker_identity_and_worker_bearing_backend_debug_are_redacted() {
     );
     assert!(error_debug.contains("message: \"[REDACTED]\""));
     assert!(!error_debug.contains("secret diagnostic"));
+    Ok(())
 }
 
 #[test]
@@ -516,9 +620,13 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
     };
     assert!(zero_time.validate().is_err());
 
+    let event_identity = identity();
+    let event_target_le: TargetLe = fixed(0x54).into();
     let receipt = ShareReceipt {
         event_seq: 7,
+        job_id: fixed(0x53),
         share_id: fixed(0x51),
+        attribution_id: canonical_attribution_id(&event_identity, &event_target_le)?,
         parent_hash_le: fixed(0x52),
         winners: vec![winner(MergedChain::Wcash, 0x61)],
     };
@@ -529,8 +637,10 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
         replayed: true,
     };
     let expected = format!(
-        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"share_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[{{\"chain\":\"wcash\",\"block_hash_le\":\"{}\",\"height\":11,\"coinbase_txid_le\":\"{}\",\"reward_zat\":625000000,\"maturity_confirmations\":100}}]}},\"replayed\":true}}",
+        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"job_id\":\"{}\",\"share_id\":\"{}\",\"attribution_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[{{\"chain\":\"wcash\",\"block_hash_le\":\"{}\",\"height\":11,\"coinbase_txid_le\":\"{}\",\"reward_zat\":625000000,\"maturity_confirmations\":100}}]}},\"replayed\":true}}",
+        "53".repeat(32),
         "51".repeat(32),
+        receipt.attribution_id,
         "52".repeat(32),
         "61".repeat(32),
         "62".repeat(32),
@@ -544,8 +654,8 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
         event: BackendEvent::ShareCommitted {
             receipt,
             job_id: fixed(0x53),
-            identity: identity(),
-            target_le: fixed(0x54).into(),
+            identity: event_identity,
+            target_le: event_target_le,
         },
     };
     let event_frame = encode_backend_message(&event)?;
@@ -564,8 +674,10 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
     assert!(decode_backend_request(&raw_backend_frame(missing_time.as_bytes())).is_err());
 
     let nested_replayed = format!(
-        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"share_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[],\"replayed\":true}},\"replayed\":true}}",
+        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"job_id\":\"{}\",\"share_id\":\"{}\",\"attribution_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[],\"replayed\":true}},\"replayed\":true}}",
+        "53".repeat(32),
         "51".repeat(32),
+        "54".repeat(32),
         "52".repeat(32),
     );
     assert!(decode_backend_message(&raw_backend_frame(nested_replayed.as_bytes())).is_err());
@@ -611,13 +723,157 @@ fn job_and_winner_reward_facts_are_bounded_and_must_match() -> TestResult {
 }
 
 #[test]
+fn receipts_reject_crossed_generation_candidate_and_coinbase_bindings() -> TestResult {
+    let exact_job = job(0x11);
+    let exact_receipt = ShareReceipt {
+        event_seq: 7,
+        job_id: exact_job.job_id.clone(),
+        share_id: fixed(0x51),
+        attribution_id: fixed(0x54),
+        parent_hash_le: fixed(0x62),
+        winners: vec![
+            winner(MergedChain::Wcash, 0x61),
+            winner(MergedChain::Zcash, 0x62),
+        ],
+    };
+    exact_receipt.validate_for_job(&exact_job)?;
+
+    let mut wrong_job_id = exact_receipt.clone();
+    wrong_job_id.job_id = fixed(0x12);
+    assert!(matches!(
+        wrong_job_id.validate_for_job(&exact_job),
+        Err(ProtocolError::InvalidField {
+            field: "share_receipt.job_id",
+            ..
+        })
+    ));
+
+    let mut wrong_wcash_hash = exact_receipt.clone();
+    wrong_wcash_hash.winners[0].block_hash_le = fixed(0x64);
+    assert!(matches!(
+        wrong_wcash_hash.validate_for_job(&exact_job),
+        Err(ProtocolError::InvalidField {
+            field: "winner.block_hash_le",
+            ..
+        })
+    ));
+
+    for winner_index in [0, 1] {
+        let mut wrong_coinbase = exact_receipt.clone();
+        wrong_coinbase.winners[winner_index].coinbase_txid_le = fixed(0x65);
+        assert!(matches!(
+            wrong_coinbase.validate_for_job(&exact_job),
+            Err(ProtocolError::InvalidField {
+                field: "winner.coinbase_txid_le",
+                ..
+            })
+        ));
+    }
+
+    for crossed_job in [
+        JobDescriptor {
+            wcash_candidate_hash_le: fixed(0x66),
+            ..exact_job.clone()
+        },
+        JobDescriptor {
+            wcash_coinbase_txid_le: fixed(0x67),
+            ..exact_job.clone()
+        },
+        JobDescriptor {
+            zcash_coinbase_txid_le: fixed(0x68),
+            ..exact_job.clone()
+        },
+    ] {
+        crossed_job.validate()?;
+        assert!(exact_receipt.validate_for_job(&crossed_job).is_err());
+    }
+
+    let event_identity = identity();
+    let event_target_le: TargetLe = fixed(0x54).into();
+    let exact_event = BackendEvent::ShareCommitted {
+        receipt: ShareReceipt {
+            attribution_id: canonical_attribution_id(&event_identity, &event_target_le)?,
+            ..exact_receipt.clone()
+        },
+        job_id: exact_receipt.job_id.clone(),
+        identity: event_identity,
+        target_le: event_target_le,
+    };
+    exact_event.validate()?;
+
+    let mut crossed_identity = exact_event.clone();
+    let BackendEvent::ShareCommitted {
+        identity: crossed_worker,
+        ..
+    } = &mut crossed_identity
+    else {
+        unreachable!("fixture is a share event");
+    };
+    crossed_worker.label = "another.worker".to_owned();
+    assert!(matches!(
+        crossed_identity.validate(),
+        Err(ProtocolError::InvalidField {
+            field: "event.attribution",
+            ..
+        })
+    ));
+
+    let mut crossed_target = exact_event;
+    let BackendEvent::ShareCommitted { target_le, .. } = &mut crossed_target else {
+        unreachable!("fixture is a share event");
+    };
+    *target_le = fixed(0x55).into();
+    assert!(matches!(
+        crossed_target.validate(),
+        Err(ProtocolError::InvalidField {
+            field: "event.attribution",
+            ..
+        })
+    ));
+
+    let crossed_event = BackendEvent::ShareCommitted {
+        receipt: exact_receipt,
+        job_id: fixed(0x12),
+        identity: identity(),
+        target_le: fixed(0x54).into(),
+    };
+    assert!(matches!(
+        crossed_event.validate(),
+        Err(ProtocolError::InvalidField {
+            field: "event.job_id",
+            ..
+        })
+    ));
+
+    for invalid_job in [
+        JobDescriptor {
+            wcash_candidate_hash_le: fixed(0),
+            ..exact_job.clone()
+        },
+        JobDescriptor {
+            wcash_coinbase_txid_le: fixed(0),
+            ..exact_job.clone()
+        },
+        JobDescriptor {
+            zcash_coinbase_txid_le: fixed(0),
+            ..exact_job
+        },
+    ] {
+        assert!(invalid_job.validate().is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn share_receipt_commits_canonical_exact_winners() {
     let parent_hash = fixed(0x72);
     let wcash = winner(MergedChain::Wcash, 0x61);
     let zcash = winner(MergedChain::Zcash, 0x72);
     let receipt = |winners| ShareReceipt {
         event_seq: 1,
+        job_id: fixed(0x70),
         share_id: fixed(0x71),
+        attribution_id: fixed(0x73),
         parent_hash_le: parent_hash.clone(),
         winners,
     };
@@ -994,6 +1250,16 @@ fn event_pages_are_strictly_ordered_and_cursor_bound() {
         ],
     };
     assert!(gap.validate().is_err());
+
+    let stalled = BackendMessage::EventsPage {
+        version: 1,
+        id: 5,
+        after_event_seq: 10,
+        next_event_seq: 10,
+        complete: false,
+        events: Vec::new(),
+    };
+    assert!(stalled.validate().is_err());
 }
 
 #[test]

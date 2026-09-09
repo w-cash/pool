@@ -457,9 +457,12 @@ mod tests {
         header[100..104].copy_from_slice(&[1, 2, 3, id]);
         wcash_pool_protocol::JobDescriptor {
             job_id: Hex32::new([id; 32]),
+            wcash_candidate_hash_le: Hex32::new([id.wrapping_add(5); 32]),
             header_input: Hex108::new(header),
             wcash_previous_hash_le: Hex32::new([id.wrapping_add(2); 32]),
             zcash_previous_hash_le: Hex32::new([id.wrapping_add(1); 32]),
+            wcash_coinbase_txid_le: Hex32::new([id.wrapping_add(6); 32]),
+            zcash_coinbase_txid_le: Hex32::new([id.wrapping_add(7); 32]),
             wcash_target_le: TargetLe::new([id.wrapping_add(3); 32]),
             zcash_target_le: TargetLe::new([id.wrapping_add(4); 32]),
             wcash_height: u32::from(id) + 1,

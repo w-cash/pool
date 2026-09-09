@@ -15,8 +15,9 @@ mod unix;
 
 #[cfg(unix)]
 pub use unix::{
-    BackendClient, BackendClientConfig, BackendIdentity, BackendStreamPhase, ClientConfigError,
-    ClientError, DeliveredBackendEvent, EventPage, ExpectedBackend, HealthSnapshot, JobSnapshot,
-    JobStateIntegrationError, MonotonicAnchor, MonotonicTimeline, ShareSubmission, TimelineError,
-    UnverifiedShareCommit, VerifiedShareCommit,
+    BackendAuthority, BackendClient, BackendClientConfig, BackendConnectionBinding,
+    BackendIdentity, BackendStreamPhase, ClientConfigError, ClientError, DeliveredBackendEvent,
+    EventPage, ExpectedBackend, HealthSnapshot, JobSnapshot, JobStateIntegrationError,
+    MonotonicAnchor, MonotonicTimeline, ShareSubmission, TimelineError, UnverifiedShareCommit,
+    VerifiedShareCommit,
 };

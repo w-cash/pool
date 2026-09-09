@@ -1,6 +1,7 @@
 use std::fmt;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     error::invalid, CanonicalUuid, FixedHex, Hex108, Hex1344, Hex32, Hex4, ProtocolError, TargetLe,
@@ -29,6 +30,15 @@ pub const MAX_CHAIN_VALUE_ZAT: u64 = 2_100_000_000_000_000;
 
 /// Defensive wire bound for a chain's coinbase maturity requirement.
 pub const MAX_MATURITY_CONFIRMATIONS: u32 = 1_000_000;
+
+/// Canonical CompactSize prefix for a 1,344-byte Equihash `(200, 9)` solution.
+pub const EQUIHASH_SOLUTION_COMPACT_SIZE: [u8; 3] = [0xfd, 0x40, 0x05];
+
+/// Domain separator for the stable proof identity returned in a share receipt.
+pub const SHARE_ID_DOMAIN: &[u8] = b"wcash-pool/share-id/v1";
+
+/// Domain separator for immutable worker-and-target attribution.
+pub const ATTRIBUTION_ID_DOMAIN: &[u8] = b"wcash-pool/attribution-id/v1";
 
 fn encode_length_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtocolError> {
     let payload =
@@ -122,12 +132,18 @@ impl WorkerIdentity {
 pub struct JobDescriptor {
     /// Backend-generated identifier for the exact frozen generation.
     pub job_id: Hex32,
+    /// Proof-independent Wcash candidate hash in raw little-endian byte order.
+    pub wcash_candidate_hash_le: Hex32,
     /// Version through compact difficulty, excluding nonce and solution.
     pub header_input: Hex108,
     /// Wcash predecessor hash in consensus/raw little-endian byte order.
     pub wcash_previous_hash_le: Hex32,
     /// Zcash predecessor hash in consensus/raw little-endian byte order.
     pub zcash_previous_hash_le: Hex32,
+    /// Wcash candidate coinbase transaction ID in raw little-endian byte order.
+    pub wcash_coinbase_txid_le: Hex32,
+    /// Zcash parent coinbase transaction ID in raw little-endian byte order.
+    pub zcash_coinbase_txid_le: Hex32,
     /// Authenticated Wcash target in little-endian numeric byte order.
     pub wcash_target_le: TargetLe,
     /// Authenticated Zcash target in little-endian numeric byte order.
@@ -152,6 +168,7 @@ impl JobDescriptor {
     /// Checks identifiers, targets, heights, and lifetime bounds.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         require_nonzero_hex(&self.job_id, "job.job_id")?;
+        require_nonzero_hex(&self.wcash_candidate_hash_le, "job.wcash_candidate_hash_le")?;
         validate_v4_header_input(
             &self.header_input,
             "job.header_input.version",
@@ -159,6 +176,8 @@ impl JobDescriptor {
         )?;
         require_nonzero_hex(&self.wcash_previous_hash_le, "job.wcash_previous_hash_le")?;
         require_nonzero_hex(&self.zcash_previous_hash_le, "job.zcash_previous_hash_le")?;
+        require_nonzero_hex(&self.wcash_coinbase_txid_le, "job.wcash_coinbase_txid_le")?;
+        require_nonzero_hex(&self.zcash_coinbase_txid_le, "job.zcash_coinbase_txid_le")?;
         if self.header_input.as_bytes()[4..36] != self.zcash_previous_hash_le.as_bytes()[..] {
             return Err(invalid(
                 "job.zcash_previous_hash_le",
@@ -208,6 +227,65 @@ pub(crate) fn validate_v4_header_input(
         return Err(invalid(time_field, "must be nonzero"));
     }
     Ok(())
+}
+
+/// Computes the raw little-endian Zcash parent-header hash for one submitted share.
+///
+/// Zcash serializes the fixed 108-byte pre-nonce header, the complete 32-byte
+/// nonce, the canonical CompactSize encoding of a 1,344-byte solution, and the
+/// raw solution bytes before applying SHA-256 twice. This helper deliberately
+/// does not validate Equihash; it only binds a backend receipt to the exact
+/// bytes submitted through this protocol.
+pub fn canonical_parent_header_hash_le(
+    header_input: &Hex108,
+    nonce: &Hex32,
+    solution: &Hex1344,
+) -> Hex32 {
+    let mut first = Sha256::new();
+    first.update(header_input.as_bytes());
+    first.update(nonce.as_bytes());
+    first.update(EQUIHASH_SOLUTION_COMPACT_SIZE);
+    first.update(solution.as_bytes());
+    let first = first.finalize();
+    Hex32::new(Sha256::digest(first).into())
+}
+
+/// Computes the stable identity of one exact submitted proof.
+///
+/// Worker identity and assigned target are intentionally excluded: the backend
+/// stores them as the immutable attribution fingerprint for this proof, so a
+/// retry with different attribution is a conflict rather than a second share.
+pub fn canonical_share_id(job_id: &Hex32, time: &Hex4, nonce: &Hex32, solution: &Hex1344) -> Hex32 {
+    let mut hasher = Sha256::new();
+    hasher.update(SHARE_ID_DOMAIN);
+    hasher.update(job_id.as_bytes());
+    hasher.update(time.as_bytes());
+    hasher.update(nonce.as_bytes());
+    hasher.update(solution.as_bytes());
+    Hex32::new(hasher.finalize().into())
+}
+
+/// Computes the stable attribution bound into every durable share receipt.
+///
+/// The canonical UUID bytes and explicit label length make this encoding
+/// unambiguous. The assigned target is included so a retry cannot claim easier
+/// work or another account after the matching journal event has been projected.
+pub fn canonical_attribution_id(
+    identity: &WorkerIdentity,
+    target_le: &TargetLe,
+) -> Result<Hex32, ProtocolError> {
+    identity.validate()?;
+    require_nonzero_target(target_le, "attribution.target_le")?;
+    let label_len = u16::try_from(identity.label.len())
+        .map_err(|_| invalid("worker.label", "length cannot be represented canonically"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(ATTRIBUTION_ID_DOMAIN);
+    hasher.update(identity.account_id.get().as_bytes());
+    hasher.update(identity.worker_id.get().as_bytes());
+    hasher.update(label_len.to_be_bytes());
+    hasher.update(identity.label.as_bytes());
+    hasher.update(target_le.as_bytes());
+    Ok(Hex32::new(hasher.finalize().into()))
 }
 
 /// A job plus the backend-authenticated remaining time it may accept shares.
@@ -338,18 +416,32 @@ impl WinnerDescriptor {
     pub fn validate_for_job(&self, job: &JobDescriptor) -> Result<(), ProtocolError> {
         job.validate()?;
         self.validate()?;
-        let (height, reward, maturity) = match self.chain {
+        let (height, reward, maturity, coinbase_txid) = match self.chain {
             MergedChain::Wcash => (
                 job.wcash_height,
                 job.wcash_reward_zat,
                 job.wcash_maturity_confirmations,
+                &job.wcash_coinbase_txid_le,
             ),
             MergedChain::Zcash => (
                 job.zcash_height,
                 job.zcash_reward_zat,
                 job.zcash_maturity_confirmations,
+                &job.zcash_coinbase_txid_le,
             ),
         };
+        if self.chain == MergedChain::Wcash && self.block_hash_le != job.wcash_candidate_hash_le {
+            return Err(invalid(
+                "winner.block_hash_le",
+                "must match the proof-independent Wcash candidate hash in its job",
+            ));
+        }
+        if &self.coinbase_txid_le != coinbase_txid {
+            return Err(invalid(
+                "winner.coinbase_txid_le",
+                "must match the winning chain coinbase transaction ID in its job",
+            ));
+        }
         if self.height != height {
             return Err(invalid(
                 "winner.height",
@@ -398,8 +490,12 @@ impl ChainTip {
 pub struct ShareReceipt {
     /// Monotonic sequence of the authoritative journal commit.
     pub event_seq: u64,
+    /// Exact backend generation that accepted this share.
+    pub job_id: Hex32,
     /// Backend-computed stable share identifier.
     pub share_id: Hex32,
+    /// Stable hash of the authenticated worker identity and exact issued target.
+    pub attribution_id: Hex32,
     /// Validated parent header hash in raw little-endian byte order.
     pub parent_hash_le: Hex32,
     /// Exact winning blocks durably created with this share.
@@ -415,7 +511,9 @@ impl ShareReceipt {
         if self.event_seq == 0 {
             return Err(invalid("share_receipt.event_seq", "must be positive"));
         }
+        require_nonzero_hex(&self.job_id, "share_receipt.job_id")?;
         require_nonzero_hex(&self.share_id, "share_receipt.share_id")?;
+        require_nonzero_hex(&self.attribution_id, "share_receipt.attribution_id")?;
         require_nonzero_hex(&self.parent_hash_le, "share_receipt.parent_hash_le")?;
         if self.winners.len() > 2 {
             return Err(invalid(
@@ -439,6 +537,22 @@ impl ShareReceipt {
                 ));
             }
             previous = Some(winner.chain);
+        }
+        Ok(())
+    }
+
+    /// Checks that this receipt and all winners belong to one exact generation.
+    pub fn validate_for_job(&self, job: &JobDescriptor) -> Result<(), ProtocolError> {
+        job.validate()?;
+        self.validate()?;
+        if self.job_id != job.job_id {
+            return Err(invalid(
+                "share_receipt.job_id",
+                "must match the submitted backend generation",
+            ));
+        }
+        for winner in &self.winners {
+            winner.validate_for_job(job)?;
         }
         Ok(())
     }
@@ -685,6 +799,15 @@ impl BackendEvent {
             } => {
                 receipt.validate()?;
                 require_nonzero_hex(job_id, "event.job_id")?;
+                if receipt.job_id != *job_id {
+                    return Err(invalid("event.job_id", "must match share_receipt.job_id"));
+                }
+                if receipt.attribution_id != canonical_attribution_id(identity, target_le)? {
+                    return Err(invalid(
+                        "event.attribution",
+                        "must match share_receipt.attribution_id",
+                    ));
+                }
                 identity.validate()?;
                 require_nonzero_target(target_le, "event.target_le")
             }
@@ -1228,6 +1351,7 @@ impl BackendMessage {
                 id,
                 after_event_seq,
                 next_event_seq,
+                complete,
                 events,
                 ..
             } => {
@@ -1236,6 +1360,12 @@ impl BackendMessage {
                     return Err(invalid(
                         "events_page.events",
                         format!("must contain at most {MAX_EVENT_PAGE_ITEMS} events"),
+                    ));
+                }
+                if !complete && events.is_empty() {
+                    return Err(invalid(
+                        "events_page.events",
+                        "an incomplete page must advance with at least one event",
                     ));
                 }
                 let mut previous = *after_event_seq;

@@ -328,6 +328,14 @@ impl RegistryEntry {
             && self.storage.live_resource().is_some()
             && now_ms < self.accept_until_ms
     }
+
+    fn retained_at_watermark(&self, now_ms: u64) -> bool {
+        matches!(
+            self.state,
+            AdmissionState::Accepting | AdmissionState::Suspended
+        ) && self.storage.live_resource().is_some()
+            && now_ms < self.accept_until_ms
+    }
 }
 
 /// Current generation plus the exact bounded set Wolf still accepts.
@@ -346,6 +354,7 @@ pub struct GenerationRegistry {
     watermark_current: Option<JobId>,
     watermark_recent: VecDeque<JobId>,
     last_event_seq: Option<u64>,
+    last_delivery_anchor_ms: Option<u64>,
     last_monotonic_ms: Option<u64>,
     synchronized: bool,
 }
@@ -361,6 +370,7 @@ impl GenerationRegistry {
             watermark_current: None,
             watermark_recent: VecDeque::with_capacity(config.maximum_recent),
             last_event_seq: None,
+            last_delivery_anchor_ms: None,
             last_monotonic_ms: None,
             synchronized: false,
         }
@@ -379,6 +389,23 @@ impl GenerationRegistry {
     /// Returns the current generation ID without extending its lifetime.
     pub const fn current_job_id(&self) -> Option<JobId> {
         self.current
+    }
+
+    /// Suspends every live admission until a fresh authoritative snapshot succeeds.
+    ///
+    /// This transition is deliberately idempotent. It retains immutable generation
+    /// descriptors, terminal tombstones, deadlines, and the last journal watermark,
+    /// while removing every current/recent admission role. Existing admission guards
+    /// remain valid resource fences, but no new admission can begin.
+    pub fn suspend(&mut self) {
+        for entry in self.entries.values_mut() {
+            if entry.state == AdmissionState::Accepting {
+                entry.state = AdmissionState::Suspended;
+            }
+        }
+        self.current = None;
+        self.recent.clear();
+        self.synchronized = false;
     }
 
     /// Returns exact admissible current/recent roles at `now_ms`.
@@ -434,6 +461,11 @@ impl GenerationRegistry {
         recent: &[AcceptableJob],
         request_started_ms: u64,
     ) -> Result<(), JobRegistryError> {
+        let effective_now_ms = self
+            .last_monotonic_ms
+            .map_or(request_started_ms, |observed| {
+                observed.max(request_started_ms)
+            });
         let result = self.prepare_snapshot(event_seq, current, recent, request_started_ms);
         match result {
             Ok(prepared) => {
@@ -443,12 +475,17 @@ impl GenerationRegistry {
                 self.watermark_current = self.current;
                 self.watermark_recent = self.recent.clone();
                 self.last_event_seq = Some(event_seq);
-                self.last_monotonic_ms = Some(request_started_ms);
+                self.last_delivery_anchor_ms = Some(request_started_ms);
+                self.last_monotonic_ms = Some(effective_now_ms);
                 self.synchronized = true;
+                // The request-start anchor prevents transport latency from extending
+                // a lease; the effective policy time prevents a delayed response
+                // from rewinding expiry already observed by another caller.
+                self.expire_at(effective_now_ms);
                 Ok(())
             }
             Err(error) => {
-                self.suspend_live_work();
+                self.suspend();
                 Err(error)
             }
         }
@@ -463,9 +500,29 @@ impl GenerationRegistry {
         event: &BackendEvent,
         delivery_anchor_ms: u64,
     ) -> Result<(), JobRegistryError> {
-        let result = self.try_apply_event(event, delivery_anchor_ms);
+        let policy_now_ms = self
+            .last_monotonic_ms
+            .map_or(delivery_anchor_ms, |observed| {
+                observed.max(delivery_anchor_ms)
+            });
+        self.apply_event_at(event, delivery_anchor_ms, policy_now_ms)
+    }
+
+    /// Applies one event while expiring policy at a later observation time.
+    ///
+    /// `delivery_anchor_ms` preserves the event's transport-authenticated lease
+    /// origin. `policy_now_ms` is sampled when the serialized registry transition
+    /// begins, so work that expired while queued cannot consume recent-job capacity
+    /// or be advertised before a later policy query prunes it.
+    pub fn apply_event_at(
+        &mut self,
+        event: &BackendEvent,
+        delivery_anchor_ms: u64,
+        policy_now_ms: u64,
+    ) -> Result<(), JobRegistryError> {
+        let result = self.try_apply_event(event, delivery_anchor_ms, policy_now_ms);
         if result.is_err() {
-            self.suspend_live_work();
+            self.suspend();
         }
         result
     }
@@ -548,7 +605,7 @@ impl GenerationRegistry {
         recent: &[AcceptableJob],
         anchor_ms: u64,
     ) -> Result<PreparedSnapshot, JobRegistryError> {
-        self.check_clock(anchor_ms)?;
+        self.check_delivery_clock(anchor_ms)?;
         if let Some(previous) = self.last_event_seq {
             if event_seq < previous {
                 return Err(JobRegistryError::SnapshotSequenceRollback {
@@ -670,11 +727,19 @@ impl GenerationRegistry {
         &mut self,
         event: &BackendEvent,
         anchor_ms: u64,
+        policy_now_ms: u64,
     ) -> Result<(), JobRegistryError> {
         if !self.synchronized {
             return Err(JobRegistryError::NotSynchronized);
         }
-        self.check_clock(anchor_ms)?;
+        self.check_delivery_clock(anchor_ms)?;
+        self.check_clock(policy_now_ms)?;
+        if policy_now_ms < anchor_ms {
+            return Err(JobRegistryError::ClockMovedBackwards);
+        }
+        let effective_now_ms = self
+            .last_monotonic_ms
+            .map_or(policy_now_ms, |observed| observed.max(policy_now_ms));
         event
             .validate()
             .map_err(|_| JobRegistryError::InvalidBackendEvent)?;
@@ -691,7 +756,7 @@ impl GenerationRegistry {
             });
         }
 
-        self.expire_at(anchor_ms);
+        self.expire_at(effective_now_ms);
         match event {
             BackendEvent::JobActivated { job, .. } => {
                 self.activate(job, anchor_ms)?;
@@ -720,10 +785,15 @@ impl GenerationRegistry {
             | BackendEvent::WinnerOrphaned { .. }
             | BackendEvent::WinnerMatured { .. } => {}
         }
+        // A valid event can spend time queued behind a bounded backend exchange.
+        // Deadlines remain anchored to transport receipt, while policy state is
+        // immediately expired at the latest time already observed by any caller.
+        self.expire_at(effective_now_ms);
         self.last_event_seq = Some(event.event_seq());
         self.watermark_current = self.current;
         self.watermark_recent = self.recent.clone();
-        self.last_monotonic_ms = Some(anchor_ms);
+        self.last_delivery_anchor_ms = Some(anchor_ms);
+        self.last_monotonic_ms = Some(effective_now_ms);
         Ok(())
     }
 
@@ -850,9 +920,19 @@ impl GenerationRegistry {
         Ok(())
     }
 
+    fn check_delivery_clock(&self, anchor_ms: u64) -> Result<(), JobRegistryError> {
+        if self
+            .last_delivery_anchor_ms
+            .is_some_and(|previous| anchor_ms < previous)
+        {
+            return Err(JobRegistryError::ClockMovedBackwards);
+        }
+        Ok(())
+    }
+
     fn advance_clock(&mut self, now_ms: u64) -> Result<(), JobRegistryError> {
         if let Err(error) = self.check_clock(now_ms) {
-            self.suspend_live_work();
+            self.suspend();
             return Err(error);
         }
         self.expire_at(now_ms);
@@ -883,24 +963,13 @@ impl GenerationRegistry {
         self.watermark_current = self.watermark_current.filter(|id| {
             self.entries
                 .get(id)
-                .is_some_and(|entry| entry.accepting(now_ms))
+                .is_some_and(|entry| entry.retained_at_watermark(now_ms))
         });
         self.watermark_recent.retain(|id| {
             self.entries
                 .get(id)
-                .is_some_and(|entry| entry.accepting(now_ms))
+                .is_some_and(|entry| entry.retained_at_watermark(now_ms))
         });
-    }
-
-    fn suspend_live_work(&mut self) {
-        for entry in self.entries.values_mut() {
-            if entry.state == AdmissionState::Accepting {
-                entry.state = AdmissionState::Suspended;
-            }
-        }
-        self.current = None;
-        self.recent.clear();
-        self.synchronized = false;
     }
 }
 
@@ -1036,9 +1105,12 @@ mod tests {
         header[100..104].copy_from_slice(&[1, 2, 3, id]);
         JobDescriptor {
             job_id: Hex32::new([id; 32]),
+            wcash_candidate_hash_le: Hex32::new([id.wrapping_add(5); 32]),
             header_input: Hex108::new(header),
             wcash_previous_hash_le: Hex32::new([id.wrapping_add(2); 32]),
             zcash_previous_hash_le: Hex32::new([id.wrapping_add(1); 32]),
+            wcash_coinbase_txid_le: Hex32::new([id.wrapping_add(6); 32]),
+            zcash_coinbase_txid_le: Hex32::new([id.wrapping_add(7); 32]),
             wcash_target_le: TargetLe::new([id.wrapping_add(3); 32]),
             zcash_target_le: TargetLe::new([id.wrapping_add(4); 32]),
             wcash_height: u32::from(id) + 1,
@@ -1105,6 +1177,52 @@ mod tests {
     }
 
     #[test]
+    fn delayed_snapshot_preserves_policy_time_and_request_anchored_deadline() {
+        let mut registry = registry();
+        registry
+            .apply_snapshot(4, Some(&acceptable(1, 1_000, 900)), &[], 100)
+            .expect("initial snapshot is valid");
+        let _ = registry
+            .admissible_job_ids(150)
+            .expect("policy time advances while resubscription is in flight");
+        registry.suspend();
+
+        registry
+            .apply_snapshot(5, Some(&acceptable(2, 1_000, 100)), &[], 110)
+            .expect("ordered snapshot anchor may predate a later policy query");
+        assert_eq!(registry.last_monotonic_ms, Some(150));
+        assert_eq!(registry.entries[&id(2)].accept_until_ms, 210);
+        assert!(registry.begin_admission(id(2), 209).is_ok());
+        assert!(matches!(
+            registry.begin_admission(id(2), 210),
+            Err(JobRegistryError::StaleJob(job_id)) if job_id == id(2)
+        ));
+    }
+
+    #[test]
+    fn snapshot_expired_in_transport_is_recorded_without_reactivation() {
+        let mut registry = registry();
+        registry
+            .apply_snapshot(4, Some(&acceptable(1, 1_000, 900)), &[], 100)
+            .expect("initial snapshot is valid");
+        let _ = registry
+            .admissible_job_ids(250)
+            .expect("policy time advances while resubscription is in flight");
+        registry.suspend();
+
+        registry
+            .apply_snapshot(5, Some(&acceptable(2, 100, 100)), &[], 110)
+            .expect("the snapshot fact is valid even though its lease elapsed");
+        assert!(registry.is_synchronized());
+        assert_eq!(registry.last_event_seq(), Some(5));
+        assert_eq!(registry.current_job_id(), None);
+        assert!(matches!(
+            registry.begin_admission(id(2), 250),
+            Err(JobRegistryError::StaleJob(job_id)) if job_id == id(2)
+        ));
+    }
+
+    #[test]
     fn malformed_snapshot_suspends_prior_work_atomically() {
         let mut registry = registry();
         let current = acceptable(1, 1_000, 500);
@@ -1120,6 +1238,66 @@ mod tests {
             registry.begin_admission(id(1), 12),
             Err(JobRegistryError::NotSynchronized)
         ));
+    }
+
+    #[test]
+    fn explicit_suspension_is_idempotent_and_preserves_guards_and_tombstones() {
+        let mut registry = registry();
+        let current = acceptable(1, 1_000, 500);
+        let recent = acceptable(2, 1_000, 400);
+        registry
+            .apply_snapshot(1, Some(&current), &[recent], 0)
+            .expect("initial snapshot is valid");
+        registry
+            .apply_snapshot(2, Some(&current), &[], 1)
+            .expect("omitting recent work is authoritative");
+        assert_eq!(
+            registry.collect_retired(1).expect("clock is monotonic"),
+            vec![id(2)]
+        );
+        assert!(matches!(
+            registry.entries[&id(2)].storage,
+            GenerationStorage::Tombstone(_)
+        ));
+
+        let guard = registry
+            .begin_admission(id(1), 2)
+            .expect("current work is initially admissible");
+        let watermark = registry.last_event_seq();
+        registry.suspend();
+        registry.suspend();
+
+        assert!(!registry.is_synchronized());
+        assert_eq!(registry.last_event_seq(), watermark);
+        assert_eq!(registry.current_job_id(), None);
+        assert_eq!(registry.in_flight(id(1)), Some(1));
+        assert_eq!(guard.generation().id(), id(1));
+        assert!(matches!(
+            registry.entries[&id(2)].storage,
+            GenerationStorage::Tombstone(_)
+        ));
+        assert_eq!(
+            registry.generation(id(2)).map(BackendGeneration::id),
+            Some(id(2))
+        );
+        assert!(matches!(
+            registry.begin_admission(id(1), 2),
+            Err(JobRegistryError::NotSynchronized)
+        ));
+
+        registry
+            .apply_snapshot(2, Some(&current), &[], 3)
+            .expect("the exact same watermark snapshot restores suspended work");
+        let restored_guard = registry
+            .begin_admission(id(1), 3)
+            .expect("restored current work is admissible");
+        assert!(registry.is_synchronized());
+        assert!(matches!(
+            registry.entries[&id(2)].storage,
+            GenerationStorage::Tombstone(_)
+        ));
+        drop(restored_guard);
+        drop(guard);
     }
 
     #[test]
@@ -1328,6 +1506,47 @@ mod tests {
     }
 
     #[test]
+    fn delayed_activation_prunes_expired_recent_capacity_before_rotation() {
+        let mut registry = GenerationRegistry::new(
+            GenerationRegistryConfig::new(1, 8).expect("fixture limits are valid"),
+        );
+        registry
+            .apply_snapshot(
+                1,
+                Some(&acceptable(1, 100, 100)),
+                &[acceptable(2, 100, 5)],
+                0,
+            )
+            .expect("initial full recent set is valid");
+
+        registry
+            .apply_event_at(
+                &BackendEvent::JobActivated {
+                    event_seq: 2,
+                    job: descriptor(3, 100),
+                },
+                1,
+                10,
+            )
+            .expect("expired queued history is pruned before activation rotates current work");
+
+        assert_eq!(registry.current_job_id(), Some(id(3)));
+        assert_eq!(
+            registry
+                .admissible_job_ids(10)
+                .expect("registry remains synchronized"),
+            AdmissibleJobIds {
+                current: Some(id(3)),
+                recent: vec![id(1)],
+            }
+        );
+        assert!(matches!(
+            registry.begin_admission(id(2), 10),
+            Err(JobRegistryError::StaleJob(job_id)) if job_id == id(2)
+        ));
+    }
+
+    #[test]
     fn closure_blocks_new_work_but_guard_fences_resource_retirement() {
         let mut registry = registry();
         registry
@@ -1492,6 +1711,72 @@ mod tests {
             Err(JobRegistryError::ClockMovedBackwards)
         ));
         assert!(!registry.is_synchronized());
+    }
+
+    #[test]
+    fn buffered_events_do_not_extend_lifetimes_or_trip_policy_clock() {
+        let mut registry = registry();
+        registry
+            .apply_snapshot(5, Some(&acceptable(1, 1_000, 900)), &[], 100)
+            .expect("snapshot is valid");
+        let _ = registry
+            .admissible_job_ids(150)
+            .expect("policy time advances while the backend exchange is in flight");
+
+        registry
+            .apply_event(
+                &BackendEvent::JobActivated {
+                    event_seq: 6,
+                    job: descriptor(2, 100),
+                },
+                110,
+            )
+            .expect("an ordered transport anchor may predate a policy query");
+        assert!(registry.begin_admission(id(2), 209).is_ok());
+        assert!(matches!(
+            registry.begin_admission(id(2), 210),
+            Err(JobRegistryError::StaleJob(job_id)) if job_id == id(2)
+        ));
+
+        registry
+            .apply_event(
+                &BackendEvent::JobInvalidated {
+                    event_seq: 7,
+                    job_id: id(3).to_protocol(),
+                    reason: JobInvalidationReason::Age,
+                    accept_for_ms: 0,
+                },
+                110,
+            )
+            .expect("multiple events delivered by one exchange share an anchor");
+        assert_eq!(registry.last_event_seq(), Some(7));
+    }
+
+    #[test]
+    fn activation_expired_while_buffered_is_recorded_but_never_admitted() {
+        let mut registry = registry();
+        registry
+            .apply_snapshot(5, Some(&acceptable(1, 1_000, 900)), &[], 100)
+            .expect("snapshot is valid");
+        let _ = registry
+            .admissible_job_ids(250)
+            .expect("policy time advances while the backend exchange is in flight");
+
+        registry
+            .apply_event(
+                &BackendEvent::JobActivated {
+                    event_seq: 6,
+                    job: descriptor(2, 100),
+                },
+                110,
+            )
+            .expect("the contiguous journal fact is still recorded");
+        assert_eq!(registry.last_event_seq(), Some(6));
+        assert_eq!(registry.current_job_id(), None);
+        assert!(matches!(
+            registry.begin_admission(id(2), 250),
+            Err(JobRegistryError::StaleJob(job_id)) if job_id == id(2)
+        ));
     }
 
     #[test]

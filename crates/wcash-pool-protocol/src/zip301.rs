@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     backend::{
-        require_nonzero_hex, validate_bounded_text, validate_v4_header_input, validate_worker_label,
+        require_nonzero_hex, validate_bounded_text, validate_v4_header_input,
+        validate_worker_label, EQUIHASH_SOLUTION_COMPACT_SIZE,
     },
     error::invalid,
     FixedHex, Hex108, Hex1344, Hex24, Hex28, Hex32, Hex4, ProtocolError, TargetBe,
@@ -575,7 +576,7 @@ fn decode_zip301_submit(
     };
     let encoded_solution = parameter_string(params, 4, "mining.submit solution")?;
     let compact_solution = parse_miner_hex::<1347>(encoded_solution, "mining.submit solution")?;
-    if compact_solution.as_bytes()[..3] != [0xfd, 0x40, 0x05] {
+    if compact_solution.as_bytes()[..3] != EQUIHASH_SOLUTION_COMPACT_SIZE {
         return Err(invalid(
             "mining.submit solution",
             "must start with canonical CompactSize fd4005",

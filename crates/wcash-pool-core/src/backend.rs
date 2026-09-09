@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wcash_pool_protocol::{
-    BackendRequest, Hex1344, Hex32, Hex4, MergedChain, ShareReceipt, TargetLe, WinnerDescriptor,
-    WorkerIdentity,
+    canonical_attribution_id, canonical_share_id, BackendRequest, Hex1344, Hex32, Hex4,
+    MergedChain, ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity,
 };
 
-const SHARE_DOMAIN: &[u8] = b"wcash-pool/fake-share-id/v1";
 const PARENT_DOMAIN: &[u8] = b"wcash-pool/fake-parent-hash/v1";
 const WCASH_DOMAIN: &[u8] = b"wcash-pool/fake-wcash-hash/v1";
 const COINBASE_DOMAIN: &[u8] = b"wcash-pool/fake-coinbase-hash/v1";
@@ -69,15 +68,7 @@ impl FakeMiningBackend {
         else {
             return Err(MiningBackendError::NotSubmitShare);
         };
-        Ok(digest(
-            SHARE_DOMAIN,
-            [
-                job_id.as_bytes().as_slice(),
-                time.as_bytes(),
-                nonce.as_bytes(),
-                solution.as_bytes(),
-            ],
-        ))
+        Ok(canonical_share_id(job_id, time, nonce, solution))
     }
 
     /// Plans independent child/parent candidate bits for a raw request.
@@ -185,7 +176,10 @@ impl MiningBackend for FakeMiningBackend {
         }
         let receipt = ShareReceipt {
             event_seq,
+            job_id,
             share_id: share_id.clone(),
+            attribution_id: canonical_attribution_id(&fingerprint.identity, &fingerprint.target_le)
+                .map_err(|_| MiningBackendError::InvalidProtocolRequest)?,
             parent_hash_le,
             winners,
         };

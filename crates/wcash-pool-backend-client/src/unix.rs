@@ -3,6 +3,7 @@ use std::{
     fmt, io,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -15,6 +16,7 @@ use tokio::{
 };
 use wcash_pool_core::{GenerationRegistry, JobRegistryError, SubmissionContext};
 use wcash_pool_protocol::{
+    canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id,
     decode_backend_message, encode_backend_request, AcceptableJob, BackendCapability,
     BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex1344, Hex32,
     Hex4, JobDescriptor, ProtocolError, ShareReceipt, TargetLe, WorkerIdentity,
@@ -216,6 +218,63 @@ pub struct BackendIdentity {
     pub current_event_seq: u64,
 }
 
+/// Persistent chain and journal authority negotiated for one backend connection.
+///
+/// Fields are private so edge orchestration can compare authorities without
+/// manufacturing an identity that bypasses the validated hello exchange.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendAuthority {
+    wcash_genesis: Hex32,
+    zcash_genesis: Hex32,
+    chain_id: u32,
+    backend_instance: CanonicalUuid,
+    journal_stream: CanonicalUuid,
+}
+
+/// Opaque binding between one snapshot and the exact live client that produced it.
+///
+/// Persistent authority equality alone is insufficient: two connections can have
+/// different snapshot cursors and queued events. Pointer identity on the private
+/// connection token prevents orchestration from cross-wiring those streams.
+#[derive(Clone)]
+pub struct BackendConnectionBinding {
+    authority: BackendAuthority,
+    connection_token: Arc<()>,
+    snapshot_event_seq: u64,
+}
+
+impl fmt::Debug for BackendConnectionBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendConnectionBinding")
+            .field("authority", &self.authority)
+            .field("snapshot_event_seq", &self.snapshot_event_seq)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BackendConnectionBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.authority == other.authority
+            && self.snapshot_event_seq == other.snapshot_event_seq
+            && Arc::ptr_eq(&self.connection_token, &other.connection_token)
+    }
+}
+
+impl Eq for BackendConnectionBinding {}
+
+impl BackendConnectionBinding {
+    /// Returns the persistent authority authenticated for this connection.
+    pub const fn authority(&self) -> &BackendAuthority {
+        &self.authority
+    }
+
+    /// Returns the exact snapshot watermark that established live mode.
+    pub const fn snapshot_event_seq(&self) -> u64 {
+        self.snapshot_event_seq
+    }
+}
+
 /// A client-captured monotonic instant that predates one backend I/O exchange.
 ///
 /// The constructor is intentionally private. Code applying backend-relative job
@@ -316,6 +375,7 @@ pub enum JobStateIntegrationError {
 pub struct DeliveredBackendEvent {
     event: BackendEvent,
     anchor: MonotonicAnchor,
+    connection_binding: BackendConnectionBinding,
 }
 
 impl DeliveredBackendEvent {
@@ -334,6 +394,11 @@ impl DeliveredBackendEvent {
         self.anchor
     }
 
+    /// Returns the opaque live connection that delivered this event.
+    pub const fn connection_binding(&self) -> &BackendConnectionBinding {
+        &self.connection_binding
+    }
+
     /// Applies this exact event using its transport-captured pre-I/O anchor.
     pub fn apply_to_registry(
         &self,
@@ -342,6 +407,18 @@ impl DeliveredBackendEvent {
     ) -> Result<(), JobStateIntegrationError> {
         let anchor_ms = timeline.anchor_ms(self.anchor)?;
         registry.apply_event(&self.event, anchor_ms)?;
+        Ok(())
+    }
+
+    /// Applies this event using its transport anchor and a later serialized policy time.
+    pub fn apply_to_registry_at(
+        &self,
+        registry: &mut GenerationRegistry,
+        timeline: MonotonicTimeline,
+        policy_now_ms: u64,
+    ) -> Result<(), JobStateIntegrationError> {
+        let anchor_ms = timeline.anchor_ms(self.anchor)?;
+        registry.apply_event_at(&self.event, anchor_ms, policy_now_ms)?;
         Ok(())
     }
 }
@@ -438,24 +515,55 @@ impl VerifiedShareCommit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobSnapshot {
     /// Snapshot journal watermark.
-    pub event_seq: u64,
+    event_seq: u64,
     /// Current job, if the backend is safely issuing work.
-    pub current: Option<AcceptableJob>,
+    current: Option<AcceptableJob>,
     /// Explicitly bounded prior jobs still in ingress grace.
-    pub recent: Vec<AcceptableJob>,
+    recent: Vec<AcceptableJob>,
     /// Journal cursor replayed on this connection before subscription.
     ///
     /// When this is smaller than `event_seq`, accounting must replay the missing
     /// range on a separate replay connection before credit or payout resumes. The
     /// job state in this snapshot is nevertheless authoritative at `event_seq`.
-    pub replayed_through_event_seq: u64,
+    replayed_through_event_seq: u64,
     anchor: MonotonicAnchor,
+    connection_binding: BackendConnectionBinding,
 }
 
 impl JobSnapshot {
+    /// Returns the snapshot's exact journal watermark.
+    pub const fn event_seq(&self) -> u64 {
+        self.event_seq
+    }
+
+    /// Returns the current exact job, if mining was active in this snapshot.
+    pub const fn current(&self) -> Option<&AcceptableJob> {
+        self.current.as_ref()
+    }
+
+    /// Returns the ordered prior jobs still in backend-authenticated ingress grace.
+    pub fn recent(&self) -> &[AcceptableJob] {
+        &self.recent
+    }
+
+    /// Returns the journal cursor replayed before this connection subscribed.
+    pub const fn replayed_through_event_seq(&self) -> u64 {
+        self.replayed_through_event_seq
+    }
+
     /// Returns the monotonic instant captured before `SubscribeJobs` I/O began.
     pub const fn anchor(&self) -> MonotonicAnchor {
         self.anchor
+    }
+
+    /// Returns the persistent authority authenticated by the hello exchange.
+    pub const fn authority(&self) -> &BackendAuthority {
+        self.connection_binding.authority()
+    }
+
+    /// Returns an opaque binding to the exact live connection and snapshot cursor.
+    pub fn connection_binding(&self) -> BackendConnectionBinding {
+        self.connection_binding.clone()
     }
 
     /// Initializes generation policy using the exact pre-subscription I/O anchor.
@@ -660,6 +768,60 @@ pub enum ClientError {
         /// Sequence received from the backend.
         actual: u64,
     },
+    /// A live response claimed a journal state whose events were not delivered first.
+    #[error(
+        "backend {operation} response requires live events through {required}; delivered through {delivered}"
+    )]
+    LiveEventFlushIncomplete {
+        /// Response whose watermark was not flushed.
+        operation: &'static str,
+        /// Journal sequence the response depends on.
+        required: u64,
+        /// Greatest contiguous event delivered on this live connection.
+        delivered: u64,
+    },
+    /// A share acknowledgement was not paired with its exact durable event.
+    #[error(
+        "backend share commit event {event_seq} did not exactly match the submitted share receipt"
+    )]
+    ShareCommitEventMismatch {
+        /// Sequence claimed by the share receipt.
+        event_seq: u64,
+    },
+    /// One canonical proof identity was associated with conflicting receipts.
+    #[error(
+        "backend share identity was already bound to event {recorded_event_seq}, not claimed event {claimed_event_seq}"
+    )]
+    ShareCommitHistoryConflict {
+        /// Retained journal sequence carrying the same canonical share identity.
+        recorded_event_seq: u64,
+        /// Sequence claimed by the correlated response.
+        claimed_event_seq: u64,
+    },
+    /// An old idempotent replay needs confirmation from the durable projector.
+    #[error("historical share replay requires projected-receipt confirmation")]
+    HistoricalReplayRequiresProjection {
+        /// Exact response which the projector must match byte-for-byte.
+        receipt: Box<ShareReceipt>,
+    },
+    /// A response labelled as a fresh commit reused an already observed sequence.
+    #[error(
+        "backend fresh share commit sequence {event_seq} did not advance past {previous_event_seq}"
+    )]
+    FreshShareCommitDidNotAdvance {
+        /// Sequence claimed by the fresh receipt.
+        event_seq: u64,
+        /// Live event cursor before the submission began.
+        previous_event_seq: u64,
+    },
+    /// The journal committed this exact share but its correlated response rejected it.
+    #[error(
+        "backend durably committed share event {event_seq} but returned a contradictory error"
+    )]
+    ContradictoryShareOutcome {
+        /// Exact matching commit event observed before the error response.
+        event_seq: u64,
+    },
     /// The bounded unsolicited-event queue filled while awaiting a response.
     #[error("backend event queue reached its capacity of {capacity}")]
     EventQueueFull {
@@ -687,13 +849,18 @@ pub struct BackendClient {
     stream: UnixStream,
     config: BackendClientConfig,
     identity: BackendIdentity,
+    connection_token: Arc<()>,
     next_request_id: u64,
     queued_events: VecDeque<DeliveredBackendEvent>,
+    observed_events: VecDeque<BackendEvent>,
+    historical_events: VecDeque<BackendEvent>,
     phase: BackendStreamPhase,
     replay_cursor: u64,
     replay_complete: bool,
     observed_event_high_watermark: u64,
     live_event_cursor: Option<u64>,
+    subscribed_snapshot_event_seq: Option<u64>,
+    live_event_anchor_floor: Option<MonotonicAnchor>,
     usable: bool,
 }
 
@@ -705,6 +872,8 @@ impl fmt::Debug for BackendClient {
             .field("identity", &self.identity)
             .field("next_request_id", &self.next_request_id)
             .field("queued_events", &self.queued_events.len())
+            .field("observed_events", &self.observed_events.len())
+            .field("historical_events", &self.historical_events.len())
             .field("phase", &self.phase)
             .field("replay_cursor", &self.replay_cursor)
             .field("replay_complete", &self.replay_complete)
@@ -713,6 +882,11 @@ impl fmt::Debug for BackendClient {
                 &self.observed_event_high_watermark,
             )
             .field("live_event_cursor", &self.live_event_cursor)
+            .field(
+                "subscribed_snapshot_event_seq",
+                &self.subscribed_snapshot_event_seq,
+            )
+            .field("live_event_anchor_floor", &self.live_event_anchor_floor)
             .field("usable", &self.usable)
             .finish_non_exhaustive()
     }
@@ -755,13 +929,18 @@ impl BackendClient {
             stream,
             config,
             identity: placeholder,
+            connection_token: Arc::new(()),
             next_request_id: 1,
             queued_events: VecDeque::new(),
+            observed_events: VecDeque::new(),
+            historical_events: VecDeque::new(),
             phase: BackendStreamPhase::Replay,
             replay_cursor: last_event_seq,
             replay_complete: false,
             observed_event_high_watermark: 0,
             live_event_cursor: None,
+            subscribed_snapshot_event_seq: None,
+            live_event_anchor_floor: None,
             usable: true,
         };
         let request_id = client.allocate_request_id()?;
@@ -830,6 +1009,34 @@ impl BackendClient {
         self.phase
     }
 
+    /// Returns whether framing and request correlation remain trustworthy.
+    pub const fn is_usable(&self) -> bool {
+        self.usable
+    }
+
+    /// Returns whether this is the exact live connection that produced `binding`.
+    pub fn is_bound_to(&self, binding: &BackendConnectionBinding) -> bool {
+        self.phase == BackendStreamPhase::Live
+            && self.authority() == binding.authority
+            && self.subscribed_snapshot_event_seq == Some(binding.snapshot_event_seq)
+            && Arc::ptr_eq(&self.connection_token, &binding.connection_token)
+    }
+
+    /// Returns the opaque binding for this client's established live snapshot.
+    pub fn connection_binding(&self) -> Option<BackendConnectionBinding> {
+        let snapshot_event_seq = self.subscribed_snapshot_event_seq?;
+        (self.phase == BackendStreamPhase::Live).then(|| BackendConnectionBinding {
+            authority: self.authority(),
+            connection_token: Arc::clone(&self.connection_token),
+            snapshot_event_seq,
+        })
+    }
+
+    /// Returns the contiguous live journal cursor observed on this connection.
+    pub const fn live_event_cursor(&self) -> Option<u64> {
+        self.live_event_cursor
+    }
+
     /// Returns the last journal sequence replayed on this connection.
     pub const fn replay_cursor(&self) -> u64 {
         self.replay_cursor
@@ -847,7 +1054,12 @@ impl BackendClient {
     /// received before that correlated response are queued here. This avoids
     /// cancelling a partially read frame merely because a healthy chain is quiet.
     pub fn pop_queued_event(&mut self) -> Option<DeliveredBackendEvent> {
-        self.queued_events.pop_front()
+        let delivered = self.queued_events.pop_front()?;
+        if self.observed_events.len() == self.config.event_queue_capacity {
+            self.observed_events.pop_front();
+        }
+        self.observed_events.push_back(delivered.event().clone());
+        Some(delivered)
     }
 
     /// Requests an atomic current/recent job snapshot, then irreversibly enters live mode.
@@ -898,13 +1110,24 @@ impl BackendClient {
                 }
                 self.observe_watermark("job snapshot", event_seq)?;
                 self.live_event_cursor = Some(event_seq);
+                self.subscribed_snapshot_event_seq = Some(event_seq);
+                // A later live event might already be waiting in the socket before
+                // the next request begins. This pre-subscription request anchor is
+                // therefore the conservative lower bound for that event's lease.
+                self.live_event_anchor_floor = Some(anchor);
                 self.phase = BackendStreamPhase::Live;
+                let connection_binding = BackendConnectionBinding {
+                    authority: self.authority(),
+                    connection_token: Arc::clone(&self.connection_token),
+                    snapshot_event_seq: event_seq,
+                };
                 Ok(JobSnapshot {
                     event_seq,
                     current,
                     recent,
                     replayed_through_event_seq: after_event_seq,
                     anchor,
+                    connection_binding,
                 })
             }
             BackendMessage::Error { code, message, .. } => {
@@ -928,6 +1151,26 @@ impl BackendClient {
         submission: ShareSubmission,
     ) -> Result<UnverifiedShareCommit, ClientError> {
         self.ensure_phase("submit_share", BackendStreamPhase::Live)?;
+        let live_cursor_before = match self.live_event_cursor {
+            Some(cursor) => cursor,
+            None => {
+                return Err(self.invalidate(ClientError::UnexpectedResponse {
+                    expected: "job_snapshot",
+                    actual: "live share submission",
+                }));
+            }
+        };
+        let submitted_job_id = submission.job_id.clone();
+        let submitted_identity = submission.identity.clone();
+        let submitted_target_le = submission.target_le.clone();
+        let expected_attribution_id =
+            canonical_attribution_id(&submission.identity, &submission.target_le)?;
+        let expected_share_id = canonical_share_id(
+            &submission.job_id,
+            &submission.time,
+            &submission.nonce,
+            &submission.solution,
+        );
         let request_id = self.allocate_request_id()?;
         let (response, _) = self
             .exchange(
@@ -949,15 +1192,64 @@ impl BackendClient {
             BackendMessage::ShareCommitted {
                 receipt, replayed, ..
             } => {
-                if !replayed {
-                    self.observe_watermark("share commit", receipt.event_seq)?;
-                } else {
-                    self.observed_event_high_watermark =
-                        self.observed_event_high_watermark.max(receipt.event_seq);
+                if receipt.job_id != submitted_job_id {
+                    return Err(self.invalidate(ClientError::Protocol(
+                        ProtocolError::InvalidField {
+                            field: "share_receipt.job_id",
+                            reason: "must match the submitted backend generation".to_owned(),
+                        },
+                    )));
                 }
+                if receipt.share_id != expected_share_id {
+                    return Err(self.invalidate(ClientError::Protocol(
+                        ProtocolError::InvalidField {
+                            field: "share_receipt.share_id",
+                            reason: "must match the canonical submitted proof identity".to_owned(),
+                        },
+                    )));
+                }
+                if receipt.attribution_id != expected_attribution_id {
+                    return Err(self.invalidate(ClientError::Protocol(
+                        ProtocolError::InvalidField {
+                            field: "share_receipt.attribution_id",
+                            reason: "must match the submitted worker identity and target"
+                                .to_owned(),
+                        },
+                    )));
+                }
+                if !replayed && receipt.event_seq <= live_cursor_before {
+                    return Err(self.invalidate(ClientError::FreshShareCommitDidNotAdvance {
+                        event_seq: receipt.event_seq,
+                        previous_event_seq: live_cursor_before,
+                    }));
+                }
+                self.require_live_events_through("share commit", receipt.event_seq)?;
+                self.require_consistent_share_history(
+                    &receipt,
+                    &submitted_identity,
+                    &submitted_target_le,
+                )?;
+                self.require_matching_share_event(
+                    &receipt,
+                    &submitted_identity,
+                    &submitted_target_le,
+                    live_cursor_before,
+                    replayed,
+                )?;
                 Ok(UnverifiedShareCommit { receipt, replayed })
             }
             BackendMessage::Error { code, message, .. } => {
+                if let Some(event_seq) = self.matching_share_event_seq(
+                    &submitted_job_id,
+                    &expected_share_id,
+                    &expected_attribution_id,
+                    &submitted_identity,
+                    &submitted_target_le,
+                ) {
+                    return Err(
+                        self.invalidate(ClientError::ContradictoryShareOutcome { event_seq })
+                    );
+                }
                 Err(ClientError::BackendRejected { code, message })
             }
             other => Err(self.invalidate(ClientError::UnexpectedResponse {
@@ -977,6 +1269,11 @@ impl BackendClient {
         context: SubmissionContext,
     ) -> Result<VerifiedShareCommit, ClientError> {
         let descriptor = context.generation().descriptor().clone();
+        let expected_parent_hash_le = canonical_parent_header_hash_le(
+            &descriptor.header_input,
+            context.nonce(),
+            context.solution(),
+        );
         let submission = ShareSubmission {
             job_id: context.job_id(),
             identity: context.identity().clone(),
@@ -985,14 +1282,24 @@ impl BackendClient {
             nonce: context.nonce().clone(),
             solution: context.solution().clone(),
         };
-        let result = self.submit_share(submission).await;
-        let result = result.and_then(|commit| {
-            self.validate_receipt_for_job(commit.receipt(), &descriptor)?;
-            Ok(VerifiedShareCommit {
-                receipt: commit.receipt,
-                replayed: commit.replayed,
-            })
-        });
+        let result = match self.submit_share(submission).await {
+            Ok(commit) => {
+                self.validate_receipt_for_job(
+                    commit.receipt(),
+                    &descriptor,
+                    &expected_parent_hash_le,
+                )?;
+                Ok(VerifiedShareCommit {
+                    receipt: commit.receipt,
+                    replayed: commit.replayed,
+                })
+            }
+            Err(ClientError::HistoricalReplayRequiresProjection { receipt }) => {
+                self.validate_receipt_for_job(&receipt, &descriptor, &expected_parent_hash_le)?;
+                Err(ClientError::HistoricalReplayRequiresProjection { receipt })
+            }
+            Err(error) => Err(error),
+        };
         drop(context);
         result
     }
@@ -1061,6 +1368,7 @@ impl BackendClient {
                 }
                 self.replay_cursor = next_event_seq;
                 self.replay_complete = complete;
+                self.remember_historical_events(&events);
                 Ok(EventPage {
                     after_event_seq: response_cursor,
                     next_event_seq,
@@ -1101,6 +1409,7 @@ impl BackendClient {
                 ..
             } => {
                 self.observe_watermark("health", event_seq)?;
+                self.require_live_events_through("health", event_seq)?;
                 Ok(HealthSnapshot {
                     event_seq,
                     healthy,
@@ -1144,6 +1453,19 @@ impl BackendClient {
         let deadline = self.config.request_timeout;
         let capacity = self.config.event_queue_capacity;
         let anchor = MonotonicAnchor(Instant::now());
+        let (event_anchor, event_binding) = if allow_events {
+            match (self.live_event_anchor_floor, self.connection_binding()) {
+                (Some(anchor), Some(binding)) => (anchor, Some(binding)),
+                _ => {
+                    return Err(self.invalidate(ClientError::UnexpectedResponse {
+                        expected: "job_snapshot",
+                        actual: "live event exchange",
+                    }));
+                }
+            }
+        } else {
+            (anchor, None)
+        };
 
         // From the first I/O poll until a correlated response is decoded, dropping
         // this future must poison the connection. Rust futures are cancellation-safe
@@ -1189,8 +1511,18 @@ impl BackendClient {
                     self.live_event_cursor = Some(actual);
                     self.observed_event_high_watermark =
                         self.observed_event_high_watermark.max(actual);
-                    self.queued_events
-                        .push_back(DeliveredBackendEvent { event, anchor });
+                    let connection_binding =
+                        event_binding
+                            .clone()
+                            .ok_or(ClientError::UnexpectedResponse {
+                                expected: "job_snapshot",
+                                actual: "unbound live event",
+                            })?;
+                    self.queued_events.push_back(DeliveredBackendEvent {
+                        event,
+                        anchor: event_anchor,
+                        connection_binding,
+                    });
                     continue;
                 }
                 let response_id =
@@ -1213,6 +1545,13 @@ impl BackendClient {
 
         match result {
             Ok(Ok(message)) => {
+                if allow_events {
+                    // Any event left for a later exchange cannot predate this
+                    // request. Advancing only after a correlated response ensures
+                    // time spent idle in the socket can shorten, never extend, a
+                    // backend-authenticated generation lifetime.
+                    self.live_event_anchor_floor = Some(anchor);
+                }
                 self.usable = true;
                 Ok((message, anchor))
             }
@@ -1234,11 +1573,18 @@ impl BackendClient {
         &mut self,
         receipt: &ShareReceipt,
         descriptor: &JobDescriptor,
+        expected_parent_hash_le: &Hex32,
     ) -> Result<(), ClientError> {
-        for winner in &receipt.winners {
-            if let Err(error) = winner.validate_for_job(descriptor) {
-                return Err(self.invalidate(ClientError::Protocol(error)));
-            }
+        if let Err(error) = receipt.validate_for_job(descriptor) {
+            return Err(self.invalidate(ClientError::Protocol(error)));
+        }
+        if &receipt.parent_hash_le != expected_parent_hash_le {
+            return Err(
+                self.invalidate(ClientError::Protocol(ProtocolError::InvalidField {
+                    field: "share_receipt.parent_hash_le",
+                    reason: "must match the exact submitted parent header".to_owned(),
+                })),
+            );
         }
         Ok(())
     }
@@ -1308,6 +1654,16 @@ impl BackendClient {
         }
     }
 
+    fn authority(&self) -> BackendAuthority {
+        BackendAuthority {
+            wcash_genesis: self.config.expected.wcash_genesis.clone(),
+            zcash_genesis: self.config.expected.zcash_genesis.clone(),
+            chain_id: self.config.expected.chain_id,
+            backend_instance: self.identity.backend_instance,
+            journal_stream: self.identity.journal_stream,
+        }
+    }
+
     fn ensure_phase(
         &self,
         operation: &'static str,
@@ -1345,10 +1701,194 @@ impl BackendClient {
         Ok(())
     }
 
+    /// Requires a live response to follow every event through its journal watermark.
+    ///
+    /// A replay-phase health request has no live stream and is checked by normal
+    /// replay/snapshot reconciliation instead. Once subscribed, accepting a response
+    /// ahead of the contiguous live cursor could expose stale generations or return a
+    /// share acknowledgement before its durable accounting event is observable.
+    fn require_live_events_through(
+        &mut self,
+        operation: &'static str,
+        required: u64,
+    ) -> Result<(), ClientError> {
+        if self.phase != BackendStreamPhase::Live {
+            return Ok(());
+        }
+        let delivered = self.live_event_cursor.ok_or_else(|| {
+            self.invalidate(ClientError::UnexpectedResponse {
+                expected: "job_snapshot",
+                actual: "live response",
+            })
+        })?;
+        if delivered < required {
+            return Err(self.invalidate(ClientError::LiveEventFlushIncomplete {
+                operation,
+                required,
+                delivered,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Binds a share response to the exact journal event delivered on this stream.
+    ///
+    /// A fresh commit must always advance the pre-request live cursor. An idempotent
+    /// replay can be certified here only while its exact event remains in the live
+    /// cache. Once that event is evicted, a durable projector must confirm the
+    /// complete receipt before any miner success or accounting credit is authorized.
+    fn require_matching_share_event(
+        &mut self,
+        receipt: &ShareReceipt,
+        identity: &WorkerIdentity,
+        target_le: &TargetLe,
+        live_cursor_before: u64,
+        replayed: bool,
+    ) -> Result<(), ClientError> {
+        let live_match = self
+            .queued_events
+            .iter()
+            .map(DeliveredBackendEvent::event)
+            .chain(self.observed_events.iter())
+            .any(|event| {
+                event.event_seq() == receipt.event_seq
+                    && share_event_matches(event, receipt, identity, target_le)
+            });
+        match live_match {
+            true => Ok(()),
+            false if replayed && receipt.event_seq <= live_cursor_before => {
+                Err(ClientError::HistoricalReplayRequiresProjection {
+                    receipt: Box::new(receipt.clone()),
+                })
+            }
+            false => Err(self.invalidate(ClientError::ShareCommitEventMismatch {
+                event_seq: receipt.event_seq,
+            })),
+        }
+    }
+
+    /// Rejects sequence reuse and share re-journaling while evidence is retained.
+    ///
+    /// A canonical share ID is the idempotency key. It may name exactly one byte-
+    /// identical durable receipt at exactly one sequence. Retaining every event kind
+    /// also prevents a response from claiming a sequence already occupied by a job
+    /// or winner event. Evicted history is delegated to the durable projector, which
+    /// must gate accounting and payout in a production deployment.
+    fn require_consistent_share_history(
+        &mut self,
+        receipt: &ShareReceipt,
+        identity: &WorkerIdentity,
+        target_le: &TargetLe,
+    ) -> Result<(), ClientError> {
+        let mut sequence_conflict = false;
+        let mut share_conflict = None;
+        for event in self
+            .queued_events
+            .iter()
+            .map(DeliveredBackendEvent::event)
+            .chain(self.observed_events.iter())
+            .chain(self.historical_events.iter())
+        {
+            let exact_match = share_event_matches(event, receipt, identity, target_le);
+            if event.event_seq() == receipt.event_seq && !exact_match {
+                sequence_conflict = true;
+                break;
+            }
+            if let BackendEvent::ShareCommitted {
+                receipt: recorded_receipt,
+                ..
+            } = event
+            {
+                if recorded_receipt.share_id == receipt.share_id && !exact_match {
+                    share_conflict = Some(recorded_receipt.event_seq);
+                    break;
+                }
+            }
+        }
+
+        if sequence_conflict {
+            return Err(self.invalidate(ClientError::ShareCommitEventMismatch {
+                event_seq: receipt.event_seq,
+            }));
+        }
+        if let Some(recorded_event_seq) = share_conflict {
+            return Err(self.invalidate(ClientError::ShareCommitHistoryConflict {
+                recorded_event_seq,
+                claimed_event_seq: receipt.event_seq,
+            }));
+        }
+        Ok(())
+    }
+
+    fn matching_share_event_seq(
+        &self,
+        job_id: &Hex32,
+        share_id: &Hex32,
+        attribution_id: &Hex32,
+        identity: &WorkerIdentity,
+        target_le: &TargetLe,
+    ) -> Option<u64> {
+        self.queued_events
+            .iter()
+            .map(DeliveredBackendEvent::event)
+            .chain(self.observed_events.iter())
+            // Replay evidence can prove that a later rejection contradicts the
+            // journal, but it must never authorize a replayed miner success. The
+            // latter requires the live cache or durable projector confirmation in
+            // `require_matching_share_event`.
+            .chain(self.historical_events.iter())
+            .find_map(|event| match event {
+                BackendEvent::ShareCommitted {
+                    receipt,
+                    job_id: event_job_id,
+                    identity: event_identity,
+                    target_le: event_target_le,
+                } if event_job_id == job_id
+                    && &receipt.job_id == job_id
+                    && &receipt.share_id == share_id
+                    && &receipt.attribution_id == attribution_id
+                    && event_identity == identity
+                    && event_target_le == target_le =>
+                {
+                    Some(receipt.event_seq)
+                }
+                _ => None,
+            })
+    }
+
+    fn remember_historical_events(&mut self, events: &[BackendEvent]) {
+        for event in events {
+            if self.historical_events.len() == self.config.event_queue_capacity {
+                self.historical_events.pop_front();
+            }
+            self.historical_events.push_back(event.clone());
+        }
+    }
+
     fn invalidate(&mut self, error: ClientError) -> ClientError {
         self.usable = false;
         error
     }
+}
+
+fn share_event_matches(
+    event: &BackendEvent,
+    receipt: &ShareReceipt,
+    identity: &WorkerIdentity,
+    target_le: &TargetLe,
+) -> bool {
+    matches!(
+        event,
+        BackendEvent::ShareCommitted {
+            receipt: event_receipt,
+            job_id,
+            identity: event_identity,
+            target_le: event_target_le,
+        } if event_receipt == receipt
+            && job_id == &receipt.job_id
+            && event_identity == identity
+            && event_target_le == target_le
+    )
 }
 
 fn validate_socket_path(path: &Path) -> Result<(), ClientConfigError> {
@@ -1495,6 +2035,7 @@ mod tests {
         NonceNamespaceLease, NoncePrefixAllocator, ShareTarget, TargetBinding, TargetBounds,
     };
     use wcash_pool_protocol::{
+        canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id,
         decode_backend_request, encode_backend_message, AcceptableJob, BackendCapability,
         BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex108,
         Hex1344, Hex28, Hex32, Hex4, JobDescriptor, MergedChain, NonceProfile, NonceSuffix,
@@ -1601,6 +2142,44 @@ mod tests {
         Ok(())
     }
 
+    /// Writes the durable event before its correlated acknowledgement, matching
+    /// the backend-v1 live-stream flush contract. Exact replays reuse the original
+    /// receipt and therefore do not append or redeliver another event.
+    async fn write_share_commit(
+        stream: &mut UnixStream,
+        id: u64,
+        receipt: ShareReceipt,
+        replayed: bool,
+        identity: WorkerIdentity,
+        target_le: TargetLe,
+    ) -> TestResult {
+        if !replayed {
+            write_message(
+                stream,
+                &BackendMessage::Event {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    event: BackendEvent::ShareCommitted {
+                        job_id: receipt.job_id.clone(),
+                        receipt: receipt.clone(),
+                        identity,
+                        target_le,
+                    },
+                },
+            )
+            .await?;
+        }
+        write_message(
+            stream,
+            &BackendMessage::ShareCommitted {
+                version: BACKEND_PROTOCOL_VERSION,
+                id,
+                receipt,
+                replayed,
+            },
+        )
+        .await
+    }
+
     async fn accept_hello(listener: &UnixListener) -> TestResult<(UnixStream, u64)> {
         let (mut stream, _) = listener.accept().await?;
         let request = read_request(&mut stream).await?;
@@ -1628,9 +2207,12 @@ mod tests {
         header[100..104].copy_from_slice(&1_725_000_000_u32.to_le_bytes());
         JobDescriptor {
             job_id: Hex32::new([byte; 32]),
+            wcash_candidate_hash_le: Hex32::new([0x73; 32]),
             header_input: Hex108::new(header),
             wcash_previous_hash_le: Hex32::new([byte.wrapping_add(1); 32]),
             zcash_previous_hash_le: Hex32::new([byte; 32]),
+            wcash_coinbase_txid_le: Hex32::new([0x74; 32]),
+            zcash_coinbase_txid_le: Hex32::new([0x73; 32]),
             wcash_target_le: TargetLe::new([0x7f; 32]),
             zcash_target_le: TargetLe::new([0x3f; 32]),
             wcash_height: 11,
@@ -1676,15 +2258,32 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug)]
-    enum WinnerJobMismatch {
+    enum PreparedReceiptMismatch {
+        JobId,
+        ShareId,
+        ParentHash,
+        HistoricalParentHash,
+        CrossedNonce,
+        CrossedSolution,
+        WcashBlockHash,
+        WcashCoinbase,
+        ZcashCoinbase,
         Height,
         Reward,
         Maturity,
     }
 
-    impl WinnerJobMismatch {
+    impl PreparedReceiptMismatch {
         const fn field(self) -> &'static str {
             match self {
+                Self::JobId => "share_receipt.job_id",
+                Self::ShareId => "share_receipt.share_id",
+                Self::ParentHash
+                | Self::HistoricalParentHash
+                | Self::CrossedNonce
+                | Self::CrossedSolution => "share_receipt.parent_hash_le",
+                Self::WcashBlockHash => "winner.block_hash_le",
+                Self::WcashCoinbase | Self::ZcashCoinbase => "winner.coinbase_txid_le",
                 Self::Height => "winner.height",
                 Self::Reward => "winner.reward_zat",
                 Self::Maturity => "winner.maturity_confirmations",
@@ -1692,7 +2291,10 @@ mod tests {
         }
     }
 
-    async fn assert_prepared_winner_mismatch_rejected(mismatch: WinnerJobMismatch) -> TestResult {
+    async fn assert_prepared_receipt_mismatch_rejected(
+        mismatch: PreparedReceiptMismatch,
+    ) -> TestResult {
+        let historical_replay = matches!(mismatch, PreparedReceiptMismatch::HistoricalParentHash);
         let timeline = MonotonicTimeline::new();
         let socket = TestSocket::new()?;
         let listener = UnixListener::bind(&socket.path)?;
@@ -1709,7 +2311,7 @@ mod tests {
                 &BackendMessage::JobSnapshot {
                     version: BACKEND_PROTOCOL_VERSION,
                     id,
-                    event_seq: 10,
+                    event_seq: if historical_replay { 11 } else { 10 },
                     current: Some(AcceptableJob {
                         job: server_descriptor.clone(),
                         accept_for_ms: 40_000,
@@ -1720,36 +2322,85 @@ mod tests {
             .await?;
 
             let request = read_request(&mut stream).await?;
-            let BackendRequest::SubmitShare { id, job_id, .. } = request else {
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = request
+            else {
                 return TestResult::Err("third request was not submit_share".into());
             };
             assert_eq!(job_id, server_descriptor.job_id);
-            let mut winners = vec![
-                winner(MergedChain::Wcash, 0x73),
-                winner(MergedChain::Zcash, 0x72),
-            ];
-            match mismatch {
-                WinnerJobMismatch::Height => winners[0].height += 1,
-                WinnerJobMismatch::Reward => winners[1].reward_zat += 1,
-                WinnerJobMismatch::Maturity => winners[0].maturity_confirmations += 1,
-            }
-            let receipt = ShareReceipt {
+            let parent_hash_le =
+                canonical_parent_header_hash_le(&server_descriptor.header_input, &nonce, &solution);
+            let mut zcash_winner = winner(MergedChain::Zcash, 0x72);
+            zcash_winner.block_hash_le = parent_hash_le.clone();
+            zcash_winner.coinbase_txid_le = server_descriptor.zcash_coinbase_txid_le.clone();
+            let winners = vec![winner(MergedChain::Wcash, 0x73), zcash_winner];
+            let mut receipt = ShareReceipt {
                 event_seq: 11,
-                share_id: Hex32::new([0x71; 32]),
-                parent_hash_le: Hex32::new([0x72; 32]),
+                job_id: job_id.clone(),
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                parent_hash_le,
                 winners,
             };
+            match mismatch {
+                PreparedReceiptMismatch::JobId => receipt.job_id = Hex32::new([0x44; 32]),
+                PreparedReceiptMismatch::ShareId => {
+                    receipt.share_id = Hex32::new([0x45; 32]);
+                }
+                PreparedReceiptMismatch::ParentHash
+                | PreparedReceiptMismatch::HistoricalParentHash => {
+                    receipt.parent_hash_le = Hex32::new([0x46; 32]);
+                    receipt.winners[1].block_hash_le = receipt.parent_hash_le.clone();
+                }
+                PreparedReceiptMismatch::CrossedNonce => {
+                    receipt.parent_hash_le = canonical_parent_header_hash_le(
+                        &server_descriptor.header_input,
+                        &Hex32::new([0xa5; 32]),
+                        &solution,
+                    );
+                    receipt.winners[1].block_hash_le = receipt.parent_hash_le.clone();
+                }
+                PreparedReceiptMismatch::CrossedSolution => {
+                    receipt.parent_hash_le = canonical_parent_header_hash_le(
+                        &server_descriptor.header_input,
+                        &nonce,
+                        &Hex1344::new([0xa6; 1_344]),
+                    );
+                    receipt.winners[1].block_hash_le = receipt.parent_hash_le.clone();
+                }
+                PreparedReceiptMismatch::WcashBlockHash => {
+                    receipt.winners[0].block_hash_le = Hex32::new([0x47; 32]);
+                }
+                PreparedReceiptMismatch::WcashCoinbase => {
+                    receipt.winners[0].coinbase_txid_le = Hex32::new([0x48; 32]);
+                }
+                PreparedReceiptMismatch::ZcashCoinbase => {
+                    receipt.winners[1].coinbase_txid_le = Hex32::new([0x49; 32]);
+                }
+                PreparedReceiptMismatch::Height => receipt.winners[0].height += 1,
+                PreparedReceiptMismatch::Reward => receipt.winners[1].reward_zat += 1,
+                PreparedReceiptMismatch::Maturity => {
+                    receipt.winners[0].maturity_confirmations += 1;
+                }
+            }
             // The peer's response is valid in isolation; only binding it to the
             // exact submitted generation reveals the accounting conflict.
             receipt.validate()?;
-            write_message(
+            write_share_commit(
                 &mut stream,
-                &BackendMessage::ShareCommitted {
-                    version: BACKEND_PROTOCOL_VERSION,
-                    id,
-                    receipt,
-                    replayed: false,
-                },
+                id,
+                receipt,
+                historical_replay,
+                identity,
+                target_le,
             )
             .await?;
             TestResult::Ok(())
@@ -1958,7 +2609,17 @@ mod tests {
             .await?;
 
             let request = read_request(&mut stream).await?;
-            let BackendRequest::SubmitShare { id, time, .. } = request else {
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = request
+            else {
                 return TestResult::Err("third request was not submit_share".into());
             };
             assert_eq!(time, Hex4::new([0x78, 0x56, 0x34, 0x12]));
@@ -1979,27 +2640,21 @@ mod tests {
             release_rx
                 .await
                 .map_err(|_| "test did not release the delayed response")?;
-            write_message(
-                &mut stream,
-                &BackendMessage::ShareCommitted {
-                    version: BACKEND_PROTOCOL_VERSION,
-                    id,
-                    receipt: ShareReceipt {
-                        event_seq: 12,
-                        share_id: Hex32::new([0x71; 32]),
-                        parent_hash_le: Hex32::new([0x72; 32]),
-                        winners: vec![winner(MergedChain::Wcash, 0x73)],
-                    },
-                    replayed: false,
-                },
-            )
-            .await?;
+            let receipt = ShareReceipt {
+                event_seq: 12,
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                job_id,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: vec![winner(MergedChain::Wcash, 0x73)],
+            };
+            write_share_commit(&mut stream, id, receipt, false, identity, target_le).await?;
             TestResult::Ok(())
         });
 
         let mut client = connect_client_at(&socket, 10).await?;
         let snapshot = client.subscribe_jobs(10).await?;
-        assert_eq!(snapshot.replayed_through_event_seq, 10);
+        assert_eq!(snapshot.replayed_through_event_seq(), 10);
 
         let mut in_flight = Box::pin(client.submit_share(share_submission()));
         tokio::select! {
@@ -2016,7 +2671,7 @@ mod tests {
         let commit = in_flight.await?;
         assert_eq!(commit.receipt().event_seq, 12);
         assert!(!commit.replayed());
-        assert_eq!(client.queued_event_count(), 1);
+        assert_eq!(client.queued_event_count(), 2);
         let delivery = client
             .pop_queued_event()
             .ok_or("expected queued job activation")?;
@@ -2028,12 +2683,101 @@ mod tests {
             delivery.event(),
             BackendEvent::JobActivated { event_seq: 11, .. }
         ));
+        assert!(matches!(
+            client
+                .pop_queued_event()
+                .ok_or("expected queued share commit")?
+                .event(),
+            BackendEvent::ShareCommitted { receipt, .. } if receipt.event_seq == 12
+        ));
         server.await??;
         Ok(())
     }
 
     #[tokio::test]
-    async fn identical_share_retry_preserves_receipt_and_reports_replay() -> TestResult {
+    async fn activation_prequeued_during_idle_uses_the_prior_exchange_anchor() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let (event_sent_tx, event_sent_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let mut activation = job(0x62);
+            activation.max_age_ms = 10;
+            write_message(
+                &mut stream,
+                &BackendMessage::Event {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    event: BackendEvent::JobActivated {
+                        event_seq: 11,
+                        job: activation,
+                    },
+                },
+            )
+            .await?;
+            event_sent_tx
+                .send(())
+                .map_err(|_| "client stopped before the idle event was queued")?;
+
+            let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("third request was not health".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::HealthStatus {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 11,
+                    healthy: true,
+                    pending_wcash: 0,
+                    pending_zcash: 0,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let timeline = MonotonicTimeline::new();
+        let mut client = connect_client_at(&socket, 10).await?;
+        let snapshot = client.subscribe_jobs(10).await?;
+        let mut registry = GenerationRegistry::new(GenerationRegistryConfig::new(2, 8)?);
+        snapshot.apply_to_registry(&mut registry, timeline)?;
+        event_sent_rx.await?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let after_idle = Instant::now();
+
+        let health = client.health().await?;
+        assert_eq!(health.event_seq, 11);
+        let delivery = client.pop_queued_event().ok_or("missing idle activation")?;
+        assert!(
+            delivery.anchor().elapsed_at(after_idle) >= Duration::from_millis(20),
+            "an event queued while idle must inherit the prior stream-boundary anchor"
+        );
+        delivery.apply_to_registry_at(&mut registry, timeline, timeline.now_ms()?)?;
+        assert!(
+            registry.current_generation(timeline.now_ms()?)?.is_none(),
+            "socket residency must not extend the ten-millisecond generation lease"
+        );
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_share_retry_preserves_receipt_and_rejects_rejournaling() -> TestResult {
         let socket = TestSocket::new()?;
         let listener = UnixListener::bind(&socket.path)?;
         let expected_submission = share_submission();
@@ -2062,8 +2806,18 @@ mod tests {
             .await?;
 
             let receipt = ShareReceipt {
-                event_seq: 12,
-                share_id: Hex32::new([0x71; 32]),
+                event_seq: 11,
+                job_id: expected_submission.job_id.clone(),
+                share_id: canonical_share_id(
+                    &expected_submission.job_id,
+                    &expected_submission.time,
+                    &expected_submission.nonce,
+                    &expected_submission.solution,
+                ),
+                attribution_id: canonical_attribution_id(
+                    &expected_submission.identity,
+                    &expected_submission.target_le,
+                )?,
                 parent_hash_le: Hex32::new([0x72; 32]),
                 winners: vec![winner(MergedChain::Wcash, 0x73)],
             };
@@ -2090,17 +2844,46 @@ mod tests {
                 assert_eq!(nonce, expected_submission.nonce);
                 assert_eq!(*solution, expected_submission.solution);
 
-                write_message(
+                write_share_commit(
                     &mut stream,
-                    &BackendMessage::ShareCommitted {
-                        version: BACKEND_PROTOCOL_VERSION,
-                        id,
-                        receipt: receipt.clone(),
-                        replayed,
-                    },
+                    id,
+                    receipt.clone(),
+                    replayed,
+                    identity,
+                    target_le,
                 )
                 .await?;
             }
+
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = request
+            else {
+                return TestResult::Err("request was not submit_share".into());
+            };
+            assert_eq!(job_id, expected_submission.job_id);
+            assert_eq!(time, expected_submission.time);
+            assert_eq!(nonce, expected_submission.nonce);
+            assert_eq!(*solution, expected_submission.solution);
+            let mut rejournaled_receipt = receipt;
+            rejournaled_receipt.event_seq = 12;
+            write_share_commit(
+                &mut stream,
+                id,
+                rejournaled_receipt,
+                false,
+                identity,
+                target_le,
+            )
+            .await?;
             TestResult::Ok(())
         });
 
@@ -2111,6 +2894,224 @@ mod tests {
         assert_eq!(first.receipt(), replay.receipt());
         assert!(!first.replayed());
         assert!(replay.replayed());
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::ShareCommitHistoryConflict {
+                recorded_event_seq: 11,
+                claimed_event_seq: 12,
+            })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drained_observed_replay_stays_exact_and_keeps_attribution_bound() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let expected_submission = share_submission();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let first = read_request(&mut stream).await?;
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = first
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                job_id: job_id.clone(),
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            write_share_commit(&mut stream, id, receipt.clone(), false, identity, target_le)
+                .await?;
+
+            for _ in 0..2 {
+                let BackendRequest::SubmitShare { id, .. } = read_request(&mut stream).await?
+                else {
+                    return TestResult::Err("retry request was not submit_share".into());
+                };
+                write_message(
+                    &mut stream,
+                    &BackendMessage::ShareCommitted {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id,
+                        receipt: receipt.clone(),
+                        replayed: true,
+                    },
+                )
+                .await?;
+            }
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        let first = client.submit_share(expected_submission.clone()).await?;
+        assert!(!first.replayed());
+        assert!(matches!(
+            client
+                .pop_queued_event()
+                .ok_or("fresh commit event was not queued")?
+                .event(),
+            BackendEvent::ShareCommitted { receipt, .. } if receipt.event_seq == 11
+        ));
+
+        let replay = client.submit_share(expected_submission.clone()).await?;
+        assert!(replay.replayed());
+        assert_eq!(replay.receipt(), first.receipt());
+
+        let mut crossed = expected_submission;
+        crossed.identity.label = "another.worker".to_owned();
+        assert!(matches!(
+            client.submit_share(crossed).await,
+            Err(ClientError::Protocol(ProtocolError::InvalidField {
+                field: "share_receipt.attribution_id",
+                ..
+            }))
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_replay_after_reconnect_requires_projected_receipt_confirmation(
+    ) -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let BackendRequest::Hello {
+                id, last_event_seq, ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("first request was not hello".into());
+            };
+            assert_eq!(last_event_seq, 11);
+            let mut hello = hello_ok(id);
+            let BackendMessage::HelloOk {
+                current_event_seq, ..
+            } = &mut hello
+            else {
+                unreachable!("hello fixture has the expected variant")
+            };
+            *current_event_seq = 11;
+            write_message(&mut stream, &hello).await?;
+
+            let BackendRequest::SubscribeJobs {
+                id,
+                after_event_seq,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            assert_eq!(after_event_seq, 11);
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 11,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                job_id: job_id.clone(),
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt,
+                    replayed: true,
+                },
+            )
+            .await?;
+
+            let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("fourth request was not health".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::HealthStatus {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 11,
+                    healthy: true,
+                    pending_wcash: 0,
+                    pending_zcash: 0,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 11).await?;
+        let _ = client.subscribe_jobs(11).await?;
+        let receipt = match client.submit_share(share_submission()).await {
+            Err(ClientError::HistoricalReplayRequiresProjection { receipt }) => receipt,
+            other => return Err(format!("unexpected historical replay result: {other:?}").into()),
+        };
+        assert_eq!(receipt.event_seq, 11);
+        assert_eq!(receipt.job_id, share_submission().job_id);
+        assert!(client.health().await?.healthy);
         server.await??;
         Ok(())
     }
@@ -2176,7 +3177,7 @@ mod tests {
                     id,
                     event_seq: 10,
                     current: Some(AcceptableJob {
-                        job: server_descriptor,
+                        job: server_descriptor.clone(),
                         accept_for_ms: 40_000,
                     }),
                     recent: Vec::new(),
@@ -2185,7 +3186,17 @@ mod tests {
             .await?;
 
             let request = read_request(&mut stream).await?;
-            let BackendRequest::SubmitShare { id, .. } = request else {
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = request
+            else {
                 return TestResult::Err("third request was not submit_share".into());
             };
             share_seen_tx
@@ -2194,21 +3205,19 @@ mod tests {
             release_rx
                 .await
                 .map_err(|_| "test did not release the share response")?;
-            write_message(
-                &mut stream,
-                &BackendMessage::ShareCommitted {
-                    version: BACKEND_PROTOCOL_VERSION,
-                    id,
-                    receipt: ShareReceipt {
-                        event_seq: 11,
-                        share_id: Hex32::new([0x71; 32]),
-                        parent_hash_le: Hex32::new([0x72; 32]),
-                        winners: Vec::new(),
-                    },
-                    replayed: false,
-                },
-            )
-            .await?;
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                job_id,
+                parent_hash_le: canonical_parent_header_hash_le(
+                    &server_descriptor.header_input,
+                    &nonce,
+                    &solution,
+                ),
+                winners: Vec::new(),
+            };
+            write_share_commit(&mut stream, id, receipt, false, identity, target_le).await?;
             TestResult::Ok(())
         });
 
@@ -2272,13 +3281,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_submission_rejects_job_mismatched_winner_facts() -> TestResult {
+    async fn prepared_submission_rejects_crossed_proof_and_generation_bindings() -> TestResult {
         for mismatch in [
-            WinnerJobMismatch::Height,
-            WinnerJobMismatch::Reward,
-            WinnerJobMismatch::Maturity,
+            PreparedReceiptMismatch::JobId,
+            PreparedReceiptMismatch::ShareId,
+            PreparedReceiptMismatch::ParentHash,
+            PreparedReceiptMismatch::HistoricalParentHash,
+            PreparedReceiptMismatch::CrossedNonce,
+            PreparedReceiptMismatch::CrossedSolution,
+            PreparedReceiptMismatch::WcashBlockHash,
+            PreparedReceiptMismatch::WcashCoinbase,
+            PreparedReceiptMismatch::ZcashCoinbase,
+            PreparedReceiptMismatch::Height,
+            PreparedReceiptMismatch::Reward,
+            PreparedReceiptMismatch::Maturity,
         ] {
-            assert_prepared_winner_mismatch_rejected(mismatch).await?;
+            assert_prepared_receipt_mismatch_rejected(mismatch).await?;
         }
         Ok(())
     }
@@ -2422,7 +3440,7 @@ mod tests {
         assert!(page.complete);
         assert_eq!(client.replay_cursor(), 10);
         let snapshot = client.subscribe_jobs(10).await?;
-        assert_eq!(snapshot.replayed_through_event_seq, 10);
+        assert_eq!(snapshot.replayed_through_event_seq(), 10);
         assert_eq!(client.stream_phase(), BackendStreamPhase::Live);
 
         assert!(matches!(
@@ -2595,13 +3613,849 @@ mod tests {
 
         let mut client = connect_client_at(&socket, 10).await?;
         let snapshot = client.subscribe_jobs(10).await?;
-        assert_eq!(snapshot.event_seq, 12);
-        assert_eq!(snapshot.replayed_through_event_seq, 10);
+        assert_eq!(snapshot.event_seq(), 12);
+        assert_eq!(snapshot.replayed_through_event_seq(), 10);
         assert!(snapshot
             .anchor()
             .checked_deadline(Duration::from_millis(1))
             .is_some());
         assert_eq!(client.stream_phase(), BackendStreamPhase::Live);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_health_response_rejects_an_unflushed_event_watermark() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = request else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::Health { id, .. } = request else {
+                return TestResult::Err("third request was not health".into());
+            };
+            // Deliberately omit event 11. A watermark alone is not proof that
+            // the pool received the state it is about to rely on.
+            write_message(
+                &mut stream,
+                &BackendMessage::HealthStatus {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 11,
+                    healthy: true,
+                    pending_wcash: 0,
+                    pending_zcash: 0,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::LiveEventFlushIncomplete {
+                operation: "health",
+                required: 11,
+                delivered: 10,
+            })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn share_response_rejects_an_unflushed_commit_event() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = request else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = request
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let share_id = canonical_share_id(&job_id, &time, &nonce, &solution);
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                job_id,
+                share_id,
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            // Deliberately send the correlated response without its durable event.
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt,
+                    replayed: false,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::LiveEventFlushIncomplete {
+                operation: "share commit",
+                required: 11,
+                delivered: 10,
+            })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_share_response_must_advance_the_live_cursor() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let receipt = ShareReceipt {
+                event_seq: 10,
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                job_id,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt,
+                    replayed: false,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::FreshShareCommitDidNotAdvance {
+                event_seq: 10,
+                previous_event_seq: 10,
+            })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrently_committed_replay_accepts_its_exact_future_event() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                job_id,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::Event {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    event: BackendEvent::ShareCommitted {
+                        job_id: receipt.job_id.clone(),
+                        receipt: receipt.clone(),
+                        identity,
+                        target_le,
+                    },
+                },
+            )
+            .await?;
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt,
+                    replayed: true,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        let commit = client.submit_share(share_submission()).await?;
+        assert!(commit.replayed());
+        assert_eq!(commit.receipt().event_seq, 11);
+        assert!(client.is_usable());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn share_response_rejects_nonmatching_flushed_commit_events() -> TestResult {
+        #[derive(Clone, Copy)]
+        enum EventMismatch {
+            OtherEventKind,
+            CrossedIdentity,
+            CrossedTarget,
+        }
+
+        for mismatch in [
+            EventMismatch::OtherEventKind,
+            EventMismatch::CrossedIdentity,
+            EventMismatch::CrossedTarget,
+        ] {
+            let socket = TestSocket::new()?;
+            let listener = UnixListener::bind(&socket.path)?;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = accept_hello(&listener).await?;
+                let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await?
+                else {
+                    return TestResult::Err("second request was not subscribe_jobs".into());
+                };
+                write_message(
+                    &mut stream,
+                    &BackendMessage::JobSnapshot {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id,
+                        event_seq: 10,
+                        current: None,
+                        recent: Vec::new(),
+                    },
+                )
+                .await?;
+
+                let BackendRequest::SubmitShare {
+                    id,
+                    job_id,
+                    identity,
+                    target_le,
+                    time,
+                    nonce,
+                    solution,
+                    ..
+                } = read_request(&mut stream).await?
+                else {
+                    return TestResult::Err("third request was not submit_share".into());
+                };
+                let receipt = ShareReceipt {
+                    event_seq: 11,
+                    share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                    attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                    job_id: job_id.clone(),
+                    parent_hash_le: Hex32::new([0x72; 32]),
+                    winners: Vec::new(),
+                };
+                let event = match mismatch {
+                    EventMismatch::OtherEventKind => BackendEvent::JobActivated {
+                        event_seq: 11,
+                        job: job(0x61),
+                    },
+                    EventMismatch::CrossedIdentity => {
+                        let crossed_identity = WorkerIdentity {
+                            account_id: uuid(17),
+                            worker_id: uuid(18),
+                            label: "crossed.worker".to_owned(),
+                        };
+                        let mut crossed_receipt = receipt.clone();
+                        crossed_receipt.attribution_id =
+                            canonical_attribution_id(&crossed_identity, &target_le)?;
+                        BackendEvent::ShareCommitted {
+                            receipt: crossed_receipt,
+                            job_id: job_id.clone(),
+                            identity: crossed_identity,
+                            target_le: target_le.clone(),
+                        }
+                    }
+                    EventMismatch::CrossedTarget => {
+                        let crossed_target = TargetLe::new([0x55; 32]);
+                        let mut crossed_receipt = receipt.clone();
+                        crossed_receipt.attribution_id =
+                            canonical_attribution_id(&identity, &crossed_target)?;
+                        BackendEvent::ShareCommitted {
+                            receipt: crossed_receipt,
+                            job_id: job_id.clone(),
+                            identity,
+                            target_le: crossed_target,
+                        }
+                    }
+                };
+                write_message(
+                    &mut stream,
+                    &BackendMessage::Event {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        event,
+                    },
+                )
+                .await?;
+                write_message(
+                    &mut stream,
+                    &BackendMessage::ShareCommitted {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id,
+                        receipt,
+                        replayed: false,
+                    },
+                )
+                .await?;
+                TestResult::Ok(())
+            });
+
+            let mut client = connect_client_at(&socket, 10).await?;
+            let _ = client.subscribe_jobs(10).await?;
+            assert!(matches!(
+                client.submit_share(share_submission()).await,
+                Err(ClientError::ShareCommitEventMismatch { event_seq: 11 })
+            ));
+            assert!(matches!(
+                client.health().await,
+                Err(ClientError::ConnectionUnusable)
+            ));
+            server.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_event_followed_by_correlated_error_is_terminally_contradictory() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                job_id: job_id.clone(),
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::Event {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    event: BackendEvent::ShareCommitted {
+                        receipt,
+                        job_id,
+                        identity,
+                        target_le,
+                    },
+                },
+            )
+            .await?;
+            write_message(
+                &mut stream,
+                &BackendMessage::Error {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    code: BackendErrorCode::LowDifficulty,
+                    message: "contradictory rejection".to_owned(),
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::ContradictoryShareOutcome { event_seq: 11 })
+        ));
+        assert!(matches!(
+            client
+                .pop_queued_event()
+                .ok_or("durable commit event must remain observable")?
+                .event(),
+            BackendEvent::ShareCommitted { receipt, .. } if receipt.event_seq == 11
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_evidence_requires_projection_and_detects_a_later_retry_error() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let expected = share_submission();
+        let receipt = ShareReceipt {
+            event_seq: 11,
+            job_id: expected.job_id.clone(),
+            share_id: canonical_share_id(
+                &expected.job_id,
+                &expected.time,
+                &expected.nonce,
+                &expected.solution,
+            ),
+            attribution_id: canonical_attribution_id(&expected.identity, &expected.target_le)?,
+            parent_hash_le: Hex32::new([0x72; 32]),
+            winners: Vec::new(),
+        };
+        let replay_event = BackendEvent::ShareCommitted {
+            receipt: receipt.clone(),
+            job_id: expected.job_id.clone(),
+            identity: expected.identity.clone(),
+            target_le: expected.target_le.clone(),
+        };
+        let server_replay_event = replay_event.clone();
+        let server_receipt = receipt.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let BackendRequest::Hello {
+                id, last_event_seq, ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("first request was not hello".into());
+            };
+            assert_eq!(last_event_seq, 10);
+            let mut hello = hello_ok(id);
+            let BackendMessage::HelloOk {
+                current_event_seq, ..
+            } = &mut hello
+            else {
+                unreachable!("hello fixture has the expected variant")
+            };
+            *current_event_seq = 11;
+            write_message(&mut stream, &hello).await?;
+
+            let BackendRequest::ReadEvents {
+                id,
+                after_event_seq,
+                limit,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("second request was not read_events".into());
+            };
+            assert_eq!(after_event_seq, 10);
+            assert_eq!(limit, 1);
+            write_message(
+                &mut stream,
+                &BackendMessage::EventsPage {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    after_event_seq,
+                    next_event_seq: 11,
+                    complete: true,
+                    events: vec![server_replay_event],
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubscribeJobs {
+                id,
+                after_event_seq,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("third request was not subscribe_jobs".into());
+            };
+            assert_eq!(after_event_seq, 11);
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 11,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("fourth request was not submit_share".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt: server_receipt,
+                    replayed: true,
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("fifth request was not submit_share".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::Error {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    code: BackendErrorCode::LowDifficulty,
+                    message: "contradictory rejection".to_owned(),
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let page = client.read_events(10, 1).await?;
+        assert_eq!(page.events, vec![replay_event]);
+        let _ = client.subscribe_jobs(11).await?;
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::HistoricalReplayRequiresProjection { receipt })
+                if receipt.event_seq == 11
+        ));
+        assert!(client.is_usable());
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::ContradictoryShareOutcome { event_seq: 11 })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_non_share_event_cannot_be_relabelled_as_a_share_commit() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let expected = share_submission();
+        let receipt = ShareReceipt {
+            event_seq: 11,
+            job_id: expected.job_id.clone(),
+            share_id: canonical_share_id(
+                &expected.job_id,
+                &expected.time,
+                &expected.nonce,
+                &expected.solution,
+            ),
+            attribution_id: canonical_attribution_id(&expected.identity, &expected.target_le)?,
+            parent_hash_le: Hex32::new([0x72; 32]),
+            winners: Vec::new(),
+        };
+        let occupied_event = BackendEvent::GenerationClosed {
+            event_seq: 11,
+            job_id: expected.job_id.clone(),
+        };
+        let server_event = occupied_event.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let BackendRequest::Hello {
+                id, last_event_seq, ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("first request was not hello".into());
+            };
+            assert_eq!(last_event_seq, 10);
+            let mut hello = hello_ok(id);
+            let BackendMessage::HelloOk {
+                current_event_seq, ..
+            } = &mut hello
+            else {
+                unreachable!("hello fixture has the expected variant")
+            };
+            *current_event_seq = 11;
+            write_message(&mut stream, &hello).await?;
+
+            let BackendRequest::ReadEvents {
+                id,
+                after_event_seq,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("second request was not read_events".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::EventsPage {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    after_event_seq,
+                    next_event_seq: 11,
+                    complete: true,
+                    events: vec![server_event],
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("third request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 11,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("fourth request was not submit_share".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt,
+                    replayed: true,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let page = client.read_events(10, 1).await?;
+        assert_eq!(page.events, vec![occupied_event]);
+        let _ = client.subscribe_jobs(11).await?;
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::ShareCommitEventMismatch { event_seq: 11 })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observed_commit_followed_by_retry_error_is_terminally_contradictory() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: None,
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let BackendRequest::SubmitShare {
+                id,
+                job_id,
+                identity,
+                target_le,
+                time,
+                nonce,
+                solution,
+                ..
+            } = read_request(&mut stream).await?
+            else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                job_id: job_id.clone(),
+                share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
+                attribution_id: canonical_attribution_id(&identity, &target_le)?,
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners: Vec::new(),
+            };
+            write_share_commit(&mut stream, id, receipt, false, identity, target_le).await?;
+
+            let BackendRequest::SubmitShare { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("retry request was not submit_share".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::Error {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    code: BackendErrorCode::LowDifficulty,
+                    message: "contradictory retry rejection".to_owned(),
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let _ = client.subscribe_jobs(10).await?;
+        let _ = client.submit_share(share_submission()).await?;
+        let committed = client
+            .pop_queued_event()
+            .ok_or("fresh commit event must be observable")?;
+        assert!(matches!(
+            committed.event(),
+            BackendEvent::ShareCommitted { receipt, .. } if receipt.event_seq == 11
+        ));
+        assert!(matches!(
+            client.submit_share(share_submission()).await,
+            Err(ClientError::ContradictoryShareOutcome { event_seq: 11 })
+        ));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
         server.await??;
         Ok(())
     }
