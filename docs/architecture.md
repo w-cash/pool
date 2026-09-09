@@ -57,7 +57,7 @@ This is the target flow. No executable currently composes these steps.
 | wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v1 request, response, event, target-endian and identity types; exact candidate, coinbase, parent-header and stable share-ID bindings; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | TCP/TLS listener, connection deadlines, rate limits, worker database, ASIC interoperability certification |
 | wcash-pool-core | In-memory session ordering, immutable worker binding, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, authoritative current/recent lifetime, bounded non-resurrectable generation tombstones, in-flight retirement fences, target policy, and integer vardiff including inactivity easing | Durable nonce-lease orchestration, durable generation-ID history, runtime composition, database persistence, crash recovery, network I/O, consensus validation |
 | wcash-pool-backend-client | Timeout-bounded Unix-socket connection, strict handshake and identity checks, request correlation, job snapshot/event replay, transport-branded lifetime anchors, exact submitted header time, canonical submitted-proof and job-bound receipt checks, live response-watermark flush enforcement, a core-validated share adapter that owns the admission fence through backend I/O, branded share commits, health checks, and bounded unsolicited-event buffering | A compatible wolf server, cryptographic remote-peer authentication, production integration |
-| wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization with exact miner-login binding, immutable session assignments, target-before-notify ordering, bounded global job fanout, replay-aware vardiff sampling, cancellation-safe serialized Wolf submissions, and global suspension on terminal backend/event-stream failure | TCP/TLS stream driver, authorization implementation, idle backend heartbeat, durable nonce leasing, accounting event sink, public listener, certified ASIC transcript |
+| wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization with exact miner-login binding, immutable session assignments, target-before-notify ordering, bounded global job fanout, replay-aware vardiff sampling, cancellation-safe serialized Wolf submissions, a bounded idle health/event pump with a mandatory acknowledged consumer seam, and global suspension on terminal backend/event-stream failure | TCP/TLS stream driver, authorization implementation, durable event-consumer/projector implementation, durable nonce leasing, public listener, certified ASIC transcript |
 | wcash-poold | A machine-readable readiness command that exits not-ready | Serve command, miner/admin/metrics listeners, configuration, database, wallet, payout loop, deployment |
 | Accounting | Protocol receipts and event shapes only | PostgreSQL schema and projector, balances, maturity, fees, rounding, reorg reversal, payouts |
 | Operations | Hermetic source checks and test scaffolding | Container image, manifests, monitoring, backups, runbooks, private soak, public endpoint |
@@ -183,10 +183,11 @@ a new negotiated protocol version.
   registry. This prior-boundary rule covers events already waiting in the Unix
   socket before the next heartbeat begins: transport and idle residency can
   shorten a lease, but can never extend wolf's remaining acceptance interval.
-- The current client only receives queued live events while performing bounded
-  request/response exchanges. A runtime must therefore issue bounded health
-  heartbeats and drain every queued event (or later provide a dedicated reader)
-  so an otherwise idle miner connection cannot leave accounting behind.
+- The listener-free share actor owns the client and issues bounded health
+  heartbeats between serialized submissions. It passes every queued live-event
+  batch through a mandatory, timeout-bounded consumer before applying the batch
+  to job policy; consumer failure or timeout globally suspends admission. This
+  repository does not yet supply the durable consumer implementation.
 - `HealthStatus.event_seq` is a live delivery barrier. Before returning health,
   wolf must send every missing live `Event` frame, in contiguous order, through
   that watermark on the same connection.
@@ -301,11 +302,13 @@ reversing ledger entries. Wolf must therefore retain enough durable winner
 history to observe reorgs after maturity rather than deleting all tracking at
 the maturity threshold.
 
-The current listener-free share actor drains live backend events into the
-in-memory job registry so job sequencing cannot silently lag behind a share
-response. It does not persist accounting or winner events. A deployment must
-independently replay and transactionally project every journal sequence; it
-must never advance a durable accounting cursor from the in-memory job registry.
+The current listener-free share actor sends each bounded live-event batch to a
+mandatory deployment-owned consumer before applying it to the in-memory job
+registry, so job sequencing cannot silently advance beyond acknowledged event
+delivery. This repository does not implement that durable consumer. A future
+deployment must replay and transactionally project every journal sequence,
+acknowledge a live batch only after its complete cursor is durable, and never
+advance a durable accounting cursor from the in-memory job registry.
 
 Balances, fees, rounding, and payout batches belong to a separate append-only
 pool ledger derived from those events. That ledger and its database schema

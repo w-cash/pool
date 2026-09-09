@@ -7,12 +7,13 @@
 Implemented controls are limited to strict bounded wire codecs, redacted
 secret-bearing debug output, endian-distinct target types, exact job/proof
 receipt bindings, in-memory session/job/nonce/vardiff policy, global
-generation suspension, finite listener-free connection actors, and a
-timeout-bounded Unix backend client tested with local mock peers. There is no
-stream driver, public listener, authentication implementation, idle backend
-event pump, durable pool database, payout code, wallet, deployment, or
-live-node test. Every operational control below remains a release requirement
-unless it is explicitly identified as implemented.
+generation suspension, finite listener-free connection actors, a
+timeout-bounded Unix backend client, and a bounded idle health/event pump with
+a mandatory acknowledged consumer seam, all tested with local mock peers.
+There is no durable event-consumer implementation, stream driver, public
+listener, authentication implementation, pool database, payout code, wallet,
+deployment, or live-node test. Every operational control below remains a
+release requirement unless it is explicitly identified as implemented.
 
 ## Assets
 
@@ -146,16 +147,18 @@ request-start anchor; an activation that waited in the socket during an idle
 period therefore loses that idle time rather than gaining a fresh lease.
 
 The current client queues unsolicited live events only while completing
-bounded requests. Until a dedicated reader exists, the runtime must send
-periodic health requests and drain that queue. Before `HealthStatus`, wolf must
-send every missing live event contiguously through the response watermark on the
-same connection. Before a fresh `ShareCommitted` response, it must deliver the
-exact matching share event, including receipt, job, immutable worker identity,
-and issued target. The client rejects an unflushed future sequence, a fresh
-receipt that does not advance, or any different event at the claimed sequence.
-These are accounting-omission and attribution risks, not health signals. Any
-such failure globally suspends generation admission and notifies both
-established and future miner sessions to close.
+bounded requests. Its single-owner actor sends periodic health requests and
+passes each queued batch through a mandatory timeout-bounded consumer before
+job policy observes it. Consumer failure or timeout fails closed; no durable
+consumer implementation exists yet. Before `HealthStatus`, wolf must send every
+missing live event contiguously through the response watermark on the same
+connection. Before a fresh `ShareCommitted` response, it must deliver the exact
+matching share event, including receipt, job, immutable worker identity, and
+issued target. The client rejects an unflushed future sequence, a fresh receipt
+that does not advance, or any different event at the claimed sequence. These
+are accounting-omission and attribution risks, not health signals. Any such
+failure globally suspends generation admission and notifies both established
+and future miner sessions to close.
 
 ### Rotation races and withheld late shares
 

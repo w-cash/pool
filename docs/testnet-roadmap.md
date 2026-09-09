@@ -135,10 +135,11 @@ wrong-session, wrong-job, and disconnect races are covered without live nodes.
 
 Current note: deterministic codec, bounded connection/session actors, global
 job fanout and suspension, exact-login policy, replay-aware vardiff, request
-limiting, cancellation-safe submission serialization, and in-memory tests cover
-only the library layer. There is no stream driver, socket listener, TLS
-termination, credential implementation, idle backend heartbeat, durable nonce
-lease, or certified ASIC transcript yet.
+limiting, cancellation-safe submission serialization, and a bounded idle
+health/event pump with a mandatory consumer seam cover only the library layer.
+There is no durable event-consumer implementation, stream driver, socket
+listener, TLS termination, credential implementation, durable nonce lease, or
+certified ASIC transcript yet.
 
 ## Phase 3 — End-to-end job and share lifecycle
 
