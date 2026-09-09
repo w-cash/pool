@@ -18,5 +18,5 @@ pub use unix::{
     BackendClient, BackendClientConfig, BackendIdentity, BackendStreamPhase, ClientConfigError,
     ClientError, DeliveredBackendEvent, EventPage, ExpectedBackend, HealthSnapshot, JobSnapshot,
     JobStateIntegrationError, MonotonicAnchor, MonotonicTimeline, ShareSubmission, TimelineError,
-    VerifiedShareCommit,
+    UnverifiedShareCommit, VerifiedShareCommit,
 };

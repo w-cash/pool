@@ -21,6 +21,15 @@ pub const BACKEND_LENGTH_PREFIX_BYTES: usize = 4;
 /// Maximum number of journal events returned in one bounded page.
 pub const MAX_EVENT_PAGE_ITEMS: u16 = 1_024;
 
+/// Maximum monetary value representable by either 21-million-coin chain.
+///
+/// Wcash and Zcash both use eight decimal places, so this bound is expressed
+/// in their shared smallest unit (zatoshi).
+pub const MAX_CHAIN_VALUE_ZAT: u64 = 2_100_000_000_000_000;
+
+/// Defensive wire bound for a chain's coinbase maturity requirement.
+pub const MAX_MATURITY_CONFIRMATIONS: u32 = 1_000_000;
+
 fn encode_length_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtocolError> {
     let payload =
         serde_json::to_vec(message).map_err(|error| ProtocolError::Json(error.to_string()))?;
@@ -127,6 +136,14 @@ pub struct JobDescriptor {
     pub wcash_height: u32,
     /// Candidate Zcash height.
     pub zcash_height: u32,
+    /// Exact value paid to the configured Wcash pool recipient, in zatoshi.
+    pub wcash_reward_zat: u64,
+    /// Exact value paid to the configured Zcash pool recipient, in zatoshi.
+    pub zcash_reward_zat: u64,
+    /// Confirmations required before this Wcash reward becomes mature.
+    pub wcash_maturity_confirmations: u32,
+    /// Confirmations required before this Zcash reward becomes mature.
+    pub zcash_maturity_confirmations: u32,
     /// Backend-enforced maximum lifetime from activation.
     pub max_age_ms: u32,
 }
@@ -156,6 +173,16 @@ impl JobDescriptor {
         if self.zcash_height == 0 {
             return Err(invalid("job.zcash_height", "must be positive"));
         }
+        validate_reward(self.wcash_reward_zat, "job.wcash_reward_zat")?;
+        validate_reward(self.zcash_reward_zat, "job.zcash_reward_zat")?;
+        validate_maturity(
+            self.wcash_maturity_confirmations,
+            "job.wcash_maturity_confirmations",
+        )?;
+        validate_maturity(
+            self.zcash_maturity_confirmations,
+            "job.zcash_maturity_confirmations",
+        )?;
         if !(1..=600_000).contains(&self.max_age_ms) {
             return Err(invalid("job.max_age_ms", "must be in 1..=600000"));
         }
@@ -254,15 +281,112 @@ pub enum BackendCapability {
     EventReplayV1,
     /// Every share is independently classified against two network targets.
     DualTargetV1,
+    /// Winning shares and reversible reward lifecycle changes are journaled.
+    WinnerLifecycleV1,
 }
 
 /// Capabilities every protocol-v1 backend must advertise exactly once.
-pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 4] = [
+pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 5] = [
     BackendCapability::JobStreamV1,
     BackendCapability::DurableShareReceiptsV1,
     BackendCapability::EventReplayV1,
     BackendCapability::DualTargetV1,
+    BackendCapability::WinnerLifecycleV1,
 ];
+
+/// One of the independently submitted merged-mining chains.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergedChain {
+    /// The Wcash auxiliary chain.
+    Wcash,
+    /// The Zcash parent chain.
+    Zcash,
+}
+
+/// Immutable facts about one exact network-target winner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WinnerDescriptor {
+    /// Chain whose target this block satisfies.
+    pub chain: MergedChain,
+    /// Exact winning block hash in raw little-endian byte order.
+    pub block_hash_le: Hex32,
+    /// Candidate block height on `chain`.
+    pub height: u32,
+    /// Coinbase transaction ID in raw little-endian byte order.
+    pub coinbase_txid_le: Hex32,
+    /// Exact value paid to the configured pool recipient, in zatoshi.
+    pub reward_zat: u64,
+    /// Confirmations required before this reward becomes spendable.
+    pub maturity_confirmations: u32,
+}
+
+impl WinnerDescriptor {
+    /// Checks bounded immutable winner facts.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        require_nonzero_hex(&self.block_hash_le, "winner.block_hash_le")?;
+        if self.height == 0 {
+            return Err(invalid("winner.height", "must be positive"));
+        }
+        require_nonzero_hex(&self.coinbase_txid_le, "winner.coinbase_txid_le")?;
+        validate_reward(self.reward_zat, "winner.reward_zat")?;
+        validate_maturity(self.maturity_confirmations, "winner.maturity_confirmations")
+    }
+
+    /// Checks that immutable reward facts match the generation that produced them.
+    pub fn validate_for_job(&self, job: &JobDescriptor) -> Result<(), ProtocolError> {
+        job.validate()?;
+        self.validate()?;
+        let (height, reward, maturity) = match self.chain {
+            MergedChain::Wcash => (
+                job.wcash_height,
+                job.wcash_reward_zat,
+                job.wcash_maturity_confirmations,
+            ),
+            MergedChain::Zcash => (
+                job.zcash_height,
+                job.zcash_reward_zat,
+                job.zcash_maturity_confirmations,
+            ),
+        };
+        if self.height != height {
+            return Err(invalid(
+                "winner.height",
+                "must match the winning chain height in its job",
+            ));
+        }
+        if self.reward_zat != reward {
+            return Err(invalid(
+                "winner.reward_zat",
+                "must match the winning chain reward in its job",
+            ));
+        }
+        if self.maturity_confirmations != maturity {
+            return Err(invalid(
+                "winner.maturity_confirmations",
+                "must match the winning chain maturity in its job",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact best-chain tip sampled while observing one winner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainTip {
+    /// Best-chain tip hash in raw little-endian byte order.
+    pub block_hash_le: Hex32,
+    /// Best-chain tip height.
+    pub height: u32,
+}
+
+impl ChainTip {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        require_nonzero_hex(&self.block_hash_le, "winner_tip.block_hash_le")
+    }
+}
 
 /// Wire representation of an atomic validate-and-journal result.
 ///
@@ -278,19 +402,45 @@ pub struct ShareReceipt {
     pub share_id: Hex32,
     /// Validated parent header hash in raw little-endian byte order.
     pub parent_hash_le: Hex32,
-    /// Whether this share met the Wcash network target.
-    pub wcash_candidate: bool,
-    /// Whether this share met the Zcash network target.
-    pub zcash_candidate: bool,
+    /// Exact winning blocks durably created with this share.
+    ///
+    /// Entries are canonical chain order (`wcash`, then `zcash`), contain each
+    /// chain at most once, and are empty for an ordinary pool share.
+    pub winners: Vec<WinnerDescriptor>,
 }
 
 impl ShareReceipt {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    /// Checks receipt identifiers and canonical winner facts.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.event_seq == 0 {
             return Err(invalid("share_receipt.event_seq", "must be positive"));
         }
         require_nonzero_hex(&self.share_id, "share_receipt.share_id")?;
-        require_nonzero_hex(&self.parent_hash_le, "share_receipt.parent_hash_le")
+        require_nonzero_hex(&self.parent_hash_le, "share_receipt.parent_hash_le")?;
+        if self.winners.len() > 2 {
+            return Err(invalid(
+                "share_receipt.winners",
+                "must contain at most one winner per merged chain",
+            ));
+        }
+        let mut previous = None;
+        for winner in &self.winners {
+            winner.validate()?;
+            if previous.is_some_and(|chain| chain >= winner.chain) {
+                return Err(invalid(
+                    "share_receipt.winners",
+                    "must be unique and ordered wcash before zcash",
+                ));
+            }
+            if winner.chain == MergedChain::Zcash && winner.block_hash_le != self.parent_hash_le {
+                return Err(invalid(
+                    "share_receipt.winners",
+                    "zcash winner hash must equal the validated parent header hash",
+                ));
+            }
+            previous = Some(winner.chain);
+        }
+        Ok(())
     }
 }
 
@@ -318,7 +468,7 @@ pub enum BackendEvent {
     },
     /// No later share may be committed to this generation.
     GenerationClosed {
-        /// Monotonic backend journal sequence and payout close watermark.
+        /// Monotonic backend journal sequence and share-admission close watermark.
         event_seq: u64,
         /// Closed generation.
         job_id: Hex32,
@@ -333,6 +483,52 @@ pub enum BackendEvent {
         identity: WorkerIdentity,
         /// Exact target issued for this share, in little-endian numeric order.
         target_le: TargetLe,
+    },
+    /// A winning block was observed on one chain's current best chain.
+    WinnerObserved {
+        /// Monotonic backend journal sequence.
+        event_seq: u64,
+        /// Share whose proof created this winner.
+        share_id: Hex32,
+        /// Generation that produced the winner.
+        job_id: Hex32,
+        /// Immutable winning-block and reward facts.
+        winner: WinnerDescriptor,
+        /// Exact best-chain tip used for this observation.
+        tip: ChainTip,
+        /// Confirmation count computed from the same state snapshot as `tip`.
+        confirmations: u32,
+    },
+    /// A previously observed winner left one chain's current best chain.
+    WinnerOrphaned {
+        /// Monotonic backend journal sequence.
+        event_seq: u64,
+        /// Share whose proof created this winner.
+        share_id: Hex32,
+        /// Generation that produced the winner.
+        job_id: Hex32,
+        /// Immutable winning-block and reward facts.
+        winner: WinnerDescriptor,
+        /// Exact replacement best-chain tip that does not contain the winner.
+        tip: ChainTip,
+    },
+    /// An observed winner reached its chain-specific spendability threshold.
+    ///
+    /// Maturity is reversible: a later deep reorganization can still emit
+    /// `winner_orphaned` for the same winner.
+    WinnerMatured {
+        /// Monotonic backend journal sequence.
+        event_seq: u64,
+        /// Share whose proof created this winner.
+        share_id: Hex32,
+        /// Generation that produced the winner.
+        job_id: Hex32,
+        /// Immutable winning-block and reward facts.
+        winner: WinnerDescriptor,
+        /// Exact best-chain tip used for this maturity observation.
+        tip: ChainTip,
+        /// Confirmation count computed from the same state snapshot as `tip`.
+        confirmations: u32,
     },
 }
 
@@ -373,6 +569,52 @@ impl fmt::Debug for BackendEvent {
                 .field("identity", &"[REDACTED]")
                 .field("target_le", target_le)
                 .finish(),
+            Self::WinnerObserved {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+            } => formatter
+                .debug_struct("WinnerObserved")
+                .field("event_seq", event_seq)
+                .field("share_id", share_id)
+                .field("job_id", job_id)
+                .field("winner", winner)
+                .field("tip", tip)
+                .field("confirmations", confirmations)
+                .finish(),
+            Self::WinnerOrphaned {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            } => formatter
+                .debug_struct("WinnerOrphaned")
+                .field("event_seq", event_seq)
+                .field("share_id", share_id)
+                .field("job_id", job_id)
+                .field("winner", winner)
+                .field("tip", tip)
+                .finish(),
+            Self::WinnerMatured {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+            } => formatter
+                .debug_struct("WinnerMatured")
+                .field("event_seq", event_seq)
+                .field("share_id", share_id)
+                .field("job_id", job_id)
+                .field("winner", winner)
+                .field("tip", tip)
+                .field("confirmations", confirmations)
+                .finish(),
         }
     }
 }
@@ -383,7 +625,10 @@ impl BackendEvent {
         match self {
             Self::JobActivated { event_seq, .. }
             | Self::JobInvalidated { event_seq, .. }
-            | Self::GenerationClosed { event_seq, .. } => *event_seq,
+            | Self::GenerationClosed { event_seq, .. }
+            | Self::WinnerObserved { event_seq, .. }
+            | Self::WinnerOrphaned { event_seq, .. }
+            | Self::WinnerMatured { event_seq, .. } => *event_seq,
             Self::ShareCommitted { receipt, .. } => receipt.event_seq,
         }
     }
@@ -443,6 +688,29 @@ impl BackendEvent {
                 identity.validate()?;
                 require_nonzero_target(target_le, "event.target_le")
             }
+            Self::WinnerObserved {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+                ..
+            } => validate_winner_observation(share_id, job_id, winner, tip, *confirmations, false),
+            Self::WinnerOrphaned {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => validate_winner_orphan(share_id, job_id, winner, tip),
+            Self::WinnerMatured {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+                ..
+            } => validate_winner_observation(share_id, job_id, winner, tip, *confirmations, true),
         }
     }
 }
@@ -1294,6 +1562,96 @@ fn require_non_nil_uuid(value: &CanonicalUuid, field: &'static str) -> Result<()
 fn require_nonzero_target(value: &TargetLe, field: &'static str) -> Result<(), ProtocolError> {
     if value.is_zero() {
         return Err(invalid(field, "must be nonzero"));
+    }
+    Ok(())
+}
+
+fn validate_reward(value: u64, field: &'static str) -> Result<(), ProtocolError> {
+    if !(1..=MAX_CHAIN_VALUE_ZAT).contains(&value) {
+        return Err(invalid(
+            field,
+            format!("must be in 1..={MAX_CHAIN_VALUE_ZAT} zatoshi"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_maturity(value: u32, field: &'static str) -> Result<(), ProtocolError> {
+    if !(1..=MAX_MATURITY_CONFIRMATIONS).contains(&value) {
+        return Err(invalid(
+            field,
+            format!("must be in 1..={MAX_MATURITY_CONFIRMATIONS}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_winner_reference(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+) -> Result<(), ProtocolError> {
+    require_nonzero_hex(share_id, "winner_event.share_id")?;
+    require_nonzero_hex(job_id, "winner_event.job_id")?;
+    winner.validate()
+}
+
+fn validate_winner_observation(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+    tip: &ChainTip,
+    confirmations: u32,
+    matured: bool,
+) -> Result<(), ProtocolError> {
+    validate_winner_reference(share_id, job_id, winner)?;
+    tip.validate()?;
+    let tip_is_winner = tip.block_hash_le == winner.block_hash_le;
+    let tip_is_at_winner_height = tip.height == winner.height;
+    if tip_is_winner != tip_is_at_winner_height {
+        return Err(invalid(
+            "winner_event.tip",
+            "tip hash must equal the winner hash exactly at the winner height",
+        ));
+    }
+    let expected = tip
+        .height
+        .checked_sub(winner.height)
+        .and_then(|depth| depth.checked_add(1))
+        .ok_or_else(|| {
+            invalid(
+                "winner_event.confirmations",
+                "tip height must be at or above the winner height",
+            )
+        })?;
+    if confirmations != expected {
+        return Err(invalid(
+            "winner_event.confirmations",
+            "must equal tip height minus winner height plus one",
+        ));
+    }
+    if matured && confirmations < winner.maturity_confirmations {
+        return Err(invalid(
+            "winner_event.confirmations",
+            "matured winner has not reached its immutable confirmation requirement",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_winner_orphan(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+    tip: &ChainTip,
+) -> Result<(), ProtocolError> {
+    validate_winner_reference(share_id, job_id, winner)?;
+    tip.validate()?;
+    if tip.block_hash_le == winner.block_hash_le {
+        return Err(invalid(
+            "winner_event.tip",
+            "orphan replacement tip must not be the winning block",
+        ));
     }
     Ok(())
 }

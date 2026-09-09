@@ -17,8 +17,9 @@ use wcash_pool_core::{GenerationRegistry, JobRegistryError, SubmissionContext};
 use wcash_pool_protocol::{
     decode_backend_message, encode_backend_request, AcceptableJob, BackendCapability,
     BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex1344, Hex32,
-    Hex4, ProtocolError, ShareReceipt, TargetLe, WorkerIdentity, BACKEND_LENGTH_PREFIX_BYTES,
-    BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES, MAX_EVENT_PAGE_ITEMS,
+    Hex4, JobDescriptor, ProtocolError, ShareReceipt, TargetLe, WorkerIdentity,
+    BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES,
+    MAX_EVENT_PAGE_ITEMS,
 };
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -385,12 +386,36 @@ impl fmt::Debug for ShareSubmission {
     }
 }
 
-/// Correlated share commit returned over this client's identity-checked session.
+/// Correlated but job-unbound response from the lower-level share API.
+///
+/// This value proves strict framing, protocol semantics, network identity, and
+/// request correlation. Its winner facts have not been checked against a retained
+/// pool generation, so it must not authorize credit or payout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnverifiedShareCommit {
+    receipt: ShareReceipt,
+    replayed: bool,
+}
+
+impl UnverifiedShareCommit {
+    /// Returns the backend's structurally valid receipt.
+    pub const fn receipt(&self) -> &ShareReceipt {
+        &self.receipt
+    }
+
+    /// Returns whether this response referred to an already-durable commit.
+    pub const fn replayed(&self) -> bool {
+        self.replayed
+    }
+}
+
+/// Job-bound share commit returned over this client's identity-checked session.
 ///
 /// The fields are intentionally private: freely constructible protocol wire values are
-/// untrusted claims. This brand proves only that this client validated framing, protocol
-/// semantics, network identity, and request correlation. It does not cryptographically
-/// authenticate the process controlling the Unix socket.
+/// untrusted claims. This brand proves that this client validated framing, protocol
+/// semantics, network identity, request correlation, and every exact winner against
+/// the retained generation used for submission. It does not cryptographically authenticate
+/// the process controlling the Unix socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedShareCommit {
     receipt: ShareReceipt,
@@ -892,15 +917,16 @@ impl BackendClient {
         }
     }
 
-    /// Validates and durably attributes one reconstructed share through the backend.
+    /// Exchanges one freely constructed share with the backend.
     ///
-    /// This lower-level method accepts freely constructed fields. Production pool
-    /// orchestration should call [`Self::submit_prepared_share`] so the core
-    /// generation-admission fence remains alive for the complete I/O exchange.
+    /// Its response is deliberately unverified because no retained generation is
+    /// available to authenticate winner reward facts. Production orchestration
+    /// must call [`Self::submit_prepared_share`] so those facts are job-bound and
+    /// the core generation-admission fence remains alive for the complete exchange.
     pub async fn submit_share(
         &mut self,
         submission: ShareSubmission,
-    ) -> Result<VerifiedShareCommit, ClientError> {
+    ) -> Result<UnverifiedShareCommit, ClientError> {
         self.ensure_phase("submit_share", BackendStreamPhase::Live)?;
         let request_id = self.allocate_request_id()?;
         let (response, _) = self
@@ -929,7 +955,7 @@ impl BackendClient {
                     self.observed_event_high_watermark =
                         self.observed_event_high_watermark.max(receipt.event_seq);
                 }
-                Ok(VerifiedShareCommit { receipt, replayed })
+                Ok(UnverifiedShareCommit { receipt, replayed })
             }
             BackendMessage::Error { code, message, .. } => {
                 Err(ClientError::BackendRejected { code, message })
@@ -950,6 +976,7 @@ impl BackendClient {
         &mut self,
         context: SubmissionContext,
     ) -> Result<VerifiedShareCommit, ClientError> {
+        let descriptor = context.generation().descriptor().clone();
         let submission = ShareSubmission {
             job_id: context.job_id(),
             identity: context.identity().clone(),
@@ -959,6 +986,13 @@ impl BackendClient {
             solution: context.solution().clone(),
         };
         let result = self.submit_share(submission).await;
+        let result = result.and_then(|commit| {
+            self.validate_receipt_for_job(commit.receipt(), &descriptor)?;
+            Ok(VerifiedShareCommit {
+                receipt: commit.receipt,
+                replayed: commit.replayed,
+            })
+        });
         drop(context);
         result
     }
@@ -1194,6 +1228,19 @@ impl BackendClient {
             .checked_add(1)
             .ok_or_else(|| self.invalidate(ClientError::RequestIdExhausted))?;
         Ok(current)
+    }
+
+    fn validate_receipt_for_job(
+        &mut self,
+        receipt: &ShareReceipt,
+        descriptor: &JobDescriptor,
+    ) -> Result<(), ClientError> {
+        for winner in &receipt.winners {
+            if let Err(error) = winner.validate_for_job(descriptor) {
+                return Err(self.invalidate(ClientError::Protocol(error)));
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1450,9 +1497,9 @@ mod tests {
     use wcash_pool_protocol::{
         decode_backend_request, encode_backend_message, AcceptableJob, BackendCapability,
         BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex108,
-        Hex1344, Hex28, Hex32, Hex4, JobDescriptor, NonceProfile, NonceSuffix, ShareReceipt,
-        TargetLe, WorkerIdentity, BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION,
-        MAX_BACKEND_PAYLOAD_BYTES,
+        Hex1344, Hex28, Hex32, Hex4, JobDescriptor, MergedChain, NonceProfile, NonceSuffix,
+        ProtocolError, ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity,
+        BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES,
     };
 
     use super::{
@@ -1506,6 +1553,7 @@ mod tests {
             BackendCapability::DurableShareReceiptsV1,
             BackendCapability::EventReplayV1,
             BackendCapability::DualTargetV1,
+            BackendCapability::WinnerLifecycleV1,
         ]
     }
 
@@ -1587,7 +1635,28 @@ mod tests {
             zcash_target_le: TargetLe::new([0x3f; 32]),
             wcash_height: 11,
             zcash_height: 22,
+            wcash_reward_zat: 625_000_000,
+            zcash_reward_zat: 312_500_000,
+            wcash_maturity_confirmations: 100,
+            zcash_maturity_confirmations: 100,
             max_age_ms: 45_000,
+        }
+    }
+
+    fn winner(chain: MergedChain, block_hash: u8) -> WinnerDescriptor {
+        WinnerDescriptor {
+            chain,
+            block_hash_le: Hex32::new([block_hash; 32]),
+            height: match chain {
+                MergedChain::Wcash => 11,
+                MergedChain::Zcash => 22,
+            },
+            coinbase_txid_le: Hex32::new([block_hash.wrapping_add(1); 32]),
+            reward_zat: match chain {
+                MergedChain::Wcash => 625_000_000,
+                MergedChain::Zcash => 312_500_000,
+            },
+            maturity_confirmations: 100,
         }
     }
 
@@ -1604,6 +1673,144 @@ mod tests {
             nonce: Hex32::new([0x41; 32]),
             solution: Hex1344::new([0x51; 1344]),
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WinnerJobMismatch {
+        Height,
+        Reward,
+        Maturity,
+    }
+
+    impl WinnerJobMismatch {
+        const fn field(self) -> &'static str {
+            match self {
+                Self::Height => "winner.height",
+                Self::Reward => "winner.reward_zat",
+                Self::Maturity => "winner.maturity_confirmations",
+            }
+        }
+    }
+
+    async fn assert_prepared_winner_mismatch_rejected(mismatch: WinnerJobMismatch) -> TestResult {
+        let timeline = MonotonicTimeline::new();
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let descriptor = job(0x31);
+        let server_descriptor = descriptor.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = accept_hello(&listener).await?;
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::SubscribeJobs { id, .. } = request else {
+                return TestResult::Err("second request was not subscribe_jobs".into());
+            };
+            write_message(
+                &mut stream,
+                &BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 10,
+                    current: Some(AcceptableJob {
+                        job: server_descriptor.clone(),
+                        accept_for_ms: 40_000,
+                    }),
+                    recent: Vec::new(),
+                },
+            )
+            .await?;
+
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::SubmitShare { id, job_id, .. } = request else {
+                return TestResult::Err("third request was not submit_share".into());
+            };
+            assert_eq!(job_id, server_descriptor.job_id);
+            let mut winners = vec![
+                winner(MergedChain::Wcash, 0x73),
+                winner(MergedChain::Zcash, 0x72),
+            ];
+            match mismatch {
+                WinnerJobMismatch::Height => winners[0].height += 1,
+                WinnerJobMismatch::Reward => winners[1].reward_zat += 1,
+                WinnerJobMismatch::Maturity => winners[0].maturity_confirmations += 1,
+            }
+            let receipt = ShareReceipt {
+                event_seq: 11,
+                share_id: Hex32::new([0x71; 32]),
+                parent_hash_le: Hex32::new([0x72; 32]),
+                winners,
+            };
+            // The peer's response is valid in isolation; only binding it to the
+            // exact submitted generation reveals the accounting conflict.
+            receipt.validate()?;
+            write_message(
+                &mut stream,
+                &BackendMessage::ShareCommitted {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    receipt,
+                    replayed: false,
+                },
+            )
+            .await?;
+            TestResult::Ok(())
+        });
+
+        let mut client = connect_client_at(&socket, 10).await?;
+        let snapshot = client.subscribe_jobs(10).await?;
+        let mut registry = GenerationRegistry::new(GenerationRegistryConfig::new(2, 8)?);
+        snapshot.apply_to_registry(&mut registry, timeline)?;
+        let generation = registry
+            .current_generation(timeline.now_ms()?)?
+            .ok_or("snapshot did not install its current generation")?
+            .clone();
+        let generation_id = generation.id();
+        let bounds = TargetBounds::new(
+            generation.wcash_network_target(),
+            generation.zcash_network_target(),
+            ShareTarget::MAX,
+        )?;
+        let assignment = JobAssignment::new(
+            &generation,
+            TargetBinding::new(1, ShareTarget::MAX, bounds)?,
+        )?;
+        let allocator =
+            NoncePrefixAllocator::new(NonceProfile::FourByte, NonceNamespaceLease::new(1)?);
+        let mut session = wcash_pool_core::MiningSession::new(uuid(4).get(), 2)?;
+        let _ = session.subscribe(&allocator)?;
+        session.complete_authorization(AuthenticatedWorker::new(
+            uuid(7).get(),
+            uuid(8).get(),
+            "account.worker",
+        )?)?;
+        session.announce_job(assignment)?;
+        let context = session.prepare_submission(
+            "account.worker",
+            generation_id,
+            generation.header_time(),
+            NonceSuffix::TwentyEight(Hex28::new([0x41; 28])),
+            Box::new(Hex1344::new([0x51; 1_344])),
+            &mut registry,
+            timeline.now_ms()?,
+        )?;
+
+        match client.submit_prepared_share(context).await {
+            Err(ClientError::Protocol(ProtocolError::InvalidField { field, .. })) => {
+                assert_eq!(field, mismatch.field());
+            }
+            other => {
+                return Err(format!(
+                    "{mismatch:?} mismatch produced an unexpected branded result: {other:?}"
+                )
+                .into());
+            }
+        }
+        assert_eq!(registry.in_flight(generation_id), Some(0));
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::ConnectionUnusable)
+        ));
+        server.await??;
+        Ok(())
     }
 
     #[test]
@@ -1781,8 +1988,7 @@ mod tests {
                         event_seq: 12,
                         share_id: Hex32::new([0x71; 32]),
                         parent_hash_le: Hex32::new([0x72; 32]),
-                        wcash_candidate: true,
-                        zcash_candidate: false,
+                        winners: vec![winner(MergedChain::Wcash, 0x73)],
                     },
                     replayed: false,
                 },
@@ -1859,8 +2065,7 @@ mod tests {
                 event_seq: 12,
                 share_id: Hex32::new([0x71; 32]),
                 parent_hash_le: Hex32::new([0x72; 32]),
-                wcash_candidate: true,
-                zcash_candidate: false,
+                winners: vec![winner(MergedChain::Wcash, 0x73)],
             };
 
             for replayed in [false, true] {
@@ -1998,8 +2203,7 @@ mod tests {
                         event_seq: 11,
                         share_id: Hex32::new([0x71; 32]),
                         parent_hash_le: Hex32::new([0x72; 32]),
-                        wcash_candidate: false,
-                        zcash_candidate: false,
+                        winners: Vec::new(),
                     },
                     replayed: false,
                 },
@@ -2064,6 +2268,18 @@ mod tests {
         assert_eq!(commit.receipt().event_seq, 11);
         assert_eq!(registry.in_flight(generation.id()), Some(0));
         server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_submission_rejects_job_mismatched_winner_facts() -> TestResult {
+        for mismatch in [
+            WinnerJobMismatch::Height,
+            WinnerJobMismatch::Reward,
+            WinnerJobMismatch::Maturity,
+        ] {
+            assert_prepared_winner_mismatch_rejected(mismatch).await?;
+        }
         Ok(())
     }
 

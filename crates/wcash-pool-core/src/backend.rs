@@ -5,11 +5,14 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wcash_pool_protocol::{
-    BackendRequest, Hex1344, Hex32, Hex4, ShareReceipt, TargetLe, WorkerIdentity,
+    BackendRequest, Hex1344, Hex32, Hex4, MergedChain, ShareReceipt, TargetLe, WinnerDescriptor,
+    WorkerIdentity,
 };
 
 const SHARE_DOMAIN: &[u8] = b"wcash-pool/fake-share-id/v1";
 const PARENT_DOMAIN: &[u8] = b"wcash-pool/fake-parent-hash/v1";
+const WCASH_DOMAIN: &[u8] = b"wcash-pool/fake-wcash-hash/v1";
+const COINBASE_DOMAIN: &[u8] = b"wcash-pool/fake-coinbase-hash/v1";
 
 /// Boundary implemented by the trusted local consensus backend.
 ///
@@ -153,12 +156,38 @@ impl MiningBackend for FakeMiningBackend {
         );
         let (wcash_candidate, zcash_candidate) =
             self.planned_outcomes.remove(&share_id).unwrap_or_default();
+        let mut winners = Vec::with_capacity(2);
+        if wcash_candidate {
+            winners.push(WinnerDescriptor {
+                chain: MergedChain::Wcash,
+                block_hash_le: digest(WCASH_DOMAIN, [share_id.as_bytes().as_slice()]),
+                height: 11,
+                coinbase_txid_le: digest(
+                    COINBASE_DOMAIN,
+                    [share_id.as_bytes().as_slice(), b"wcash"],
+                ),
+                reward_zat: 625_000_000,
+                maturity_confirmations: 100,
+            });
+        }
+        if zcash_candidate {
+            winners.push(WinnerDescriptor {
+                chain: MergedChain::Zcash,
+                block_hash_le: parent_hash_le.clone(),
+                height: 22,
+                coinbase_txid_le: digest(
+                    COINBASE_DOMAIN,
+                    [share_id.as_bytes().as_slice(), b"zcash"],
+                ),
+                reward_zat: 312_500_000,
+                maturity_confirmations: 100,
+            });
+        }
         let receipt = ShareReceipt {
             event_seq,
             share_id: share_id.clone(),
             parent_hash_le,
-            wcash_candidate,
-            zcash_candidate,
+            winners,
         };
         self.next_event_seq = event_seq;
         self.processed.insert(
@@ -266,8 +295,8 @@ mod tests {
         assert!(!first.replayed);
         assert!(retry.replayed);
         assert_eq!(first.receipt, retry.receipt);
-        assert!(first.receipt.wcash_candidate);
-        assert!(!first.receipt.zcash_candidate);
+        assert_eq!(first.receipt.winners.len(), 1);
+        assert_eq!(first.receipt.winners[0].chain, MergedChain::Wcash);
         assert_eq!(backend.processed_count(), 1);
         Ok(())
     }

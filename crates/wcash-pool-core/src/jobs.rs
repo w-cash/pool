@@ -715,7 +715,10 @@ impl GenerationRegistry {
                     self.recent.retain(|recent| *recent != id);
                 }
             }
-            BackendEvent::ShareCommitted { .. } => {}
+            BackendEvent::ShareCommitted { .. }
+            | BackendEvent::WinnerObserved { .. }
+            | BackendEvent::WinnerOrphaned { .. }
+            | BackendEvent::WinnerMatured { .. } => {}
         }
         self.last_event_seq = Some(event.event_seq());
         self.watermark_current = self.current;
@@ -1040,6 +1043,10 @@ mod tests {
             zcash_target_le: TargetLe::new([id.wrapping_add(4); 32]),
             wcash_height: u32::from(id) + 1,
             zcash_height: u32::from(id) + 2,
+            wcash_reward_zat: 625_000_000,
+            zcash_reward_zat: 312_500_000,
+            wcash_maturity_confirmations: 100,
+            zcash_maturity_confirmations: 100,
             max_age_ms,
         }
     }

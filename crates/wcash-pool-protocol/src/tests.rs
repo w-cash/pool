@@ -32,7 +32,28 @@ fn job(byte: u8) -> JobDescriptor {
         zcash_target_le: fixed(0x3f).into(),
         wcash_height: 11,
         zcash_height: 22,
+        wcash_reward_zat: 625_000_000,
+        zcash_reward_zat: 312_500_000,
+        wcash_maturity_confirmations: 100,
+        zcash_maturity_confirmations: 100,
         max_age_ms: 45_000,
+    }
+}
+
+fn winner(chain: MergedChain, byte: u8) -> WinnerDescriptor {
+    WinnerDescriptor {
+        chain,
+        block_hash_le: fixed(byte),
+        height: match chain {
+            MergedChain::Wcash => 11,
+            MergedChain::Zcash => 22,
+        },
+        coinbase_txid_le: fixed(byte.wrapping_add(1)),
+        reward_zat: match chain {
+            MergedChain::Wcash => 625_000_000,
+            MergedChain::Zcash => 312_500_000,
+        },
+        maturity_confirmations: 100,
     }
 }
 
@@ -443,8 +464,7 @@ fn worker_identity_and_worker_bearing_backend_debug_are_redacted() {
             event_seq: 1,
             share_id: fixed(0x31),
             parent_hash_le: fixed(0x32),
-            wcash_candidate: false,
-            zcash_candidate: false,
+            winners: Vec::new(),
         },
         job_id: fixed(0x33),
         identity: worker,
@@ -500,8 +520,7 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
         event_seq: 7,
         share_id: fixed(0x51),
         parent_hash_le: fixed(0x52),
-        wcash_candidate: true,
-        zcash_candidate: false,
+        winners: vec![winner(MergedChain::Wcash, 0x61)],
     };
     let response = BackendMessage::ShareCommitted {
         version: 1,
@@ -510,9 +529,11 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
         replayed: true,
     };
     let expected = format!(
-        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"share_id\":\"{}\",\"parent_hash_le\":\"{}\",\"wcash_candidate\":true,\"zcash_candidate\":false}},\"replayed\":true}}",
+        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"share_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[{{\"chain\":\"wcash\",\"block_hash_le\":\"{}\",\"height\":11,\"coinbase_txid_le\":\"{}\",\"reward_zat\":625000000,\"maturity_confirmations\":100}}]}},\"replayed\":true}}",
         "51".repeat(32),
         "52".repeat(32),
+        "61".repeat(32),
+        "62".repeat(32),
     );
     let frame = encode_backend_message(&response)?;
     assert_eq!(frame, raw_backend_frame(expected.as_bytes()));
@@ -543,11 +564,247 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
     assert!(decode_backend_request(&raw_backend_frame(missing_time.as_bytes())).is_err());
 
     let nested_replayed = format!(
-        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"share_id\":\"{}\",\"parent_hash_le\":\"{}\",\"wcash_candidate\":true,\"zcash_candidate\":false,\"replayed\":true}},\"replayed\":true}}",
+        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"share_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[],\"replayed\":true}},\"replayed\":true}}",
         "51".repeat(32),
         "52".repeat(32),
     );
     assert!(decode_backend_message(&raw_backend_frame(nested_replayed.as_bytes())).is_err());
+    Ok(())
+}
+
+#[test]
+fn job_and_winner_reward_facts_are_bounded_and_must_match() -> TestResult {
+    let exact_job = job(0x11);
+    let wcash = winner(MergedChain::Wcash, 0x61);
+    let zcash = winner(MergedChain::Zcash, 0x62);
+    wcash.validate_for_job(&exact_job)?;
+    zcash.validate_for_job(&exact_job)?;
+
+    let mut excessive_reward = exact_job.clone();
+    excessive_reward.wcash_reward_zat = MAX_CHAIN_VALUE_ZAT + 1;
+    assert!(excessive_reward.validate().is_err());
+
+    let mut zero_reward = exact_job.clone();
+    zero_reward.zcash_reward_zat = 0;
+    assert!(zero_reward.validate().is_err());
+
+    let mut zero_winner_reward = wcash.clone();
+    zero_winner_reward.reward_zat = 0;
+    assert!(zero_winner_reward.validate().is_err());
+
+    let mut zero_maturity = exact_job.clone();
+    zero_maturity.zcash_maturity_confirmations = 0;
+    assert!(zero_maturity.validate().is_err());
+
+    let mut wrong_reward = wcash.clone();
+    wrong_reward.reward_zat += 1;
+    assert!(wrong_reward.validate_for_job(&exact_job).is_err());
+
+    let mut wrong_height = wcash.clone();
+    wrong_height.height += 1;
+    assert!(wrong_height.validate_for_job(&exact_job).is_err());
+
+    let mut wrong_maturity = wcash;
+    wrong_maturity.maturity_confirmations += 1;
+    assert!(wrong_maturity.validate_for_job(&exact_job).is_err());
+    Ok(())
+}
+
+#[test]
+fn share_receipt_commits_canonical_exact_winners() {
+    let parent_hash = fixed(0x72);
+    let wcash = winner(MergedChain::Wcash, 0x61);
+    let zcash = winner(MergedChain::Zcash, 0x72);
+    let receipt = |winners| ShareReceipt {
+        event_seq: 1,
+        share_id: fixed(0x71),
+        parent_hash_le: parent_hash.clone(),
+        winners,
+    };
+
+    assert!(receipt(Vec::new()).validate().is_ok());
+    assert!(receipt(vec![wcash.clone()]).validate().is_ok());
+    assert!(receipt(vec![zcash.clone()]).validate().is_ok());
+    assert!(receipt(vec![wcash.clone(), zcash.clone()])
+        .validate()
+        .is_ok());
+    assert!(receipt(vec![wcash.clone(), wcash.clone()])
+        .validate()
+        .is_err());
+    assert!(receipt(vec![zcash.clone(), wcash.clone()])
+        .validate()
+        .is_err());
+    assert!(receipt(vec![wcash.clone(), zcash.clone(), wcash])
+        .validate()
+        .is_err());
+
+    let mismatched_parent = winner(MergedChain::Zcash, 0x73);
+    assert!(receipt(vec![mismatched_parent]).validate().is_err());
+}
+
+#[test]
+fn winner_lifecycle_binds_exact_tip_depth_and_reversible_maturity() {
+    let wcash = winner(MergedChain::Wcash, 0x61);
+    let share_id = fixed(0x51);
+    let job_id = fixed(0x52);
+    let tip = ChainTip {
+        block_hash_le: fixed(0x71),
+        height: 110,
+    };
+    let mature = BackendEvent::WinnerMatured {
+        event_seq: 1,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: tip.clone(),
+        confirmations: 100,
+    };
+    assert!(mature.validate().is_ok());
+
+    let shallow = BackendEvent::WinnerMatured {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: fixed(0x72),
+            height: 109,
+        },
+        confirmations: 99,
+    };
+    assert!(shallow.validate().is_err());
+
+    let inconsistent_depth = BackendEvent::WinnerObserved {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: tip.clone(),
+        confirmations: 99,
+    };
+    assert!(inconsistent_depth.validate().is_err());
+
+    let tip_below_winner = BackendEvent::WinnerObserved {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: fixed(0x73),
+            height: 10,
+        },
+        confirmations: 1,
+    };
+    assert!(tip_below_winner.validate().is_err());
+
+    let wrong_tip_at_winner_height = BackendEvent::WinnerObserved {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: fixed(0x75),
+            height: 11,
+        },
+        confirmations: 1,
+    };
+    assert!(wrong_tip_at_winner_height.validate().is_err());
+
+    let winner_hash_at_later_height = BackendEvent::WinnerObserved {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: wcash.block_hash_le.clone(),
+            height: 12,
+        },
+        confirmations: 2,
+    };
+    assert!(winner_hash_at_later_height.validate().is_err());
+
+    let self_orphan = BackendEvent::WinnerOrphaned {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: wcash.block_hash_le.clone(),
+            height: wcash.height,
+        },
+    };
+    assert!(self_orphan.validate().is_err());
+
+    // A deep reorganization remains representable after a maturity event.
+    let post_maturity_orphan = BackendEvent::WinnerOrphaned {
+        event_seq: 2,
+        share_id,
+        job_id,
+        winner: wcash,
+        tip: ChainTip {
+            block_hash_le: fixed(0x74),
+            height: 0,
+        },
+    };
+    assert!(post_maturity_orphan.validate().is_ok());
+}
+
+#[test]
+fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult {
+    let wcash = winner(MergedChain::Wcash, 0x61);
+    let events = [
+        BackendEvent::WinnerObserved {
+            event_seq: 1,
+            share_id: fixed(0x51),
+            job_id: fixed(0x52),
+            winner: wcash.clone(),
+            tip: ChainTip {
+                block_hash_le: wcash.block_hash_le.clone(),
+                height: 11,
+            },
+            confirmations: 1,
+        },
+        BackendEvent::WinnerOrphaned {
+            event_seq: 2,
+            share_id: fixed(0x51),
+            job_id: fixed(0x52),
+            winner: wcash.clone(),
+            tip: ChainTip {
+                block_hash_le: fixed(0x72),
+                height: 0,
+            },
+        },
+        BackendEvent::WinnerMatured {
+            event_seq: 3,
+            share_id: fixed(0x51),
+            job_id: fixed(0x52),
+            winner: wcash,
+            tip: ChainTip {
+                block_hash_le: fixed(0x73),
+                height: 110,
+            },
+            confirmations: 100,
+        },
+    ];
+    for (event, expected_tag) in
+        events
+            .into_iter()
+            .zip(["winner_observed", "winner_orphaned", "winner_matured"])
+    {
+        let message = BackendMessage::Event {
+            version: BACKEND_PROTOCOL_VERSION,
+            event,
+        };
+        let frame = encode_backend_message(&message)?;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&frame[BACKEND_LENGTH_PREFIX_BYTES..])?;
+        assert_eq!(value["event"]["event"], expected_tag);
+        assert_eq!(decode_backend_message(&frame)?, message);
+
+        value["event"]["winner"]["unreviewed"] = serde_json::json!(true);
+        let payload = serde_json::to_vec(&value)?;
+        assert!(decode_backend_message(&raw_backend_frame(&payload)).is_err());
+    }
     Ok(())
 }
 
