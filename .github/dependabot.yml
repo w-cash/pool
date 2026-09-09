@@ -1,0 +1,33 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: monthly
+      timezone: Europe/London
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      production:
+        dependency-type: production
+      development:
+        dependency-type: development
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: wednesday
+      timezone: Europe/London
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"

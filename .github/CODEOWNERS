@@ -1,0 +1,12 @@
+# Default ownership until the Wcash organization creates dedicated protocol,
+# operations, and security review teams.
+* @RustNinja
+
+# Changes to these boundaries require explicit maintainer review.
+/.github/ @RustNinja
+/deny.toml @RustNinja
+/docs/architecture.md @RustNinja
+/docs/threat-model.md @RustNinja
+/crates/wcash-pool-backend-client/ @RustNinja
+/crates/wcash-pool-core/ @RustNinja
+/crates/wcash-pool-protocol/ @RustNinja

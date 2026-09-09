@@ -1,0 +1,44 @@
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# This is a stable project policy allowlist, not an inventory of the current
+# graph, so pre-approved licenses do not produce non-actionable CI warnings.
+unused-allowed-license = "allow"
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+allow-wildcard-paths = true
+deny = [
+  # Keep the network stack on an explicitly configured rustls path. An
+  # exception must be reviewed together with its complete transitive tree.
+  { name = "openssl" },
+  { name = "openssl-sys" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
