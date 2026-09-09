@@ -25,4 +25,7 @@ pub use error::{MinerError, MinerErrorCode};
 pub use rate_limit::{ConnectionCapacity, ConnectionPermit, RateLimit, RateLimitError};
 pub use router::{JobRouter, JobRouterError, JobSubscription, JobUpdate};
 #[cfg(unix)]
-pub use submission::{ShareRouter, ShareRouterError, ShareRouterHandle};
+pub use submission::{
+    BackendEventConsumer, BackendEventConsumerError, ShareRouter, ShareRouterConfig,
+    ShareRouterConfigError, ShareRouterError, ShareRouterHandle,
+};

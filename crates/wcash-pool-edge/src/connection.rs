@@ -445,10 +445,10 @@ impl ConnectionActor {
             Err(
                 ShareRouterError::Unavailable
                 | ShareRouterError::JobStreamUnusable
+                | ShareRouterError::EventConsumerUnusable
                 | ShareRouterError::TaskFailed
                 | ShareRouterError::BackendNotLive
-                | ShareRouterError::BackendConnectionMismatch
-                | ShareRouterError::InvalidQueueCapacity { .. },
+                | ShareRouterError::BackendConnectionMismatch,
             ) => {
                 self.queue_error(
                     response_id,

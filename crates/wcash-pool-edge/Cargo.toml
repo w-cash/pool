@@ -17,5 +17,8 @@ wcash-pool-backend-client = { path = "../wcash-pool-backend-client" }
 wcash-pool-core = { path = "../wcash-pool-core" }
 wcash-pool-protocol = { path = "../wcash-pool-protocol" }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

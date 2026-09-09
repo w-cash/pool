@@ -231,6 +231,33 @@ pub struct BackendAuthority {
     journal_stream: CanonicalUuid,
 }
 
+impl BackendAuthority {
+    /// Returns the authenticated Wcash genesis hash.
+    pub const fn wcash_genesis(&self) -> &Hex32 {
+        &self.wcash_genesis
+    }
+
+    /// Returns the authenticated Zcash genesis hash.
+    pub const fn zcash_genesis(&self) -> &Hex32 {
+        &self.zcash_genesis
+    }
+
+    /// Returns the authenticated Wcash chain identifier.
+    pub const fn chain_id(&self) -> u32 {
+        self.chain_id
+    }
+
+    /// Returns the stable backend installation identity.
+    pub const fn backend_instance(&self) -> &CanonicalUuid {
+        &self.backend_instance
+    }
+
+    /// Returns the stable journal namespace used to key durable event cursors.
+    pub const fn journal_stream(&self) -> &CanonicalUuid {
+        &self.journal_stream
+    }
+}
+
 /// Opaque binding between one snapshot and the exact live client that produced it.
 ///
 /// Persistent authority equality alone is insufficient: two connections can have
