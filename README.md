@@ -1,21 +1,43 @@
 # Wcash Pool
 
-The Wcash pool is the miner-facing service for Equihash merged mining across
-Wcash and Zcash. It is designed to keep public ZIP-301 sessions, worker
-authentication, variable difficulty, and accounting outside the consensus
-node.
+This repository is the phase-0 engineering foundation for a future
+Wcash/Zcash merged-mining pool. It is not a running pool and is not ready for
+public miners, Wcash Testnet, or funds of value. The only executable currently
+reports `ready: false`; it has no `serve` command and opens no listener.
 
-The repository is under active testnet development. It is not ready for public
-mining or funds of value.
+## Responsibility boundary
 
-## Design boundary
+The pool is intended to own long-lived ZIP-301 miner sessions, worker
+authentication, externally leased nonce namespaces, per-miner share targets
+and vardiff, miner-facing job assignment, and the PostgreSQL accounting
+projection. None of those policy decisions can establish consensus validity.
 
-The pool does not implement Equihash, AuxPoW, block-template construction, or
-network-target validation. Those consensus-sensitive operations remain in the
-Wcash node's `wcash-merge-miner` backend. The pool accepts a share only after
-that backend has validated it and durably recorded its attribution.
+The `wcash-merge-miner` backend in
+[`w-cash/wolf`](https://github.com/w-cash/wolf) remains the sole authority
+for template construction, Equihash validation, Wcash and Zcash network-target
+classification, AuxPoW construction, durable accepted-share receipts, winner
+outboxes, and block submission. The pool must fail closed when that authority
+is unavailable or its identity is inconsistent.
 
-See [SECURITY.md](SECURITY.md) before deploying or reporting a vulnerability.
+## Implementation status
+
+| Area | Current phase-0 state |
+| --- | --- |
+| Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs with deterministic positive and negative tests |
+| Pool policy | In-memory session ordering, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff with inactivity easing |
+| Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetime anchors, submitted-header-time preservation, and a fenced core-to-backend share path tested against local mock peers |
+| Service process | Readiness-only command; no miner or administrative listener |
+| Persistence and money | No PostgreSQL projection, balance ledger, maturity tracking, payout engine, wallet integration, or signing |
+| Wolf integration | The matching backend-v1 Unix-socket server and durable replay journal are not implemented in wolf |
+| Operations | No production container, deployment manifests, public endpoint, private soak, or release readiness |
+
+The next blocking change is the wolf backend and journal contract described in
+[the architecture](docs/architecture.md#exact-next-wolf-backend-and-journal-requirement).
+The staged evidence required before any public endpoint is listed in the
+[testnet roadmap](docs/testnet-roadmap.md).
+
+See [SECURITY.md](SECURITY.md) before reporting a vulnerability. Do not deploy
+this repository as a mining service.
 
 ## License
 
