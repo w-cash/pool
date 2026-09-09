@@ -94,7 +94,7 @@ existing consensus coordinator and durable winner state.
   parent header bytes, the proof-independent Wcash candidate hash, explicit
   Wcash and Zcash predecessor hashes, the Wcash candidate and Zcash parent
   coinbase transaction IDs, separate little-endian Wcash and Zcash network
-  targets, both heights, each chain's exact positive pool-recipient reward in
+  targets, both heights, each chain's exact non-negative pool-recipient reward in
   zatoshi, each chain's immutable maturity requirement, a unique job ID, and a
   bounded maximum age.
 - Snapshot current and recent entries must report remaining accept_for_ms from
@@ -135,7 +135,7 @@ existing consensus coordinator and durable winner state.
 - The immutable receipt binds its exact job ID, stable share ID, and parent
   header hash, then contains zero, one, or two exact winner descriptors in
   canonical Wcash-then-Zcash order. Each descriptor binds chain, block hash,
-  height, coinbase transaction ID, positive pool reward, and maturity
+  height, coinbase transaction ID, non-negative pool reward, and maturity
   requirement. A Wcash winner hash and both chains' coinbase transaction IDs
   must match the originating job. A Zcash winner hash must equal the validated
   parent-header hash. Boolean candidate flags are insufficient evidence.

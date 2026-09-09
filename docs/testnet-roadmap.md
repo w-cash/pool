@@ -53,7 +53,7 @@ Required wolf gates:
 - immutable jobs binding a unique job ID, exact 108-byte parent header input,
   proof-independent Wcash candidate hash, explicit Wcash and Zcash
   predecessors, the Wcash candidate and Zcash parent coinbase transaction IDs,
-  endian-typed targets, both heights, each chain's exact positive reward and
+  endian-typed targets, both heights, each chain's exact non-negative reward and
   maturity requirement, maximum age, and snapshot remaining lifetime;
 - independently validated Zcash proposal attestation before a job is released;
 - share submission bound to the exact job, pool-authenticated account and

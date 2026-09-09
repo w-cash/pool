@@ -1697,10 +1697,10 @@ fn require_nonzero_target(value: &TargetLe, field: &'static str) -> Result<(), P
 }
 
 fn validate_reward(value: u64, field: &'static str) -> Result<(), ProtocolError> {
-    if !(1..=MAX_CHAIN_VALUE_ZAT).contains(&value) {
+    if value > MAX_CHAIN_VALUE_ZAT {
         return Err(invalid(
             field,
-            format!("must be in 1..={MAX_CHAIN_VALUE_ZAT} zatoshi"),
+            format!("must be no greater than {MAX_CHAIN_VALUE_ZAT} zatoshi"),
         ));
     }
     Ok(())

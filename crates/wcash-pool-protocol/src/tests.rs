@@ -685,7 +685,7 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
 }
 
 #[test]
-fn job_and_winner_reward_facts_are_bounded_and_must_match() -> TestResult {
+fn job_and_winner_reward_facts_include_zero_tail_and_must_match() -> TestResult {
     let exact_job = job(0x11);
     let wcash = winner(MergedChain::Wcash, 0x61);
     let zcash = winner(MergedChain::Zcash, 0x62);
@@ -696,13 +696,13 @@ fn job_and_winner_reward_facts_are_bounded_and_must_match() -> TestResult {
     excessive_reward.wcash_reward_zat = MAX_CHAIN_VALUE_ZAT + 1;
     assert!(excessive_reward.validate().is_err());
 
-    let mut zero_reward = exact_job.clone();
-    zero_reward.zcash_reward_zat = 0;
-    assert!(zero_reward.validate().is_err());
+    let mut zero_reward_job = exact_job.clone();
+    zero_reward_job.wcash_reward_zat = 0;
+    zero_reward_job.validate()?;
 
     let mut zero_winner_reward = wcash.clone();
     zero_winner_reward.reward_zat = 0;
-    assert!(zero_winner_reward.validate().is_err());
+    zero_winner_reward.validate_for_job(&zero_reward_job)?;
 
     let mut zero_maturity = exact_job.clone();
     zero_maturity.zcash_maturity_confirmations = 0;
