@@ -11,7 +11,7 @@
 | --- | --- |
 | 0 — Repository foundation | Implementation present; clean-clone CI evidence is still required on the release commit |
 | 1 — Wolf backend API | Blocked: pool-side v1 contract and client exist, matching wolf server and cross-repository vectors do not |
-| 2 — Miner protocol edge | Partial: strict ZIP-301 codec and policy state machines exist; network listener, TLS, auth provider, limits, and ASIC transcripts do not |
+| 2 — Miner protocol edge | Partial: strict ZIP-301 codec, policy state machines, and a bounded loopback-only accepted-stream driver with synthetic 4+28 transcripts exist; public listener, TLS, concrete auth provider, service composition, and certified ASIC transcripts do not |
 | 3 and later | Not implemented |
 
 Each phase has an explicit exit gate. Work may be prototyped in parallel, but a
@@ -111,8 +111,8 @@ the pool cannot bypass wolf's consensus validation.
 
 Deliverables:
 
-- bounded ZIP-301 framing and strict JSON/message validation (codec
-  implemented; listener integration pending);
+- bounded ZIP-301 framing and strict JSON/message validation (codec and
+  loopback accepted-stream integration implemented; public listener pending);
 - TLS, subscription, authorization, worker identity, clean disconnect, and
   backpressure;
 - exact login binding: until aliases are explicitly represented, authentication
@@ -138,11 +138,14 @@ wrong-session, wrong-job, and disconnect races are covered without live nodes.
 
 Current note: deterministic codec, bounded connection/session actors, global
 job fanout and suspension, exact-login policy, replay-aware vardiff, request
-limiting, cancellation-safe submission serialization, and a bounded idle
-health/event pump with a mandatory consumer seam cover only the library layer.
-There is no durable event-consumer implementation, stream driver, socket
-listener, TLS termination, credential implementation, durable nonce lease, or
-certified ASIC transcript yet.
+limiting, cancellation-safe submission serialization, a bounded idle
+health/event pump with a mandatory consumer seam, and a loopback-only
+accepted-stream driver cover only the library/test layer. The driver enforces
+strict LF framing, absolute frame/idle/write/auth/submission deadlines, bounded
+backpressure, cancellation cleanup, and the standard 4+28 nonce split. There
+is no durable event-consumer implementation, public socket listener, TLS
+termination, credential implementation, durable nonce lease, service
+composition, or certified ASIC transcript yet.
 
 ## Phase 3 — End-to-end job and share lifecycle
 
