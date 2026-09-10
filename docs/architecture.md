@@ -80,8 +80,13 @@ existing consensus coordinator and durable winner state.
   and unsupported-version messages before backend work.
 - Require Hello as the first request. HelloOk must return distinct non-nil
   backend_session, stable backend_instance, and stable journal_stream IDs;
-  exact Wcash and Zcash genesis hashes; the non-zero Wcash chain ID; current
-  journal sequence; and every required version-1 capability exactly once.
+  exact Wcash and Zcash genesis hashes; the non-zero Wcash chain ID;
+  domain-separated 32-byte commitments to the exact Wcash child and Zcash
+  parent block-reward recipients; current journal sequence; and every required
+  version-1 capability exactly once.
+- Configure both payout commitments independently of the socket peer and require
+  exact equality during Hello. A changed template recipient must therefore stop
+  mining instead of silently redirecting either chain's rewards.
 - Treat those IDs as consistency and replacement detection, not as
   cryptographic authentication. A changed backend instance or journal stream
   is an operator-visible reconciliation event, never an automatic reset.

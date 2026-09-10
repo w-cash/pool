@@ -1252,6 +1252,8 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
         capabilities: capabilities(),
         wcash_genesis: fixed(1),
         zcash_genesis: fixed(2),
+        wcash_payout_commitment: fixed(3),
+        zcash_payout_commitment: fixed(4),
         chain_id: 0x5745_4301,
         current_event_seq: 0,
     };
@@ -1259,6 +1261,25 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
         decode_backend_message(&encode_backend_message(&valid)?)?,
         valid
     );
+
+    let mut missing_commitment: serde_json::Value =
+        serde_json::from_slice(&encode_backend_message(&valid)?[BACKEND_LENGTH_PREFIX_BYTES..])?;
+    missing_commitment
+        .as_object_mut()
+        .ok_or("hello_ok must encode as an object")?
+        .remove("wcash_payout_commitment");
+    let payload = serde_json::to_vec(&missing_commitment)?;
+    assert!(decode_backend_message(&raw_backend_frame(&payload)).is_err());
+
+    let mut zero_commitment = valid.clone();
+    if let BackendMessage::HelloOk {
+        zcash_payout_commitment,
+        ..
+    } = &mut zero_commitment
+    {
+        *zcash_payout_commitment = fixed(0);
+    }
+    assert!(encode_backend_message(&zero_commitment).is_err());
 
     let mut duplicate_identity = valid.clone();
     if let BackendMessage::HelloOk {
@@ -1300,6 +1321,8 @@ fn semantic_identities_reject_nil_uuids() {
         capabilities: capabilities(),
         wcash_genesis: fixed(1),
         zcash_genesis: fixed(2),
+        wcash_payout_commitment: fixed(3),
+        zcash_payout_commitment: fixed(4),
         chain_id: 1,
         current_event_seq: 0,
     };

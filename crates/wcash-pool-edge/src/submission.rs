@@ -667,10 +667,15 @@ mod tests {
     }
 
     fn client_config(path: &Path) -> TestResult<BackendClientConfig> {
-        let expected =
-            ExpectedBackend::new(Hex32::new([0x11; 32]), Hex32::new([0x22; 32]), 0x5743_4153)?
-                .with_backend_instance(uuid(2))
-                .with_journal_stream(uuid(3));
+        let expected = ExpectedBackend::new(
+            Hex32::new([0x11; 32]),
+            Hex32::new([0x22; 32]),
+            0x5743_4153,
+            Hex32::new([0x33; 32]),
+            Hex32::new([0x44; 32]),
+        )?
+        .with_backend_instance(uuid(2))
+        .with_journal_stream(uuid(3));
         Ok(BackendClientConfig::new(path, expected)?
             .with_timeouts(Duration::from_secs(1), Duration::from_secs(1))?)
     }
@@ -706,6 +711,8 @@ mod tests {
                 capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                 wcash_genesis: Hex32::new([0x11; 32]),
                 zcash_genesis: Hex32::new([0x22; 32]),
+                wcash_payout_commitment: Hex32::new([0x33; 32]),
+                zcash_payout_commitment: Hex32::new([0x44; 32]),
                 chain_id: 0x5743_4153,
                 current_event_seq: 10,
             },
@@ -989,6 +996,8 @@ mod tests {
                     capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                     wcash_genesis: Hex32::new([0x11; 32]),
                     zcash_genesis: Hex32::new([0x22; 32]),
+                    wcash_payout_commitment: Hex32::new([0x33; 32]),
+                    zcash_payout_commitment: Hex32::new([0x44; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1328,6 +1337,8 @@ mod tests {
                     capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                     wcash_genesis: Hex32::new([0x11; 32]),
                     zcash_genesis: Hex32::new([0x22; 32]),
+                    wcash_payout_commitment: Hex32::new([0x33; 32]),
+                    zcash_payout_commitment: Hex32::new([0x44; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1408,6 +1419,8 @@ mod tests {
                     capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                     wcash_genesis: Hex32::new([0x11; 32]),
                     zcash_genesis: Hex32::new([0x22; 32]),
+                    wcash_payout_commitment: Hex32::new([0x33; 32]),
+                    zcash_payout_commitment: Hex32::new([0x44; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1475,6 +1488,8 @@ mod tests {
                     capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                     wcash_genesis: Hex32::new([0x11; 32]),
                     zcash_genesis: Hex32::new([0x22; 32]),
+                    wcash_payout_commitment: Hex32::new([0x33; 32]),
+                    zcash_payout_commitment: Hex32::new([0x44; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1575,6 +1590,8 @@ mod tests {
                     capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                     wcash_genesis: Hex32::new([0x11; 32]),
                     zcash_genesis: Hex32::new([0x22; 32]),
+                    wcash_payout_commitment: Hex32::new([0x33; 32]),
+                    zcash_payout_commitment: Hex32::new([0x44; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1868,6 +1885,8 @@ mod tests {
                     capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
                     wcash_genesis: Hex32::new([0x11; 32]),
                     zcash_genesis: Hex32::new([0x22; 32]),
+                    wcash_payout_commitment: Hex32::new([0x33; 32]),
+                    zcash_payout_commitment: Hex32::new([0x44; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },

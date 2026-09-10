@@ -134,6 +134,11 @@ journal_stream plus event_seq and share_id in the future PostgreSQL projection.
 After ambiguous delivery the pool replays wolf's journal before deciding
 whether to resubmit or credit.
 
+The backend Hello exchange also binds independently configured, domain-separated
+32-byte commitments for the exact Wcash and Zcash block-reward recipients. Any
+template-node or backend configuration drift that changes either recipient is a
+fatal authority mismatch; the pool must not issue miner work from that socket.
+
 The live job snapshot can have a watermark ahead of the pool's last projected
 accounting event. The snapshot may restore mining state, but it must never be
 used as evidence that the intervening shares were credited. Before balances or

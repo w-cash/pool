@@ -1118,6 +1118,10 @@ pub enum BackendMessage {
         wcash_genesis: Hex32,
         /// Pinned Zcash genesis block hash in raw byte order.
         zcash_genesis: Hex32,
+        /// Domain-separated commitment to the exact Wcash block-reward recipient.
+        wcash_payout_commitment: Hex32,
+        /// Domain-separated commitment to the exact Zcash block-reward recipient.
+        zcash_payout_commitment: Hex32,
         /// Wcash AuxPoW chain identifier.
         chain_id: u32,
         /// Latest durable event sequence.
@@ -1217,6 +1221,8 @@ impl fmt::Debug for BackendMessage {
                 capabilities,
                 wcash_genesis,
                 zcash_genesis,
+                wcash_payout_commitment,
+                zcash_payout_commitment,
                 chain_id,
                 current_event_seq,
             } => formatter
@@ -1229,6 +1235,8 @@ impl fmt::Debug for BackendMessage {
                 .field("capabilities", capabilities)
                 .field("wcash_genesis", wcash_genesis)
                 .field("zcash_genesis", zcash_genesis)
+                .field("wcash_payout_commitment", wcash_payout_commitment)
+                .field("zcash_payout_commitment", zcash_payout_commitment)
                 .field("chain_id", chain_id)
                 .field("current_event_seq", current_event_seq)
                 .finish(),
@@ -1350,6 +1358,8 @@ impl BackendMessage {
                 capabilities,
                 wcash_genesis,
                 zcash_genesis,
+                wcash_payout_commitment,
+                zcash_payout_commitment,
                 chain_id,
                 ..
             } => {
@@ -1382,6 +1392,8 @@ impl BackendMessage {
                 }
                 require_nonzero_hex(wcash_genesis, "hello_ok.wcash_genesis")?;
                 require_nonzero_hex(zcash_genesis, "hello_ok.zcash_genesis")?;
+                require_nonzero_hex(wcash_payout_commitment, "hello_ok.wcash_payout_commitment")?;
+                require_nonzero_hex(zcash_payout_commitment, "hello_ok.zcash_payout_commitment")?;
                 if *chain_id == 0 {
                     return Err(invalid("hello_ok.chain_id", "must be nonzero"));
                 }

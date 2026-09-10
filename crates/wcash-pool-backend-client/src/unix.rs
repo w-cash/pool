@@ -35,22 +35,26 @@ const MAX_EVENT_QUEUE_CAPACITY: usize = 4_096;
 // operating system's responsibility.
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 
-/// Expected immutable network and optional persistent backend identities.
+/// Expected immutable network, payout-recipient, and optional backend identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedBackend {
     wcash_genesis: Hex32,
     zcash_genesis: Hex32,
     chain_id: u32,
+    wcash_payout_commitment: Hex32,
+    zcash_payout_commitment: Hex32,
     backend_instance: Option<CanonicalUuid>,
     journal_stream: Option<CanonicalUuid>,
 }
 
 impl ExpectedBackend {
-    /// Creates mandatory Wcash and Zcash network expectations.
+    /// Creates mandatory Wcash/Zcash network and payout-recipient expectations.
     pub fn new(
         wcash_genesis: Hex32,
         zcash_genesis: Hex32,
         chain_id: u32,
+        wcash_payout_commitment: Hex32,
+        zcash_payout_commitment: Hex32,
     ) -> Result<Self, ClientConfigError> {
         if wcash_genesis.is_zero() {
             return Err(ClientConfigError::ZeroNetworkIdentity {
@@ -65,10 +69,22 @@ impl ExpectedBackend {
         if chain_id == 0 {
             return Err(ClientConfigError::ZeroNetworkIdentity { field: "chain_id" });
         }
+        if wcash_payout_commitment.is_zero() {
+            return Err(ClientConfigError::ZeroPayoutCommitment {
+                field: "wcash_payout_commitment",
+            });
+        }
+        if zcash_payout_commitment.is_zero() {
+            return Err(ClientConfigError::ZeroPayoutCommitment {
+                field: "zcash_payout_commitment",
+            });
+        }
         Ok(Self {
             wcash_genesis,
             zcash_genesis,
             chain_id,
+            wcash_payout_commitment,
+            zcash_payout_commitment,
             backend_instance: None,
             journal_stream: None,
         })
@@ -198,6 +214,12 @@ pub enum ClientConfigError {
         /// Invalid expected field.
         field: &'static str,
     },
+    /// A required payout-recipient commitment used an invalid all-zero value.
+    #[error("expected {field} must be nonzero")]
+    ZeroPayoutCommitment {
+        /// Invalid expected field.
+        field: &'static str,
+    },
     /// Backend and journal identities identify different namespaces.
     #[error("expected backend instance and journal stream identities must be distinct")]
     DuplicatePersistentIdentity,
@@ -218,7 +240,7 @@ pub struct BackendIdentity {
     pub current_event_seq: u64,
 }
 
-/// Persistent chain and journal authority negotiated for one backend connection.
+/// Persistent chain, payout-recipient, and journal authority for one connection.
 ///
 /// Fields are private so edge orchestration can compare authorities without
 /// manufacturing an identity that bypasses the validated hello exchange.
@@ -227,6 +249,8 @@ pub struct BackendAuthority {
     wcash_genesis: Hex32,
     zcash_genesis: Hex32,
     chain_id: u32,
+    wcash_payout_commitment: Hex32,
+    zcash_payout_commitment: Hex32,
     backend_instance: CanonicalUuid,
     journal_stream: CanonicalUuid,
 }
@@ -245,6 +269,16 @@ impl BackendAuthority {
     /// Returns the authenticated Wcash chain identifier.
     pub const fn chain_id(&self) -> u32 {
         self.chain_id
+    }
+
+    /// Returns the authenticated Wcash block-reward recipient commitment.
+    pub const fn wcash_payout_commitment(&self) -> &Hex32 {
+        &self.wcash_payout_commitment
+    }
+
+    /// Returns the authenticated Zcash block-reward recipient commitment.
+    pub const fn zcash_payout_commitment(&self) -> &Hex32 {
+        &self.zcash_payout_commitment
     }
 
     /// Returns the stable backend installation identity.
@@ -994,6 +1028,8 @@ impl BackendClient {
                 capabilities,
                 wcash_genesis,
                 zcash_genesis,
+                wcash_payout_commitment,
+                zcash_payout_commitment,
                 chain_id,
                 current_event_seq,
                 ..
@@ -1003,6 +1039,8 @@ impl BackendClient {
                     &journal_stream,
                     &wcash_genesis,
                     &zcash_genesis,
+                    &wcash_payout_commitment,
+                    &zcash_payout_commitment,
                     chain_id,
                     last_event_seq,
                     current_event_seq,
@@ -1627,6 +1665,8 @@ impl BackendClient {
         journal_stream: &CanonicalUuid,
         wcash_genesis: &Hex32,
         zcash_genesis: &Hex32,
+        wcash_payout_commitment: &Hex32,
+        zcash_payout_commitment: &Hex32,
         chain_id: u32,
         last_event_seq: u64,
         current_event_seq: u64,
@@ -1644,6 +1684,16 @@ impl BackendClient {
         if chain_id != self.config.expected.chain_id {
             return Err(self.invalidate(ClientError::IdentityMismatch {
                 field: "Wcash chain ID",
+            }));
+        }
+        if wcash_payout_commitment != &self.config.expected.wcash_payout_commitment {
+            return Err(self.invalidate(ClientError::IdentityMismatch {
+                field: "Wcash payout commitment",
+            }));
+        }
+        if zcash_payout_commitment != &self.config.expected.zcash_payout_commitment {
+            return Err(self.invalidate(ClientError::IdentityMismatch {
+                field: "Zcash payout commitment",
             }));
         }
         if self
@@ -1690,6 +1740,8 @@ impl BackendClient {
             wcash_genesis: self.config.expected.wcash_genesis.clone(),
             zcash_genesis: self.config.expected.zcash_genesis.clone(),
             chain_id: self.config.expected.chain_id,
+            wcash_payout_commitment: self.config.expected.wcash_payout_commitment.clone(),
+            zcash_payout_commitment: self.config.expected.zcash_payout_commitment.clone(),
             backend_instance: self.identity.backend_instance,
             journal_stream: self.identity.journal_stream,
         }
@@ -2130,11 +2182,15 @@ mod tests {
     }
 
     fn expected_backend() -> TestResult<ExpectedBackend> {
-        Ok(
-            ExpectedBackend::new(Hex32::new([0x11; 32]), Hex32::new([0x22; 32]), 0x5743_4153)?
-                .with_backend_instance(uuid(2))
-                .with_journal_stream(uuid(3)),
-        )
+        Ok(ExpectedBackend::new(
+            Hex32::new([0x11; 32]),
+            Hex32::new([0x22; 32]),
+            0x5743_4153,
+            Hex32::new([0x33; 32]),
+            Hex32::new([0x44; 32]),
+        )?
+        .with_backend_instance(uuid(2))
+        .with_journal_stream(uuid(3)))
     }
 
     fn config(path: &Path) -> TestResult<BackendClientConfig> {
@@ -2152,6 +2208,8 @@ mod tests {
             capabilities: required_capabilities(),
             wcash_genesis: Hex32::new([0x11; 32]),
             zcash_genesis: Hex32::new([0x22; 32]),
+            wcash_payout_commitment: Hex32::new([0x33; 32]),
+            zcash_payout_commitment: Hex32::new([0x44; 32]),
             chain_id: 0x5743_4153,
             current_event_seq: 10,
         }
@@ -2497,6 +2555,30 @@ mod tests {
 
     #[test]
     fn configuration_rejects_ambiguous_paths_and_unbounded_values() -> TestResult {
+        assert!(matches!(
+            ExpectedBackend::new(
+                Hex32::new([0x11; 32]),
+                Hex32::new([0x22; 32]),
+                0x5743_4153,
+                Hex32::new([0; 32]),
+                Hex32::new([0x44; 32]),
+            ),
+            Err(ClientConfigError::ZeroPayoutCommitment {
+                field: "wcash_payout_commitment"
+            })
+        ));
+        assert!(matches!(
+            ExpectedBackend::new(
+                Hex32::new([0x11; 32]),
+                Hex32::new([0x22; 32]),
+                0x5743_4153,
+                Hex32::new([0x33; 32]),
+                Hex32::new([0; 32]),
+            ),
+            Err(ClientConfigError::ZeroPayoutCommitment {
+                field: "zcash_payout_commitment"
+            })
+        ));
         let expected = expected_backend()?;
         assert!(matches!(
             BackendClientConfig::new("relative.sock", expected.clone()),
@@ -2532,6 +2614,9 @@ mod tests {
         assert_eq!(client.identity().backend_instance, uuid(2));
         assert_eq!(client.identity().journal_stream, uuid(3));
         assert_eq!(client.identity().current_event_seq, 10);
+        let authority = client.authority();
+        assert_eq!(authority.wcash_payout_commitment(), &Hex32::new([0x33; 32]));
+        assert_eq!(authority.zcash_payout_commitment(), &Hex32::new([0x44; 32]));
         server.await??;
         Ok(())
     }
@@ -2566,9 +2651,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_payout_commitment_fails_closed() -> TestResult {
+        for (change_wcash, expected_field) in [
+            (true, "Wcash payout commitment"),
+            (false, "Zcash payout commitment"),
+        ] {
+            let socket = TestSocket::new()?;
+            let listener = UnixListener::bind(&socket.path)?;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_request(&mut stream).await?;
+                let BackendRequest::Hello { id, .. } = request else {
+                    return TestResult::Err("first request was not hello".into());
+                };
+                let mut response = hello_ok(id);
+                let BackendMessage::HelloOk {
+                    wcash_payout_commitment,
+                    zcash_payout_commitment,
+                    ..
+                } = &mut response
+                else {
+                    unreachable!("hello fixture has the expected variant")
+                };
+                if change_wcash {
+                    *wcash_payout_commitment = Hex32::new([0x99; 32]);
+                } else {
+                    *zcash_payout_commitment = Hex32::new([0x99; 32]);
+                }
+                write_message(&mut stream, &response).await?;
+                TestResult::Ok(())
+            });
+
+            let result = BackendClient::connect(config(&socket.path)?, uuid(9), 0).await;
+            assert!(matches!(
+                result,
+                Err(ClientError::IdentityMismatch { field }) if field == expected_field
+            ));
+            server.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nonzero_replay_cursor_requires_a_journal_identity() -> TestResult {
-        let expected =
-            ExpectedBackend::new(Hex32::new([0x11; 32]), Hex32::new([0x22; 32]), 0x5743_4153)?;
+        let expected = ExpectedBackend::new(
+            Hex32::new([0x11; 32]),
+            Hex32::new([0x22; 32]),
+            0x5743_4153,
+            Hex32::new([0x33; 32]),
+            Hex32::new([0x44; 32]),
+        )?;
         let config = BackendClientConfig::new("/tmp/unused-wcash-backend.sock", expected)?;
         assert!(matches!(
             BackendClient::connect(config, uuid(9), 1).await,

@@ -49,7 +49,8 @@ Required wolf gates:
   big-endian backend-v1 framing;
 - Hello-first negotiation of distinct backend session, stable backend
   instance and journal stream, Wcash and Zcash genesis identities, Wcash chain
-  ID, and the complete capability set;
+  ID, exact Wcash and Zcash payout-recipient commitments, and the complete
+  capability set;
 - immutable jobs binding a unique job ID, exact 108-byte parent header input,
   proof-independent Wcash candidate hash, explicit Wcash and Zcash
   predecessors, the Wcash candidate and Zcash parent coinbase transaction IDs,
