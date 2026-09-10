@@ -73,7 +73,8 @@ Required wolf gates:
   maturity back to the originating job;
 - an atomic current/recent snapshot followed by authoritative job activation,
   invalidation, generation-closure, share-commit, winner-observed,
-  winner-orphaned, and winner-matured events;
+  winner-orphaned, Wcash-only winner-quarantined, Wcash-only winner-requeued,
+  and winner-matured events;
 - one stable, contiguous, replayable journal sequence with bounded ReadEvents
   pages and fail-closed stream identity;
 - a separate replay connection that closes any accounting gap through the
@@ -90,7 +91,8 @@ Required wolf gates:
   and poisons unflushed or crossed responses;
 - crash recovery that preserves decoded/in-flight submissions and pending
   Wcash or Zcash winners, retains observation after maturity for deep-reorg
-  reversal, and reports health for both outboxes;
+  reversal, reports health for both outboxes, and exposes the quarantined Wcash
+  subset without silently treating it as ordinary retry pressure;
 - reconnect recovery through the existing process-global JobRouter so local
   deadlines, terminal generation tombstones, and watermark history cannot be
   reset by constructing a replacement router;

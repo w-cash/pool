@@ -636,6 +636,8 @@ pub struct HealthSnapshot {
     pub healthy: bool,
     /// Pending Wcash winner submissions.
     pub pending_wcash: u32,
+    /// Wcash winners held due to a conflicting AuxPoW witness.
+    pub quarantined_wcash: u32,
     /// Pending Zcash winner submissions.
     pub pending_zcash: u32,
 }
@@ -1432,6 +1434,7 @@ impl BackendClient {
                 event_seq,
                 healthy,
                 pending_wcash,
+                quarantined_wcash,
                 pending_zcash,
                 ..
             } => {
@@ -1441,6 +1444,7 @@ impl BackendClient {
                     event_seq,
                     healthy,
                     pending_wcash,
+                    quarantined_wcash,
                     pending_zcash,
                 })
             }
@@ -2770,7 +2774,8 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
-                    pending_wcash: 0,
+                    pending_wcash: 1,
+                    quarantined_wcash: 1,
                     pending_zcash: 0,
                 },
             )
@@ -2789,6 +2794,8 @@ mod tests {
 
         let health = client.health().await?;
         assert_eq!(health.event_seq, 11);
+        assert_eq!(health.pending_wcash, 1);
+        assert_eq!(health.quarantined_wcash, 1);
         let delivery = client.pop_queued_event().ok_or("missing idle activation")?;
         assert!(
             delivery.anchor().elapsed_at(after_idle) >= Duration::from_millis(20),
@@ -3123,6 +3130,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -3161,6 +3169,7 @@ mod tests {
                     event_seq: 10,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -3442,6 +3451,7 @@ mod tests {
                     event_seq: 10,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -3687,6 +3697,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -4505,6 +4516,7 @@ mod tests {
                     event_seq: 9,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -4643,6 +4655,7 @@ mod tests {
                     event_seq: 10,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -4696,6 +4709,7 @@ mod tests {
                     event_seq: 10,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
