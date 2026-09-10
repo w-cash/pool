@@ -783,6 +783,8 @@ impl GenerationRegistry {
             BackendEvent::ShareCommitted { .. }
             | BackendEvent::WinnerObserved { .. }
             | BackendEvent::WinnerOrphaned { .. }
+            | BackendEvent::WinnerQuarantined { .. }
+            | BackendEvent::WinnerRequeued { .. }
             | BackendEvent::WinnerMatured { .. } => {}
         }
         // A valid event can spend time queued behind a bounded backend exchange.
@@ -1096,7 +1098,7 @@ fn deadline(anchor_ms: u64, duration_ms: u32) -> Result<u64, JobRegistryError> {
 mod tests {
     use super::*;
     use crate::{TargetBinding, TargetBounds};
-    use wcash_pool_protocol::{Hex108, TargetLe};
+    use wcash_pool_protocol::{ChainTip, Hex108, MergedChain, TargetLe, WinnerDescriptor};
 
     fn descriptor(id: u8, max_age_ms: u32) -> JobDescriptor {
         let mut header = [id; 108];
@@ -1157,6 +1159,57 @@ mod tests {
             generation.zcash_network_target().to_backend(),
             raw.zcash_target_le
         );
+    }
+
+    #[test]
+    fn winner_quarantine_transitions_advance_only_the_journal_watermark() {
+        let mut registry = registry();
+        registry
+            .apply_snapshot(1, Some(&acceptable(1, 1_000, 900)), &[], 0)
+            .expect("initial snapshot is valid");
+        let winner = WinnerDescriptor {
+            chain: MergedChain::Wcash,
+            block_hash_le: Hex32::new([6; 32]),
+            height: 2,
+            coinbase_txid_le: Hex32::new([7; 32]),
+            reward_zat: 625_000_000,
+            maturity_confirmations: 100,
+        };
+
+        registry
+            .apply_event(
+                &BackendEvent::WinnerQuarantined {
+                    event_seq: 2,
+                    share_id: Hex32::new([8; 32]),
+                    job_id: id(1).to_protocol(),
+                    winner: winner.clone(),
+                    tip: ChainTip {
+                        block_hash_le: winner.block_hash_le.clone(),
+                        height: winner.height,
+                    },
+                },
+                1,
+            )
+            .expect("quarantine is a contiguous accounting event");
+        registry
+            .apply_event(
+                &BackendEvent::WinnerRequeued {
+                    event_seq: 3,
+                    share_id: Hex32::new([8; 32]),
+                    job_id: id(1).to_protocol(),
+                    winner,
+                    tip: ChainTip {
+                        block_hash_le: Hex32::new([9; 32]),
+                        height: 1,
+                    },
+                },
+                2,
+            )
+            .expect("requeue is a contiguous accounting event");
+
+        assert_eq!(registry.last_event_seq(), Some(3));
+        assert_eq!(registry.current_job_id(), Some(id(1)));
+        assert!(registry.begin_admission(id(1), 2).is_ok());
     }
 
     #[test]

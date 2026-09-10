@@ -99,6 +99,8 @@ impl RouterState {
             BackendEvent::ShareCommitted { .. }
             | BackendEvent::WinnerObserved { .. }
             | BackendEvent::WinnerOrphaned { .. }
+            | BackendEvent::WinnerQuarantined { .. }
+            | BackendEvent::WinnerRequeued { .. }
             | BackendEvent::WinnerMatured { .. } => None,
         })
     }

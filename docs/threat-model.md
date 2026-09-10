@@ -168,8 +168,11 @@ invalidation and generation-closure events. The pool stops advertising that
 generation and its in-memory admission lease fences already started
 submissions until they finish. The implemented backend adapter owns that fence
 through the complete asynchronous request, including timeout and cancellation.
-Wolf retains consensus resources and pending
-winner outboxes independently of the pool connection. Backend protocol v1 has
+Wolf retains consensus resources and pending winner outboxes independently of
+the pool connection. A same-ID, different-AuxPoW Wcash witness must enter an
+explicit durable quarantine, and exact-byte replay can resume only after a
+`WinnerRequeued` event records authoritative best-chain absence. Backend
+protocol v1 has
 no pool-controlled retirement capability, so documentation and code must not
 invent one.
 

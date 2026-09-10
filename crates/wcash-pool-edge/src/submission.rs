@@ -1035,6 +1035,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -1112,6 +1113,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -1194,6 +1196,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -1264,6 +1267,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -1448,6 +1452,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )
@@ -1764,6 +1769,7 @@ mod tests {
                     event_seq: 11,
                     healthy: true,
                     pending_wcash: 0,
+                    quarantined_wcash: 0,
                     pending_zcash: 0,
                 },
             )

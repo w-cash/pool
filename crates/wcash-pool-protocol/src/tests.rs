@@ -143,6 +143,20 @@ fn backend_health_frame_has_exact_big_endian_golden_encoding() -> TestResult {
     assert_eq!(frame, raw_backend_frame(payload));
     assert_eq!(decode_backend_request(&frame)?, request);
     assert_eq!(request.id(), 7);
+
+    let response = BackendMessage::HealthStatus {
+        version: 1,
+        id: 7,
+        event_seq: 9,
+        healthy: true,
+        pending_wcash: 2,
+        quarantined_wcash: 1,
+        pending_zcash: 3,
+    };
+    let frame = encode_backend_message(&response)?;
+    let payload = br#"{"type":"health_status","v":1,"id":7,"event_seq":9,"healthy":true,"pending_wcash":2,"quarantined_wcash":1,"pending_zcash":3}"#;
+    assert_eq!(frame, raw_backend_frame(payload));
+    assert_eq!(decode_backend_message(&frame)?, response);
     Ok(())
 }
 
@@ -328,6 +342,7 @@ fn frame_codec_decodes_server_messages_and_submit_share_is_redacted() -> TestRes
         event_seq: 4,
         healthy: true,
         pending_wcash: 0,
+        quarantined_wcash: 0,
         pending_zcash: 1,
     };
     let frame = FrameCodec::encode_server(&response)?;
@@ -350,6 +365,42 @@ fn frame_codec_decodes_server_messages_and_submit_share_is_redacted() -> TestRes
     assert!(!debug.contains(&"04".repeat(1_344)));
     let message: ClientMessage = submission.into();
     assert!(matches!(message, BackendRequest::SubmitShare { id: 8, .. }));
+    Ok(())
+}
+
+#[test]
+fn backend_health_requires_consistent_wcash_quarantine_pressure() -> TestResult {
+    let healthy = BackendMessage::HealthStatus {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+        event_seq: 4,
+        healthy: true,
+        pending_wcash: 2,
+        quarantined_wcash: 1,
+        pending_zcash: 3,
+    };
+    assert!(healthy.validate().is_ok());
+    assert_eq!(
+        decode_backend_message(&encode_backend_message(&healthy)?)?,
+        healthy
+    );
+
+    let inconsistent = BackendMessage::HealthStatus {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+        event_seq: 4,
+        healthy: false,
+        pending_wcash: 1,
+        quarantined_wcash: 2,
+        pending_zcash: 0,
+    };
+    assert!(inconsistent.validate().is_err());
+    assert!(encode_backend_message(&inconsistent).is_err());
+
+    let missing_quarantine = raw_backend_frame(
+        br#"{"type":"health_status","v":1,"id":7,"event_seq":4,"healthy":true,"pending_wcash":0,"pending_zcash":0}"#,
+    );
+    assert!(decode_backend_message(&missing_quarantine).is_err());
     Ok(())
 }
 
@@ -1006,6 +1057,110 @@ fn winner_lifecycle_binds_exact_tip_depth_and_reversible_maturity() {
 }
 
 #[test]
+fn wcash_witness_quarantine_has_an_explicit_requeue_transition() {
+    let wcash = winner(MergedChain::Wcash, 0x61);
+    let share_id = fixed(0x51);
+    let job_id = fixed(0x52);
+
+    let quarantined = BackendEvent::WinnerQuarantined {
+        event_seq: 1,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: wcash.block_hash_le.clone(),
+            height: wcash.height,
+        },
+    };
+    assert!(quarantined.validate().is_ok());
+
+    let quarantined_below_height = BackendEvent::WinnerQuarantined {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: fixed(0x71),
+            height: wcash.height - 1,
+        },
+    };
+    assert!(quarantined_below_height.validate().is_err());
+
+    let wrong_id_at_winner_height = BackendEvent::WinnerQuarantined {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: fixed(0x72),
+            height: wcash.height,
+        },
+    };
+    assert!(wrong_id_at_winner_height.validate().is_err());
+
+    let winner_id_at_later_height = BackendEvent::WinnerQuarantined {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: wcash.block_hash_le.clone(),
+            height: wcash.height + 1,
+        },
+    };
+    assert!(winner_id_at_later_height.validate().is_err());
+
+    let requeued = BackendEvent::WinnerRequeued {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: fixed(0x73),
+            height: wcash.height - 1,
+        },
+    };
+    assert!(requeued.validate().is_ok());
+
+    let requeued_while_present = BackendEvent::WinnerRequeued {
+        event_seq: 2,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: wcash.clone(),
+        tip: ChainTip {
+            block_hash_le: wcash.block_hash_le.clone(),
+            height: wcash.height,
+        },
+    };
+    assert!(requeued_while_present.validate().is_err());
+
+    let zcash = winner(MergedChain::Zcash, 0x72);
+    let zcash_quarantine = BackendEvent::WinnerQuarantined {
+        event_seq: 3,
+        share_id: share_id.clone(),
+        job_id: job_id.clone(),
+        winner: zcash.clone(),
+        tip: ChainTip {
+            block_hash_le: zcash.block_hash_le.clone(),
+            height: zcash.height,
+        },
+    };
+    assert!(zcash_quarantine.validate().is_err());
+
+    let zcash_requeue = BackendEvent::WinnerRequeued {
+        event_seq: 3,
+        share_id,
+        job_id,
+        winner: zcash,
+        tip: ChainTip {
+            block_hash_le: fixed(0x74),
+            height: 21,
+        },
+    };
+    assert!(zcash_requeue.validate().is_err());
+}
+
+#[test]
 fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult {
     let wcash = winner(MergedChain::Wcash, 0x61);
     let events = [
@@ -1030,8 +1185,28 @@ fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult
                 height: 0,
             },
         },
-        BackendEvent::WinnerMatured {
+        BackendEvent::WinnerQuarantined {
             event_seq: 3,
+            share_id: fixed(0x51),
+            job_id: fixed(0x52),
+            winner: wcash.clone(),
+            tip: ChainTip {
+                block_hash_le: fixed(0x73),
+                height: 12,
+            },
+        },
+        BackendEvent::WinnerRequeued {
+            event_seq: 4,
+            share_id: fixed(0x51),
+            job_id: fixed(0x52),
+            winner: wcash.clone(),
+            tip: ChainTip {
+                block_hash_le: fixed(0x74),
+                height: 10,
+            },
+        },
+        BackendEvent::WinnerMatured {
+            event_seq: 5,
             share_id: fixed(0x51),
             job_id: fixed(0x52),
             winner: wcash,
@@ -1042,11 +1217,13 @@ fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult
             confirmations: 100,
         },
     ];
-    for (event, expected_tag) in
-        events
-            .into_iter()
-            .zip(["winner_observed", "winner_orphaned", "winner_matured"])
-    {
+    for (event, expected_tag) in events.into_iter().zip([
+        "winner_observed",
+        "winner_orphaned",
+        "winner_quarantined",
+        "winner_requeued",
+        "winner_matured",
+    ]) {
         let message = BackendMessage::Event {
             version: BACKEND_PROTOCOL_VERSION,
             event,

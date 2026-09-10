@@ -626,6 +626,38 @@ pub enum BackendEvent {
         /// Exact replacement best-chain tip that does not contain the winner.
         tip: ChainTip,
     },
+    /// A Wcash winner is quarantined because the best chain contains the same
+    /// proof-independent block ID with a different AuxPoW witness.
+    ///
+    /// The exact submitted and conflicting block bytes remain private to the
+    /// backend. The pool must suspend reward progression for this winner until
+    /// a later `winner_observed` or `winner_requeued` event resolves the state.
+    WinnerQuarantined {
+        /// Monotonic backend journal sequence.
+        event_seq: u64,
+        /// Share whose proof created this winner.
+        share_id: Hex32,
+        /// Generation that produced the winner.
+        job_id: Hex32,
+        /// Immutable winning-block and reward facts.
+        winner: WinnerDescriptor,
+        /// Exact best-chain tip sampled when the witness conflict was found.
+        tip: ChainTip,
+    },
+    /// A quarantined Wcash winner is absent from the current best chain and its
+    /// exact retained bytes are eligible for backend-controlled resubmission.
+    WinnerRequeued {
+        /// Monotonic backend journal sequence.
+        event_seq: u64,
+        /// Share whose proof created this winner.
+        share_id: Hex32,
+        /// Generation that produced the winner.
+        job_id: Hex32,
+        /// Immutable winning-block and reward facts.
+        winner: WinnerDescriptor,
+        /// Exact best-chain tip sampled before releasing the quarantine.
+        tip: ChainTip,
+    },
     /// An observed winner reached its chain-specific spendability threshold.
     ///
     /// Maturity is reversible: a later deep reorganization can still emit
@@ -713,6 +745,34 @@ impl fmt::Debug for BackendEvent {
                 .field("winner", winner)
                 .field("tip", tip)
                 .finish(),
+            Self::WinnerQuarantined {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            } => formatter
+                .debug_struct("WinnerQuarantined")
+                .field("event_seq", event_seq)
+                .field("share_id", share_id)
+                .field("job_id", job_id)
+                .field("winner", winner)
+                .field("tip", tip)
+                .finish(),
+            Self::WinnerRequeued {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            } => formatter
+                .debug_struct("WinnerRequeued")
+                .field("event_seq", event_seq)
+                .field("share_id", share_id)
+                .field("job_id", job_id)
+                .field("winner", winner)
+                .field("tip", tip)
+                .finish(),
             Self::WinnerMatured {
                 event_seq,
                 share_id,
@@ -742,6 +802,8 @@ impl BackendEvent {
             | Self::GenerationClosed { event_seq, .. }
             | Self::WinnerObserved { event_seq, .. }
             | Self::WinnerOrphaned { event_seq, .. }
+            | Self::WinnerQuarantined { event_seq, .. }
+            | Self::WinnerRequeued { event_seq, .. }
             | Self::WinnerMatured { event_seq, .. } => *event_seq,
             Self::ShareCommitted { receipt, .. } => receipt.event_seq,
         }
@@ -826,6 +888,20 @@ impl BackendEvent {
                 tip,
                 ..
             } => validate_winner_orphan(share_id, job_id, winner, tip),
+            Self::WinnerQuarantined {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => validate_wcash_winner_quarantine(share_id, job_id, winner, tip),
+            Self::WinnerRequeued {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => validate_wcash_winner_requeue(share_id, job_id, winner, tip),
             Self::WinnerMatured {
                 share_id,
                 job_id,
@@ -1102,6 +1178,8 @@ pub enum BackendMessage {
         healthy: bool,
         /// Wcash winners retained in the durable outbox.
         pending_wcash: u32,
+        /// Pending Wcash winners held behind conflicting-witness quarantine.
+        quarantined_wcash: u32,
         /// Zcash winners retained in the durable outbox.
         pending_zcash: u32,
     },
@@ -1202,6 +1280,7 @@ impl fmt::Debug for BackendMessage {
                 event_seq,
                 healthy,
                 pending_wcash,
+                quarantined_wcash,
                 pending_zcash,
             } => formatter
                 .debug_struct("HealthStatus")
@@ -1210,6 +1289,7 @@ impl fmt::Debug for BackendMessage {
                 .field("event_seq", event_seq)
                 .field("healthy", healthy)
                 .field("pending_wcash", pending_wcash)
+                .field("quarantined_wcash", quarantined_wcash)
                 .field("pending_zcash", pending_zcash)
                 .finish(),
             Self::Error {
@@ -1393,7 +1473,21 @@ impl BackendMessage {
                 }
                 Ok(())
             }
-            Self::HealthStatus { id, .. } => require_nonzero_id(*id),
+            Self::HealthStatus {
+                id,
+                pending_wcash,
+                quarantined_wcash,
+                ..
+            } => {
+                require_nonzero_id(*id)?;
+                if quarantined_wcash > pending_wcash {
+                    return Err(invalid(
+                        "health_status.quarantined_wcash",
+                        "must not exceed pending_wcash",
+                    ));
+                }
+                Ok(())
+            }
             Self::Error { id, message, .. } => {
                 if *id != 0 {
                     require_nonzero_id(*id)?;
@@ -1784,6 +1878,62 @@ fn validate_winner_orphan(
         ));
     }
     Ok(())
+}
+
+fn validate_wcash_winner_quarantine(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+    tip: &ChainTip,
+) -> Result<(), ProtocolError> {
+    validate_wcash_winner_transition(share_id, job_id, winner, tip)?;
+    let tip_is_winner = tip.block_hash_le == winner.block_hash_le;
+    let tip_is_at_winner_height = tip.height == winner.height;
+    if tip.height < winner.height {
+        return Err(invalid(
+            "winner_event.tip",
+            "quarantine tip must be at or above the Wcash winner height",
+        ));
+    }
+    if tip_is_winner != tip_is_at_winner_height {
+        return Err(invalid(
+            "winner_event.tip",
+            "tip hash must equal the Wcash winner ID exactly at its height",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wcash_winner_requeue(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+    tip: &ChainTip,
+) -> Result<(), ProtocolError> {
+    validate_wcash_winner_transition(share_id, job_id, winner, tip)?;
+    if tip.block_hash_le == winner.block_hash_le {
+        return Err(invalid(
+            "winner_event.tip",
+            "requeue tip must not be the quarantined Wcash winner",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wcash_winner_transition(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+    tip: &ChainTip,
+) -> Result<(), ProtocolError> {
+    validate_winner_reference(share_id, job_id, winner)?;
+    if winner.chain != MergedChain::Wcash {
+        return Err(invalid(
+            "winner_event.winner.chain",
+            "conflicting-witness quarantine is Wcash-only",
+        ));
+    }
+    tip.validate()
 }
 
 pub(crate) fn require_nonzero_hex<const N: usize>(

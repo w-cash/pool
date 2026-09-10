@@ -148,17 +148,18 @@ existing consensus coordinator and durable winner state.
   generation retained by `SubmissionContext`. Any mismatch poisons the backend
   connection and releases the admission fence without exposing branded success.
 
-This generation-binding addition changes the pre-Wolf backend-v1 wire shape.
-The version remains 1 only because no Wolf backend-v1 server or deployed pool
-consumer exists; once version 1 ships, any further incompatible change requires
-a new negotiated protocol version.
+These generation-binding and winner-quarantine additions change the pre-Wolf
+backend-v1 wire shape. The version remains 1 only because no Wolf backend-v1
+server or deployed pool consumer exists; once version 1 ships, any further
+incompatible change requires a new negotiated protocol version.
 
 ### Durable replay journal
 
 - One stable journal_stream defines one non-reusable, contiguous event_seq
   namespace. The journal must persist job activation, invalidation, closure,
-  accepted-share, winner-observed, winner-orphaned, and winner-matured events
-  and recover them after a crash.
+  accepted-share, `winner_observed`, `winner_orphaned`, Wcash-only
+  `winner_quarantined`, Wcash-only `winner_requeued`, and `winner_matured`
+  events and recover them after a crash.
 - ReadEvents(after_event_seq, limit) must return a bounded contiguous page
   beginning at after_event_seq plus one, or an empty **complete** page with an
   unchanged cursor. An incomplete page must advance. A gap, duplicate sequence
@@ -207,14 +208,22 @@ a new negotiated protocol version.
   outcomes poison the stream.
 - Candidate receipts must be durable before acknowledgement, and wolf must
   retain and retry pending block submissions independently of the pool
-  connection. HealthStatus must expose pending Wcash and Zcash winner pressure.
+  connection. HealthStatus must expose pending Wcash and Zcash winner pressure
+  plus the Wcash-only quarantined subset; `quarantined_wcash` must not exceed
+  `pending_wcash`.
 - Winner lifecycle events repeat the immutable winner facts and identify the
   originating share and job. Observation and maturity events bind an exact
   best-chain tip and a confirmation count equal to
   `tip_height - winner_height + 1`; maturity additionally meets the winner's
   advertised chain-specific threshold. An orphan event binds the replacement
-  best-chain tip. `GenerationClosed` closes share admission only and is never
-  block acceptance, reward maturity, or payout evidence.
+  best-chain tip. A Wcash witness conflict emits `WinnerQuarantined`; reward
+  progression stops until exact-witness observation or `WinnerRequeued` records
+  authoritative absence and releases the exact retained bytes for backend-only
+  resubmission. Both transitions bind the sampled best-chain tip and are invalid
+  for Zcash. The conflicting and retained block bytes stay in wolf's private
+  durable journal rather than crossing the pool protocol. `GenerationClosed`
+  closes share admission only and is never block acceptance, reward maturity,
+  or payout evidence.
 - Crash recovery, torn-tail handling, fsync ordering, journal locking, bounded
   growth or explicit rotation, and exact-retry behavior need deterministic
   wolf tests. Cross-repository golden frames must pin the pool and wolf to the
