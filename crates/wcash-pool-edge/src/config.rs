@@ -86,6 +86,7 @@ pub struct EdgeConfig {
     frame_timeout: Duration,
     write_timeout: Duration,
     authorization_timeout: Duration,
+    submission_timeout: Duration,
 }
 
 impl EdgeConfig {
@@ -97,11 +98,13 @@ impl EdgeConfig {
         frame_timeout: Duration,
         write_timeout: Duration,
         authorization_timeout: Duration,
+        submission_timeout: Duration,
     ) -> Result<Self, EdgeConfigError> {
         validate_timeout("idle_timeout", idle_timeout)?;
         validate_timeout("frame_timeout", frame_timeout)?;
         validate_timeout("write_timeout", write_timeout)?;
         validate_timeout("authorization_timeout", authorization_timeout)?;
+        validate_timeout("submission_timeout", submission_timeout)?;
         if frame_timeout > idle_timeout {
             return Err(EdgeConfigError::FrameTimeoutExceedsIdle);
         }
@@ -112,6 +115,7 @@ impl EdgeConfig {
             frame_timeout,
             write_timeout,
             authorization_timeout,
+            submission_timeout,
         })
     }
 
@@ -143,6 +147,11 @@ impl EdgeConfig {
     /// Returns the deadline for one credential verification operation.
     pub const fn authorization_timeout(self) -> Duration {
         self.authorization_timeout
+    }
+
+    /// Returns the deadline for one admitted share submission operation.
+    pub const fn submission_timeout(self) -> Duration {
+        self.submission_timeout
     }
 }
 
@@ -214,12 +223,14 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(5),
             Duration::from_secs(2),
+            Duration::from_secs(30),
         )
         .expect("configuration is valid");
         assert_eq!(config.limits(), limits);
         assert_eq!(config.request_rate(), rate());
         assert_eq!(config.idle_timeout(), Duration::from_secs(90));
         assert_eq!(config.frame_timeout(), Duration::from_secs(10));
+        assert_eq!(config.submission_timeout(), Duration::from_secs(30));
     }
 
     #[test]
@@ -247,8 +258,23 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
+                Duration::from_secs(1),
             ),
             Err(EdgeConfigError::FrameTimeoutExceedsIdle)
         );
+        assert!(matches!(
+            EdgeConfig::new(
+                limits,
+                rate(),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::ZERO,
+            ),
+            Err(EdgeConfigError::InvalidTimeout {
+                field: "submission_timeout"
+            })
+        ));
     }
 }

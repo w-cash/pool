@@ -54,10 +54,10 @@ This is the target flow. No executable currently composes these steps.
 
 | Component | Implemented now | Explicitly absent |
 | --- | --- | --- |
-| wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v1 request, response, event, target-endian and identity types; exact candidate, coinbase, parent-header and stable share-ID bindings; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | TCP/TLS listener, connection deadlines, rate limits, worker database, ASIC interoperability certification |
+| wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v1 request, response, event, target-endian and identity types; exact candidate, coinbase, parent-header and stable share-ID bindings; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | TCP/TLS listener, worker database, ASIC interoperability certification |
 | wcash-pool-core | In-memory session ordering, immutable worker binding, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, authoritative current/recent lifetime, bounded non-resurrectable generation tombstones, in-flight retirement fences, target policy, and integer vardiff including inactivity easing | Durable nonce-lease orchestration, durable generation-ID history, runtime composition, database persistence, crash recovery, network I/O, consensus validation |
 | wcash-pool-backend-client | Timeout-bounded Unix-socket connection, strict handshake and identity checks, request correlation, job snapshot/event replay, transport-branded lifetime anchors, exact submitted header time, canonical submitted-proof and job-bound receipt checks, live response-watermark flush enforcement, a core-validated share adapter that owns the admission fence through backend I/O, branded share commits, health checks, and bounded unsolicited-event buffering | A compatible wolf server, cryptographic remote-peer authentication, production integration |
-| wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization with exact miner-login binding, immutable session assignments, target-before-notify ordering, bounded global job fanout, replay-aware vardiff sampling, cancellation-safe serialized Wolf submissions, a bounded idle health/event pump with a mandatory acknowledged consumer seam, and global suspension on terminal backend/event-stream failure | TCP/TLS stream driver, authorization implementation, durable event-consumer/projector implementation, durable nonce leasing, public listener, certified ASIC transcript |
+| wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization with exact miner-login binding, immutable session assignments, target-before-notify ordering, bounded global job fanout, replay-aware vardiff sampling, cancellation-safe serialized Wolf submissions, a bounded idle health/event pump with a mandatory acknowledged consumer seam, global suspension on terminal backend/event-stream failure, and a loopback-only admitted-TCP driver with strict LF framing, absolute deadlines, bounded writes, clean cancellation, and synthetic 4+28 transcript tests | Public TCP/TLS listener, authorization implementation, durable event-consumer/projector implementation, durable nonce leasing, service composition, certified ASIC transcript |
 | wcash-poold | A machine-readable readiness command that exits not-ready | Serve command, miner/admin/metrics listeners, configuration, database, wallet, payout loop, deployment |
 | Accounting | Protocol receipts and event shapes only | PostgreSQL schema and projector, balances, maturity, fees, rounding, reorg reversal, payouts |
 | Operations | Hermetic source checks and test scaffolding | Container image, manifests, monitoring, backups, runbooks, private soak, public endpoint |
@@ -268,8 +268,10 @@ remain in Wolf's bounded grace window; those assignments can still validate
 shares already in flight. If an activation was skipped or old work expired
 while queued, the next notification is forced clean.
 
-The current repository implements these state machines as libraries. It does
-not implement the stream driver, listener, credential store, or their
+The current repository implements these state machines as libraries and has a
+loopback-only accepted-stream driver for deterministic tests of the standard
+four-byte server prefix plus 28-byte miner suffix. It does not implement a
+public listener, TLS, credential store, ASIC certification, or their service
 orchestration. Per-session vardiff changes are installed on the next fresh Wolf
 generation; changing a target on an already advertised immutable generation
 would require a separate miner-facing job identifier and is not emulated. A

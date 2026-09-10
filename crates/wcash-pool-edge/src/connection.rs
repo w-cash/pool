@@ -204,8 +204,8 @@ impl fmt::Debug for ConnectionActor {
 impl ConnectionActor {
     /// Creates one connection actor. The supplied nonce allocator must be backed
     /// by a durable, externally fenced namespace lease before public deployment.
-    /// This synchronous actor enforces count bounds; the later stream driver must
-    /// enforce the finite I/O and authorization durations carried by `config`.
+    /// This synchronous actor enforces count bounds; its stream driver must enforce
+    /// the finite I/O and authorization durations carried by `config`.
     pub fn new(
         session_id: Uuid,
         config: EdgeConfig,
@@ -238,6 +238,18 @@ impl ConnectionActor {
     /// Returns whether this actor has entered its terminal state.
     pub const fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    pub(crate) const fn edge_config(&self) -> EdgeConfig {
+        self.config
+    }
+
+    pub(crate) fn nonce_profile(&self) -> wcash_pool_protocol::NonceProfile {
+        self.nonce_allocator.profile()
+    }
+
+    pub(crate) fn subscribe_job_updates(&self) -> crate::JobSubscription {
+        self.router.subscribe()
     }
 
     /// Applies one strictly decoded request and returns any external operation.
@@ -973,6 +985,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(5),
             Duration::from_secs(2),
+            Duration::from_secs(10),
         )
         .expect("edge config is valid");
         let generation =
