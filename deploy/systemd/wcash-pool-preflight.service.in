@@ -1,0 +1,45 @@
+[Unit]
+Description=Validate ZecWec Testnet pool without opening miner or portal listeners
+Documentation=file:///usr/local/share/zecwec-deploy/docs/zecwec-testnet-deployment.md
+Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service zecwec-zallet.service
+After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service zecwec-zallet.service
+ConditionPathIsExecutable=/opt/wcash/current/wcash-poold
+ConditionPathExists=/etc/wcash-pool/pool.runtime.toml
+
+[Service]
+Type=oneshot
+User=wcash-pool
+Group=wcash-pool
+SupplementaryGroups=wcash-pool-socket
+UMask=0077
+LoadCredential=database-url:@DATABASE_RUNTIME_URL_CREDENTIAL@
+LoadCredential=portal-token-pepper:@PORTAL_TOKEN_PEPPER_CREDENTIAL@
+LoadCredential=portal-totp-key:@PORTAL_TOTP_KEY_CREDENTIAL@
+LoadCredential=zallet-config:@ZALLET_CONFIG_FILE@
+LoadCredential=zallet-cookie:@ZALLET_STATE_DIR@/.cookie
+LoadCredential=wcash-node-cookie:@WCASH_RPC_COOKIE_SOURCE@
+LoadCredential=zcash-node-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
+ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh wcash-poold
+ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh wcash-wallet
+ExecStart=/opt/wcash/current/wcash-poold config-check --config /etc/wcash-pool/pool.runtime.toml
+ExecStart=/opt/wcash/current/wcash-poold preflight --config /etc/wcash-pool/pool.runtime.toml
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

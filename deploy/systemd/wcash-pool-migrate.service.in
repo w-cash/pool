@@ -1,0 +1,41 @@
+[Unit]
+Description=Apply ZecWec Testnet pool database migrations
+Documentation=file:///usr/local/share/zecwec-deploy/docs/zecwec-testnet-deployment.md
+Requires=postgresql.service
+After=postgresql.service
+ConditionPathIsExecutable=/opt/wcash/current/wcash-poold
+ConditionPathExists=/etc/wcash-pool/pool.migrate.toml
+
+[Service]
+Type=oneshot
+User=wcash-pool
+Group=wcash-pool
+UMask=0077
+LoadCredential=database-url:@DATABASE_MIGRATOR_URL_CREDENTIAL@
+LoadCredential=portal-token-pepper:@PORTAL_TOKEN_PEPPER_CREDENTIAL@
+LoadCredential=portal-totp-key:@PORTAL_TOTP_KEY_CREDENTIAL@
+ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh wcash-poold
+ExecStartPre=/opt/wcash/current/wcash-poold config-check --config /etc/wcash-pool/pool.migrate.toml
+ExecStart=/opt/wcash/current/wcash-poold migrate --config /etc/wcash-pool/pool.migrate.toml
+ExecStartPost=/usr/local/libexec/zecwec/grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url @POSTGRES_RUNTIME_ROLE@
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

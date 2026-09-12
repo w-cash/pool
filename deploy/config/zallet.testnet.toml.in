@@ -1,0 +1,32 @@
+[consensus]
+network = "test"
+
+[database]
+wallet = "wallet.db"
+
+[external]
+# The payout pipeline persists exact bytes before the independent Zebra RPC
+# broadcasts them. Zallet must never race that crash-recovery boundary.
+broadcast = false
+
+[features]
+as_of_version = "0.1.0-beta.3"
+
+[features.deprecated]
+
+[features.experimental]
+
+[indexer]
+validator_address = "@ZCASH_VALIDATOR_RPC_SOCKET@"
+validator_cookie_path = "/run/credentials/zecwec-zallet.service/validator-cookie"
+db_path = "zaino"
+
+[keystore]
+encryption_identity = "encryption-identity.txt"
+require_backup = true
+
+[note_management]
+
+[rpc]
+bind = ["@ZALLET_RPC@"]
+async_operation_limit = 32
