@@ -2,16 +2,17 @@
 
 > **Current state: phase-0 libraries only, not deployable.** Strict protocol,
 > in-memory policy, Unix backend-client, and listener-free miner-edge actors
-> exist. There is no public miner listener, compatible wolf backend-v1 server,
-> service-composed accepted-share path, PostgreSQL projection, payout engine,
-> production image, or Wcash/Zcash endpoint. Passing source CI does not make
-> this pool Testnet- or production-ready.
+> exist. Wolf contains a source-compatible backend-v1 server and durable
+> journal, but there is no public miner listener, service-composed
+> accepted-share path, exact private Wcash collector attestation, PostgreSQL
+> projection, payout engine, production image, or Wcash/Zcash endpoint. Passing
+> source CI does not make this pool Testnet- or production-ready.
 
 | Phase | Current status |
 | --- | --- |
 | 0 — Repository foundation | Implementation present; clean-clone CI evidence is still required on the release commit |
-| 1 — Wolf backend API | Blocked: pool-side v1 contract and client exist, matching wolf server and cross-repository vectors do not |
-| 2 — Miner protocol edge | Partial: strict ZIP-301 codec, policy state machines, and a bounded loopback-only accepted-stream driver with synthetic 4+28 transcripts exist; public listener, TLS, concrete auth provider, service composition, and certified ASIC transcripts do not |
+| 1 — Wolf backend API | Partial: matching source implementations and a pinned protocol baseline exist; service composition, private Wcash recipient attestation, fixed cross-repository vectors, and release recovery evidence do not |
+| 2 — Miner protocol edge | Partial: strict ZIP-301 codec, policy state machines, and a bounded loopback-only accepted-stream driver with synthetic 4+28 transcripts exist; public listener, TLS, concrete auth provider, durable nonce leasing, service composition, and certified ASIC transcripts do not |
 | 3 and later | Not implemented |
 
 Each phase has an explicit exit gate. Work may be prototyped in parallel, but a
@@ -38,10 +39,12 @@ until the exact committed revision passes the clean-clone checks.
 
 ## Phase 1 — Freeze the wolf backend API
 
-This is the next cross-repository blocker. The pool-side backend-v1 wire types
-and Unix client now exist, but `w-cash/wolf` does not expose their matching
-server. Wolf must adapt its existing coordinator and durable journal rather
-than asking this repository to duplicate consensus logic.
+The pool-side backend-v1 wire types and Unix client exist. Wolf pins the same
+protocol baseline and exposes a permission-restricted listener, serialized
+authority, retained native jobs, and durable journal around its consensus
+coordinator. Phase 1 remains partial until the two services are composed and
+the following cross-repository recovery, compatibility, and private-recipient
+gates are evidenced on exact release revisions.
 
 Required wolf gates:
 
@@ -51,6 +54,12 @@ Required wolf gates:
   instance and journal stream, Wcash and Zcash genesis identities, Wcash chain
   ID, exact Wcash and Zcash payout-recipient commitments, and the complete
   capability set;
+- exact private Wcash collector verification using only a read-only incoming
+  viewing capability to trial-decrypt and authorize every Ironwood coinbase
+  action, reject undecryptable or unattributed actions, verify that all positive
+  value belongs to the collector and sums to the exact reward, and bind the
+  result to the immutable job and payout commitment without exposing a spending
+  key;
 - immutable jobs binding a unique job ID, exact 108-byte parent header input,
   proof-independent Wcash candidate hash, explicit Wcash and Zcash
   predecessors, the Wcash candidate and Zcash parent coinbase transaction IDs,
@@ -177,6 +186,9 @@ Deliverables:
 - independent Wcash and Zcash reward maturity and reorg reversal;
 - explicit fee, rounding, dust, minimum payout, and adjustment rules;
 - idempotent payout batches with an isolated wallet/signer boundary;
+- an NU6.3 Zcash collector test that scans and reconciles direct Ironwood
+  coinbase, constructs and signs a payout, broadcasts it through the selected
+  parent stack, survives restart/rescan, and reverses state safely on reorg;
 - backup, restore, schema migration, reconciliation, and operator audit tools.
 
 Exit gate: crash-after-every-write, duplicate, reorg, rounding, conservation,

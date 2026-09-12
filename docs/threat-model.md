@@ -8,12 +8,13 @@ Implemented controls are limited to strict bounded wire codecs, redacted
 secret-bearing debug output, endian-distinct target types, exact job/proof
 receipt bindings, in-memory session/job/nonce/vardiff policy, global
 generation suspension, finite listener-free connection actors, a
-timeout-bounded Unix backend client, and a bounded idle health/event pump with
-a mandatory acknowledged consumer seam, all tested with local mock peers.
-There is no durable event-consumer implementation, stream driver, public
-listener, authentication implementation, pool database, payout code, wallet,
-deployment, or live-node test. Every operational control below remains a
-release requirement unless it is explicitly identified as implemented.
+timeout-bounded Unix backend client, a bounded idle health/event pump with a
+mandatory acknowledged consumer seam, and a loopback-only test driver, all
+tested with local mock peers and synthetic transcripts. There is no durable
+event-consumer implementation, public listener, authentication implementation,
+pool database, payout code, wallet, deployment, or live-node test. Every
+operational control below remains a release requirement unless it is explicitly
+identified as implemented.
 
 ## Assets
 
@@ -55,10 +56,15 @@ Equihash solutions, event pages, and relevant strings; they reject trailing,
 unknown, and non-canonical backend encodings before policy use. The backend
 client enforces configured connection and request deadlines.
 
-The future public listener must additionally enforce accept, TLS,
-authentication, request, write, and idle deadlines plus per-IP, per-account,
-and global concurrency and byte budgets before expensive hashing or backend
-calls. Those listener controls do not exist yet.
+The future public edge must additionally enforce accept, authentication,
+request, write, and idle deadlines plus per-IP, per-account, and global
+concurrency and byte budgets before expensive hashing or backend calls. Its
+preferred listener requires TLS and certificate validation. A separate port may
+support legacy plaintext ASIC firmware only with an explicitly disclosed
+warning and a rate-limited, revocable credential that has mining-only authority.
+A LAN or ISP observer can read and replay that credential, so it must never be
+a portal password or authorize payout/account operations. Those listener
+controls do not exist yet.
 
 Required tests include truncation at every byte boundary, oversized lengths,
 invalid UTF-8 where applicable, trailing bytes, slow reads, request floods,
@@ -138,6 +144,16 @@ The backend Hello exchange also binds independently configured, domain-separated
 32-byte commitments for the exact Wcash and Zcash block-reward recipients. Any
 template-node or backend configuration drift that changes either recipient is a
 fatal authority mismatch; the pool must not issue miner work from that socket.
+
+A commitment does not by itself prove the recipient hidden inside a private
+Wcash Ironwood ciphertext. The current Wolf pool-backend path correctly rejects
+that weaker trust class. Before private collector mode is enabled, a protected
+coordinator must use only the collector's read-only incoming viewing capability
+to trial-decrypt and authorize every Ironwood coinbase action. Any undecryptable
+or unattributed action rejects the template. The coordinator then verifies that
+all positive value belongs to the collector, checks the exact aggregate, and
+binds the result to the job and commitment. The spending key remains in the
+isolated payout signer. Failure never triggers transparent fallback.
 
 The live job snapshot can have a watermark ahead of the pool's last projected
 accounting event. The snapshot may restore mining state, but it must never be
@@ -292,8 +308,10 @@ exclude credentials or full solutions by default. Retention and operator
 access must be documented before public Testnet. No TLS listener or operational
 logging policy exists in the current binary.
 
-Shielded Wcash rewards do not make the pool's database, network telemetry, or
-Zcash payout path private. Privacy claims must state these limitations.
+Private Wcash Ironwood rewards do not make the pool's database or network
+telemetry private. A standard Zcash Ironwood coinbase is publicly recoverable
+under ZIP-213 even though later spend linkage can be shielded. Privacy claims
+must state these limitations.
 
 ## Explicit non-goals
 

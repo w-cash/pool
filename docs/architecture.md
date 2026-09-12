@@ -56,19 +56,24 @@ This is the target flow. No executable currently composes these steps.
 | --- | --- | --- |
 | wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v1 request, response, event, target-endian and identity types; exact candidate, coinbase, parent-header and stable share-ID bindings; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | TCP/TLS listener, worker database, ASIC interoperability certification |
 | wcash-pool-core | In-memory session ordering, immutable worker binding, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, authoritative current/recent lifetime, bounded non-resurrectable generation tombstones, in-flight retirement fences, target policy, and integer vardiff including inactivity easing | Durable nonce-lease orchestration, durable generation-ID history, runtime composition, database persistence, crash recovery, network I/O, consensus validation |
-| wcash-pool-backend-client | Timeout-bounded Unix-socket connection, strict handshake and identity checks, request correlation, job snapshot/event replay, transport-branded lifetime anchors, exact submitted header time, canonical submitted-proof and job-bound receipt checks, live response-watermark flush enforcement, a core-validated share adapter that owns the admission fence through backend I/O, branded share commits, health checks, and bounded unsolicited-event buffering | A compatible wolf server, cryptographic remote-peer authentication, production integration |
+| wcash-pool-backend-client | Timeout-bounded Unix-socket connection, strict handshake and identity checks, request correlation, job snapshot/event replay, transport-branded lifetime anchors, exact submitted header time, canonical submitted-proof and job-bound receipt checks, live response-watermark flush enforcement, a core-validated share adapter that owns the admission fence through backend I/O, branded share commits, health checks, and bounded unsolicited-event buffering | Service composition, exact private Wcash recipient verification, cross-repository release evidence, and cryptographic peer authentication if transport stops being local |
 | wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization with exact miner-login binding, immutable session assignments, target-before-notify ordering, bounded global job fanout, replay-aware vardiff sampling, cancellation-safe serialized Wolf submissions, a bounded idle health/event pump with a mandatory acknowledged consumer seam, global suspension on terminal backend/event-stream failure, and a loopback-only admitted-TCP driver with strict LF framing, absolute deadlines, bounded writes, clean cancellation, and synthetic 4+28 transcript tests | Public TCP/TLS listener, authorization implementation, durable event-consumer/projector implementation, durable nonce leasing, service composition, certified ASIC transcript |
 | wcash-poold | A machine-readable readiness command that exits not-ready | Serve command, miner/admin/metrics listeners, configuration, database, wallet, payout loop, deployment |
 | Accounting | Protocol receipts and event shapes only | PostgreSQL schema and projector, balances, maturity, fees, rounding, reorg reversal, payouts |
 | Operations | Hermetic source checks and test scaffolding | Container image, manifests, monitoring, backups, runbooks, private soak, public endpoint |
 
-## Exact next wolf backend and journal requirement
+## Wolf backend and remaining integration requirements
 
-The pool-side wire contract is implemented in wcash-pool-protocol, but the
-matching server does not yet exist in wolf. Existing wolf command interfaces
-and its private JSON-lines journal are not a substitute for this contract. The
-next cross-repository change must expose the following adapter around wolf's
-existing consensus coordinator and durable winner state.
+The pool-side wire contract is implemented in `wcash-pool-protocol`. Wolf now
+pins the protocol baseline at pool commit
+`adb66440a99a8dba9189ee15849e46e5a8c08441` and contains the matching private
+Unix listener, serialized authority, native retained-job path, and durable
+journal. That source-level match does not make the pair deployable: the pool
+service does not compose it into a public miner path, fixed cross-repository
+release vectors and recovery evidence remain required, and Wolf currently
+refuses a private Wcash collector because it cannot independently prove the
+encrypted recipient. The following remains the release contract for the
+integrated pair.
 
 ### Transport and handshake
 
@@ -87,6 +92,13 @@ existing consensus coordinator and durable winner state.
 - Configure both payout commitments independently of the socket peer and require
   exact equality during Hello. A changed template recipient must therefore stop
   mining instead of silently redirecting either chain's rewards.
+- Before accepting a private Wcash collector, Wolf must use a read-only incoming
+  viewing capability to trial-decrypt and authorize every coinbase Ironwood
+  action, reject any undecryptable or unattributed action, verify that all
+  positive value belongs to the collector and sums to the exact reward, and
+  bind that attestation to the job and configured payout commitment. The
+  spending key must not enter this process. A trusted-template-node label or
+  commitment without independent trial decryption is insufficient.
 - Treat those IDs as consistency and replacement detection, not as
   cryptographic authentication. A changed backend instance or journal stream
   is an operator-visible reconciliation event, never an automatic reset.
@@ -360,7 +372,8 @@ public listener. Backend, database, metrics, admin, node, validator, and wallet
 interfaces remain isolated and are not exposed by default. Payout signing keys
 should stay outside the public pool process.
 
-No image or endpoint should be published until the compatible wolf server,
+No image or endpoint should be published until the compatible pair is composed
+as a service, private Wcash collector recipients are verified exactly, the
 PostgreSQL projection, full miner edge, durable accounting, restart recovery,
 end-to-end merged-mining tests, and the gates in
 [testnet-roadmap.md](testnet-roadmap.md) are complete.
