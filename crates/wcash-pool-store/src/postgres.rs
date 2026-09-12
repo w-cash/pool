@@ -2,6 +2,7 @@
 
 use std::{future::Future, pin::Pin, str::FromStr};
 
+use futures_util::TryStreamExt;
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
@@ -10,6 +11,9 @@ use uuid::Uuid;
 use wcash_pool_backend_client::{BackendAuthority, DeliveredBackendEvent};
 use wcash_pool_core::{NonceCursor, NonceNamespaceLease, NoncePrefixAllocator};
 use wcash_pool_edge::{BackendEventConsumer, BackendEventConsumerError};
+use wcash_pool_portal::{
+    Asset, ChainNetwork, PayoutBatchRequest, PayoutOutput, ReceiverKind as PortalReceiverKind,
+};
 use wcash_pool_protocol::{
     BackendEvent, MergedChain, NonceProfile, ProtocolError, WinnerDescriptor,
 };
@@ -24,6 +28,8 @@ const MAX_DATABASE_CONNECTIONS: u32 = 64;
 const MAX_REPLAY_BATCH: usize = 1_024;
 const MAX_PPLNS_SHARES: i64 = 100_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
+const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
+const LEDGER_SNAPSHOT_DOMAIN: &[u8] = b"zecwec/ledger-snapshot/v1";
 
 /// Explicit chain environment for a deployment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +68,7 @@ impl Chain {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, StoreError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "wcash" => Ok(Self::Wcash),
             "zcash" => Ok(Self::Zcash),
@@ -78,6 +84,51 @@ impl From<MergedChain> for Chain {
             MergedChain::Zcash => Self::Zcash,
         }
     }
+}
+
+/// Exact chain-wallet state observed by a separately authenticated wallet
+/// adapter. The store derives the ledger facts and checkpoint identity; a
+/// caller cannot supply either one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletObservation {
+    /// Chain whose wallet and accounting ledger were inspected.
+    pub chain: Chain,
+    /// Digest of the wallet adapter's canonical state response.
+    pub wallet_state_digest: [u8; 32],
+    /// Spendable collector balance reported by the wallet, in atomic units.
+    pub wallet_spendable_zat: u64,
+    /// Canonical best-chain tip hash in chain wire byte order.
+    pub best_tip_hash: [u8; 32],
+    /// Canonical best-chain tip height.
+    pub best_tip_height: u32,
+    /// Time at which the wallet snapshot was taken, as Unix seconds.
+    pub observed_at: u64,
+    /// Short expiry selected by the wallet adapter, as Unix seconds.
+    pub valid_until: u64,
+}
+
+/// Database-issued reconciliation checkpoint binding wallet state to one exact
+/// immutable accounting snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletReconciliation {
+    /// Store-generated checkpoint identity.
+    pub id: Uuid,
+    /// Reconciled chain.
+    pub chain: Chain,
+    /// Hash of every sealed chain ledger line visible in the checkpoint.
+    pub ledger_root: [u8; 32],
+    /// Number of sealed ledger transactions committed by the root.
+    pub ledger_transaction_count: u64,
+    /// Spendable wallet balance proven equal to the internal collector asset.
+    pub wallet_spendable_zat: u64,
+    /// Best-chain tip used by the wallet observation.
+    pub best_tip_hash: [u8; 32],
+    /// Best-chain height used by the wallet observation.
+    pub best_tip_height: u32,
+    /// Observation time as Unix seconds.
+    pub observed_at: u64,
+    /// Expiry after which no new payout batch may consume this checkpoint.
+    pub valid_until: u64,
 }
 
 /// Immutable database and backend identity for one Testnet or Mainnet service.
@@ -243,6 +294,12 @@ pub struct PayoutBatch {
     pub state: PayoutBatchState,
     /// Immutable chain-policy revision used to build and validate this batch.
     pub policy_version: u64,
+    /// Database-issued wallet reconciliation consumed by this batch.
+    pub reconciliation_id: Uuid,
+    /// Exact post-reservation ledger snapshot committed to the signer request.
+    pub ledger_root: [u8; 32],
+    /// Last immutable ledger sequence included in `ledger_root`.
+    pub ledger_sequence_cutoff: u64,
     /// Sum of miner outputs in atomic units.
     pub miner_total_zat: u64,
     /// Exact outputs approved by the accounting transaction.
@@ -250,16 +307,34 @@ pub struct PayoutBatch {
 }
 
 /// One exact output in an accounting-reserved payout batch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PayoutInstruction {
+    /// Stable signer-output identity unique within the batch.
+    pub allocation_id: Uuid,
     /// Miner account whose liability is being settled.
     pub account_id: Uuid,
     /// Versioned destination row frozen into this batch.
     pub destination_id: Uuid,
+    /// Receiver class attested when the immutable destination was stored.
+    pub receiver_kind: ReceiverKind,
     /// Full destination passed only to the isolated wallet builder.
     pub address: String,
     /// Exact output amount in atomic units.
     pub amount_zat: u64,
+}
+
+impl std::fmt::Debug for PayoutInstruction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PayoutInstruction")
+            .field("allocation_id", &self.allocation_id)
+            .field("account_id", &self.account_id)
+            .field("destination_id", &self.destination_id)
+            .field("receiver_kind", &self.receiver_kind)
+            .field("address", &"[REDACTED]")
+            .field("amount_zat", &self.amount_zat)
+            .finish()
+    }
 }
 
 /// Persisted signer result sufficient to resume or reconcile broadcast after a
@@ -378,7 +453,8 @@ impl ChainPolicy {
             || self.payout_threshold_zat == 0
             || self.required_confirmations < 100
             || self.required_confirmations > 1_000_000
-            || !(1..=1_000).contains(&self.maximum_payout_outputs)
+            || !(1..=u32::try_from(wcash_pool_portal::MAX_PAYOUT_OUTPUTS).unwrap_or(u32::MAX))
+                .contains(&self.maximum_payout_outputs)
             || self.maximum_network_fee_bps == 0
             || self.maximum_network_fee_bps > 1_000
             || self.policy_version == 0
@@ -396,6 +472,16 @@ pub enum ReceiverKind {
     Transparent,
     /// Current shielded Ironwood receiver.
     Ironwood,
+}
+
+impl ReceiverKind {
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "transparent" => Ok(Self::Transparent),
+            "ironwood" => Ok(Self::Ironwood),
+            _ => Err(StoreError::CorruptDatabaseState("payout receiver kind")),
+        }
+    }
 }
 
 /// Production readiness of payout-destination configuration.
@@ -497,8 +583,8 @@ pub enum ProjectionResult {
 /// Cloneable PostgreSQL authority for one immutable deployment.
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
-    pool: PgPool,
-    identity: DeploymentIdentity,
+    pub(crate) pool: PgPool,
+    pub(crate) identity: DeploymentIdentity,
 }
 
 impl PostgresStore {
@@ -1078,7 +1164,8 @@ impl PostgresStore {
     ) -> Result<bool, StoreError> {
         let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE workers SET enabled=FALSE WHERE deployment_id=$1 AND id=$2 AND account_id=$3 AND enabled",
+            "UPDATE workers SET enabled=FALSE,revoked_at=clock_timestamp() \
+             WHERE deployment_id=$1 AND id=$2 AND account_id=$3 AND enabled",
         )
         .bind(self.identity.id)
         .bind(worker_id)
@@ -1164,17 +1251,144 @@ impl PostgresStore {
         u64::try_from(pending.len()).map_err(|_| StoreError::MoneyOverflow)
     }
 
+    /// Records one short-lived, chain-specific wallet reconciliation. The
+    /// ledger root and checkpoint UUID are always derived inside this store.
+    /// A mismatch is committed as durable evidence and freezes new payouts.
+    pub async fn record_wallet_reconciliation(
+        &self,
+        observation: &WalletObservation,
+    ) -> Result<WalletReconciliation, StoreError> {
+        if observation.wallet_state_digest == [0; 32]
+            || observation.best_tip_hash == [0; 32]
+            || observation.best_tip_height == 0
+            || observation.observed_at == 0
+            || observation.valid_until <= observation.observed_at
+            || observation
+                .valid_until
+                .saturating_sub(observation.observed_at)
+                > MAX_WALLET_RECONCILIATION_AGE_SECS
+        {
+            return Err(StoreError::InvalidWalletObservation);
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *transaction)
+            .await?;
+        let lock_key = format!("zecwec:{}:{}", self.identity.id, observation.chain.as_str());
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(lock_key)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "SELECT payouts_frozen FROM chain_safety_state \
+             WHERE deployment_id=$1 AND chain=$2 FOR UPDATE",
+        )
+        .bind(self.identity.id)
+        .bind(observation.chain.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(StoreError::MissingChainPolicy(observation.chain))?;
+
+        let database_now = unix_u64(
+            sqlx::query_scalar::<_, i64>("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
+        if observation.observed_at > database_now
+            || database_now.saturating_sub(observation.observed_at)
+                > MAX_WALLET_RECONCILIATION_AGE_SECS
+            || observation.valid_until <= database_now
+        {
+            return Err(StoreError::InvalidWalletObservation);
+        }
+
+        let has_ambiguous_payout = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM payout_batches \
+             WHERE deployment_id=$1 AND chain=$2 \
+               AND state IN ('signed','broadcast','reorged'))",
+        )
+        .bind(self.identity.id)
+        .bind(observation.chain.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_ambiguous_payout {
+            return Err(StoreError::WalletReconciliationBlocked);
+        }
+
+        let snapshot =
+            ledger_snapshot(&mut transaction, self.identity.id, observation.chain, None).await?;
+        let checkpoint_id = Uuid::new_v4();
+        let matched = snapshot.collector_spendable_zat == observation.wallet_spendable_zat;
+        sqlx::query(
+            "INSERT INTO wallet_reconciliations \
+             (deployment_id,id,chain,ledger_root,ledger_transaction_count,wallet_state_digest, \
+              wallet_spendable_zat,ledger_spendable_zat,best_tip_hash,best_tip_height, \
+              observed_at,valid_until,status) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,to_timestamp($11),to_timestamp($12),$13)",
+        )
+        .bind(self.identity.id)
+        .bind(checkpoint_id)
+        .bind(observation.chain.as_str())
+        .bind(snapshot.root.as_slice())
+        .bind(as_i64(snapshot.transaction_count)?)
+        .bind(observation.wallet_state_digest.as_slice())
+        .bind(as_i64(observation.wallet_spendable_zat)?)
+        .bind(as_i64(snapshot.collector_spendable_zat)?)
+        .bind(observation.best_tip_hash.as_slice())
+        .bind(i64::from(observation.best_tip_height))
+        .bind(unix_i64(observation.observed_at)?)
+        .bind(unix_i64(observation.valid_until)?)
+        .bind(if matched { "matched" } else { "mismatch" })
+        .execute(&mut *transaction)
+        .await?;
+
+        if !matched {
+            sqlx::query(
+                "UPDATE chain_safety_state SET payouts_frozen=TRUE, \
+                 frozen_by_backend_event_seq=CASE WHEN payouts_frozen \
+                     THEN frozen_by_backend_event_seq ELSE NULL END, \
+                 freeze_reason=CASE WHEN payouts_frozen THEN freeze_reason \
+                     ELSE 'wallet_reconciliation_mismatch' END, \
+                 updated_at=clock_timestamp() WHERE deployment_id=$1 AND chain=$2",
+            )
+            .bind(self.identity.id)
+            .bind(observation.chain.as_str())
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(StoreError::CollectorReconciliationFailed);
+        }
+
+        transaction.commit().await?;
+        Ok(WalletReconciliation {
+            id: checkpoint_id,
+            chain: observation.chain,
+            ledger_root: snapshot.root,
+            ledger_transaction_count: snapshot.transaction_count,
+            wallet_spendable_zat: observation.wallet_spendable_zat,
+            best_tip_hash: observation.best_tip_hash,
+            best_tip_height: observation.best_tip_height,
+            observed_at: observation.observed_at,
+            valid_until: observation.valid_until,
+        })
+    }
+
     /// Reserves all automatic balances at or above their versioned threshold.
     /// A chain-scoped PostgreSQL advisory lock serializes concurrent builders.
     pub async fn create_payout_batch(
         &self,
         chain: Chain,
         idempotency_key: Uuid,
+        reconciliation_id: Uuid,
     ) -> Result<PayoutBatch, StoreError> {
-        if idempotency_key.is_nil() {
+        if idempotency_key.is_nil() || reconciliation_id.is_nil() {
             return Err(StoreError::InvalidPayoutBatch);
         }
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *transaction)
+            .await?;
         let lock_key = format!("zecwec:{}:{}", self.identity.id, chain.as_str());
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
             .bind(lock_key)
@@ -1189,13 +1403,28 @@ impl PostgresStore {
         .await?
         {
             let batch = load_payout_batch(&mut transaction, self.identity.id, batch_id).await?;
-            if batch.chain != chain {
+            if batch.chain != chain || batch.reconciliation_id != reconciliation_id {
                 return Err(StoreError::PayoutIdempotencyConflict);
             }
             transaction.rollback().await?;
             return Ok(batch);
         }
         lock_unfrozen_chain(&mut transaction, self.identity.id, chain).await?;
+        let checkpoint = load_usable_wallet_reconciliation(
+            &mut transaction,
+            self.identity.id,
+            chain,
+            reconciliation_id,
+        )
+        .await?;
+        let current_snapshot =
+            ledger_snapshot(&mut transaction, self.identity.id, chain, None).await?;
+        if checkpoint.ledger_root != current_snapshot.root
+            || checkpoint.ledger_transaction_count != current_snapshot.transaction_count
+            || checkpoint.wallet_spendable_zat != current_snapshot.collector_spendable_zat
+        {
+            return Err(StoreError::WalletReconciliationStale);
+        }
         let policy = sqlx::query(
             "SELECT maximum_payout_outputs,policy_version FROM chain_policies \
              WHERE deployment_id=$1 AND chain=$2 FOR SHARE",
@@ -1210,7 +1439,7 @@ impl PostgresStore {
             .map_err(|_| StoreError::CorruptDatabaseState("policy version"))?;
         let rows = sqlx::query(
             "SELECT e.account_id,(-SUM(e.amount_zat))::BIGINT AS amount_zat, \
-                    d.id AS destination_id,d.address \
+                    d.id AS destination_id,d.address,d.receiver_kind \
              FROM ledger_entries e \
              JOIN ledger_transactions t \
                ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
@@ -1219,7 +1448,7 @@ impl PostgresStore {
               AND d.chain=$2 AND d.state='active' AND d.automatic \
              WHERE e.deployment_id=$1 AND t.chain=$2 \
                AND e.ledger_account='miner_payable' \
-             GROUP BY e.account_id,d.id,d.address,d.payout_threshold_zat \
+             GROUP BY e.account_id,d.id,d.address,d.receiver_kind,d.payout_threshold_zat \
              HAVING -SUM(e.amount_zat) >= d.payout_threshold_zat \
              ORDER BY e.account_id LIMIT $3",
         )
@@ -1240,8 +1469,10 @@ impl PostgresStore {
                 .checked_add(amount_zat)
                 .ok_or(StoreError::MoneyOverflow)?;
             outputs.push(PayoutInstruction {
+                allocation_id: Uuid::new_v4(),
                 account_id: row.try_get("account_id")?,
                 destination_id: row.try_get("destination_id")?,
+                receiver_kind: ReceiverKind::parse(&row.try_get::<String, _>("receiver_kind")?)?,
                 address: row.try_get("address")?,
                 amount_zat,
             });
@@ -1263,14 +1494,15 @@ impl PostgresStore {
         for output in &outputs {
             sqlx::query(
                 "INSERT INTO payout_items \
-                 (deployment_id,batch_id,account_id,destination_id,amount_zat) \
-                 VALUES ($1,$2,$3,$4,$5)",
+                 (deployment_id,batch_id,account_id,destination_id,amount_zat,allocation_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6)",
             )
             .bind(self.identity.id)
             .bind(batch_id)
             .bind(output.account_id)
             .bind(output.destination_id)
             .bind(as_i64(output.amount_zat)?)
+            .bind(output.allocation_id)
             .execute(&mut *transaction)
             .await?;
             entries.push((
@@ -1284,7 +1516,7 @@ impl PostgresStore {
                 -as_i64(output.amount_zat)?,
             ));
         }
-        insert_owned_ledger_transaction(
+        let reservation_transaction_id = insert_owned_ledger_transaction(
             &mut transaction,
             self.identity.id,
             chain,
@@ -1294,15 +1526,123 @@ impl PostgresStore {
             &entries,
         )
         .await?;
+        let ledger_sequence_cutoff = u64::try_from(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT ledger_sequence FROM ledger_transactions \
+                 WHERE deployment_id=$1 AND id=$2",
+            )
+            .bind(self.identity.id)
+            .bind(reservation_transaction_id)
+            .fetch_one(&mut *transaction)
+            .await?,
+        )
+        .map_err(|_| StoreError::CorruptDatabaseState("ledger sequence"))?;
+        let post_reservation_snapshot = ledger_snapshot(
+            &mut transaction,
+            self.identity.id,
+            chain,
+            Some(ledger_sequence_cutoff),
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE payout_batches SET reconciliation_id=$3,ledger_root=$4,ledger_sequence_cutoff=$5 \
+             WHERE deployment_id=$1 AND id=$2 AND state='draft'",
+        )
+        .bind(self.identity.id)
+        .bind(batch_id)
+        .bind(reconciliation_id)
+        .bind(post_reservation_snapshot.root.as_slice())
+        .bind(as_i64(ledger_sequence_cutoff)?)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::InvalidPayoutBatch);
+        }
         transaction.commit().await?;
         Ok(PayoutBatch {
             id: batch_id,
             chain,
             state: PayoutBatchState::Draft,
             policy_version,
+            reconciliation_id,
+            ledger_root: post_reservation_snapshot.root,
+            ledger_sequence_cutoff,
             miner_total_zat: total,
             outputs,
         })
+    }
+
+    /// Constructs the exact signer request from immutable database facts. No
+    /// caller can inject a reconciliation UUID, ledger root, receiver class,
+    /// address, or amount.
+    pub async fn build_signer_request(
+        &self,
+        batch_id: Uuid,
+    ) -> Result<PayoutBatchRequest, StoreError> {
+        if batch_id.is_nil() {
+            return Err(StoreError::InvalidPayoutBatch);
+        }
+        let mut transaction = self.pool.begin().await?;
+        let batch = load_payout_batch(&mut transaction, self.identity.id, batch_id).await?;
+        if batch.state != PayoutBatchState::Draft {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        lock_unfrozen_chain(&mut transaction, self.identity.id, batch.chain).await?;
+        load_usable_wallet_reconciliation(
+            &mut transaction,
+            self.identity.id,
+            batch.chain,
+            batch.reconciliation_id,
+        )
+        .await?;
+        let derived_snapshot = ledger_snapshot(
+            &mut transaction,
+            self.identity.id,
+            batch.chain,
+            Some(batch.ledger_sequence_cutoff),
+        )
+        .await?;
+        if derived_snapshot.root != batch.ledger_root {
+            return Err(StoreError::WalletReconciliationStale);
+        }
+        let reservation_matches = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ledger_transactions \
+             WHERE deployment_id=$1 AND ledger_sequence=$2 AND chain=$3 \
+               AND kind='payout_reserved' AND reference=$4)",
+        )
+        .bind(self.identity.id)
+        .bind(as_i64(batch.ledger_sequence_cutoff)?)
+        .bind(batch.chain.as_str())
+        .bind(batch.id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !reservation_matches {
+            return Err(StoreError::CorruptDatabaseState(
+                "payout ledger sequence fence",
+            ));
+        }
+        let request = PayoutBatchRequest {
+            batch_id: batch.id,
+            asset: asset_for_chain(batch.chain),
+            network: network_for_deployment(self.identity.network),
+            ledger_root: batch.ledger_root,
+            reconciliation_id: batch.reconciliation_id,
+            outputs: batch
+                .outputs
+                .into_iter()
+                .map(|output| PayoutOutput {
+                    allocation_id: output.allocation_id,
+                    canonical_address: output.address,
+                    receiver_kind: portal_receiver_kind(output.receiver_kind),
+                    amount_zat: output.amount_zat,
+                })
+                .collect(),
+        };
+        request
+            .validate()
+            .map_err(|_| StoreError::CorruptDatabaseState("payout signer request"))?;
+        transaction.rollback().await?;
+        Ok(request)
     }
 
     /// Records the isolated signer's exact unsigned digest, transaction ID,
@@ -1878,7 +2218,7 @@ impl BackendEventConsumer for PostgresStore {
     }
 }
 
-fn validate_component(value: &str, maximum: usize) -> Result<(), StoreError> {
+pub(crate) fn validate_component(value: &str, maximum: usize) -> Result<(), StoreError> {
     if value.is_empty()
         || value.len() > maximum
         || !value.bytes().all(|byte| {
@@ -1918,11 +2258,11 @@ fn account_credential_from_row(
     })
 }
 
-fn unix_i64(value: u64) -> Result<i64, StoreError> {
+pub(crate) fn unix_i64(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::InvalidTimestamp)
 }
 
-fn unix_u64(value: i64) -> Result<u64, StoreError> {
+pub(crate) fn unix_u64(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::CorruptDatabaseState("timestamp"))
 }
 
@@ -1940,7 +2280,8 @@ async fn load_payout_batch(
     batch_id: Uuid,
 ) -> Result<PayoutBatch, StoreError> {
     let row = sqlx::query(
-        "SELECT chain,state,policy_version FROM payout_batches \
+        "SELECT chain,state,policy_version,reconciliation_id,ledger_root,ledger_sequence_cutoff \
+         FROM payout_batches \
          WHERE deployment_id=$1 AND id=$2 FOR UPDATE",
     )
     .bind(deployment_id)
@@ -1952,11 +2293,27 @@ async fn load_payout_batch(
     let state = PayoutBatchState::parse(&row.try_get::<String, _>("state")?)?;
     let policy_version = u64::try_from(row.try_get::<i64, _>("policy_version")?)
         .map_err(|_| StoreError::CorruptDatabaseState("payout policy version"))?;
+    let reconciliation_id = row.try_get::<Option<Uuid>, _>("reconciliation_id")?.ok_or(
+        StoreError::CorruptDatabaseState("payout reconciliation identity"),
+    )?;
+    let ledger_root = exact_hash(
+        row.try_get::<Option<Vec<u8>>, _>("ledger_root")?
+            .ok_or(StoreError::CorruptDatabaseState("payout ledger root"))?,
+        "payout ledger root",
+    )?;
+    let ledger_sequence_cutoff = u64::try_from(
+        row.try_get::<Option<i64>, _>("ledger_sequence_cutoff")?
+            .ok_or(StoreError::CorruptDatabaseState(
+                "payout ledger sequence cutoff",
+            ))?,
+    )
+    .map_err(|_| StoreError::CorruptDatabaseState("payout ledger sequence cutoff"))?;
     let rows = sqlx::query(
-        "SELECT i.account_id,i.destination_id,i.amount_zat,d.address \
+        "SELECT i.allocation_id,i.account_id,i.destination_id,i.amount_zat, \
+                d.address,d.receiver_kind \
          FROM payout_items i JOIN payout_destinations d \
            ON (d.deployment_id,d.id)=(i.deployment_id,i.destination_id) \
-         WHERE i.deployment_id=$1 AND i.batch_id=$2 ORDER BY i.account_id",
+         WHERE i.deployment_id=$1 AND i.batch_id=$2 ORDER BY i.account_id,i.allocation_id",
     )
     .bind(deployment_id)
     .bind(batch_id)
@@ -1974,8 +2331,10 @@ async fn load_payout_batch(
             .checked_add(amount_zat)
             .ok_or(StoreError::MoneyOverflow)?;
         outputs.push(PayoutInstruction {
+            allocation_id: row.try_get("allocation_id")?,
             account_id: row.try_get("account_id")?,
             destination_id: row.try_get("destination_id")?,
+            receiver_kind: ReceiverKind::parse(&row.try_get::<String, _>("receiver_kind")?)?,
             address: row.try_get("address")?,
             amount_zat,
         });
@@ -1985,9 +2344,211 @@ async fn load_payout_batch(
         chain,
         state,
         policy_version,
+        reconciliation_id,
+        ledger_root,
+        ledger_sequence_cutoff,
         miner_total_zat,
         outputs,
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LedgerSnapshot {
+    root: [u8; 32],
+    transaction_count: u64,
+    collector_spendable_zat: u64,
+}
+
+async fn ledger_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    chain: Chain,
+    sequence_cutoff: Option<u64>,
+) -> Result<LedgerSnapshot, StoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(LEDGER_SNAPSHOT_DOMAIN);
+    hasher.update(deployment_id.as_bytes());
+    hasher.update([match chain {
+        Chain::Wcash => 1,
+        Chain::Zcash => 2,
+    }]);
+    let mut transaction_count = 0u64;
+    let mut previous_transaction = None;
+    {
+        let mut rows = sqlx::query(
+            "SELECT t.id,t.ledger_sequence,t.kind,t.backend_event_seq,t.reference,t.sealed_entry_count, \
+                    e.line_no,e.account_id,e.ledger_account,e.amount_zat \
+             FROM ledger_transactions t JOIN ledger_entries e \
+               ON (e.deployment_id,e.transaction_id)=(t.deployment_id,t.id) \
+             WHERE t.deployment_id=$1 AND t.chain=$2 AND t.sealed_at IS NOT NULL \
+               AND ($3::BIGINT IS NULL OR t.ledger_sequence <= $3) \
+             ORDER BY t.ledger_sequence,e.line_no",
+        )
+        .bind(deployment_id)
+        .bind(chain.as_str())
+        .bind(sequence_cutoff.map(as_i64).transpose()?)
+        .fetch(&mut **transaction);
+        while let Some(row) = rows.try_next().await? {
+            let transaction_id = row.try_get::<Uuid, _>("id")?;
+            let ledger_sequence = row.try_get::<i64, _>("ledger_sequence")?;
+            if ledger_sequence <= 0 {
+                return Err(StoreError::CorruptDatabaseState("ledger sequence"));
+            }
+            if previous_transaction != Some(transaction_id) {
+                transaction_count = transaction_count
+                    .checked_add(1)
+                    .ok_or(StoreError::MoneyOverflow)?;
+                previous_transaction = Some(transaction_id);
+            }
+            hasher.update(ledger_sequence.to_be_bytes());
+            hasher.update(transaction_id.as_bytes());
+            hash_bounded_text(&mut hasher, &row.try_get::<String, _>("kind")?, 64)?;
+            match row.try_get::<Option<i64>, _>("backend_event_seq")? {
+                Some(sequence) if sequence > 0 => {
+                    hasher.update([1]);
+                    hasher.update(sequence.to_be_bytes());
+                }
+                None => hasher.update([0]),
+                _ => return Err(StoreError::CorruptDatabaseState("ledger event sequence")),
+            }
+            hash_bounded_text(&mut hasher, &row.try_get::<String, _>("reference")?, 256)?;
+            let sealed_entry_count = row.try_get::<i32, _>("sealed_entry_count")?;
+            let line_no = row.try_get::<i32, _>("line_no")?;
+            if sealed_entry_count < 2 || line_no <= 0 {
+                return Err(StoreError::CorruptDatabaseState("ledger seal"));
+            }
+            hasher.update(sealed_entry_count.to_be_bytes());
+            hasher.update(line_no.to_be_bytes());
+            match row.try_get::<Option<Uuid>, _>("account_id")? {
+                Some(account_id) => {
+                    hasher.update([1]);
+                    hasher.update(account_id.as_bytes());
+                }
+                None => hasher.update([0]),
+            }
+            hash_bounded_text(
+                &mut hasher,
+                &row.try_get::<String, _>("ledger_account")?,
+                64,
+            )?;
+            let amount_zat = row.try_get::<i64, _>("amount_zat")?;
+            if amount_zat == 0 {
+                return Err(StoreError::CorruptDatabaseState("zero ledger line"));
+            }
+            hasher.update(amount_zat.to_be_bytes());
+        }
+    }
+    hasher.update(transaction_count.to_be_bytes());
+    let collector_spendable = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(e.amount_zat),0)::BIGINT FROM ledger_entries e \
+         JOIN ledger_transactions t \
+           ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
+         WHERE e.deployment_id=$1 AND t.chain=$2 \
+           AND t.sealed_at IS NOT NULL \
+           AND ($3::BIGINT IS NULL OR t.ledger_sequence <= $3) \
+           AND e.ledger_account='collector_spendable_asset'",
+    )
+    .bind(deployment_id)
+    .bind(chain.as_str())
+    .bind(sequence_cutoff.map(as_i64).transpose()?)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(LedgerSnapshot {
+        root: hasher.finalize().into(),
+        transaction_count,
+        collector_spendable_zat: u64::try_from(collector_spendable)
+            .map_err(|_| StoreError::CollectorReconciliationFailed)?,
+    })
+}
+
+fn hash_bounded_text(
+    hasher: &mut Sha256,
+    value: &str,
+    maximum_length: usize,
+) -> Result<(), StoreError> {
+    if value.is_empty() || value.len() > maximum_length {
+        return Err(StoreError::CorruptDatabaseState("ledger text"));
+    }
+    let length = u16::try_from(value.len())
+        .map_err(|_| StoreError::CorruptDatabaseState("ledger text length"))?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(value.as_bytes());
+    Ok(())
+}
+
+async fn load_usable_wallet_reconciliation(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    chain: Chain,
+    reconciliation_id: Uuid,
+) -> Result<WalletReconciliation, StoreError> {
+    let row = sqlx::query(
+        "SELECT chain,ledger_root,ledger_transaction_count,wallet_spendable_zat, \
+                ledger_spendable_zat,best_tip_hash,best_tip_height, \
+                EXTRACT(EPOCH FROM observed_at)::BIGINT AS observed_at, \
+                EXTRACT(EPOCH FROM valid_until)::BIGINT AS valid_until,status, \
+                valid_until > clock_timestamp() AS unexpired \
+         FROM wallet_reconciliations WHERE deployment_id=$1 AND id=$2 FOR SHARE",
+    )
+    .bind(deployment_id)
+    .bind(reconciliation_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(StoreError::WalletReconciliationStale)?;
+    let stored_chain = Chain::parse(&row.try_get::<String, _>("chain")?)?;
+    let status = row.try_get::<String, _>("status")?;
+    let unexpired = row.try_get::<bool, _>("unexpired")?;
+    let wallet_spendable_zat = u64::try_from(row.try_get::<i64, _>("wallet_spendable_zat")?)
+        .map_err(|_| StoreError::CorruptDatabaseState("wallet balance"))?;
+    let ledger_spendable_zat = u64::try_from(row.try_get::<i64, _>("ledger_spendable_zat")?)
+        .map_err(|_| StoreError::CorruptDatabaseState("ledger balance"))?;
+    if stored_chain != chain
+        || status != "matched"
+        || !unexpired
+        || wallet_spendable_zat != ledger_spendable_zat
+    {
+        return Err(StoreError::WalletReconciliationStale);
+    }
+    Ok(WalletReconciliation {
+        id: reconciliation_id,
+        chain,
+        ledger_root: exact_hash(row.try_get("ledger_root")?, "wallet ledger root")?,
+        ledger_transaction_count: u64::try_from(row.try_get::<i64, _>("ledger_transaction_count")?)
+            .map_err(|_| StoreError::CorruptDatabaseState("ledger transaction count"))?,
+        wallet_spendable_zat,
+        best_tip_hash: exact_hash(row.try_get("best_tip_hash")?, "wallet best tip")?,
+        best_tip_height: u32::try_from(row.try_get::<i64, _>("best_tip_height")?)
+            .map_err(|_| StoreError::CorruptDatabaseState("wallet best tip height"))?,
+        observed_at: unix_u64(row.try_get("observed_at")?)?,
+        valid_until: unix_u64(row.try_get("valid_until")?)?,
+    })
+}
+
+fn exact_hash(value: Vec<u8>, field: &'static str) -> Result<[u8; 32], StoreError> {
+    value
+        .try_into()
+        .map_err(|_| StoreError::CorruptDatabaseState(field))
+}
+
+const fn asset_for_chain(chain: Chain) -> Asset {
+    match chain {
+        Chain::Wcash => Asset::Wec,
+        Chain::Zcash => Asset::Zec,
+    }
+}
+
+const fn network_for_deployment(network: DeploymentNetwork) -> ChainNetwork {
+    match network {
+        DeploymentNetwork::Testnet => ChainNetwork::Testnet,
+        DeploymentNetwork::Mainnet => ChainNetwork::Mainnet,
+    }
+}
+
+const fn portal_receiver_kind(receiver: ReceiverKind) -> PortalReceiverKind {
+    match receiver {
+        ReceiverKind::Transparent => PortalReceiverKind::Transparent,
+        ReceiverKind::Ironwood => PortalReceiverKind::Ironwood,
+    }
 }
 
 struct SignedTransitionFacts<'a> {
@@ -2460,8 +3021,9 @@ async fn import_worker(
     .await?;
     sqlx::query(
         "INSERT INTO workers \
-         (deployment_id,id,account_id,label,canonical_login,enabled) \
-         VALUES ($1,$2,$3,$4,$5,FALSE) ON CONFLICT (deployment_id,id) DO NOTHING",
+         (deployment_id,id,account_id,label,canonical_login,enabled,revoked_at) \
+         VALUES ($1,$2,$3,$4,$5,FALSE,clock_timestamp()) \
+         ON CONFLICT (deployment_id,id) DO NOTHING",
     )
     .bind(deployment_id)
     .bind(worker_id)
@@ -3115,6 +3677,9 @@ pub enum StoreError {
     /// Account ID and canonical login did not identify the same owner.
     #[error("account login does not match the requested owner")]
     AccountOwnershipMismatch,
+    /// One account reached the reviewed bound on retained worker identities.
+    #[error("account worker limit reached")]
+    WorkerLimitReached,
     /// Chain address attestation or payout policy was malformed.
     #[error("invalid payout destination")]
     InvalidPayoutDestination,
@@ -3171,6 +3736,15 @@ pub enum StoreError {
     /// The collector wallet asset is smaller than the confirmed liability plus fee.
     #[error("collector wallet asset does not reconcile with the payout")]
     CollectorReconciliationFailed,
+    /// Wallet observation lacked a current nonzero tip, digest, or bounded time window.
+    #[error("wallet reconciliation observation is invalid or stale")]
+    InvalidWalletObservation,
+    /// An unresolved signed, broadcast, or reorged payment makes wallet balance ambiguous.
+    #[error("wallet reconciliation is blocked by an unresolved payout")]
+    WalletReconciliationBlocked,
+    /// Reconciliation expired, belongs to another chain, or no longer matches the ledger.
+    #[error("wallet reconciliation no longer matches the current ledger")]
+    WalletReconciliationStale,
     /// A nonce reservation lacked an owner or positive count.
     #[error("invalid durable nonce reservation")]
     InvalidNonceReservation,

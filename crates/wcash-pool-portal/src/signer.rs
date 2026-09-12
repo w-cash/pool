@@ -4,10 +4,11 @@
 //! the fail-closed contract that the durable accounting projector may call
 //! after reconciling a mature payout batch.
 
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{Asset, ChainNetwork, ReceiverKind};
@@ -164,6 +165,9 @@ pub enum SignerError {
     /// Wallet or node refused the exact transaction.
     #[error("payout transaction was rejected")]
     Rejected,
+    /// Signer readiness did not finish inside the bounded health-check window.
+    #[error("payout signer readiness timed out")]
+    ReadinessTimeout,
 }
 
 /// Spending-key service implemented outside the Internet-facing portal.
@@ -203,17 +207,40 @@ impl IsolatedPayoutSigner for DisabledPayoutSigner {
 /// Testnet-only orchestration guard around an isolated signer.
 pub struct TestnetPayoutBoundary {
     signer: Arc<dyn IsolatedPayoutSigner>,
+    readiness_slots: Arc<Semaphore>,
 }
 
 impl TestnetPayoutBoundary {
     /// Creates a boundary. Supplying a disabled signer is explicit and safe.
     pub fn new(signer: Arc<dyn IsolatedPayoutSigner>) -> Self {
-        Self { signer }
+        Self {
+            signer,
+            readiness_slots: Arc::new(Semaphore::new(1)),
+        }
     }
 
-    /// Checks the isolated signer without constructing or signing a payment.
-    pub fn readiness(&self) -> Result<(), SignerError> {
-        self.signer.readiness()
+    /// Checks the synchronous isolated signer on one cancellation-safe bounded
+    /// blocking slot. A timed-out blocking call retains the slot until it
+    /// actually exits, preventing readiness probes from exhausting Tokio's
+    /// blocking pool.
+    pub async fn readiness_bounded(&self, timeout: Duration) -> Result<(), SignerError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(5) {
+            return Err(SignerError::InvalidRequest);
+        }
+        let permit =
+            tokio::time::timeout(timeout, Arc::clone(&self.readiness_slots).acquire_owned())
+                .await
+                .map_err(|_| SignerError::ReadinessTimeout)?
+                .map_err(|_| SignerError::Rejected)?;
+        let signer = Arc::clone(&self.signer);
+        let check = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            signer.readiness()
+        });
+        tokio::time::timeout(timeout, check)
+            .await
+            .map_err(|_| SignerError::ReadinessTimeout)?
+            .map_err(|_| SignerError::Rejected)?
     }
 
     /// Validates and delegates an exact Testnet request.
@@ -245,6 +272,7 @@ impl fmt::Debug for TestnetPayoutBoundary {
         formatter
             .debug_struct("TestnetPayoutBoundary")
             .field("signer", &"[ISOLATED]")
+            .field("readiness_slots", &"[BOUNDED]")
             .finish()
     }
 }
@@ -253,6 +281,7 @@ impl fmt::Debug for TestnetPayoutBoundary {
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FixedSigner;
 
@@ -272,6 +301,25 @@ mod tests {
                 transaction_id: "a".repeat(64),
                 output_total_zat: request.outputs.iter().map(|output| output.amount_zat).sum(),
             })
+        }
+    }
+
+    struct SlowSigner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl IsolatedPayoutSigner for SlowSigner {
+        fn readiness(&self) -> Result<(), SignerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        }
+
+        fn sign_and_broadcast(
+            &self,
+            _request: &PayoutBatchRequest,
+        ) -> Result<BroadcastReceipt, SignerError> {
+            Err(SignerError::Rejected)
         }
     }
 
@@ -316,6 +364,29 @@ mod tests {
             .execute(&request(ChainNetwork::Testnet))
             .unwrap_or_else(|error| panic!("unexpected signer failure: {error}"));
         assert_eq!(receipt.output_total_zat, 5);
+    }
+
+    #[tokio::test]
+    async fn timed_out_readiness_retains_its_blocking_slot_until_exit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let boundary = TestnetPayoutBoundary::new(Arc::new(SlowSigner {
+            calls: Arc::clone(&calls),
+        }));
+        assert_eq!(
+            boundary.readiness_bounded(Duration::from_millis(10)).await,
+            Err(SignerError::ReadinessTimeout)
+        );
+        assert_eq!(
+            boundary.readiness_bounded(Duration::from_millis(10)).await,
+            Err(SignerError::ReadinessTimeout)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert_eq!(
+            boundary.readiness_bounded(Duration::from_millis(200)).await,
+            Ok(())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

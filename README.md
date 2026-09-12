@@ -5,12 +5,14 @@ account-based Equihash pool that will merge-mine Wcash and Zcash from one ASIC
 connection. Miners will configure one worker and receive independently
 accounted WEC and ZEC rewards at two chain-specific payout destinations.
 
-> **Current status:** non-deployable engineering foundation. There is no public
-> mining listener, composed PostgreSQL account service, monetary ledger,
-> collector-wallet service, or payout signer. A tested miner-portal crate and
-> embedded UI now exist, but they are not composed or deployed. The executable
-> still reports `ready: false`, has no `serve` command, and opens no listener.
-> Do not point miners or funds at this repository.
+> **Current status:** non-deployable engineering foundation. The tested
+> PostgreSQL store now provides the shared account/token truth, authoritative
+> event projection, dual-chain monetary ledger, portal adapter, private read
+> models, and wallet-reconciliation fence. There is still no public mining
+> listener, authoritative address-decoder composition, collector-wallet
+> service, or crash-safe payout signer. The executable still reports
+> `ready: false`, has no `serve` command, and opens no listener. Do not point
+> miners or funds at this repository.
 
 ## Product decision
 
@@ -86,9 +88,9 @@ is unavailable or its identity is inconsistent.
 | Pool policy | In-memory session ordering with exact authorized-login reuse, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff that excludes idempotently replayed receipts |
 | Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetimes, submitted-header-time preservation, canonical proof/receipt/attribution binding, live response-watermark flush enforcement, bounded all-event sequence and share-identity evidence, and a fenced core-to-backend share path tested against local mock peers |
 | Miner edge | Listener-free bounded actors plus a loopback-only admitted-TCP stream driver for the standard 4+28 nonce profile, with strict framing, absolute deadlines, bounded backpressure, and deterministic synthetic transcripts; no public listener, TLS, credential implementation, durable nonce lease, or ASIC certification |
-| Miner portal | Responsive six-page UI; Argon2id login, encrypted TOTP, digest-only browser sessions, CSRF/origin controls, canonical shared-store worker provisioning contract, masked dual payout settings, replacement hold, loopback server composition, and fail-closed signer boundary; PostgreSQL and wallet adapters are not yet composed |
+| Miner portal | Responsive six-page UI; Argon2id login, encrypted TOTP, digest-only browser sessions, CSRF/origin controls, concrete PostgreSQL worker/payout adapter, masked dual payout settings, authenticated bounded reward/block/payout histories, replacement hold, loopback server composition, and fail-closed signer boundary; authoritative address and wallet adapters are not yet composed |
 | Service process | Readiness-only command; no composed miner or administrative listener |
-| Persistence and money | No PostgreSQL projection, balance ledger, maturity tracking, payout engine, wallet integration, or signing |
+| Persistence and money | Deployment-fenced PostgreSQL projection, chain-specific PPLNS, immature/spendable collector assets, conserved sealed ledger, maturity/reorg/idempotency handling, bounded payout batches, restart recovery, and DB-issued wallet/ledger reconciliation roots; no collector-wallet integration or crash-safe signing/broadcast composition |
 | Wolf integration | Wolf now contains a pool-backend-v1 Unix listener, durable journal, native retained-job path, and matching protocol pin; service composition, end-to-end release evidence, and exact private Wcash recipient attestation remain incomplete |
 | Operations | No production container, deployment manifests, public endpoint, private soak, or release readiness |
 

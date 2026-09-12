@@ -14,6 +14,10 @@ use tokio::{
 use uuid::Uuid;
 use wcash_pool_backend_client::{BackendClient, BackendClientConfig, ExpectedBackend};
 use wcash_pool_edge::AuthenticationError;
+use wcash_pool_portal::{
+    Asset, ChainNetwork, PageRequest, PayoutPreferenceChange, PoolDataSource, PortalRepository,
+    ReceiverKind as PortalReceiverKind, ValidatedDestination,
+};
 use wcash_pool_protocol::{
     canonical_attribution_id, decode_backend_request, encode_backend_message, BackendEvent,
     BackendMessage, BackendRequest, CanonicalUuid, ChainTip, Hex108, Hex32, JobDescriptor,
@@ -21,8 +25,9 @@ use wcash_pool_protocol::{
     BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, REQUIRED_BACKEND_CAPABILITIES,
 };
 use wcash_pool_store::{
-    Chain, ChainPolicy, DeploymentIdentity, DeploymentNetwork, PayoutConfirmation, PayoutReorg,
-    PostgresStore, ProjectionResult, StoreError,
+    generate_mining_token, hash_mining_token, Chain, ChainPolicy, DeploymentIdentity,
+    DeploymentNetwork, PayoutConfirmation, PayoutReorg, PostgresPoolDataSource, PostgresStore,
+    ProjectionResult, StoreError, WalletObservation, WalletReconciliation,
 };
 
 fn identity(seed: u8) -> DeploymentIdentity {
@@ -195,8 +200,10 @@ async fn insert_destination(
     };
     sqlx::query(
         "INSERT INTO payout_destinations \
-         (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by,validated_at,active_after,address_digest,payout_threshold_zat,automatic,state) \
-         VALUES ($1,$2,$3,$4,'testnet',$5,'transparent','integration-authority-v1',clock_timestamp(),clock_timestamp(),$6,1,true,'active')",
+         (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by,validated_at, \
+          active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
+         VALUES ($1,$2,$3,$4,'testnet',$5,'transparent','integration-authority-v1', \
+                 clock_timestamp(),clock_timestamp(),$6,1,true,'active',1)",
     )
     .bind(store.deployment_id())
     .bind(destination_id)
@@ -328,6 +335,46 @@ async fn fund_operator_capital(
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await
+}
+
+async fn reconcile_wallet(
+    store: &PostgresStore,
+    pool: &sqlx::PgPool,
+    chain: Chain,
+) -> Result<WalletReconciliation, StoreError> {
+    let now = sqlx::query_scalar::<_, i64>("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+        .fetch_one(pool)
+        .await?;
+    let spendable = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(e.amount_zat),0)::BIGINT FROM ledger_entries e \
+         JOIN ledger_transactions t \
+           ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
+         WHERE e.deployment_id=$1 AND t.chain=$2 \
+           AND e.ledger_account='collector_spendable_asset'",
+    )
+    .bind(store.deployment_id())
+    .bind(chain.as_str())
+    .fetch_one(pool)
+    .await?;
+    let now = u64::try_from(now).expect("database clock is positive");
+    store
+        .record_wallet_reconciliation(&WalletObservation {
+            chain,
+            wallet_state_digest: [match chain {
+                Chain::Wcash => 0x91,
+                Chain::Zcash => 0x92,
+            }; 32],
+            wallet_spendable_zat: u64::try_from(spendable)
+                .expect("collector spendable balance is nonnegative"),
+            best_tip_hash: [match chain {
+                Chain::Wcash => 0xa1,
+                Chain::Zcash => 0xa2,
+            }; 32],
+            best_tip_height: 50_000,
+            observed_at: now,
+            valid_until: now + 240,
+        })
+        .await
 }
 
 #[tokio::test]
@@ -724,19 +771,108 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     credit_payable(&store, &admin, second_account_id, Chain::Wcash, 200)
         .await
         .expect("second WEC credit commits");
+    let first_wec_reconciliation = reconcile_wallet(&store, &admin, Chain::Wcash)
+        .await
+        .expect("first WEC wallet state reconciles");
     let key = Uuid::new_v4();
     let wec_batch = store
-        .create_payout_batch(Chain::Wcash, key)
+        .create_payout_batch(Chain::Wcash, key, first_wec_reconciliation.id)
         .await
         .expect("WEC batch builds");
     assert_eq!(wec_batch.outputs.len(), 1, "batch policy caps output count");
     assert_eq!(wec_batch.miner_total_zat, 200, "ZEC never enters WEC batch");
+    assert_eq!(wec_batch.reconciliation_id, first_wec_reconciliation.id);
+    assert_eq!(
+        store
+            .create_payout_batch(Chain::Wcash, key, first_wec_reconciliation.id)
+            .await
+            .expect("exact payout creation replay is idempotent"),
+        wec_batch
+    );
+    let signer_request = store
+        .build_signer_request(wec_batch.id)
+        .await
+        .expect("signer request is derived from stored reconciliation facts");
+    assert_eq!(
+        signer_request.reconciliation_id,
+        first_wec_reconciliation.id
+    );
+    assert_eq!(signer_request.ledger_root, wec_batch.ledger_root);
+    assert_eq!(signer_request.outputs.len(), 1);
+    assert_eq!(
+        signer_request.outputs[0].allocation_id,
+        wec_batch.outputs[0].allocation_id
+    );
+    assert!(
+        sqlx::query("UPDATE payout_batches SET ledger_root=$3 WHERE deployment_id=$1 AND id=$2",)
+            .bind(store.deployment_id())
+            .bind(wec_batch.id)
+            .bind([0xee; 32].as_slice())
+            .execute(&admin)
+            .await
+            .is_err(),
+        "database trigger seals the signer ledger root"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE payout_items SET amount_zat=amount_zat+1 \
+             WHERE deployment_id=$1 AND batch_id=$2",
+        )
+        .bind(store.deployment_id())
+        .bind(wec_batch.id)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "database trigger seals payout outputs"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO payout_items \
+             (deployment_id,batch_id,account_id,destination_id,amount_zat,allocation_id) \
+             SELECT $1,$2,$3,d.id,1,$4 FROM payout_destinations d \
+              WHERE d.deployment_id=$1 AND d.account_id=$3 AND d.chain='wcash' AND d.state='active'",
+        )
+        .bind(store.deployment_id())
+        .bind(wec_batch.id)
+        .bind(account_id)
+        .bind(Uuid::new_v4())
+        .execute(&admin)
+        .await
+        .is_err(),
+        "database trigger rejects outputs appended after the batch seal"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE payout_destinations SET address='tampered-address' \
+             WHERE deployment_id=$1 AND id=$2",
+        )
+        .bind(store.deployment_id())
+        .bind(wec_batch.outputs[0].destination_id)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "database trigger seals validated destination facts"
+    );
+    let second_wec_reconciliation = reconcile_wallet(&store, &admin, Chain::Wcash)
+        .await
+        .expect("post-reservation WEC wallet state reconciles");
+    assert!(matches!(
+        store
+            .create_payout_batch(Chain::Wcash, key, second_wec_reconciliation.id)
+            .await,
+        Err(StoreError::PayoutIdempotencyConflict)
+    ));
     let second_wec_batch = store
-        .create_payout_batch(Chain::Wcash, Uuid::new_v4())
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), second_wec_reconciliation.id)
         .await
         .expect("deterministic pagination leaves the next WEC account payable");
     assert_eq!(second_wec_batch.outputs.len(), 1);
     assert_eq!(second_wec_batch.miner_total_zat, 100);
+    let replayed_signer_request = store
+        .build_signer_request(wec_batch.id)
+        .await
+        .expect("historic signer root re-derives after later ledger appends");
+    assert_eq!(replayed_signer_request.ledger_root, wec_batch.ledger_root);
     assert_eq!(
         store
             .list_resumable_payout_batches(Chain::Wcash, 10)
@@ -745,12 +881,17 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
             .len(),
         2
     );
+    let zec_reconciliation = reconcile_wallet(&store, &admin, Chain::Zcash)
+        .await
+        .expect("ZEC wallet state reconciles independently");
     assert!(matches!(
-        store.create_payout_batch(Chain::Zcash, key).await,
+        store
+            .create_payout_batch(Chain::Zcash, key, zec_reconciliation.id)
+            .await,
         Err(StoreError::PayoutIdempotencyConflict)
     ));
     let zec_batch = store
-        .create_payout_batch(Chain::Zcash, Uuid::new_v4())
+        .create_payout_batch(Chain::Zcash, Uuid::new_v4(), zec_reconciliation.id)
         .await
         .expect("ZEC batch builds");
     assert_eq!(zec_batch.miner_total_zat, 300, "WEC never enters ZEC batch");
@@ -790,6 +931,10 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         )
         .await
         .expect("exact signer replay is idempotent");
+    assert!(matches!(
+        reconcile_wallet(&store, &admin, Chain::Wcash).await,
+        Err(StoreError::WalletReconciliationBlocked)
+    ));
     assert!(matches!(
         store
             .mark_payout_signed(
@@ -980,6 +1125,273 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
             .await,
         Err(AuthenticationError::Denied)
     ));
+
+    // The portal adapter uses this exact PostgreSQL identity and token truth;
+    // there is no secondary SQLite worker or payout database.
+    PortalRepository::readiness(&store)
+        .await
+        .expect("deployment and zero-fee policies are portal-ready");
+    let portal_account = Uuid::new_v4();
+    let password_token = generate_mining_token().expect("test password material exists");
+    let password_hash = hash_mining_token(&password_token).expect("password PHC is canonical");
+    PortalRepository::create_account(&store, portal_account, "bob", &password_hash, 1_725_000_100)
+        .await
+        .expect("portal account persists");
+    let credential = PortalRepository::account_by_username(&store, "bob")
+        .await
+        .expect("portal lookup succeeds")
+        .expect("portal account exists");
+    assert_eq!(credential.id, portal_account);
+    let portal_worker =
+        PortalRepository::provision_worker(&store, portal_account, "bob", "rig1", 1_725_000_101)
+            .await
+            .expect("portal worker persists through shared store");
+    assert!(portal_worker.token.starts_with("zw1."));
+    assert!(auth
+        .authenticate_credentials("bob.rig1", &portal_worker.token)
+        .await
+        .is_ok());
+    let listed = PortalRepository::list_workers(&store, portal_account, "bob")
+        .await
+        .expect("workers list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].revoked_at, None);
+    assert!(PortalRepository::revoke_worker(
+        &store,
+        portal_account,
+        portal_worker.worker_id,
+        1_725_000_102,
+    )
+    .await
+    .expect("portal worker revocation commits"));
+    let listed = PortalRepository::list_workers(&store, portal_account, "bob")
+        .await
+        .expect("revoked worker remains auditable");
+    assert_eq!(listed[0].revoked_at, Some(1_725_000_102));
+    assert!(matches!(
+        auth.authenticate_credentials("bob.rig1", &portal_worker.token)
+            .await,
+        Err(AuthenticationError::Denied)
+    ));
+
+    let first_destination = ValidatedDestination::from_authoritative_validation(
+        Asset::Wec,
+        ChainNetwork::Testnet,
+        "wtestsapling1portalintegrationdestination0001".to_owned(),
+        PortalReceiverKind::Ironwood,
+    )
+    .expect("authoritative fixture");
+    let first_setting = PortalRepository::configure_payout(
+        &store,
+        PayoutPreferenceChange {
+            account_id: portal_account,
+            destination: &first_destination,
+            threshold_zat: 100,
+            automatic: true,
+            changed_at: 1_725_000_110,
+            replacement_hold_secs: 48 * 60 * 60,
+            address_digest: &[0x31; 32],
+        },
+    )
+    .await
+    .expect("initial payout activates immediately");
+    assert!(first_setting.active_destination.is_some());
+    assert_eq!(first_setting.pending_destination, None);
+    assert_eq!(first_setting.revision, 1);
+    let replacement = ValidatedDestination::from_authoritative_validation(
+        Asset::Wec,
+        ChainNetwork::Testnet,
+        "wtestsapling1portalintegrationdestination0002".to_owned(),
+        PortalReceiverKind::Ironwood,
+    )
+    .expect("authoritative replacement fixture");
+    let replacement_setting = PortalRepository::configure_payout(
+        &store,
+        PayoutPreferenceChange {
+            account_id: portal_account,
+            destination: &replacement,
+            threshold_zat: 200,
+            automatic: false,
+            changed_at: 1_725_000_120,
+            replacement_hold_secs: 48 * 60 * 60,
+            address_digest: &[0x32; 32],
+        },
+    )
+    .await
+    .expect("replacement is held");
+    assert!(replacement_setting.active_destination.is_some());
+    assert!(replacement_setting.pending_destination.is_some());
+    assert_eq!(
+        replacement_setting.pending_effective_at,
+        Some(1_725_000_120 + 48 * 60 * 60)
+    );
+    assert_eq!(replacement_setting.revision, 2);
+    let settings = PortalRepository::payout_settings(
+        &store,
+        portal_account,
+        ChainNetwork::Testnet,
+        1_725_000_121,
+    )
+    .await
+    .expect("masked settings load");
+    assert_eq!(settings.len(), 1);
+    let active = PortalRepository::active_payout_destination(
+        &store,
+        portal_account,
+        Asset::Wec,
+        ChainNetwork::Testnet,
+        1_725_000_121,
+    )
+    .await
+    .expect("active destination reads")
+    .expect("initial destination remains active");
+    assert_eq!(
+        active.canonical_address(),
+        first_destination.canonical_address()
+    );
+    assert!(PortalRepository::payout_settings(
+        &store,
+        portal_account,
+        ChainNetwork::Mainnet,
+        1_725_000_121,
+    )
+    .await
+    .is_err());
+
+    let historic_account = event_worker.account_id.get();
+    let rewards = PortalRepository::reward_history(
+        &store,
+        historic_account,
+        PageRequest {
+            before: None,
+            limit: 1,
+        },
+    )
+    .await
+    .expect("private rewards page");
+    assert_eq!(rewards.items.len(), 1);
+    assert!(rewards.next_before.is_some());
+    let blocks = PortalRepository::found_blocks(
+        &store,
+        historic_account,
+        PageRequest {
+            before: None,
+            limit: 10,
+        },
+    )
+    .await
+    .expect("private found-block page");
+    assert_eq!(blocks.items.len(), 2);
+    let payouts = PortalRepository::payout_history(
+        &store,
+        wec_batch.outputs[0].account_id,
+        PageRequest {
+            before: None,
+            limit: 10,
+        },
+    )
+    .await
+    .expect("private payout page");
+    assert!(!payouts.items.is_empty());
+    assert!(payouts
+        .items
+        .iter()
+        .any(|payout| payout.transaction_id.is_some()));
+
+    let overview = PostgresPoolDataSource::new(store.clone());
+    assert!(!overview.overview().available);
+    overview
+        .refresh()
+        .await
+        .expect("overview projection refreshes");
+    let snapshot = overview.overview();
+    assert!(snapshot.available);
+    assert_eq!(snapshot.wec_fee_bps, Some(0));
+    assert_eq!(snapshot.zec_fee_bps, Some(0));
+    assert_eq!(snapshot.fee_policy_revision, Some(1));
+    assert_eq!(
+        snapshot.wcash_height,
+        Some(u64::from(descriptor.wcash_height - 1))
+    );
+    assert_eq!(
+        snapshot.zcash_height,
+        Some(u64::from(descriptor.zcash_height - 1))
+    );
+
+    let stale_store = PostgresStore::connect(&database_url, 2, identity(73))
+        .await
+        .expect("isolated reconciliation deployment connects");
+    stale_store
+        .bind_deployment()
+        .await
+        .expect("isolated reconciliation deployment binds");
+    stale_store
+        .bind_zero_fee_launch_policies(&policy(Chain::Wcash), &policy(Chain::Zcash))
+        .await
+        .expect("isolated reconciliation policies bind");
+    let stale_account = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts (deployment_id,id,login) VALUES ($1,$2,'stale_account')")
+        .bind(stale_store.deployment_id())
+        .bind(stale_account)
+        .execute(&admin)
+        .await
+        .expect("isolated reconciliation account seeds");
+    insert_destination(&stale_store, &admin, stale_account, Chain::Wcash)
+        .await
+        .expect("isolated reconciliation destination seeds");
+    credit_payable(&stale_store, &admin, stale_account, Chain::Wcash, 10)
+        .await
+        .expect("isolated reconciliation payable credit commits");
+    let stale_checkpoint = reconcile_wallet(&stale_store, &admin, Chain::Wcash)
+        .await
+        .expect("initial isolated wallet state reconciles");
+    fund_operator_capital(&stale_store, &admin, Chain::Wcash, 1)
+        .await
+        .expect("later ledger fact commits");
+    assert!(matches!(
+        stale_store
+            .create_payout_batch(Chain::Wcash, Uuid::new_v4(), stale_checkpoint.id)
+            .await,
+        Err(StoreError::WalletReconciliationStale)
+    ));
+    let database_now = u64::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+            .fetch_one(&admin)
+            .await
+            .expect("database clock reads"),
+    )
+    .expect("database clock is positive");
+    assert!(matches!(
+        stale_store
+            .record_wallet_reconciliation(&WalletObservation {
+                chain: Chain::Wcash,
+                wallet_state_digest: [0xc1; 32],
+                wallet_spendable_zat: 12,
+                best_tip_hash: [0xc2; 32],
+                best_tip_height: 60_000,
+                observed_at: database_now,
+                valid_until: database_now + 240,
+            })
+            .await,
+        Err(StoreError::CollectorReconciliationFailed)
+    ));
+    let mismatch_state = sqlx::query(
+        "SELECT s.payouts_frozen,s.freeze_reason, \
+                (SELECT COUNT(*) FROM wallet_reconciliations r \
+                  WHERE r.deployment_id=s.deployment_id AND r.chain=s.chain \
+                    AND r.status='mismatch') AS mismatch_count \
+         FROM chain_safety_state s WHERE s.deployment_id=$1 AND s.chain='wcash'",
+    )
+    .bind(stale_store.deployment_id())
+    .fetch_one(&admin)
+    .await
+    .expect("wallet mismatch audit state reads");
+    assert!(mismatch_state.get::<bool, _>("payouts_frozen"));
+    assert_eq!(
+        mismatch_state.get::<Option<String>, _>("freeze_reason"),
+        Some("wallet_reconciliation_mismatch".to_owned())
+    );
+    assert_eq!(mismatch_state.get::<i64, _>("mismatch_count"), 1);
 
     let counts = sqlx::query(
         "SELECT \

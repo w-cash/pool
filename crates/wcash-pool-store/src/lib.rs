@@ -9,6 +9,7 @@
 
 mod accounting;
 mod auth;
+mod portal;
 mod postgres;
 
 pub use accounting::{
@@ -18,9 +19,11 @@ pub use auth::{
     generate_mining_token, hash_mining_token, MiningToken, MiningTokenError,
     PostgresAuthenticationProvider,
 };
+pub use portal::PostgresPoolDataSource;
 pub use postgres::{
     AccountCredentialRecord, AuthenticatedPortalSession, Chain, ChainPolicy, DeploymentIdentity,
     DeploymentNetwork, NewPortalSessionRecord, NonceRange, PayoutBatch, PayoutBatchState,
     PayoutConfigurationReadiness, PayoutConfirmation, PayoutInstruction, PayoutReorg,
     PostgresStore, ProjectionResult, ReceiverKind, SignedPayoutArtifact, StoreError,
+    WalletObservation, WalletReconciliation,
 };

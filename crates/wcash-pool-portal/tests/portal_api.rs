@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use axum::{
@@ -556,6 +557,22 @@ impl IsolatedPayoutSigner for ReadySigner {
     }
 }
 
+struct BlockingReadinessSigner;
+
+impl IsolatedPayoutSigner for BlockingReadinessSigner {
+    fn readiness(&self) -> Result<(), SignerError> {
+        std::thread::sleep(Duration::from_millis(750));
+        Ok(())
+    }
+
+    fn sign_and_broadcast(
+        &self,
+        _request: &PayoutBatchRequest,
+    ) -> Result<BroadcastReceipt, SignerError> {
+        Err(SignerError::Rejected)
+    }
+}
+
 fn portal(clock: Arc<FixedClock>) -> axum::Router {
     portal_with_repository(clock, Arc::new(MemoryRepository::default()))
 }
@@ -919,6 +936,76 @@ async fn readiness_fails_closed_without_signer() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn readiness_times_out_without_blocking_tokio_workers() {
+    let clock = Arc::new(FixedClock::default());
+    clock.0.store(1_800_000_000, Ordering::SeqCst);
+    let app = PortalApp::with_clock(
+        PortalConfig::testnet(),
+        PortalSecrets::new([3; 32], [7; 32]),
+        Arc::new(MemoryRepository::default()),
+        Arc::new(FixtureValidator),
+        Arc::new(UnavailablePoolData),
+        Arc::new(TestnetPayoutBoundary::new(Arc::new(
+            BlockingReadinessSigner,
+        ))),
+        clock,
+    )
+    .expect("valid blocking-signer portal")
+    .router();
+    let response = tokio::time::timeout(
+        Duration::from_millis(650),
+        app.oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        ),
+    )
+    .await
+    .expect("readiness route has an absolute deadline")
+    .expect("readiness response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn private_history_routes_require_authentication_and_bounded_pages() {
+    let app = portal(Arc::new(FixedClock::default()));
+    for route in ["/api/v1/rewards", "/api/v1/blocks", "/api/v1/payouts"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(route)
+                    .body(Body::empty())
+                    .expect("history request"),
+            )
+            .await
+            .expect("history response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let (session, _, _) = register_and_login(&app, "historyminer").await;
+    let invalid = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/rewards?limit=0")
+                .header("cookie", &session)
+                .body(Body::empty())
+                .expect("invalid page request"),
+        )
+        .await
+        .expect("invalid page response");
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let unavailable = app
+        .oneshot(
+            Request::get("/api/v1/rewards?limit=100")
+                .header("cookie", session)
+                .body(Body::empty())
+                .expect("valid page request"),
+        )
+        .await
+        .expect("valid page response");
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

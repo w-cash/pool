@@ -25,6 +25,11 @@ stream exactly match the deployment row.
 - Payout output count and signer fee are policy-capped; transaction IDs are
   unique per chain; exact signed bytes and best-chain evidence are retained for
   crash recovery and reorg handling.
+- Every new payout batch consumes a fresh, short-lived wallet reconciliation
+  whose wallet balance matches the chain-specific spendable collector ledger.
+  The store—not an API caller—derives the checkpoint UUID and streaming ledger
+  root used by the isolated signer request. Stale roots and wallet mismatches
+  fail closed; mismatches freeze that chain.
 - Nonce ranges are atomically reserved by profile and namespace before their
   one-shot allocator is constructed. A crash may waste a range but cannot
   cause the database to reissue it.
@@ -44,13 +49,15 @@ be labelled as archival telemetry, but they are not accounting entries.
 
 ## Deliberate readiness gates
 
-This crate is not a standalone public-pool launch. Payout destination writes
-remain disabled until the service supplies authoritative Wolf Wcash and
-Zcash/Zallet address decoders. Signing and broadcast also require a separately
-audited, durable wallet-reconciliation checkpoint. The public ZIP-301 service,
-TLS/plaintext listeners, portal adapter, signing isolation, and PostgreSQL
-least-privilege roles are composed by `wcash-poold`; readiness must stay false
-until those dependencies are present.
+This crate is not a standalone public-pool launch. It supplies the concrete
+PostgreSQL portal adapter and durable wallet/ledger reconciliation contract,
+but payout destination writes remain disabled until the service supplies
+authoritative Wolf Wcash and Zcash/Zallet address decoders. The isolated wallet
+integration must also persist signed transaction bytes before broadcast; the
+portal's current one-call sign-and-broadcast test boundary is not safe for that
+production transition. The public ZIP-301 service, TLS/plaintext listeners,
+wallet adapter, and PostgreSQL least-privilege roles are composed by
+`wcash-poold`; readiness must stay false until those dependencies are present.
 
 Run the real database suite only against a disposable PostgreSQL database:
 
