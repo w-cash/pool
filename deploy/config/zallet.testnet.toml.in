@@ -1,5 +1,7 @@
 [builder]
 
+[builder.limits]
+
 [consensus]
 network = "test"
 

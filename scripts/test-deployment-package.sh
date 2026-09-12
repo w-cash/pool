@@ -148,7 +148,7 @@ assert runtime["wcash_wallet_sync_timeout_seconds"] == 900
 assert runtime["wcash_signer_account"] == "33333333-3333-4333-8333-333333333333"
 assert runtime["zcash_signer_account"] == "44444444-4444-4444-8444-444444444444"
 assert zallet["consensus"]["network"] == "test"
-assert zallet["builder"] == {}
+assert zallet["builder"] == {"limits": {}}
 assert zallet["external"]["broadcast"] is False
 assert zallet["features"]["as_of_version"] == "0.1.0-beta.3"
 assert zallet["rpc"]["bind"] == ["127.0.0.1:28232"]
