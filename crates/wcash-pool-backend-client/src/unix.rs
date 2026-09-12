@@ -19,7 +19,7 @@ use wcash_pool_protocol::{
     canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id,
     decode_backend_message, encode_backend_request, AcceptableJob, BackendCapability,
     BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex1344, Hex32,
-    Hex4, JobDescriptor, ProtocolError, ShareReceipt, TargetLe, WorkerIdentity,
+    Hex4, JobDescriptor, ProtocolError, ShareReceipt, TargetBe, TargetLe, WorkerIdentity,
     BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES,
     MAX_EVENT_PAGE_ITEMS,
 };
@@ -43,6 +43,7 @@ pub struct ExpectedBackend {
     chain_id: u32,
     wcash_payout_commitment: Hex32,
     zcash_payout_commitment: Hex32,
+    share_target_ceiling_be: TargetBe,
     backend_instance: Option<CanonicalUuid>,
     journal_stream: Option<CanonicalUuid>,
 }
@@ -55,6 +56,7 @@ impl ExpectedBackend {
         chain_id: u32,
         wcash_payout_commitment: Hex32,
         zcash_payout_commitment: Hex32,
+        share_target_ceiling_be: TargetBe,
     ) -> Result<Self, ClientConfigError> {
         if wcash_genesis.is_zero() {
             return Err(ClientConfigError::ZeroNetworkIdentity {
@@ -79,12 +81,16 @@ impl ExpectedBackend {
                 field: "zcash_payout_commitment",
             });
         }
+        if share_target_ceiling_be.is_zero() {
+            return Err(ClientConfigError::ZeroShareTargetCeiling);
+        }
         Ok(Self {
             wcash_genesis,
             zcash_genesis,
             chain_id,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             backend_instance: None,
             journal_stream: None,
         })
@@ -220,12 +226,15 @@ pub enum ClientConfigError {
         /// Invalid expected field.
         field: &'static str,
     },
+    /// The authenticated maximum accepted share target was all zeroes.
+    #[error("expected share target ceiling must be nonzero")]
+    ZeroShareTargetCeiling,
     /// Backend and journal identities identify different namespaces.
     #[error("expected backend instance and journal stream identities must be distinct")]
     DuplicatePersistentIdentity,
 }
 
-/// Identity negotiated with a protocol-v1 backend.
+/// Identity negotiated with the current authenticated backend protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendIdentity {
     /// Unique identity of this socket session.
@@ -251,6 +260,7 @@ pub struct BackendAuthority {
     chain_id: u32,
     wcash_payout_commitment: Hex32,
     zcash_payout_commitment: Hex32,
+    share_target_ceiling_be: TargetBe,
     backend_instance: CanonicalUuid,
     journal_stream: CanonicalUuid,
 }
@@ -279,6 +289,11 @@ impl BackendAuthority {
     /// Returns the authenticated Zcash block-reward recipient commitment.
     pub const fn zcash_payout_commitment(&self) -> &Hex32 {
         &self.zcash_payout_commitment
+    }
+
+    /// Returns the authenticated easiest accepted share target in ZIP-301 byte order.
+    pub const fn share_target_ceiling_be(&self) -> &TargetBe {
+        &self.share_target_ceiling_be
     }
 
     /// Returns the stable backend installation identity.
@@ -907,7 +922,7 @@ pub enum ClientError {
     RequestIdExhausted,
 }
 
-/// One timeout-bounded protocol-v1 connection to a local Unix socket.
+/// One timeout-bounded current-protocol connection to a local Unix socket.
 pub struct BackendClient {
     stream: UnixStream,
     config: BackendClientConfig,
@@ -1030,6 +1045,7 @@ impl BackendClient {
                 zcash_genesis,
                 wcash_payout_commitment,
                 zcash_payout_commitment,
+                share_target_ceiling_be,
                 chain_id,
                 current_event_seq,
                 ..
@@ -1041,6 +1057,7 @@ impl BackendClient {
                     &zcash_genesis,
                     &wcash_payout_commitment,
                     &zcash_payout_commitment,
+                    &share_target_ceiling_be,
                     chain_id,
                     last_event_seq,
                     current_event_seq,
@@ -1667,6 +1684,7 @@ impl BackendClient {
         zcash_genesis: &Hex32,
         wcash_payout_commitment: &Hex32,
         zcash_payout_commitment: &Hex32,
+        share_target_ceiling_be: &TargetBe,
         chain_id: u32,
         last_event_seq: u64,
         current_event_seq: u64,
@@ -1694,6 +1712,11 @@ impl BackendClient {
         if zcash_payout_commitment != &self.config.expected.zcash_payout_commitment {
             return Err(self.invalidate(ClientError::IdentityMismatch {
                 field: "Zcash payout commitment",
+            }));
+        }
+        if share_target_ceiling_be != &self.config.expected.share_target_ceiling_be {
+            return Err(self.invalidate(ClientError::IdentityMismatch {
+                field: "share target ceiling",
             }));
         }
         if self
@@ -1748,6 +1771,7 @@ impl BackendClient {
             chain_id: self.config.expected.chain_id,
             wcash_payout_commitment: self.config.expected.wcash_payout_commitment.clone(),
             zcash_payout_commitment: self.config.expected.zcash_payout_commitment.clone(),
+            share_target_ceiling_be: self.config.expected.share_target_ceiling_be.clone(),
             backend_instance: self.identity.backend_instance,
             journal_stream: self.identity.journal_stream,
         }
@@ -2128,7 +2152,7 @@ mod tests {
         decode_backend_request, encode_backend_message, AcceptableJob, BackendCapability,
         BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex108,
         Hex1344, Hex28, Hex32, Hex4, JobDescriptor, MergedChain, NonceProfile, NonceSuffix,
-        ProtocolError, ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity,
+        ProtocolError, ShareReceipt, TargetBe, TargetLe, WinnerDescriptor, WorkerIdentity,
         BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES,
     };
 
@@ -2194,6 +2218,11 @@ mod tests {
             0x5743_4153,
             Hex32::new([0x33; 32]),
             Hex32::new([0x44; 32]),
+            TargetBe::new([
+                0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3,
+                0xd2, 0xe1, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a, 0xab,
+                0xbc, 0xcd, 0xde, 0xef,
+            ]),
         )?
         .with_backend_instance(uuid(2))
         .with_journal_stream(uuid(3)))
@@ -2216,6 +2245,11 @@ mod tests {
             zcash_genesis: Hex32::new([0x22; 32]),
             wcash_payout_commitment: Hex32::new([0x33; 32]),
             zcash_payout_commitment: Hex32::new([0x44; 32]),
+            share_target_ceiling_be: TargetBe::new([
+                0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3,
+                0xd2, 0xe1, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a, 0xab,
+                0xbc, 0xcd, 0xde, 0xef,
+            ]),
             chain_id: 0x5743_4153,
             current_event_seq: 10,
         }
@@ -2238,7 +2272,7 @@ mod tests {
     }
 
     /// Writes the durable event before its correlated acknowledgement, matching
-    /// the backend-v1 live-stream flush contract. Exact replays reuse the original
+    /// the backend live-stream flush contract. Exact replays reuse the original
     /// receipt and therefore do not append or redeliver another event.
     async fn write_share_commit(
         stream: &mut UnixStream,
@@ -2568,6 +2602,7 @@ mod tests {
                 0x5743_4153,
                 Hex32::new([0; 32]),
                 Hex32::new([0x44; 32]),
+                TargetBe::new([1; 32]),
             ),
             Err(ClientConfigError::ZeroPayoutCommitment {
                 field: "wcash_payout_commitment"
@@ -2580,10 +2615,22 @@ mod tests {
                 0x5743_4153,
                 Hex32::new([0x33; 32]),
                 Hex32::new([0; 32]),
+                TargetBe::new([1; 32]),
             ),
             Err(ClientConfigError::ZeroPayoutCommitment {
                 field: "zcash_payout_commitment"
             })
+        ));
+        assert!(matches!(
+            ExpectedBackend::new(
+                Hex32::new([0x11; 32]),
+                Hex32::new([0x22; 32]),
+                0x5743_4153,
+                Hex32::new([0x33; 32]),
+                Hex32::new([0x44; 32]),
+                TargetBe::new([0; 32]),
+            ),
+            Err(ClientConfigError::ZeroShareTargetCeiling)
         ));
         let expected = expected_backend()?;
         assert!(matches!(
@@ -2699,6 +2746,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_asymmetric_share_target_ceiling_fails_closed() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_request(&mut stream).await?;
+            let BackendRequest::Hello { id, .. } = request else {
+                return TestResult::Err("first request was not hello".into());
+            };
+            let mut response = hello_ok(id);
+            let BackendMessage::HelloOk {
+                share_target_ceiling_be,
+                ..
+            } = &mut response
+            else {
+                unreachable!("hello fixture has the expected variant")
+            };
+            let mut changed = *share_target_ceiling_be.as_bytes();
+            changed[0] ^= 0x80;
+            *share_target_ceiling_be = TargetBe::new(changed);
+            write_message(&mut stream, &response).await?;
+            TestResult::Ok(())
+        });
+
+        let result = BackendClient::connect(config(&socket.path)?, uuid(9), 0).await;
+        assert!(matches!(
+            result,
+            Err(ClientError::IdentityMismatch {
+                field: "share target ceiling"
+            })
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nonzero_replay_cursor_requires_a_journal_identity() -> TestResult {
         let expected = ExpectedBackend::new(
             Hex32::new([0x11; 32]),
@@ -2706,6 +2789,7 @@ mod tests {
             0x5743_4153,
             Hex32::new([0x33; 32]),
             Hex32::new([0x44; 32]),
+            TargetBe::new([1; 32]),
         )?;
         let config = BackendClientConfig::new("/tmp/unused-wcash-backend.sock", expected)?;
         assert!(matches!(
@@ -4924,7 +5008,7 @@ mod tests {
             };
             let payload = serde_json::to_vec(&serde_json::json!({
                 "type": "hello_ok",
-                "v": 2,
+                "v": 1,
                 "id": id
             }))?;
             let length = u32::try_from(payload.len())?;
@@ -4938,7 +5022,7 @@ mod tests {
             result,
             Err(ClientError::VersionMismatch {
                 expected: BACKEND_PROTOCOL_VERSION,
-                actual: 2
+                actual: 1
             })
         ));
         server.await??;

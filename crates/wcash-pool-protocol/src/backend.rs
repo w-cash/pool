@@ -4,11 +4,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    error::invalid, CanonicalUuid, FixedHex, Hex108, Hex1344, Hex32, Hex4, ProtocolError, TargetLe,
+    error::invalid, CanonicalUuid, FixedHex, Hex108, Hex1344, Hex32, Hex4, ProtocolError, TargetBe,
+    TargetLe,
 };
 
 /// Version implemented by every backend message in this crate.
-pub const BACKEND_PROTOCOL_VERSION: u16 = 1;
+pub const BACKEND_PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum JSON payload accepted in one backend frame.
 pub const MAX_BACKEND_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -347,7 +348,7 @@ pub enum BackendErrorCode {
     BackendUnhealthy,
 }
 
-/// Explicit protocol-v1 features that must be negotiated before mining.
+/// Explicit versioned backend features that must be negotiated before mining.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendCapability {
@@ -363,7 +364,7 @@ pub enum BackendCapability {
     WinnerLifecycleV1,
 }
 
-/// Capabilities every protocol-v1 backend must advertise exactly once.
+/// Capabilities every current-protocol backend must advertise exactly once.
 pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 5] = [
     BackendCapability::JobStreamV1,
     BackendCapability::DurableShareReceiptsV1,
@@ -920,7 +921,7 @@ impl BackendEvent {
 pub enum BackendRequest {
     /// Negotiates protocol and chain identity before any other request.
     Hello {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Nonzero connection-local request identifier.
@@ -932,7 +933,7 @@ pub enum BackendRequest {
     },
     /// Requests an atomic current/recent job snapshot followed by events.
     SubscribeJobs {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Nonzero connection-local request identifier.
@@ -942,7 +943,7 @@ pub enum BackendRequest {
     },
     /// Validates and durably commits one fully reconstructed share.
     SubmitShare {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Nonzero connection-local request identifier.
@@ -962,7 +963,7 @@ pub enum BackendRequest {
     },
     /// Reads a bounded page for idempotent database projection.
     ReadEvents {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Nonzero connection-local request identifier.
@@ -974,7 +975,7 @@ pub enum BackendRequest {
     },
     /// Requests a bounded health snapshot.
     Health {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Nonzero connection-local request identifier.
@@ -1101,7 +1102,7 @@ impl BackendRequest {
 pub enum BackendMessage {
     /// Successful protocol and network identity negotiation.
     HelloOk {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Request identifier copied from `hello`.
@@ -1122,6 +1123,8 @@ pub enum BackendMessage {
         wcash_payout_commitment: Hex32,
         /// Domain-separated commitment to the exact Zcash block-reward recipient.
         zcash_payout_commitment: Hex32,
+        /// Easiest share target the backend will ever accept, in big-endian ZIP-301 order.
+        share_target_ceiling_be: TargetBe,
         /// Wcash AuxPoW chain identifier.
         chain_id: u32,
         /// Latest durable event sequence.
@@ -1129,7 +1132,7 @@ pub enum BackendMessage {
     },
     /// Atomic state returned before live job events begin.
     JobSnapshot {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Request identifier copied from `subscribe_jobs`.
@@ -1143,7 +1146,7 @@ pub enum BackendMessage {
     },
     /// Atomic durable share acknowledgement.
     ShareCommitted {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Request identifier copied from `submit_share`.
@@ -1155,7 +1158,7 @@ pub enum BackendMessage {
     },
     /// Bounded authoritative journal page.
     EventsPage {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Request identifier copied from `read_events`.
@@ -1171,7 +1174,7 @@ pub enum BackendMessage {
     },
     /// Backend health and winner-outbox pressure.
     HealthStatus {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Request identifier copied from `health`.
@@ -1189,7 +1192,7 @@ pub enum BackendMessage {
     },
     /// Typed request failure without secret-bearing diagnostics.
     Error {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Request identifier, or zero when no valid ID was recoverable.
@@ -1201,7 +1204,7 @@ pub enum BackendMessage {
     },
     /// Unsolicited or paginated journal event.
     Event {
-        /// Protocol version; must be one.
+        /// Protocol version; must match [`BACKEND_PROTOCOL_VERSION`].
         #[serde(rename = "v")]
         version: u16,
         /// Exact durable event.
@@ -1223,6 +1226,7 @@ impl fmt::Debug for BackendMessage {
                 zcash_genesis,
                 wcash_payout_commitment,
                 zcash_payout_commitment,
+                share_target_ceiling_be,
                 chain_id,
                 current_event_seq,
             } => formatter
@@ -1237,6 +1241,7 @@ impl fmt::Debug for BackendMessage {
                 .field("zcash_genesis", zcash_genesis)
                 .field("wcash_payout_commitment", wcash_payout_commitment)
                 .field("zcash_payout_commitment", zcash_payout_commitment)
+                .field("share_target_ceiling_be", share_target_ceiling_be)
                 .field("chain_id", chain_id)
                 .field("current_event_seq", current_event_seq)
                 .finish(),
@@ -1360,6 +1365,7 @@ impl BackendMessage {
                 zcash_genesis,
                 wcash_payout_commitment,
                 zcash_payout_commitment,
+                share_target_ceiling_be,
                 chain_id,
                 ..
             } => {
@@ -1387,13 +1393,19 @@ impl BackendMessage {
                 {
                     return Err(invalid(
                         "hello_ok.capabilities",
-                        "must contain every protocol-v1 capability exactly once",
+                        "must contain every required capability exactly once",
                     ));
                 }
                 require_nonzero_hex(wcash_genesis, "hello_ok.wcash_genesis")?;
                 require_nonzero_hex(zcash_genesis, "hello_ok.zcash_genesis")?;
                 require_nonzero_hex(wcash_payout_commitment, "hello_ok.wcash_payout_commitment")?;
                 require_nonzero_hex(zcash_payout_commitment, "hello_ok.zcash_payout_commitment")?;
+                if share_target_ceiling_be.is_zero() {
+                    return Err(invalid(
+                        "hello_ok.share_target_ceiling_be",
+                        "must be nonzero",
+                    ));
+                }
                 if *chain_id == 0 {
                     return Err(invalid("hello_ok.chain_id", "must be nonzero"));
                 }

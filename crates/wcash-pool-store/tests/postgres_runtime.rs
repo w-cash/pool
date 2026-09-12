@@ -24,7 +24,7 @@ use wcash_pool_portal::{
 use wcash_pool_protocol::{
     canonical_attribution_id, decode_backend_request, encode_backend_message, BackendEvent,
     BackendMessage, BackendRequest, CanonicalUuid, ChainTip, Hex108, Hex32, JobDescriptor,
-    MergedChain, NonceProfile, ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity,
+    MergedChain, NonceProfile, ShareReceipt, TargetBe, TargetLe, WinnerDescriptor, WorkerIdentity,
     BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, REQUIRED_BACKEND_CAPABILITIES,
 };
 use wcash_pool_store::{
@@ -146,6 +146,7 @@ async fn authority_for(
             zcash_genesis: Hex32::new(server_identity.zcash_genesis),
             wcash_payout_commitment: Hex32::new(server_identity.wcash_payout_commitment),
             zcash_payout_commitment: Hex32::new(server_identity.zcash_payout_commitment),
+            share_target_ceiling_be: TargetBe::new([0x55; 32]),
             chain_id: server_identity.chain_id,
             current_event_seq: 0,
         };
@@ -175,6 +176,7 @@ async fn authority_for(
         identity.chain_id,
         Hex32::new(identity.wcash_payout_commitment),
         Hex32::new(identity.zcash_payout_commitment),
+        TargetBe::new([0x55; 32]),
     )
     .expect("expected backend is valid")
     .with_backend_instance(CanonicalUuid::new(identity.backend_instance))
