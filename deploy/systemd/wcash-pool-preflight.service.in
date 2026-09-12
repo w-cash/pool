@@ -4,7 +4,7 @@ Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deploym
 Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service zecwec-zallet.service wcash-pool-wallet-init.service @WCASH_LIGHTWALLETD_UNIT@
 BindsTo=wcash-pool-backend.service zecwec-zallet.service @WCASH_LIGHTWALLETD_UNIT@
 After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service zecwec-zallet.service wcash-pool-wallet-init.service @WCASH_LIGHTWALLETD_UNIT@
-ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/pool.preflight.toml
 
 [Service]
