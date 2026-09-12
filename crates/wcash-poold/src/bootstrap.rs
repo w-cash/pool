@@ -5,11 +5,14 @@ use std::{sync::Arc, time::Duration};
 use wcash_pool_backend_client::{
     BackendClient, BackendClientConfig, ClientError, ExpectedBackend, MonotonicTimeline,
 };
-use wcash_pool_core::{GenerationRegistryConfig, NonceNamespaceLease, NoncePrefixAllocator};
+use wcash_pool_core::{
+    GenerationRegistryConfig, NonceNamespaceLease, NoncePrefixAllocator, ShareTarget,
+    TargetBinding, TargetBounds,
+};
 use wcash_pool_edge::{
     JobRouter, JobRouterError, ShareRouter, ShareRouterConfig, ShareRouterError,
 };
-use wcash_pool_protocol::{CanonicalUuid, Hex32, NonceProfile};
+use wcash_pool_protocol::{CanonicalUuid, Hex32, NonceProfile, TargetBe};
 use wcash_pool_store::{
     Chain, ChainPolicy, DeploymentIdentity, DeploymentNetwork, PostgresAuthenticationProvider,
     PostgresStore, StoreError,
@@ -84,6 +87,7 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
         timeline,
         JOB_UPDATE_CAPACITY,
     )?;
+    validate_initial_target_policy(&jobs, config)?;
     let share_config = ShareRouterConfig::new(
         config.maximum_miners.min(4_096),
         Duration::from_secs(5),
@@ -117,6 +121,24 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
         nonces,
         timeline,
     })
+}
+
+fn validate_initial_target_policy(
+    jobs: &JobRouter,
+    config: &RuntimeConfig,
+) -> Result<(), BootstrapError> {
+    let generation = jobs
+        .current_generation()?
+        .ok_or(BootstrapError::NoCurrentJob)?;
+    let initial = ShareTarget::from_zip301(&TargetBe::new(config.initial_share_target_be))?;
+    let easiest = ShareTarget::from_zip301(&TargetBe::new(config.easiest_share_target_be))?;
+    let bounds = TargetBounds::new(
+        generation.wcash_network_target(),
+        generation.zcash_network_target(),
+        easiest,
+    )?;
+    TargetBinding::new(1, initial, bounds)?;
+    Ok(())
 }
 
 async fn connect_store(config: &RuntimeConfig) -> Result<PostgresStore, BootstrapError> {
@@ -250,6 +272,15 @@ pub enum BootstrapError {
     /// Nonce namespace or reserved range was invalid.
     #[error(transparent)]
     Nonce(#[from] wcash_pool_core::NoncePrefixError),
+    /// Configured share-target policy cannot include every network winner.
+    #[error(transparent)]
+    TargetPolicy(#[from] wcash_pool_core::TargetPolicyError),
+    /// Configured share target was zero or malformed.
+    #[error(transparent)]
+    ShareTarget(#[from] wcash_pool_core::ShareTargetError),
+    /// Wolf did not provide a current proposal-validated job.
+    #[error("backend snapshot has no current mineable job")]
+    NoCurrentJob,
     /// An incomplete replay page did not advance its cursor.
     #[error("backend journal replay made no progress")]
     StalledReplay,

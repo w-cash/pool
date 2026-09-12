@@ -105,7 +105,12 @@ impl NonceCursor {
 pub struct NoncePrefixAllocator {
     profile: NonceProfile,
     lease: NonceNamespaceLease,
-    next: Mutex<u64>,
+    range: Mutex<ReservedRange>,
+}
+
+#[derive(Debug)]
+struct ReservedRange {
+    next: u64,
     end_exclusive: u64,
 }
 
@@ -120,8 +125,10 @@ impl NoncePrefixAllocator {
         Self {
             profile,
             lease,
-            next: Mutex::new(0),
-            end_exclusive: capacity(profile),
+            range: Mutex::new(ReservedRange {
+                next: 0,
+                end_exclusive: capacity(profile),
+            }),
         }
     }
 
@@ -143,8 +150,10 @@ impl NoncePrefixAllocator {
         Ok(Self {
             profile: cursor.profile,
             lease,
-            next: Mutex::new(cursor.next),
-            end_exclusive: capacity(cursor.profile),
+            range: Mutex::new(ReservedRange {
+                next: cursor.next,
+                end_exclusive: capacity(cursor.profile),
+            }),
         })
     }
 
@@ -173,8 +182,10 @@ impl NoncePrefixAllocator {
         Ok(Self {
             profile: cursor.profile,
             lease,
-            next: Mutex::new(cursor.next),
-            end_exclusive,
+            range: Mutex::new(ReservedRange {
+                next: cursor.next,
+                end_exclusive,
+            }),
         })
     }
 
@@ -188,14 +199,42 @@ impl NoncePrefixAllocator {
         self.lease
     }
 
+    /// Atomically extends this allocator with the immediately contiguous range
+    /// already committed by its durable lease authority.
+    ///
+    /// Skipping a range is rejected because it could belong to another live
+    /// holder. Shrinking or reinstalling an old tail is also rejected, so a
+    /// retry cannot roll the process-local cursor backwards.
+    pub fn extend_reserved(&self, start: u64, end_exclusive: u64) -> Result<(), NoncePrefixError> {
+        let mut range = self.range.lock().map_err(|_| NoncePrefixError::Poisoned)?;
+        if start != range.end_exclusive
+            || end_exclusive <= start
+            || end_exclusive > capacity(self.profile)
+        {
+            return Err(NoncePrefixError::NonContiguousReservation {
+                current_end: range.end_exclusive,
+                proposed_start: start,
+                proposed_end: end_exclusive,
+            });
+        }
+        range.end_exclusive = end_exclusive;
+        Ok(())
+    }
+
+    /// Returns how many already-reserved prefixes remain process-local.
+    pub fn remaining(&self) -> Result<u64, NoncePrefixError> {
+        let range = self.range.lock().map_err(|_| NoncePrefixError::Poisoned)?;
+        Ok(range.end_exclusive.saturating_sub(range.next))
+    }
+
     /// Allocates the next unique prefix without wrapping.
     pub fn allocate(&self) -> Result<NoncePrefix, NoncePrefixError> {
-        let mut next = self.next.lock().map_err(|_| NoncePrefixError::Poisoned)?;
-        if *next >= self.end_exclusive {
+        let mut range = self.range.lock().map_err(|_| NoncePrefixError::Poisoned)?;
+        if range.next >= range.end_exclusive {
             return Err(NoncePrefixError::Exhausted(self.profile));
         }
-        let value = *next;
-        *next += 1;
+        let value = range.next;
+        range.next += 1;
         Ok(match self.profile {
             NonceProfile::FourByte => {
                 let counter = (value as u32).to_le_bytes();
@@ -224,7 +263,11 @@ impl NoncePrefixAllocator {
 
     /// Snapshots the next-allocation cursor while holding the allocator lock.
     pub fn next_cursor(&self) -> Result<NonceCursor, NoncePrefixError> {
-        let next = *self.next.lock().map_err(|_| NoncePrefixError::Poisoned)?;
+        let next = self
+            .range
+            .lock()
+            .map_err(|_| NoncePrefixError::Poisoned)?
+            .next;
         NonceCursor::new(self.profile, self.lease, next)
     }
 
@@ -279,6 +322,18 @@ pub enum NoncePrefixError {
         start: u64,
         /// Exclusive upper fence persisted before use.
         end_exclusive: u64,
+    },
+    /// A replenishment did not continue the currently owned durable range.
+    #[error(
+        "nonce reservation [{proposed_start}, {proposed_end}) does not continue current end {current_end}"
+    )]
+    NonContiguousReservation {
+        /// Current exclusive durable fence.
+        current_end: u64,
+        /// Proposed first counter.
+        proposed_start: u64,
+        /// Proposed exclusive fence.
+        proposed_end: u64,
     },
 }
 
@@ -358,6 +413,39 @@ mod tests {
             allocator.allocate(),
             Err(NoncePrefixError::Exhausted(NonceProfile::FourByte))
         );
+    }
+
+    #[test]
+    fn durable_subrange_can_only_extend_contiguously_without_reuse() {
+        let active_lease = lease(23);
+        let allocator = NoncePrefixAllocator::restore_reserved(
+            NonceCursor::new(NonceProfile::FourByte, active_lease, 41).expect("cursor is in range"),
+            active_lease,
+            43,
+        )
+        .expect("reservation is valid");
+        assert_eq!(allocator.remaining(), Ok(2));
+        assert!(allocator.extend_reserved(43, 46).is_ok());
+        assert_eq!(allocator.remaining(), Ok(5));
+        assert_eq!(
+            allocator.extend_reserved(45, 47),
+            Err(NoncePrefixError::NonContiguousReservation {
+                current_end: 46,
+                proposed_start: 45,
+                proposed_end: 47,
+            })
+        );
+        let allocated = (0..5)
+            .map(|_| {
+                prefix_value(
+                    &allocator
+                        .allocate()
+                        .expect("extended reservation has capacity"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(allocated, vec![41, 42, 43, 44, 45]);
+        assert_eq!(allocator.remaining(), Ok(0));
     }
 
     #[test]
