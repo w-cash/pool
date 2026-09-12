@@ -314,6 +314,7 @@ impl PortalRepository for MemoryRepository {
         account_login: &'a str,
         worker_label: &'a str,
         now: u64,
+        argon2_permit: tokio::sync::OwnedSemaphorePermit,
     ) -> RepositoryFuture<'a, ProvisionedWorker> {
         let worker_id = Uuid::new_v4();
         let canonical_login = format!("{account_login}.{worker_label}");
@@ -338,7 +339,10 @@ impl PortalRepository for MemoryRepository {
                     token,
                 })
             });
-        Box::pin(async move { result })
+        Box::pin(async move {
+            let _argon2_permit = argon2_permit;
+            result
+        })
     }
 
     fn list_workers<'a>(

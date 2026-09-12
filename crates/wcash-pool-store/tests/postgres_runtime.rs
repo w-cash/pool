@@ -5,13 +5,14 @@
 // first violated test invariant so later statements cannot obscure the cause.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use num_bigint::BigUint;
 use sqlx::{postgres::PgPoolOptions, Row};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::Semaphore,
     task::JoinSet,
 };
 use uuid::Uuid;
@@ -1522,10 +1523,19 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .expect("portal lookup succeeds")
         .expect("portal account exists");
     assert_eq!(credential.id, portal_account);
-    let portal_worker =
-        PortalRepository::provision_worker(&store, portal_account, "bob", "rig1", 1_725_000_101)
-            .await
-            .expect("portal worker persists through shared store");
+    let worker_argon2_permit = Arc::new(Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("worker Argon2 permit");
+    let portal_worker = PortalRepository::provision_worker(
+        &store,
+        portal_account,
+        "bob",
+        "rig1",
+        1_725_000_101,
+        worker_argon2_permit,
+    )
+    .await
+    .expect("portal worker persists through shared store");
     assert!(portal_worker.token.starts_with("zw1."));
     assert!(auth
         .authenticate_credentials("bob.rig1", &portal_worker.token)

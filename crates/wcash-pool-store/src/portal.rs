@@ -3,6 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use sqlx::{Postgres, Row, Transaction};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 use wcash_pool_portal::{
     mask_destination, AccountCredential, Asset, AuthenticatedSession, ChainNetwork,
@@ -204,12 +205,19 @@ impl PortalRepository for PostgresStore {
         account_login: &'a str,
         worker_label: &'a str,
         now: u64,
+        argon2_permit: OwnedSemaphorePermit,
     ) -> RepositoryFuture<'a, ProvisionedWorker> {
         Box::pin(async move {
-            let (worker_id, token) =
-                provision_worker_at(self, account_id, account_login, worker_label, now)
-                    .await
-                    .map_err(repository_error)?;
+            let (worker_id, token) = provision_worker_at(
+                self,
+                account_id,
+                account_login,
+                worker_label,
+                now,
+                argon2_permit,
+            )
+            .await
+            .map_err(repository_error)?;
             Ok(ProvisionedWorker {
                 account_id,
                 worker_id,
@@ -315,21 +323,21 @@ async fn provision_worker_at(
     account_login: &str,
     worker_label: &str,
     now: u64,
+    argon2_permit: OwnedSemaphorePermit,
 ) -> Result<(Uuid, crate::MiningToken), StoreError> {
     super::postgres::validate_component(account_login, 64)?;
     super::postgres::validate_component(worker_label, 63)?;
     let worker_id = Uuid::new_v4();
     let canonical_login = format!("{account_login}.{worker_label}");
-    // Argon2 is intentionally kept off Tokio's async executor. The public
-    // portal additionally holds its shared non-queueing admission permit for
-    // the duration of this task.
-    let (token, verifier) = tokio::task::spawn_blocking(|| {
+    // Argon2 is intentionally kept off Tokio's async executor. The blocking
+    // task itself owns the shared non-queueing admission permit, so cancelling
+    // its async waiter cannot admit overlapping memory-hard work.
+    let (token, verifier) = run_worker_credential_operation(argon2_permit, || {
         let token = crate::generate_mining_token()?;
         let verifier = crate::hash_mining_token(&token)?;
         Ok::<_, crate::MiningTokenError>((token, verifier))
     })
-    .await
-    .map_err(|_| StoreError::MiningToken(crate::MiningTokenError::HashingFailed))??;
+    .await?;
     let mut transaction = store.pool.begin().await?;
     let persisted_login = sqlx::query_scalar::<_, String>(
         "SELECT login FROM accounts WHERE deployment_id=$1 AND id=$2 AND enabled FOR UPDATE",
@@ -380,6 +388,23 @@ async fn provision_worker_at(
     .await?;
     transaction.commit().await?;
     Ok((worker_id, token))
+}
+
+async fn run_worker_credential_operation<T, Operation>(
+    argon2_permit: OwnedSemaphorePermit,
+    operation: Operation,
+) -> Result<T, StoreError>
+where
+    T: Send + 'static,
+    Operation: FnOnce() -> Result<T, crate::MiningTokenError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _argon2_permit = argon2_permit;
+        operation()
+    })
+    .await
+    .map_err(|_| StoreError::MiningToken(crate::MiningTokenError::HashingFailed))?
+    .map_err(StoreError::from)
 }
 
 async fn list_workers(
@@ -1225,5 +1250,66 @@ fn portal_receiver_from_name(value: &str) -> Result<PortalReceiverKind, Reposito
         "transparent" => Ok(PortalReceiverKind::Transparent),
         "ironwood" => Ok(PortalReceiverKind::Ironwood),
         _ => Err(RepositoryError::InvalidState),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Condvar, Mutex},
+        time::Duration,
+    };
+
+    use tokio::sync::{oneshot, Semaphore};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_does_not_release_running_credential_work() -> Result<(), &'static str>
+    {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots)
+            .try_acquire_owned()
+            .map_err(|_| "initial credential permit unavailable")?;
+        let (started_tx, started_rx) = oneshot::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let blocking_release = Arc::clone(&release);
+        let waiter = tokio::spawn(run_worker_credential_operation(permit, move || {
+            let _ = started_tx.send(());
+            let (released, changed) = &*blocking_release;
+            let mut released = released
+                .lock()
+                .map_err(|_| crate::MiningTokenError::HashingFailed)?;
+            while !*released {
+                released = changed
+                    .wait(released)
+                    .map_err(|_| crate::MiningTokenError::HashingFailed)?;
+            }
+            Ok(())
+        }));
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .map_err(|_| "blocking credential operation did not start")?
+            .map_err(|_| "blocking credential start signal closed")?;
+
+        waiter.abort();
+        let waiter_result = waiter.await;
+        if waiter_result.is_ok() {
+            return Err("cancelled credential waiter completed successfully");
+        }
+        assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+
+        let (released, changed) = &*release;
+        if let Ok(mut released) = released.lock() {
+            *released = true;
+            changed.notify_one();
+        }
+        let recovered =
+            tokio::time::timeout(Duration::from_secs(2), Arc::clone(&slots).acquire_owned())
+                .await
+                .map_err(|_| "credential permit was not released after blocking exit")?
+                .map_err(|_| "credential semaphore unexpectedly closed")?;
+        drop(recovered);
+        Ok(())
     }
 }
