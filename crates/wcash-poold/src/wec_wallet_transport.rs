@@ -222,6 +222,25 @@ impl WolfWalletTransport {
             max_response_bytes,
         )
     }
+
+    /// Invokes Wolf's seedless, tip-attested collector observation command.
+    ///
+    /// The caller remains responsible for validating every response field
+    /// against its independently configured wallet authority.
+    pub(super) fn invoke_observation(
+        &self,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, NativeWalletError> {
+        self.invoke_wallet(
+            "payout-observe",
+            true,
+            Zeroizing::new(Vec::new()),
+            timeout,
+            max_response_bytes,
+        )
+        .map_err(map_readonly_invoke_error)
+    }
 }
 
 impl std::fmt::Debug for WolfWalletTransport {
@@ -858,6 +877,12 @@ fn run_child(
             .map(|failure| failure.code);
         return Err(InvokeError::Exited(failure));
     }
+    // A successful machine-protocol command has no diagnostic channel. Treat
+    // any stderr as a protocol violation so warnings cannot be silently mixed
+    // with a response from an unexpected or partially compatible executable.
+    if !error.bytes.is_empty() {
+        return Err(InvokeError::Protocol);
+    }
     input_result.map_err(|_| InvokeError::InputOutput)?;
     if output.bytes.is_empty() {
         return Err(InvokeError::Protocol);
@@ -1052,6 +1077,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    const TEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[test]
     fn loopback_endpoint_is_literal_and_has_no_url_ambiguity() {
         assert!(validate_loopback_endpoint("http://127.0.0.1:38234").is_ok());
@@ -1177,7 +1204,7 @@ mod tests {
             identity
         );
         let (_directory, _program, transport) = fixture_transport(&script);
-        let observed = transport.identity(Duration::from_secs(1), 4_096).unwrap();
+        let observed = transport.identity(TEST_PROCESS_TIMEOUT, 4_096).unwrap();
         assert_eq!(observed.network, WalletNetwork::Testnet);
         assert_eq!(observed.genesis_hash, WCASH_TESTNET_GENESIS_HASH);
         assert_eq!(observed.branch_id, WCASH_TESTNET_BRANCH_ID);
@@ -1214,7 +1241,7 @@ mod tests {
                 "payout-sign",
                 true,
                 private_frame.clone(),
-                Duration::from_secs(1),
+                TEST_PROCESS_TIMEOUT,
                 1_024,
             )
             .unwrap();
@@ -1236,11 +1263,11 @@ mod tests {
         });
         let script = format!("printf '%s' '{}'", identity);
         let (_directory, program, transport) = fixture_transport(&script);
-        assert!(transport.identity(Duration::from_secs(1), 4_096).is_ok());
+        assert!(transport.identity(TEST_PROCESS_TIMEOUT, 4_096).is_ok());
         std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
-            transport.identity(Duration::from_secs(1), 4_096),
+            transport.identity(TEST_PROCESS_TIMEOUT, 4_096),
             Err(NativeWalletError::Unavailable)
         );
     }
@@ -1268,7 +1295,7 @@ mod tests {
         let script = format!("printf '%s' '{}' >&2; exit 1", failure);
         let (_directory, _program, transport) = fixture_transport(&script);
         assert_eq!(
-            transport.identity(Duration::from_secs(1), 4_096),
+            transport.identity(TEST_PROCESS_TIMEOUT, 4_096),
             Err(NativeWalletError::IdempotencyConflict)
         );
     }
@@ -1280,7 +1307,7 @@ mod tests {
         let script = format!("printf '%s' '{oversized}'");
         let (_directory, _program, transport) = fixture_transport(&script);
         assert_eq!(
-            transport.identity(Duration::from_secs(1), 1_024),
+            transport.identity(TEST_PROCESS_TIMEOUT, 1_024),
             Err(NativeWalletError::ProtocolViolation)
         );
     }
