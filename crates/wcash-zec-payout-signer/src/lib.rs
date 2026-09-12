@@ -17,7 +17,7 @@ mod transport;
 pub use config::{validate_zallet_configuration, RpcLimits, ZecSignerConfig, ZALLET_API_VERSION};
 pub use error::{PipelineStage, ZecPayoutError};
 pub use pipeline::{
-    Checkpoint, CheckpointHook, ZecFundSource, ZecPayoutReceipt, ZecPayoutRequest, ZecPcztSigner,
+    Checkpoint, CheckpointHook, ZecFundSource, ZecPayoutExecution, ZecPayoutRequest, ZecPcztSigner,
 };
 pub use rpc::{JsonRpcTransport, RpcCall, RpcTransportError};
 pub use transport::{LoopbackHttpTransport, LoopbackTransportError};

@@ -370,6 +370,10 @@ fn beta_three_rpc_pipeline_is_exact_and_replay_is_side_effect_free() {
     assert_eq!(receipt.batch_id, request.batch.batch_id);
     assert_eq!(receipt.transaction_id, TXID);
     assert_eq!(receipt.output_total_zat, 300_000_000);
+    assert_eq!(receipt.intent_digest, request.batch.commitment().unwrap());
+    assert_eq!(receipt.transaction_id_bytes, [0xab; 32]);
+    assert_eq!(receipt.signed_transaction, vec![0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(receipt.network_fee_zat, 10_000);
 
     let call_count = zallet.calls().len() + zebra.calls().len();
     assert_eq!(signer.execute(&request).expect("exact replay"), receipt);

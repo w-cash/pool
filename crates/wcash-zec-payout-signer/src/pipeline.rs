@@ -83,8 +83,42 @@ impl fmt::Debug for ZecPayoutRequest {
     }
 }
 
-/// Successful, durably resolved ZEC payout receipt.
-pub type ZecPayoutReceipt = BroadcastReceipt;
+/// Successful ZEC payout plus the exact signer artifact required by the
+/// PostgreSQL settlement boundary after any crash or exact retry.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ZecPayoutExecution {
+    /// Portal-compatible public receipt.
+    pub receipt: BroadcastReceipt,
+    /// Digest of the exact accounting intent independently verified by Zallet.
+    pub intent_digest: [u8; 32],
+    /// Display-order transaction identifier bytes.
+    pub transaction_id_bytes: [u8; 32],
+    /// Exact signed transaction bytes that were submitted.
+    pub signed_transaction: Vec<u8>,
+    /// Exact fee verified from the signed PCZT.
+    pub network_fee_zat: u64,
+}
+
+impl fmt::Debug for ZecPayoutExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ZecPayoutExecution")
+            .field("receipt", &self.receipt)
+            .field("intent_digest", &self.intent_digest)
+            .field("transaction_id_bytes", &self.transaction_id_bytes)
+            .field("signed_transaction", &"[REDACTED]")
+            .field("network_fee_zat", &self.network_fee_zat)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for ZecPayoutExecution {
+    type Target = BroadcastReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
+}
 
 /// A fault-injection observation point around external calls and durable writes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,7 +202,10 @@ impl ZecPcztSigner {
     /// Every exact retry resumes from durable bytes. A retry after an ambiguous
     /// parent-node result re-broadcasts the same raw transaction; it never
     /// creates or signs a replacement.
-    pub fn execute(&self, request: &ZecPayoutRequest) -> Result<ZecPayoutReceipt, ZecPayoutError> {
+    pub fn execute(
+        &self,
+        request: &ZecPayoutRequest,
+    ) -> Result<ZecPayoutExecution, ZecPayoutError> {
         crate::validate_zallet_configuration(self.config.zallet_configuration())?;
         let (portal_commitment, pipeline_commitment, output_total_zat) =
             self.validate_request(request)?;
@@ -189,7 +226,7 @@ impl ZecPcztSigner {
         portal_commitment: [u8; 32],
         pipeline_commitment: [u8; 32],
         output_total_zat: u64,
-    ) -> Result<ZecPayoutReceipt, ZecPayoutError> {
+    ) -> Result<ZecPayoutExecution, ZecPayoutError> {
         let mut record = match self.journal.load(request.batch.batch_id)? {
             Some(record) => {
                 if record.pipeline_commitment != pipeline_commitment
@@ -232,7 +269,7 @@ impl ZecPcztSigner {
                 } => {
                     let inspected = self.inspect_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::CreatedVerified)?;
-                    self.verify_inspection(
+                    let _network_fee_zat = self.verify_inspection(
                         request,
                         &privacy_policy,
                         &inspected,
@@ -268,7 +305,7 @@ impl ZecPcztSigner {
                 } => {
                     let inspected = self.inspect_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::ProvedVerified)?;
-                    self.verify_inspection(
+                    let _network_fee_zat = self.verify_inspection(
                         request,
                         &privacy_policy,
                         &inspected,
@@ -300,7 +337,7 @@ impl ZecPcztSigner {
                 } => {
                     let inspected = self.inspect_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::SignedVerified)?;
-                    self.verify_inspection(
+                    let network_fee_zat = self.verify_inspection(
                         request,
                         &privacy_policy,
                         &inspected,
@@ -309,12 +346,14 @@ impl ZecPcztSigner {
                     record.stage = StoredStage::SignedVerified {
                         pczt,
                         privacy_policy,
+                        network_fee_zat,
                     };
                     self.persist(&record)?;
                 }
                 StoredStage::SignedVerified {
                     pczt,
                     privacy_policy: _,
+                    network_fee_zat,
                 } => {
                     let extracted = self.extract_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::Extracted)?;
@@ -322,24 +361,34 @@ impl ZecPcztSigner {
                     record.stage = StoredStage::Extracted {
                         raw_transaction: extracted.hex,
                         transaction_id: extracted.txid,
+                        network_fee_zat,
                     };
                     self.persist(&record)?;
                 }
                 StoredStage::Extracted {
                     raw_transaction,
                     transaction_id,
+                    network_fee_zat,
                 }
                 | StoredStage::BroadcastUnresolved {
                     raw_transaction,
                     transaction_id,
+                    network_fee_zat,
                 } => match self.broadcast(&raw_transaction, &transaction_id) {
                     BroadcastOutcome::Accepted | BroadcastOutcome::AlreadyKnown => {
                         self.rpc_checkpoint(PipelineStage::Completed)?;
                         record.stage = StoredStage::Completed {
+                            raw_transaction: raw_transaction.clone(),
                             transaction_id: transaction_id.clone(),
+                            network_fee_zat,
                         };
                         self.persist(&record)?;
-                        return Ok(receipt(&record, transaction_id));
+                        return execution(
+                            &record,
+                            transaction_id,
+                            raw_transaction,
+                            network_fee_zat,
+                        );
                     }
                     BroadcastOutcome::Rejected => {
                         self.rpc_checkpoint(PipelineStage::Rejected)?;
@@ -352,6 +401,7 @@ impl ZecPcztSigner {
                         record.stage = StoredStage::BroadcastUnresolved {
                             raw_transaction,
                             transaction_id,
+                            network_fee_zat,
                         };
                         self.persist(&record)?;
                         return Err(ZecPayoutError::BroadcastAmbiguous);
@@ -360,8 +410,12 @@ impl ZecPcztSigner {
                 StoredStage::Rejected { .. } => {
                     return Err(ZecPayoutError::BroadcastRejected);
                 }
-                StoredStage::Completed { transaction_id } => {
-                    return Ok(receipt(&record, transaction_id));
+                StoredStage::Completed {
+                    raw_transaction,
+                    transaction_id,
+                    network_fee_zat,
+                } => {
+                    return execution(&record, transaction_id, raw_transaction, network_fee_zat);
                 }
             }
         }
@@ -521,7 +575,7 @@ impl ZecPcztSigner {
         privacy_policy: &str,
         inspected: &InspectResult,
         proof_requirement: ProofRequirement,
-    ) -> Result<(), ZecPayoutError> {
+    ) -> Result<u64, ZecPayoutError> {
         let signing_hints = inspected
             .signing_hints
             .as_ref()
@@ -620,7 +674,7 @@ impl ZecPcztSigner {
         if recomputed_fee != inspected.fee_zat {
             return Err(ZecPayoutError::WalletProtocolViolation);
         }
-        Ok(())
+        u64::try_from(inspected.fee_zat).map_err(|_| ZecPayoutError::WalletProtocolViolation)
     }
 
     fn broadcast(&self, raw_transaction: &str, transaction_id: &str) -> BroadcastOutcome {
@@ -693,6 +747,7 @@ impl IsolatedPayoutSigner for ZecPcztSigner {
             source_account: self.config.account_id(),
             fund_source: ZecFundSource::Orchard,
         })
+        .map(|execution| execution.receipt)
         .map_err(map_portal_error)
     }
 }
@@ -724,14 +779,31 @@ fn map_portal_error(error: ZecPayoutError) -> SignerError {
     }
 }
 
-fn receipt(record: &JournalRecord, transaction_id: String) -> BroadcastReceipt {
-    BroadcastReceipt {
-        batch_id: record.batch_id,
-        request_commitment: record.portal_commitment,
-        asset: Asset::Zec,
-        transaction_id,
-        output_total_zat: record.output_total_zat,
-    }
+fn execution(
+    record: &JournalRecord,
+    transaction_id: String,
+    raw_transaction: String,
+    network_fee_zat: u64,
+) -> Result<ZecPayoutExecution, ZecPayoutError> {
+    let transaction_id_bytes = hex::decode(&transaction_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(ZecPayoutError::JournalCorrupt)?;
+    let signed_transaction =
+        hex::decode(raw_transaction).map_err(|_| ZecPayoutError::JournalCorrupt)?;
+    Ok(ZecPayoutExecution {
+        receipt: BroadcastReceipt {
+            batch_id: record.batch_id,
+            request_commitment: record.portal_commitment,
+            asset: Asset::Zec,
+            transaction_id,
+            output_total_zat: record.output_total_zat,
+        },
+        intent_digest: record.portal_commitment,
+        transaction_id_bytes,
+        signed_transaction,
+        network_fee_zat,
+    })
 }
 
 fn exact_zec_number(amount_zat: u64) -> Result<Number, ZecPayoutError> {
