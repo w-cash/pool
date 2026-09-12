@@ -8,6 +8,7 @@ members = [
     "crates/wcash-pool-protocol",
     "crates/wcash-pool-portal",
     "crates/wcash-zec-payout-signer",
+    "crates/wcash-wec-payout-signer",
     "crates/wcash-poold",
 ]
 resolver = "2"
