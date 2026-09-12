@@ -13,8 +13,26 @@ command -v shellcheck >/dev/null 2>&1 || {
     exit 1
 }
 
-bash -n "$repo_root"/scripts/deploy/*.sh "$repo_root/scripts/test-deployment-package.sh"
-shellcheck "$repo_root"/scripts/deploy/*.sh "$repo_root/scripts/test-deployment-package.sh"
+bash -n "$repo_root"/scripts/deploy/*.sh \
+    "$repo_root/scripts/build-zallet-testnet.sh" \
+    "$repo_root/scripts/test-deployment-package.sh"
+shellcheck "$repo_root"/scripts/deploy/*.sh \
+    "$repo_root/scripts/build-zallet-testnet.sh" \
+    "$repo_root/scripts/test-deployment-package.sh"
+grep -Fq 'base_commit=987382f67e622915228686e9f956c6a9c9a7514c' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'toolchain=1.95.0' "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'cargo "+$toolchain" build --locked --release' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq -- '--features rpc-cli,zcashd-import' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'const MIN_WALLET_POOL_SIZE: usize = 8;' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
+grep -Fq 'config.timeouts.wait = Some(WALLET_POOL_WAIT_TIMEOUT);' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
+grep -Fq '.runtime(deadpool::Runtime::Tokio1)' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
 grep -Fx -- '    --deadline 1080' \
     "$repo_root/scripts/deploy/wait-zallet-ready.sh" >/dev/null
 # shellcheck disable=SC2016
@@ -28,6 +46,7 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile "$repo_root"/scri
 PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/zallet_rpc_health.py" <<'PY'
 import http.client
 import importlib.util
+import json
 import pathlib
 import sys
 
@@ -48,6 +67,88 @@ class IncompleteRpcResponse:
 
 module.http.client.HTTPConnection = IncompleteRpcResponse
 assert module.probe("127.0.0.1", 1, "user:test-value", 0.1) is False
+
+tip = {
+    "blockhash": "01" * 32,
+    "height": 4_341_450,
+}
+ready = {
+    "node_tip": tip,
+    "wallet_tip": dict(tip),
+    "fully_synced_height": tip["height"],
+    "locked": False,
+}
+assert module.wallet_status_is_ready(ready) is True
+accountless = dict(ready)
+accountless.pop("fully_synced_height")
+assert module.wallet_status_is_ready(accountless) is True
+for field, value in [
+    ("locked", True),
+    ("sync_work_remaining", {"unscanned_blocks": 1}),
+    ("sync_work_remaining", None),
+    ("fully_synced_height", tip["height"] - 1),
+    ("fully_synced_height", None),
+    ("fully_synced_height", True),
+    ("fully_synced_height", str(tip["height"])),
+]:
+    invalid = dict(ready)
+    invalid[field] = value
+    assert module.wallet_status_is_ready(invalid) is False
+for field, value in [("height", tip["height"] - 1), ("blockhash", "11" * 32)]:
+    invalid = dict(ready)
+    invalid["wallet_tip"] = dict(tip)
+    invalid["wallet_tip"][field] = value
+    assert module.wallet_status_is_ready(invalid) is False
+for blockhash in ["0" * 64, "AA" * 32, "gg" * 32]:
+    invalid = dict(ready)
+    invalid["node_tip"] = {"blockhash": blockhash, "height": tip["height"]}
+    invalid["wallet_tip"] = dict(invalid["node_tip"])
+    assert module.wallet_status_is_ready(invalid) is False
+for height in [False, 0, -1, 0x1_0000_0000]:
+    invalid = dict(ready)
+    invalid["node_tip"] = {"blockhash": tip["blockhash"], "height": height}
+    invalid["wallet_tip"] = dict(invalid["node_tip"])
+    invalid["fully_synced_height"] = height
+    assert module.wallet_status_is_ready(invalid) is False
+
+class StaticRpcResponse:
+    status = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self, _limit):
+        return json.dumps(self.payload).encode("utf-8")
+
+class StaticRpcConnection:
+    payload = None
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def request(self, *_args, **_kwargs):
+        pass
+
+    def getresponse(self):
+        return StaticRpcResponse(self.payload)
+
+    def close(self):
+        pass
+
+module.http.client.HTTPConnection = StaticRpcConnection
+StaticRpcConnection.payload = {
+    "id": "zecwec-readiness",
+    "error": None,
+    "result": ready,
+}
+assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is True
+for malformed in [
+    [],
+    {"id": "wrong-id", "error": None, "result": ready},
+    {"id": "zecwec-readiness", "error": {"code": -1}, "result": ready},
+]:
+    StaticRpcConnection.payload = malformed
+    assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is False
 PY
 cargo build --locked --quiet --manifest-path "$repo_root/Cargo.toml" \
     --package wcash-poold --bin wcash-poold

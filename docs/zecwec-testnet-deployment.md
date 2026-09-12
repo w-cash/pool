@@ -263,10 +263,14 @@ sudo systemctl start zecwec-zallet.service
 ```
 
 A start or restart can spend several minutes scanning Zcash Testnet's recent
-chain window before the serialized wallet RPC answers. The unit allows a
-bounded eighteen-minute authenticated readiness interval and must not be
-restarted merely because RPC remains quiet during that scan. A readiness
-failure after the full interval is a hard deployment gate.
+chain window. The unit allows a bounded eighteen-minute authenticated readiness
+interval and uses individually bounded `getwalletstatus` calls throughout it.
+A response is accepted only when the wallet reports itself unlocked, the node
+and wallet tips match exactly, no scan-work field is present, and any reported
+fully-synced height equals that common tip. Zallet omits the fully-synced height
+before an account exists; the later native authority gate requires it after the
+dedicated collector is frozen. A readiness failure after the full interval is
+a hard deployment gate.
 
 Zallet account creation and mnemonic backup are deliberately reviewed manual
 bootstrap steps. Record the new account's canonical UUID, ZIP-32 index, and
