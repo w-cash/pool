@@ -31,6 +31,39 @@ def read_cookie(path: pathlib.Path) -> str:
     return cookie
 
 
+def wallet_status_is_ready(result: object) -> bool:
+    if not isinstance(result, dict) or result.get("locked") is not False:
+        return False
+    node_tip = result.get("node_tip")
+    wallet_tip = result.get("wallet_tip")
+    if not isinstance(node_tip, dict) or not isinstance(wallet_tip, dict):
+        return False
+    node_height = node_tip.get("height")
+    wallet_height = wallet_tip.get("height")
+    node_hash = node_tip.get("blockhash")
+    wallet_hash = wallet_tip.get("blockhash")
+    if (
+        type(node_height) is not int
+        or type(wallet_height) is not int
+        or not 0 < node_height <= 0xFFFFFFFF
+        or wallet_height != node_height
+        or not isinstance(node_hash, str)
+        or len(node_hash) != 64
+        or node_hash == "0" * 64
+        or any(char not in "0123456789abcdef" for char in node_hash)
+        or wallet_hash != node_hash
+    ):
+        return False
+    if "sync_work_remaining" in result:
+        return False
+    # Zallet omits this field until an account exists. The native authority gate
+    # later requires it to equal the common tip for the frozen collector account.
+    if "fully_synced_height" not in result:
+        return True
+    fully_synced_height = result["fully_synced_height"]
+    return type(fully_synced_height) is int and fully_synced_height == wallet_height
+
+
 def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
     encoded = base64.b64encode(cookie.encode("ascii")).decode("ascii")
     body = json.dumps(
@@ -54,7 +87,12 @@ def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
         if response.status != 200:
             return False
         decoded = json.loads(payload)
-        return decoded.get("error") is None and isinstance(decoded.get("result"), dict)
+        return (
+            isinstance(decoded, dict)
+            and decoded.get("id") == "zecwec-readiness"
+            and decoded.get("error") is None
+            and wallet_status_is_ready(decoded.get("result"))
+        )
     except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
         return False
     finally:
