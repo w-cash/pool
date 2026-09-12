@@ -17,6 +17,13 @@ bash -n "$repo_root"/scripts/deploy/*.sh "$repo_root/scripts/test-deployment-pac
 shellcheck "$repo_root"/scripts/deploy/*.sh "$repo_root/scripts/test-deployment-package.sh"
 grep -Fx -- '    --deadline 1080' \
     "$repo_root/scripts/deploy/wait-zallet-ready.sh" >/dev/null
+# shellcheck disable=SC2016
+grep -Fq '$script_dir/zallet_rpc_health.py' \
+    "$repo_root/scripts/deploy/wait-zallet-ready.sh"
+if grep -Fq '/usr/local/libexec' "$repo_root/scripts/deploy/wait-zallet-ready.sh"; then
+    printf 'deployment-package-test: Zallet readiness escaped its immutable release\n' >&2
+    exit 1
+fi
 PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile "$repo_root"/scripts/deploy/*.py
 PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/zallet_rpc_health.py" <<'PY'
 import http.client
@@ -215,6 +222,8 @@ assert "KillMode=mixed" in pool_unit
 assert "TimeoutStartSec=1800s" in pool_unit
 assert "TimeoutStartSec=1800s" in preflight_unit
 assert "TimeoutStartSec=1200s" in zallet_unit
+assert "ConditionFileIsExecutable=" in zallet_unit
+assert "ConditionPathIsExecutable=" not in zallet_unit
 
 wallet_init_unit = (root / "systemd/wcash-pool-wallet-init.service").read_text(encoding="utf-8")
 assert "EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env" in wallet_init_unit
