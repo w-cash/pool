@@ -1,0 +1,17 @@
+.settings-grid form {
+  display: grid;
+  gap: 16px;
+}
+
+.confirm-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 10px;
+}
+
+@media (max-width: 560px) {
+  .confirm-row {
+    grid-template-columns: 1fr;
+  }
+}

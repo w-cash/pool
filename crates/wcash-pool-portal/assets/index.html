@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ZecWec Pool — Testnet</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/forms.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="ZecWec pool overview">
+      <span class="mark">ZW</span>
+      <span>ZecWec</span>
+    </a>
+    <span class="network">Testnet · no monetary value</span>
+    <div class="session-actions">
+      <span id="account-name" class="muted"></span>
+      <button id="sign-out" class="button quiet hidden" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="auth-view" class="auth-shell">
+      <div class="auth-copy">
+        <p class="eyebrow">Equihash merged mining</p>
+        <h1>One worker.<br>Two independent rewards.</h1>
+        <p>Track WEC and ZEC without putting wallet keys or payout addresses in your ASIC.</p>
+        <dl class="facts">
+          <div><dt>Preferred</dt><dd>Encrypted Stratum</dd></div>
+          <div><dt>Accounting</dt><dd>Independent PPLNS</dd></div>
+          <div><dt>Privacy</dt><dd>Miner data stays private</dd></div>
+        </dl>
+      </div>
+      <form id="auth-form" class="panel auth-panel">
+        <div class="segmented" role="tablist" aria-label="Account action">
+          <button class="segment active" data-auth-mode="login" type="button">Sign in</button>
+          <button class="segment" data-auth-mode="register" type="button">Create account</button>
+        </div>
+        <label>Account name<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" minlength="12" maxlength="256" required></label>
+        <label id="totp-login-field">Authenticator code <span class="optional">if enabled</span><input name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
+        <p id="auth-error" class="notice error hidden" role="alert"></p>
+        <button id="auth-submit" class="button primary full" type="submit">Sign in</button>
+        <p class="fineprint">The worker token you enter in an ASIC is separate from this password.</p>
+      </form>
+    </section>
+
+    <section id="app-view" class="app-shell hidden">
+      <nav class="tabs" aria-label="Pool account">
+        <button data-page="overview" class="tab active">Overview</button>
+        <button data-page="workers" class="tab">Workers</button>
+        <button data-page="rewards" class="tab">Rewards</button>
+        <button data-page="blocks" class="tab">Blocks</button>
+        <button data-page="payouts" class="tab">Payouts</button>
+        <button data-page="settings" class="tab">Settings</button>
+      </nav>
+
+      <div id="page-overview" class="page active">
+        <div class="page-head"><div><p class="eyebrow">Pool account</p><h1>Overview</h1></div><span id="data-state" class="status warning">Connecting</span></div>
+        <div class="metric-grid">
+          <article class="metric"><span>Pool hashrate</span><strong id="pool-hashrate">—</strong><small>solutions / second</small></article>
+          <article class="metric"><span>Active workers</span><strong id="active-workers">—</strong><small>private to your account</small></article>
+          <article class="metric"><span>Wcash height</span><strong id="wcash-height">—</strong><small>WEC settlement chain</small></article>
+          <article class="metric"><span>Zcash height</span><strong id="zcash-height">—</strong><small>ZEC parent chain</small></article>
+        </div>
+        <div class="two-column">
+          <article class="asset-card wec"><div><span class="coin">W</span><h2>WEC</h2></div><p>Independent Testnet balance</p><strong>—</strong><small>Accounting projector not connected</small><p id="wec-fee">Pool fee —</p></article>
+          <article class="asset-card zec"><div><span class="coin">Z</span><h2>ZEC</h2></div><p>Independent Testnet balance</p><strong>—</strong><small>Accounting projector not connected</small><p id="zec-fee">Pool fee —</p></article>
+        </div>
+      </div>
+
+      <div id="page-workers" class="page">
+        <div class="page-head"><div><p class="eyebrow">ASIC access</p><h1>Workers</h1></div><button id="new-worker" class="button primary">New worker</button></div>
+        <div id="worker-create" class="panel compact hidden">
+          <form id="worker-form" class="inline-form"><label>Worker label<input name="label" placeholder="z15-01" maxlength="32" required></label><button class="button primary">Create token</button></form>
+          <div id="worker-secret" class="secret-box hidden" role="status"></div>
+        </div>
+        <div class="panel table-wrap"><table><thead><tr><th>Worker</th><th>Mining username</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody id="workers-body"><tr><td colspan="5" class="empty">No workers yet.</td></tr></tbody></table></div>
+      </div>
+
+      <div id="page-rewards" class="page"><div class="page-head"><div><p class="eyebrow">PPLNS</p><h1>Rewards</h1></div></div><div class="panel empty-state"><h2>Accounting connection required</h2><p>Reward estimates and immutable allocation events appear only after the durable projector is connected.</p></div></div>
+      <div id="page-blocks" class="page"><div class="page-head"><div><p class="eyebrow">Merged mining</p><h1>Blocks</h1></div></div><div class="panel empty-state"><h2>No verified block feed</h2><p>WEC, ZEC, and dual winners will appear here with confirmation and reorganization state.</p></div></div>
+      <div id="page-payouts" class="page"><div class="page-head"><div><p class="eyebrow">Settlement</p><h1>Payouts</h1></div></div><div class="panel empty-state"><h2>Signer deliberately unavailable</h2><p>No transaction is shown as paid until the isolated signer returns a reconciled on-chain transaction identifier.</p></div></div>
+
+      <div id="page-settings" class="page">
+        <div class="page-head"><div><p class="eyebrow">Account security</p><h1>Settings</h1></div></div>
+        <section class="settings-grid">
+          <form class="panel payout-form" data-asset="wec"><div class="card-title"><span class="coin wec-bg">W</span><div><h2>WEC destination</h2><p>Wcash Testnet only</p></div></div><label>Destination<input name="destination" autocomplete="off" required></label><div class="form-row"><label>Threshold, zatoshi<input name="threshold_zat" type="number" min="1" required></label><label class="check"><input name="automatic" type="checkbox" checked> Automatic payouts</label></div><label>Current password<input name="password" type="password" autocomplete="current-password" required></label><label>Authenticator code <span class="optional">if enabled</span><input name="totp_code" inputmode="numeric" pattern="[0-9]{6}"></label><button class="button primary">Save WEC setting</button><p class="setting-result muted"></p></form>
+          <form class="panel payout-form" data-asset="zec"><div class="card-title"><span class="coin zec-bg">Z</span><div><h2>ZEC destination</h2><p>Zcash Testnet only</p></div></div><label>Destination<input name="destination" autocomplete="off" required></label><div class="form-row"><label>Threshold, zatoshi<input name="threshold_zat" type="number" min="1" required></label><label class="check"><input name="automatic" type="checkbox" checked> Automatic payouts</label></div><label>Current password<input name="password" type="password" autocomplete="current-password" required></label><label>Authenticator code <span class="optional">if enabled</span><input name="totp_code" inputmode="numeric" pattern="[0-9]{6}"></label><button class="button primary">Save ZEC setting</button><p class="setting-result muted"></p></form>
+          <div class="panel"><form id="totp-form"><div class="card-title"><span class="security-icon">⌁</span><div><h2>Authenticator</h2><p>Required for payout changes after enrollment</p></div></div><label>Current password<input name="password" type="password" autocomplete="current-password" required></label><label>Existing code <span class="optional">if already enabled</span><input name="totp_code" inputmode="numeric" pattern="[0-9]{6}"></label><button class="button secondary">Begin enrollment</button></form><div id="totp-secret" class="secret-box hidden"></div><div id="totp-confirm" class="confirm-row hidden"><label>New authenticator code<input id="totp-confirm-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label><button id="totp-confirm-button" class="button primary" type="button">Confirm and sign out</button></div></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>ZecWec Testnet pool</span><span>Never provide a seed phrase or private key.</span></footer>
+</body>
+</html>

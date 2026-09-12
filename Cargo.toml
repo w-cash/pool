@@ -4,6 +4,7 @@ members = [
     "crates/wcash-pool-core",
     "crates/wcash-pool-edge",
     "crates/wcash-pool-protocol",
+    "crates/wcash-pool-portal",
     "crates/wcash-poold",
 ]
 resolver = "2"
@@ -19,13 +20,24 @@ homepage = "https://github.com/w-cash/pool"
 
 [workspace.dependencies]
 clap = { version = "4.5.47", features = ["derive"] }
+argon2 = "0.5.3"
+axum = { version = "0.8.4", features = ["json"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+data-encoding = "2.9.0"
+getrandom = "0.4.3"
 hex = "0.4.3"
+hmac = "0.12.1"
 serde = { version = "1.0.225", features = ["derive"] }
 serde_json = "1.0.145"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
+subtle = "2.6.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tower = { version = "0.5.2", features = ["util"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+zeroize = "1.8.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
