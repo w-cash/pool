@@ -137,15 +137,18 @@ fn target_endian_markers_reverse_asymmetric_bytes_and_round_trip() -> TestResult
 
 #[test]
 fn backend_health_frame_has_exact_big_endian_golden_encoding() -> TestResult {
-    let request = BackendRequest::Health { version: 1, id: 7 };
+    let request = BackendRequest::Health {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+    };
     let frame = encode_backend_request(&request)?;
-    let payload = br#"{"type":"health","v":1,"id":7}"#;
+    let payload = br#"{"type":"health","v":2,"id":7}"#;
     assert_eq!(frame, raw_backend_frame(payload));
     assert_eq!(decode_backend_request(&frame)?, request);
     assert_eq!(request.id(), 7);
 
     let response = BackendMessage::HealthStatus {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 7,
         event_seq: 9,
         healthy: true,
@@ -154,7 +157,7 @@ fn backend_health_frame_has_exact_big_endian_golden_encoding() -> TestResult {
         pending_zcash: 3,
     };
     let frame = encode_backend_message(&response)?;
-    let payload = br#"{"type":"health_status","v":1,"id":7,"event_seq":9,"healthy":true,"pending_wcash":2,"quarantined_wcash":1,"pending_zcash":3}"#;
+    let payload = br#"{"type":"health_status","v":2,"id":7,"event_seq":9,"healthy":true,"pending_wcash":2,"quarantined_wcash":1,"pending_zcash":3}"#;
     assert_eq!(frame, raw_backend_frame(payload));
     assert_eq!(decode_backend_message(&frame)?, response);
     Ok(())
@@ -183,7 +186,7 @@ fn backend_frame_rejects_missing_empty_oversize_truncated_and_trailing() {
         })
     );
 
-    let valid = raw_backend_frame(br#"{"type":"health","v":1,"id":7}"#);
+    let valid = raw_backend_frame(br#"{"type":"health","v":2,"id":7}"#);
     let mut truncated = valid.clone();
     truncated.pop();
     assert!(matches!(
@@ -200,9 +203,12 @@ fn backend_frame_rejects_missing_empty_oversize_truncated_and_trailing() {
 
 #[test]
 fn frame_codec_decodes_fragmented_and_coalesced_client_frames() -> TestResult {
-    let first = BackendRequest::Health { version: 1, id: 7 };
+    let first = BackendRequest::Health {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+    };
     let second = BackendRequest::ReadEvents {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 8,
         after_event_seq: 12,
         limit: 10,
@@ -256,7 +262,10 @@ fn frame_codec_rejects_declared_limits_before_buffering_and_recovers() -> TestRe
     );
     assert_eq!(codec.buffered_bytes(), 0);
 
-    let request = BackendRequest::Health { version: 1, id: 9 };
+    let request = BackendRequest::Health {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 9,
+    };
     let frame = FrameCodec::encode_client(&request)?;
     assert_eq!(codec.decode_client(&frame)?, (frame.len(), Some(request)));
     Ok(())
@@ -337,7 +346,7 @@ fn zip301_codec_rejects_at_limit_plus_one_and_resets_after_errors() -> TestResul
 #[test]
 fn frame_codec_decodes_server_messages_and_submit_share_is_redacted() -> TestResult {
     let response = BackendMessage::HealthStatus {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 7,
         event_seq: 4,
         healthy: true,
@@ -350,7 +359,7 @@ fn frame_codec_decodes_server_messages_and_submit_share_is_redacted() -> TestRes
     assert_eq!(codec.decode_server(&frame)?, (frame.len(), Some(response)));
 
     let submission = SubmitShare {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 8,
         job_id: fixed(1),
         identity: identity(),
@@ -398,7 +407,7 @@ fn backend_health_requires_consistent_wcash_quarantine_pressure() -> TestResult 
     assert!(encode_backend_message(&inconsistent).is_err());
 
     let missing_quarantine = raw_backend_frame(
-        br#"{"type":"health_status","v":1,"id":7,"event_seq":4,"healthy":true,"pending_wcash":0,"pending_zcash":0}"#,
+        br#"{"type":"health_status","v":2,"id":7,"event_seq":4,"healthy":true,"pending_wcash":0,"pending_zcash":0}"#,
     );
     assert!(decode_backend_message(&missing_quarantine).is_err());
     Ok(())
@@ -407,11 +416,11 @@ fn backend_health_requires_consistent_wcash_quarantine_pressure() -> TestResult 
 #[test]
 fn backend_request_rejects_unknown_fields_versions_ids_and_limits() {
     for payload in [
-        br#"{"type":"health","v":1,"id":1,"extra":true}"#.as_slice(),
-        br#"{"type":"health","v":2,"id":1}"#.as_slice(),
-        br#"{"type":"health","v":1,"id":0}"#.as_slice(),
-        br#"{"type":"read_events","v":1,"id":1,"after_event_seq":0,"limit":0}"#.as_slice(),
-        br#"{"type":"unknown","v":1,"id":1}"#.as_slice(),
+        br#"{"type":"health","v":2,"id":1,"extra":true}"#.as_slice(),
+        br#"{"type":"health","v":1,"id":1}"#.as_slice(),
+        br#"{"type":"health","v":2,"id":0}"#.as_slice(),
+        br#"{"type":"read_events","v":2,"id":1,"after_event_seq":0,"limit":0}"#.as_slice(),
+        br#"{"type":"unknown","v":2,"id":1}"#.as_slice(),
     ] {
         assert!(decode_backend_request(&raw_backend_frame(payload)).is_err());
     }
@@ -580,7 +589,7 @@ fn canonical_proof_hashes_match_cross_repository_vectors_and_bind_every_input() 
 #[test]
 fn large_submit_request_round_trips_and_debug_is_redacted() -> TestResult {
     let request = BackendRequest::SubmitShare {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 9,
         job_id: fixed(1),
         identity: identity(),
@@ -660,7 +669,7 @@ fn worker_identity_and_worker_bearing_backend_debug_are_redacted() -> TestResult
 #[test]
 fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
     let zero_time = BackendRequest::SubmitShare {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 9,
         job_id: fixed(1),
         identity: identity(),
@@ -682,13 +691,13 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
         winners: vec![winner(MergedChain::Wcash, 0x61)],
     };
     let response = BackendMessage::ShareCommitted {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 10,
         receipt: receipt.clone(),
         replayed: true,
     };
     let expected = format!(
-        "{{\"type\":\"share_committed\",\"v\":1,\"id\":10,\"receipt\":{{\"event_seq\":7,\"job_id\":\"{}\",\"share_id\":\"{}\",\"attribution_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[{{\"chain\":\"wcash\",\"block_hash_le\":\"{}\",\"height\":11,\"coinbase_txid_le\":\"{}\",\"reward_zat\":625000000,\"maturity_confirmations\":100}}]}},\"replayed\":true}}",
+        "{{\"type\":\"share_committed\",\"v\":2,\"id\":10,\"receipt\":{{\"event_seq\":7,\"job_id\":\"{}\",\"share_id\":\"{}\",\"attribution_id\":\"{}\",\"parent_hash_le\":\"{}\",\"winners\":[{{\"chain\":\"wcash\",\"block_hash_le\":\"{}\",\"height\":11,\"coinbase_txid_le\":\"{}\",\"reward_zat\":625000000,\"maturity_confirmations\":100}}]}},\"replayed\":true}}",
         "53".repeat(32),
         "51".repeat(32),
         receipt.attribution_id,
@@ -701,7 +710,7 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
     assert_eq!(decode_backend_message(&frame)?, response);
 
     let event = BackendMessage::Event {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         event: BackendEvent::ShareCommitted {
             receipt,
             job_id: fixed(0x53),
@@ -716,7 +725,7 @@ fn share_time_is_required_and_replay_status_is_response_only() -> TestResult {
     assert_eq!(decode_backend_message(&event_frame)?, event);
 
     let missing_time = format!(
-        "{{\"type\":\"submit_share\",\"v\":1,\"id\":9,\"job_id\":\"{}\",\"identity\":{{\"account_id\":\"00000000-0000-0000-0000-000000000001\",\"worker_id\":\"00000000-0000-0000-0000-000000000002\",\"label\":\"a.rig\"}},\"target_le\":\"{}\",\"nonce\":\"{}\",\"solution\":\"{}\"}}",
+        "{{\"type\":\"submit_share\",\"v\":2,\"id\":9,\"job_id\":\"{}\",\"identity\":{{\"account_id\":\"00000000-0000-0000-0000-000000000001\",\"worker_id\":\"00000000-0000-0000-0000-000000000002\",\"label\":\"a.rig\"}},\"target_le\":\"{}\",\"nonce\":\"{}\",\"solution\":\"{}\"}}",
         "01".repeat(32),
         "02".repeat(32),
         "03".repeat(32),
@@ -1244,7 +1253,7 @@ fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult
 #[test]
 fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult {
     let valid = BackendMessage::HelloOk {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 1,
         backend_session: uuid(1),
         backend_instance: uuid(2),
@@ -1254,6 +1263,11 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
         zcash_genesis: fixed(2),
         wcash_payout_commitment: fixed(3),
         zcash_payout_commitment: fixed(4),
+        share_target_ceiling_be: TargetBe::new([
+            0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3,
+            0xd2, 0xe1, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a, 0xab,
+            0xbc, 0xcd, 0xde, 0xef,
+        ]),
         chain_id: 0x5745_4301,
         current_event_seq: 0,
     };
@@ -1271,6 +1285,15 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
     let payload = serde_json::to_vec(&missing_commitment)?;
     assert!(decode_backend_message(&raw_backend_frame(&payload)).is_err());
 
+    let mut missing_target: serde_json::Value =
+        serde_json::from_slice(&encode_backend_message(&valid)?[BACKEND_LENGTH_PREFIX_BYTES..])?;
+    missing_target
+        .as_object_mut()
+        .ok_or("hello_ok must encode as an object")?
+        .remove("share_target_ceiling_be");
+    let payload = serde_json::to_vec(&missing_target)?;
+    assert!(decode_backend_message(&raw_backend_frame(&payload)).is_err());
+
     let mut zero_commitment = valid.clone();
     if let BackendMessage::HelloOk {
         zcash_payout_commitment,
@@ -1280,6 +1303,16 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
         *zcash_payout_commitment = fixed(0);
     }
     assert!(encode_backend_message(&zero_commitment).is_err());
+
+    let mut zero_target = valid.clone();
+    if let BackendMessage::HelloOk {
+        share_target_ceiling_be,
+        ..
+    } = &mut zero_target
+    {
+        *share_target_ceiling_be = TargetBe::new([0; 32]);
+    }
+    assert!(encode_backend_message(&zero_target).is_err());
 
     let mut duplicate_identity = valid.clone();
     if let BackendMessage::HelloOk {
@@ -1305,7 +1338,7 @@ fn semantic_identities_reject_nil_uuids() {
     assert!(invalid_worker.validate().is_err());
 
     let hello = BackendRequest::Hello {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 1,
         pool_instance: nil,
         last_event_seq: 0,
@@ -1313,7 +1346,7 @@ fn semantic_identities_reject_nil_uuids() {
     assert!(hello.validate().is_err());
 
     let hello_ok = BackendMessage::HelloOk {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 1,
         backend_session: nil,
         backend_instance: uuid(2),
@@ -1323,6 +1356,7 @@ fn semantic_identities_reject_nil_uuids() {
         zcash_genesis: fixed(2),
         wcash_payout_commitment: fixed(3),
         zcash_payout_commitment: fixed(4),
+        share_target_ceiling_be: TargetBe::new([1; 32]),
         chain_id: 1,
         current_event_seq: 0,
     };
@@ -1336,7 +1370,7 @@ fn snapshots_bind_remaining_lifetime_and_reject_duplicates() {
         accept_for_ms: 30_000,
     };
     let valid = BackendMessage::JobSnapshot {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 2,
         event_seq: 8,
         current: Some(current.clone()),
@@ -1412,7 +1446,7 @@ fn event_pages_are_strictly_ordered_and_cursor_bound() {
         job_id: fixed(1),
     };
     let valid = BackendMessage::EventsPage {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 3,
         after_event_seq: 10,
         next_event_seq: 12,
@@ -1433,7 +1467,7 @@ fn event_pages_are_strictly_ordered_and_cursor_bound() {
     assert!(wrong_cursor.validate().is_err());
 
     let gap = BackendMessage::EventsPage {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 4,
         after_event_seq: 10,
         next_event_seq: 13,
@@ -1452,7 +1486,7 @@ fn event_pages_are_strictly_ordered_and_cursor_bound() {
     assert!(gap.validate().is_err());
 
     let stalled = BackendMessage::EventsPage {
-        version: 1,
+        version: BACKEND_PROTOCOL_VERSION,
         id: 5,
         after_event_seq: 10,
         next_event_seq: 10,

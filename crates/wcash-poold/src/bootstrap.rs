@@ -232,6 +232,7 @@ fn backend_config(config: &RuntimeConfig) -> Result<BackendClientConfig, Bootstr
         config.chain_id,
         Hex32::new(config.wcash_payout_commitment),
         Hex32::new(config.zcash_payout_commitment),
+        TargetBe::new(config.easiest_share_target_be),
     )?
     .with_backend_instance(CanonicalUuid::new(config.backend_instance))
     .with_journal_stream(CanonicalUuid::new(config.journal_stream));

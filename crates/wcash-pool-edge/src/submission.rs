@@ -609,7 +609,7 @@ mod tests {
         canonical_parent_header_hash_le, canonical_share_id, decode_backend_request,
         encode_backend_message, AcceptableJob, BackendEvent, BackendMessage, BackendRequest,
         CanonicalUuid, Hex108, Hex1344, Hex28, Hex32, JobDescriptor, NonceProfile, NonceSuffix,
-        ShareReceipt, TargetLe, BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION,
+        ShareReceipt, TargetBe, TargetLe, BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION,
         REQUIRED_BACKEND_CAPABILITIES,
     };
 
@@ -681,6 +681,7 @@ mod tests {
             0x5743_4153,
             Hex32::new([0x33; 32]),
             Hex32::new([0x44; 32]),
+            TargetBe::new([0x55; 32]),
         )?
         .with_backend_instance(uuid(2))
         .with_journal_stream(uuid(3));
@@ -721,6 +722,7 @@ mod tests {
                 zcash_genesis: Hex32::new([0x22; 32]),
                 wcash_payout_commitment: Hex32::new([0x33; 32]),
                 zcash_payout_commitment: Hex32::new([0x44; 32]),
+                share_target_ceiling_be: TargetBe::new([0x55; 32]),
                 chain_id: 0x5743_4153,
                 current_event_seq: 10,
             },
@@ -1006,6 +1008,7 @@ mod tests {
                     zcash_genesis: Hex32::new([0x22; 32]),
                     wcash_payout_commitment: Hex32::new([0x33; 32]),
                     zcash_payout_commitment: Hex32::new([0x44; 32]),
+                    share_target_ceiling_be: TargetBe::new([0x55; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1347,6 +1350,7 @@ mod tests {
                     zcash_genesis: Hex32::new([0x22; 32]),
                     wcash_payout_commitment: Hex32::new([0x33; 32]),
                     zcash_payout_commitment: Hex32::new([0x44; 32]),
+                    share_target_ceiling_be: TargetBe::new([0x55; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1429,6 +1433,7 @@ mod tests {
                     zcash_genesis: Hex32::new([0x22; 32]),
                     wcash_payout_commitment: Hex32::new([0x33; 32]),
                     zcash_payout_commitment: Hex32::new([0x44; 32]),
+                    share_target_ceiling_be: TargetBe::new([0x55; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1498,6 +1503,7 @@ mod tests {
                     zcash_genesis: Hex32::new([0x22; 32]),
                     wcash_payout_commitment: Hex32::new([0x33; 32]),
                     zcash_payout_commitment: Hex32::new([0x44; 32]),
+                    share_target_ceiling_be: TargetBe::new([0x55; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1600,6 +1606,7 @@ mod tests {
                     zcash_genesis: Hex32::new([0x22; 32]),
                     wcash_payout_commitment: Hex32::new([0x33; 32]),
                     zcash_payout_commitment: Hex32::new([0x44; 32]),
+                    share_target_ceiling_be: TargetBe::new([0x55; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
@@ -1895,6 +1902,7 @@ mod tests {
                     zcash_genesis: Hex32::new([0x22; 32]),
                     wcash_payout_commitment: Hex32::new([0x33; 32]),
                     zcash_payout_commitment: Hex32::new([0x44; 32]),
+                    share_target_ceiling_be: TargetBe::new([0x55; 32]),
                     chain_id: 0x5743_4153,
                     current_event_seq: 10,
                 },
