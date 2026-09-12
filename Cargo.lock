@@ -2339,6 +2339,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wcash-wec-payout-signer"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "wcash-pool-portal",
+ "zeroize",
+]
+
+[[package]]
 name = "wcash-zec-payout-signer"
 version = "0.1.0-alpha.1"
 dependencies = [
