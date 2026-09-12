@@ -49,6 +49,21 @@ impl SeedSource {
         Self::Stdin
     }
 
+    /// Verifies a protected seed file's identity and access policy without
+    /// reading any spending-authority bytes.
+    ///
+    /// This probe is intentionally unavailable for standard input because a
+    /// later process invocation cannot bind itself to the same stream.
+    pub fn validate_protected_metadata(&self) -> Result<(), WecPayoutError> {
+        match self {
+            Self::ProtectedFile { path, trusted_uid } => {
+                drop(open_protected_file(path, *trusted_uid)?);
+                Ok(())
+            }
+            Self::Stdin => Err(WecPayoutError::UnsafeCredential),
+        }
+    }
+
     pub(crate) fn read(&self) -> Result<SecretSeed, WecPayoutError> {
         match self {
             Self::ProtectedFile { path, trusted_uid } => read_protected_file(path, *trusted_uid),
@@ -93,6 +108,11 @@ impl fmt::Debug for SecretSeed {
 
 #[cfg(unix)]
 fn read_protected_file(path: &Path, trusted_uid: u32) -> Result<SecretSeed, WecPayoutError> {
+    read_encoded_seed(open_protected_file(path, trusted_uid)?)
+}
+
+#[cfg(unix)]
+fn open_protected_file(path: &Path, trusted_uid: u32) -> Result<File, WecPayoutError> {
     if !path.is_absolute()
         || path
             .components()
@@ -128,7 +148,7 @@ fn read_protected_file(path: &Path, trusted_uid: u32) -> Result<SecretSeed, WecP
     {
         return Err(WecPayoutError::UnsafeCredential);
     }
-    read_encoded_seed(file)
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -154,6 +174,11 @@ fn read_protected_file(_path: &Path, _trusted_uid: u32) -> Result<SecretSeed, We
     Err(WecPayoutError::UnsafeCredential)
 }
 
+#[cfg(not(unix))]
+fn open_protected_file(_path: &Path, _trusted_uid: u32) -> Result<File, WecPayoutError> {
+    Err(WecPayoutError::UnsafeCredential)
+}
+
 fn read_encoded_seed(reader: impl Read) -> Result<SecretSeed, WecPayoutError> {
     let mut encoded = Zeroizing::new(String::new());
     reader
@@ -176,9 +201,15 @@ fn read_encoded_seed(reader: impl Read) -> Result<SecretSeed, WecPayoutError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn secret_debug_is_always_redacted() {
@@ -201,5 +232,23 @@ mod tests {
             read_encoded_seed(format!("{} {}", "42".repeat(32), "43").as_bytes()).err(),
             Some(WecPayoutError::UnsafeCredential)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_metadata_probe_does_not_read_seed_contents() {
+        let root = tempfile::tempdir().expect("temporary seed directory");
+        let root = fs::canonicalize(root.path()).expect("canonical seed directory");
+        let path = root.join("seed");
+        fs::write(&path, b"deliberately-not-an-encoded-seed").expect("write invalid seed contents");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("protect seed fixture");
+        let owner = fs::metadata(&path).expect("seed metadata").uid();
+        let source = SeedSource::protected_file(path, owner);
+
+        source
+            .validate_protected_metadata()
+            .expect("metadata is valid without reading the credential");
+        assert_eq!(source.read().err(), Some(WecPayoutError::UnsafeCredential));
     }
 }

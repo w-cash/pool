@@ -46,8 +46,8 @@ pub enum WolfTransportConfigError {
     /// The configured executable does not have the reviewed digest.
     #[error("Wcash wallet executable digest does not match")]
     ProgramDigestMismatch,
-    /// The wallet database path is not absolute and lexically canonical.
-    #[error("Wcash wallet database path is unsafe")]
+    /// The wallet database path or existing database file is unsafe.
+    #[error("Wcash wallet database boundary is unsafe")]
     UnsafeDatabasePath,
     /// Only a literal loopback plaintext endpoint is accepted at this local boundary.
     #[error("Wcash compact-block endpoint must be literal loopback HTTP")]
@@ -187,6 +187,13 @@ impl WolfWalletTransport {
         })
     }
 
+    /// Revalidates the executable and opens the existing wallet database for
+    /// reading without invoking Wolf or allowing SQLite to create side files.
+    pub(super) fn probe_readonly_boundary(&self) -> Result<(), WolfTransportConfigError> {
+        self.program.verify_now()?;
+        probe_readonly_database(&self.wallet_database)
+    }
+
     fn invoke_wallet(
         &self,
         subcommand: &'static str,
@@ -298,6 +305,41 @@ impl WolfWalletTransport {
         )
         .map_err(map_readonly_invoke_error)
     }
+}
+
+#[cfg(unix)]
+fn probe_readonly_database(path: &Path) -> Result<(), WolfTransportConfigError> {
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|_| WolfTransportConfigError::UnsafeDatabasePath)?;
+    if !named.file_type().is_file()
+        || named.file_type().is_symlink()
+        || named.nlink() != 1
+        || named.permissions().mode() & 0o022 != 0
+        || named.len() == 0
+        || std::fs::canonicalize(path).ok().as_deref() != Some(path)
+    {
+        return Err(WolfTransportConfigError::UnsafeDatabasePath);
+    }
+    let file = File::open(path).map_err(|_| WolfTransportConfigError::UnsafeDatabasePath)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| WolfTransportConfigError::UnsafeDatabasePath)?;
+    if !opened.file_type().is_file()
+        || opened.nlink() != 1
+        || opened.permissions().mode() & 0o022 != 0
+        || opened.len() == 0
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.len() != named.len()
+    {
+        return Err(WolfTransportConfigError::UnsafeDatabasePath);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn probe_readonly_database(_path: &Path) -> Result<(), WolfTransportConfigError> {
+    Err(WolfTransportConfigError::UnsafeDatabasePath)
 }
 
 impl std::fmt::Debug for WolfWalletTransport {
