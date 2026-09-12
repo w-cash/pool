@@ -1,12 +1,11 @@
 [Unit]
-Description=Watch rotating node and wallet RPC credentials for ZecWec Testnet
+Description=Watch rotating node RPC credentials for ZecWec Testnet
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
 
 [Path]
 PathChanged=@WCASH_RPC_COOKIE_SOURCE@
 PathChanged=@ZCASH_TEMPLATE_COOKIE_SOURCE@
 PathChanged=@ZCASH_VALIDATOR_COOKIE_SOURCE@
-PathChanged=@ZALLET_STATE_DIR@/.cookie
 Unit=zecwec-cookie-refresh.service
 
 [Install]

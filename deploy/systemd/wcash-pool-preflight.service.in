@@ -1,9 +1,9 @@
 [Unit]
 Description=Validate ZecWec Testnet pool without opening miner or portal listeners
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
-Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service zecwec-zallet.service wcash-pool-wallet-init.service @WCASH_LIGHTWALLETD_UNIT@
-BindsTo=wcash-pool-backend.service zecwec-zallet.service @WCASH_LIGHTWALLETD_UNIT@
-After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service zecwec-zallet.service wcash-pool-wallet-init.service @WCASH_LIGHTWALLETD_UNIT@
+Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service
+BindsTo=wcash-pool-backend.service @WCASH_NODE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service @WCASH_NODE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/pool.preflight.toml
 
@@ -20,8 +20,6 @@ Environment=ZEC_AUTHORITY_ATTESTATION=/run/credentials/wcash-pool-preflight.serv
 LoadCredential=database-url:@DATABASE_RUNTIME_URL_CREDENTIAL@
 LoadCredential=portal-token-pepper:@PORTAL_TOKEN_PEPPER_CREDENTIAL@
 LoadCredential=portal-totp-key:@PORTAL_TOTP_KEY_CREDENTIAL@
-LoadCredential=zallet-config:@ZALLET_CONFIG_FILE@
-LoadCredential=zallet-cookie:@ZALLET_STATE_DIR@/.cookie
 LoadCredential=wcash-node-cookie:@WCASH_RPC_COOKIE_SOURCE@
 LoadCredential=zcash-node-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
 LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml
@@ -44,6 +42,7 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
+InaccessiblePaths=-@WEC_SEED_FILE@ -@WCASH_WALLET_DATABASE@ -@WEC_SIGNER_JOURNAL@ -@ZALLET_CONFIG_FILE@ -@ZALLET_STATE_DIR@ -@ZEC_SIGNER_JOURNAL@
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

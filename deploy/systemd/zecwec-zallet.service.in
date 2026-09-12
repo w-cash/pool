@@ -44,6 +44,3 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
-
-[Install]
-WantedBy=zecwec-testnet-pool.target

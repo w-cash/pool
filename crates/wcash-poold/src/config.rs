@@ -72,6 +72,45 @@ pub struct RuntimeConfig {
     pub wcash_wallet_sha256: [u8; 32],
     /// Required executable owner.
     pub wcash_wallet_uid: u32,
+    /// Whether spending-key-backed automatic payout execution is online.
+    pub payout_mode: PayoutMode,
+    /// Spending authority used only when automatic payouts are explicitly enabled.
+    pub automatic_payout: Option<AutomaticPayoutConfig>,
+    /// Loopback Wcash validator JSON-RPC endpoint.
+    pub wcash_node_rpc: SocketAddr,
+    /// Protected Wcash validator JSON-RPC cookie.
+    pub wcash_node_cookie_file: PathBuf,
+    /// Loopback Zebra JSON-RPC endpoint used for exact ZEC broadcast.
+    pub zcash_node_rpc: SocketAddr,
+    /// Protected Zebra JSON-RPC cookie.
+    pub zcash_node_cookie_file: PathBuf,
+    /// Portal keyed-digest secret credential.
+    pub portal_token_pepper_file: PathBuf,
+    /// Portal TOTP encryption secret credential.
+    pub portal_totp_key_file: PathBuf,
+    /// Initial Wcash accounting policy.
+    pub wcash_policy: ChainRuntimePolicy,
+    /// Initial Zcash accounting policy.
+    pub zcash_policy: ChainRuntimePolicy,
+    /// Initial miner share target in canonical big-endian order.
+    pub initial_share_target_be: [u8; 32],
+    /// Easiest permitted miner share target in canonical big-endian order.
+    pub easiest_share_target_be: [u8; 32],
+}
+
+/// Mining and payout execution are deliberately separate availability domains.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PayoutMode {
+    /// Record exact liabilities while both collector spending keys stay offline.
+    Deferred,
+    /// Run the separately fenced automatic payout workers.
+    Automatic,
+}
+
+/// Spending-key-backed runtime inputs, absent from a deferred mining process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomaticPayoutConfig {
     /// Persistent native Wcash collector wallet database.
     pub wcash_wallet_database: PathBuf,
     /// Literal loopback Wcash compact-block endpoint.
@@ -80,10 +119,6 @@ pub struct RuntimeConfig {
     pub wcash_wallet_sync_batch_size: u32,
     /// Independent wall-clock limit for one complete seedless wallet sync.
     pub wcash_wallet_sync_timeout: Duration,
-    /// Loopback Wcash validator JSON-RPC endpoint.
-    pub wcash_node_rpc: SocketAddr,
-    /// Protected Wcash validator JSON-RPC cookie.
-    pub wcash_node_cookie_file: PathBuf,
     /// Protected Wcash collector seed credential.
     pub wcash_wallet_seed_file: PathBuf,
     /// Required owner of the Wcash seed credential.
@@ -98,28 +133,12 @@ pub struct RuntimeConfig {
     pub zallet_rpc: SocketAddr,
     /// Protected Zallet JSON-RPC cookie.
     pub zallet_cookie_file: PathBuf,
-    /// Loopback Zebra JSON-RPC endpoint used for exact ZEC broadcast.
-    pub zcash_node_rpc: SocketAddr,
-    /// Protected Zebra JSON-RPC cookie.
-    pub zcash_node_cookie_file: PathBuf,
     /// Crash-recovery journal for exact ZEC payout artifacts.
     pub zcash_signer_journal_directory: PathBuf,
     /// Exact Zallet collector account identity.
     pub zcash_signer_account: Uuid,
     /// Exact non-hardened ZIP 32 index of the Zallet collector account.
     pub zcash_signer_account_index: u32,
-    /// Portal keyed-digest secret credential.
-    pub portal_token_pepper_file: PathBuf,
-    /// Portal TOTP encryption secret credential.
-    pub portal_totp_key_file: PathBuf,
-    /// Initial Wcash accounting policy.
-    pub wcash_policy: ChainRuntimePolicy,
-    /// Initial Zcash accounting policy.
-    pub zcash_policy: ChainRuntimePolicy,
-    /// Initial miner share target in canonical big-endian order.
-    pub initial_share_target_be: [u8; 32],
-    /// Easiest permitted miner share target in canonical big-endian order.
-    pub easiest_share_target_be: [u8; 32],
 }
 
 /// Explicit zero-fee launch policy for one independently settled chain.
@@ -180,24 +199,25 @@ struct RawConfig {
     wcash_wallet_program: PathBuf,
     wcash_wallet_sha256: String,
     wcash_wallet_uid: u32,
-    wcash_wallet_database: PathBuf,
-    wcash_lightwalletd_endpoint: String,
-    wcash_wallet_sync_batch_size: u32,
-    wcash_wallet_sync_timeout_seconds: u64,
+    payout_mode: PayoutMode,
+    wcash_wallet_database: Option<PathBuf>,
+    wcash_lightwalletd_endpoint: Option<String>,
+    wcash_wallet_sync_batch_size: Option<u32>,
+    wcash_wallet_sync_timeout_seconds: Option<u64>,
     wcash_node_rpc: SocketAddr,
     wcash_node_cookie_file: PathBuf,
-    wcash_wallet_seed_file: PathBuf,
-    wcash_seed_uid: u32,
-    wcash_signer_journal_directory: PathBuf,
-    wcash_signer_account: Uuid,
-    zallet_configuration: PathBuf,
-    zallet_rpc: SocketAddr,
-    zallet_cookie_file: PathBuf,
+    wcash_wallet_seed_file: Option<PathBuf>,
+    wcash_seed_uid: Option<u32>,
+    wcash_signer_journal_directory: Option<PathBuf>,
+    wcash_signer_account: Option<Uuid>,
+    zallet_configuration: Option<PathBuf>,
+    zallet_rpc: Option<SocketAddr>,
+    zallet_cookie_file: Option<PathBuf>,
     zcash_node_rpc: SocketAddr,
     zcash_node_cookie_file: PathBuf,
-    zcash_signer_journal_directory: PathBuf,
-    zcash_signer_account: Uuid,
-    zcash_signer_account_index: u32,
+    zcash_signer_journal_directory: Option<PathBuf>,
+    zcash_signer_account: Option<Uuid>,
+    zcash_signer_account_index: Option<u32>,
     portal_token_pepper_file: PathBuf,
     portal_totp_key_file: PathBuf,
     wcash_policy: RawChainPolicy,
@@ -255,19 +275,14 @@ impl TryFrom<RawConfig> for RuntimeConfig {
         for path in [
             &raw.database_url_file,
             &raw.wcash_wallet_program,
-            &raw.wcash_wallet_database,
-            &raw.wcash_wallet_seed_file,
-            &raw.wcash_signer_journal_directory,
             &raw.wcash_node_cookie_file,
-            &raw.zallet_configuration,
-            &raw.zallet_cookie_file,
             &raw.zcash_node_cookie_file,
-            &raw.zcash_signer_journal_directory,
             &raw.portal_token_pepper_file,
             &raw.portal_totp_key_file,
         ] {
             require_absolute(path)?;
         }
+        let automatic_payout = parse_automatic_payout(&raw)?;
         if raw.stratum_listen.port() == 0
             || raw.stratum_listen.ip().is_loopback()
             || raw.stratum_listen.ip().is_multicast()
@@ -282,30 +297,13 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             || !(1..=65_535).contains(&raw.maximum_miners)
             || !(1..=raw.maximum_miners).contains(&raw.maximum_miners_per_ip)
             || !(1..=32).contains(&raw.authentication_parallelism)
-            || raw.wcash_lightwalletd_endpoint.is_empty()
-            || raw
-                .wcash_lightwalletd_endpoint
-                .chars()
-                .any(char::is_whitespace)
-            || !(1..=16).contains(&raw.wcash_wallet_sync_batch_size)
-            || raw.wcash_wallet_sync_timeout_seconds == 0
-            || Duration::from_secs(raw.wcash_wallet_sync_timeout_seconds)
-                > MAX_WCASH_WALLET_SYNC_TIMEOUT
             || !raw.wcash_node_rpc.ip().is_loopback()
             || raw.wcash_node_rpc.port() == 0
-            || !raw.zallet_rpc.ip().is_loopback()
-            || raw.zallet_rpc.port() == 0
             || !raw.zcash_node_rpc.ip().is_loopback()
             || raw.zcash_node_rpc.port() == 0
-            || raw.zallet_rpc == raw.zcash_node_rpc
-            || raw.wcash_node_rpc == raw.zallet_rpc
             || raw.wcash_node_rpc == raw.zcash_node_rpc
-            || raw.zcash_signer_account_index >= (1 << 31)
         {
             return Err(ConfigError::InvalidPolicy);
-        }
-        if raw.wcash_signer_account.is_nil() || raw.zcash_signer_account.is_nil() {
-            return Err(ConfigError::InvalidIdentity);
         }
         let wcash_genesis = decode_hex32("wcash_genesis", &raw.wcash_genesis)?;
         let zcash_genesis = decode_hex32("zcash_genesis", &raw.zcash_genesis)?;
@@ -356,24 +354,12 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             wcash_wallet_program: raw.wcash_wallet_program,
             wcash_wallet_sha256,
             wcash_wallet_uid: raw.wcash_wallet_uid,
-            wcash_wallet_database: raw.wcash_wallet_database,
-            wcash_lightwalletd_endpoint: raw.wcash_lightwalletd_endpoint,
-            wcash_wallet_sync_batch_size: raw.wcash_wallet_sync_batch_size,
-            wcash_wallet_sync_timeout: Duration::from_secs(raw.wcash_wallet_sync_timeout_seconds),
+            payout_mode: raw.payout_mode,
+            automatic_payout,
             wcash_node_rpc: raw.wcash_node_rpc,
             wcash_node_cookie_file: raw.wcash_node_cookie_file,
-            wcash_wallet_seed_file: raw.wcash_wallet_seed_file,
-            wcash_seed_uid: raw.wcash_seed_uid,
-            wcash_signer_journal_directory: raw.wcash_signer_journal_directory,
-            wcash_signer_account: raw.wcash_signer_account,
-            zallet_configuration: raw.zallet_configuration,
-            zallet_rpc: raw.zallet_rpc,
-            zallet_cookie_file: raw.zallet_cookie_file,
             zcash_node_rpc: raw.zcash_node_rpc,
             zcash_node_cookie_file: raw.zcash_node_cookie_file,
-            zcash_signer_journal_directory: raw.zcash_signer_journal_directory,
-            zcash_signer_account: raw.zcash_signer_account,
-            zcash_signer_account_index: raw.zcash_signer_account_index,
             portal_token_pepper_file: raw.portal_token_pepper_file,
             portal_totp_key_file: raw.portal_totp_key_file,
             wcash_policy: parse_chain_policy(raw.wcash_policy)?,
@@ -381,6 +367,112 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             initial_share_target_be,
             easiest_share_target_be,
         })
+    }
+}
+
+fn parse_automatic_payout(raw: &RawConfig) -> Result<Option<AutomaticPayoutConfig>, ConfigError> {
+    let fields_present = [
+        raw.wcash_wallet_database.is_some(),
+        raw.wcash_lightwalletd_endpoint.is_some(),
+        raw.wcash_wallet_sync_batch_size.is_some(),
+        raw.wcash_wallet_sync_timeout_seconds.is_some(),
+        raw.wcash_wallet_seed_file.is_some(),
+        raw.wcash_seed_uid.is_some(),
+        raw.wcash_signer_journal_directory.is_some(),
+        raw.wcash_signer_account.is_some(),
+        raw.zallet_configuration.is_some(),
+        raw.zallet_rpc.is_some(),
+        raw.zallet_cookie_file.is_some(),
+        raw.zcash_signer_journal_directory.is_some(),
+        raw.zcash_signer_account.is_some(),
+        raw.zcash_signer_account_index.is_some(),
+    ];
+    match raw.payout_mode {
+        PayoutMode::Deferred => {
+            if fields_present.into_iter().any(|present| present) {
+                return Err(ConfigError::InvalidPolicy);
+            }
+            Ok(None)
+        }
+        PayoutMode::Automatic => {
+            if fields_present.into_iter().any(|present| !present) {
+                return Err(ConfigError::InvalidPolicy);
+            }
+            let config = AutomaticPayoutConfig {
+                wcash_wallet_database: raw
+                    .wcash_wallet_database
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                wcash_lightwalletd_endpoint: raw
+                    .wcash_lightwalletd_endpoint
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                wcash_wallet_sync_batch_size: raw
+                    .wcash_wallet_sync_batch_size
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                wcash_wallet_sync_timeout: Duration::from_secs(
+                    raw.wcash_wallet_sync_timeout_seconds
+                        .ok_or(ConfigError::InvalidPolicy)?,
+                ),
+                wcash_wallet_seed_file: raw
+                    .wcash_wallet_seed_file
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                wcash_seed_uid: raw.wcash_seed_uid.ok_or(ConfigError::InvalidPolicy)?,
+                wcash_signer_journal_directory: raw
+                    .wcash_signer_journal_directory
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                wcash_signer_account: raw.wcash_signer_account.ok_or(ConfigError::InvalidPolicy)?,
+                zallet_configuration: raw
+                    .zallet_configuration
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                zallet_rpc: raw.zallet_rpc.ok_or(ConfigError::InvalidPolicy)?,
+                zallet_cookie_file: raw
+                    .zallet_cookie_file
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                zcash_signer_journal_directory: raw
+                    .zcash_signer_journal_directory
+                    .clone()
+                    .ok_or(ConfigError::InvalidPolicy)?,
+                zcash_signer_account: raw.zcash_signer_account.ok_or(ConfigError::InvalidPolicy)?,
+                zcash_signer_account_index: raw
+                    .zcash_signer_account_index
+                    .ok_or(ConfigError::InvalidPolicy)?,
+            };
+            for path in [
+                &config.wcash_wallet_database,
+                &config.wcash_wallet_seed_file,
+                &config.wcash_signer_journal_directory,
+                &config.zallet_configuration,
+                &config.zallet_cookie_file,
+                &config.zcash_signer_journal_directory,
+            ] {
+                require_absolute(path)?;
+            }
+            if config.wcash_lightwalletd_endpoint.is_empty()
+                || config
+                    .wcash_lightwalletd_endpoint
+                    .chars()
+                    .any(char::is_whitespace)
+                || !(1..=16).contains(&config.wcash_wallet_sync_batch_size)
+                || config.wcash_wallet_sync_timeout.is_zero()
+                || config.wcash_wallet_sync_timeout > MAX_WCASH_WALLET_SYNC_TIMEOUT
+                || !config.zallet_rpc.ip().is_loopback()
+                || config.zallet_rpc.port() == 0
+                || config.zallet_rpc == raw.zcash_node_rpc
+                || config.zallet_rpc == raw.wcash_node_rpc
+                || config.zcash_signer_account_index >= (1 << 31)
+            {
+                return Err(ConfigError::InvalidPolicy);
+            }
+            if config.wcash_signer_account.is_nil() || config.zcash_signer_account.is_nil() {
+                return Err(ConfigError::InvalidIdentity);
+            }
+            Ok(Some(config))
+        }
     }
 }
 
@@ -673,6 +765,7 @@ authentication_parallelism = 4
 wcash_wallet_program = "/opt/wcash/bin/wcash-wallet"
 wcash_wallet_sha256 = "{five}"
 wcash_wallet_uid = 0
+payout_mode = "automatic"
 wcash_wallet_database = "/var/lib/zecwec/wcash-wallet.sqlite"
 wcash_lightwalletd_endpoint = "http://127.0.0.1:38234"
 wcash_wallet_sync_batch_size = 16
@@ -725,6 +818,40 @@ policy_version = 1
         )
     }
 
+    fn deferred_fixture(directory: &TempDir) -> String {
+        let root = protected_root(directory);
+        let mut config = fixture(directory, "testnet")
+            .replace("payout_mode = \"automatic\"", "payout_mode = \"deferred\"");
+        for line in [
+            "wcash_wallet_database = \"/var/lib/zecwec/wcash-wallet.sqlite\"\n".to_owned(),
+            "wcash_lightwalletd_endpoint = \"http://127.0.0.1:38234\"\n".to_owned(),
+            "wcash_wallet_sync_batch_size = 16\n".to_owned(),
+            "wcash_wallet_sync_timeout_seconds = 300\n".to_owned(),
+            format!(
+                "wcash_wallet_seed_file = \"{}/wcash-seed\"\n",
+                root.display()
+            ),
+            "wcash_seed_uid = 0\n".to_owned(),
+            "wcash_signer_journal_directory = \"/var/lib/zecwec/wec-payout-journal\"\n".to_owned(),
+            "wcash_signer_account = \"55555555-5555-4555-8555-555555555555\"\n".to_owned(),
+            format!(
+                "zallet_configuration = \"{}/zallet.toml\"\n",
+                root.display()
+            ),
+            "zallet_rpc = \"127.0.0.1:28232\"\n".to_owned(),
+            format!(
+                "zallet_cookie_file = \"{}/zallet.cookie\"\n",
+                root.display()
+            ),
+            "zcash_signer_journal_directory = \"/var/lib/zecwec/zec-payout-journal\"\n".to_owned(),
+            "zcash_signer_account = \"66666666-6666-4666-8666-666666666666\"\n".to_owned(),
+            "zcash_signer_account_index = 0\n".to_owned(),
+        ] {
+            config = config.replace(&line, "");
+        }
+        config
+    }
+
     #[test]
     fn exact_testnet_policy_loads_and_credentials_remain_separate() {
         let directory = TempDir::new().expect("temp dir");
@@ -752,6 +879,36 @@ policy_version = 1
             *RuntimeConfig::portal_secret(&config.portal_token_pepper_file).expect("secret"),
             [7; 32]
         );
+    }
+
+    #[test]
+    fn deferred_mining_policy_contains_no_spending_runtime_inputs() {
+        let directory = TempDir::new().expect("temp dir");
+        let config_path = write_file(
+            &directory,
+            "pool-deferred.toml",
+            deferred_fixture(&directory).as_bytes(),
+            0o600,
+        );
+        let config = RuntimeConfig::load(&config_path).expect("valid deferred config");
+        assert_eq!(config.payout_mode, PayoutMode::Deferred);
+        assert!(config.automatic_payout.is_none());
+
+        let contaminated = write_file(
+            &directory,
+            "pool-deferred-contaminated.toml",
+            deferred_fixture(&directory)
+                .replace(
+                    "\n[wcash_policy]",
+                    "\nzallet_rpc = \"127.0.0.1:28232\"\n\n[wcash_policy]",
+                )
+                .as_bytes(),
+            0o600,
+        );
+        assert!(matches!(
+            RuntimeConfig::load(&contaminated),
+            Err(ConfigError::InvalidPolicy)
+        ));
     }
 
     #[test]
@@ -855,7 +1012,7 @@ policy_version = 1
         );
         assert!(matches!(
             RuntimeConfig::load(&missing),
-            Err(ConfigError::Toml(_))
+            Err(ConfigError::InvalidPolicy)
         ));
 
         for (name, from, to) in [

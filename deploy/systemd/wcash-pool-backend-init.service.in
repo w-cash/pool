@@ -1,9 +1,9 @@
 [Unit]
 Description=Initialize immutable ZecWec Testnet backend authority
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
-Requires=wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
-BindsTo=wcash-pool-wallet-init.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
-After=wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+Requires=@WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+BindsTo=@WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+After=@WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-merge-miner
 
 [Service]

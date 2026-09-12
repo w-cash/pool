@@ -10,6 +10,8 @@ source "$script_dir/common.sh"
 require_root
 require_command systemctl
 require_command ss
+require_command python3
+require_command runuser
 
 [[ $# -eq 1 ]] || die "usage: preflight.sh <settings>"
 settings=$1
@@ -23,6 +25,9 @@ legacy_share_journal=/var/lib/wcash-pool/share-journal-v2.jsonl
 
 trap 'systemctl stop wcash-pool.service >/dev/null 2>&1 || true' ERR
 systemctl stop zecwec-cookie-refresh.path >/dev/null 2>&1 || true
+systemctl disable zecwec-zallet.service >/dev/null 2>&1 || true
+systemctl stop zecwec-zallet.service wcash-pool-wallet-init.service \
+    wcash-pool-zec-authority-bootstrap.service >/dev/null 2>&1 || true
 
 if systemctl is-active --quiet wcash-pool.service; then
     systemctl stop wcash-pool.service
@@ -40,20 +45,21 @@ done
 
 zallet_rpc=$(read_setting "$settings" ZALLET_RPC)
 zallet_port=${zallet_rpc##*:}
-if ! systemctl is-active --quiet zecwec-zallet.service \
-    && ss -H -ltn "sport = :$zallet_port" | grep -q .; then
-    die "another wallet owns the reviewed Zallet RPC port; complete the manual wallet handover first"
+if systemctl is-active --quiet zecwec-zallet.service \
+    || ss -H -ltn "sport = :$zallet_port" | grep -q .; then
+    die "deferred-payout mining requires the Zallet wallet and RPC listener to remain offline"
 fi
 
+require_offline_collector_custody "$settings"
+
 systemctl stop wcash-pool-backend.service >/dev/null 2>&1 || true
-systemctl restart zecwec-zallet.service
-systemctl restart wcash-pool-wallet-init.service
 systemctl restart wcash-pool-backend-init.service
 systemctl restart wcash-pool-backend.service
 systemctl restart wcash-pool-migrate.service
 systemctl restart wcash-pool-preflight.service
 
-systemctl is-active --quiet zecwec-zallet.service || die "Zallet is not active"
+systemctl is-active --quiet zecwec-zallet.service \
+    && die "Zallet became active during deferred-payout preflight"
 systemctl is-active --quiet wcash-pool-backend.service || die "backend is not active"
 systemctl is-active --quiet postgresql.service || die "PostgreSQL is not active"
 
