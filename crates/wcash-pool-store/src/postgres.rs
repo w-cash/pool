@@ -445,6 +445,26 @@ pub struct PayoutReorg {
     pub observed_at: u64,
 }
 
+/// Public-chain facts needed to confirm a broadcast payout or detect that a
+/// previously confirmed payout left the best chain.
+///
+/// Only broadcast and confirmed batches are exposed through this projection.
+/// Signed transaction bytes and payout destinations remain outside the chain
+/// observation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutWatch {
+    /// Stable accounting batch identity.
+    pub batch_id: Uuid,
+    /// Chain whose validator must answer this watch.
+    pub chain: Chain,
+    /// Current durable state, either broadcast or confirmed.
+    pub state: PayoutBatchState,
+    /// Exact display-order transaction identifier committed by the signer.
+    pub transaction_id: [u8; 32],
+    /// Previously accepted best-chain evidence for a confirmed batch.
+    pub prior_confirmation: Option<PayoutConfirmation>,
+}
+
 impl PayoutReorg {
     fn validate(&self) -> Result<(), StoreError> {
         self.prior_confirmation.validate()?;
@@ -1824,6 +1844,100 @@ impl PostgresStore {
         }
         transaction.commit().await?;
         Ok(batches)
+    }
+
+    /// Lists exact transaction identities which must be checked against one
+    /// chain's authoritative best-chain view.
+    ///
+    /// Broadcast rows sort first so confirmation cannot be starved by a long
+    /// history of confirmed payments. The remaining capacity tracks the most
+    /// recently confirmed rows for explicit reorganization detection; a later
+    /// wallet reconciliation still catches a deeper historical mismatch and
+    /// freezes payouts.
+    pub async fn list_payout_watches(
+        &self,
+        chain: Chain,
+        maximum: u32,
+    ) -> Result<Vec<PayoutWatch>, StoreError> {
+        if !(1..=10_000).contains(&maximum) {
+            return Err(StoreError::InvalidPayoutBatch);
+        }
+        let rows = sqlx::query(
+            "SELECT id,state,transaction_id,confirmation_block_hash,confirmation_height, \
+                    confirmation_count \
+             FROM payout_batches \
+             WHERE deployment_id=$1 AND chain=$2 AND state IN ('broadcast','confirmed') \
+             ORDER BY CASE WHEN state='broadcast' THEN 0 ELSE 1 END, \
+                      confirmation_height DESC NULLS FIRST,created_at DESC,id DESC \
+             LIMIT $3",
+        )
+        .bind(self.identity.id)
+        .bind(chain.as_str())
+        .bind(i64::from(maximum))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut watches = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state = PayoutBatchState::parse(&row.try_get::<String, _>("state")?)?;
+            let transaction_id = exact_digest(
+                row.try_get::<Option<Vec<u8>>, _>("transaction_id")?,
+                "payout transaction ID",
+            )?;
+            if transaction_id == [0; 32] {
+                return Err(StoreError::CorruptDatabaseState("payout transaction ID"));
+            }
+            let block_hash = row.try_get::<Option<Vec<u8>>, _>("confirmation_block_hash")?;
+            let block_height = row.try_get::<Option<i64>, _>("confirmation_height")?;
+            let confirmations = row.try_get::<Option<i32>, _>("confirmation_count")?;
+            let prior_confirmation = match state {
+                PayoutBatchState::Broadcast => {
+                    if block_hash.is_some() || block_height.is_some() || confirmations.is_some() {
+                        return Err(StoreError::CorruptDatabaseState(
+                            "broadcast payout confirmation",
+                        ));
+                    }
+                    None
+                }
+                PayoutBatchState::Confirmed => {
+                    let confirmation = PayoutConfirmation {
+                        block_hash: block_hash
+                            .ok_or(StoreError::CorruptDatabaseState(
+                                "confirmed payout block hash",
+                            ))?
+                            .try_into()
+                            .map_err(|_| {
+                                StoreError::CorruptDatabaseState("confirmed payout block hash")
+                            })?,
+                        block_height: u32::try_from(
+                            block_height.ok_or(StoreError::CorruptDatabaseState(
+                                "confirmed payout height",
+                            ))?,
+                        )
+                        .map_err(|_| StoreError::CorruptDatabaseState("confirmed payout height"))?,
+                        confirmations: u32::try_from(confirmations.ok_or(
+                            StoreError::CorruptDatabaseState("confirmed payout confirmations"),
+                        )?)
+                        .map_err(|_| {
+                            StoreError::CorruptDatabaseState("confirmed payout confirmations")
+                        })?,
+                    };
+                    confirmation.validate()?;
+                    Some(confirmation)
+                }
+                _ => {
+                    return Err(StoreError::CorruptDatabaseState("payout watch state"));
+                }
+            };
+            watches.push(PayoutWatch {
+                batch_id: row.try_get("id")?,
+                chain,
+                state,
+                transaction_id,
+                prior_confirmation,
+            });
+        }
+        Ok(watches)
     }
 
     /// Confirms a broadcast payout with exact best-chain evidence and removes

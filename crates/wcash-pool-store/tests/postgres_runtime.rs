@@ -29,8 +29,8 @@ use wcash_pool_protocol::{
 };
 use wcash_pool_store::{
     generate_mining_token, hash_mining_token, Chain, ChainPolicy, DeploymentIdentity,
-    DeploymentNetwork, PayoutConfirmation, PayoutReorg, PostgresPoolDataSource, PostgresStore,
-    ProjectionResult, StoreError, WalletObservation, WalletReconciliation,
+    DeploymentNetwork, PayoutBatchState, PayoutConfirmation, PayoutReorg, PostgresPoolDataSource,
+    PostgresStore, ProjectionResult, StoreError, WalletObservation, WalletReconciliation,
 };
 
 fn identity(seed: u8) -> DeploymentIdentity {
@@ -1248,6 +1248,16 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .mark_payout_broadcast(wec_batch.id)
         .await
         .expect("broadcast replay is idempotent");
+    let broadcast_watches = store
+        .list_payout_watches(Chain::Wcash, 10)
+        .await
+        .expect("broadcast payout is visible to the validator observer");
+    assert_eq!(broadcast_watches.len(), 1);
+    assert_eq!(broadcast_watches[0].batch_id, wec_batch.id);
+    assert_eq!(broadcast_watches[0].chain, Chain::Wcash);
+    assert_eq!(broadcast_watches[0].state, PayoutBatchState::Broadcast);
+    assert_eq!(broadcast_watches[0].transaction_id, transaction_id);
+    assert_eq!(broadcast_watches[0].prior_confirmation, None);
     let payout_confirmation = PayoutConfirmation {
         block_hash: [0xf1; 32],
         block_height: 50_000,
@@ -1286,6 +1296,16 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .confirm_payout(wec_batch.id, &payout_confirmation)
         .await
         .expect("confirmation replay is idempotent");
+    let confirmed_watches = store
+        .list_payout_watches(Chain::Wcash, 10)
+        .await
+        .expect("confirmed payout remains watched for reorganization");
+    assert_eq!(confirmed_watches.len(), 1);
+    assert_eq!(confirmed_watches[0].state, PayoutBatchState::Confirmed);
+    assert_eq!(
+        confirmed_watches[0].prior_confirmation.as_ref(),
+        Some(&payout_confirmation)
+    );
     assert!(matches!(
         store
             .confirm_payout(
@@ -1313,6 +1333,11 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .mark_confirmed_payout_reorged(wec_batch.id, &payout_reorg)
         .await
         .expect("exact payout reorg replay is idempotent");
+    assert!(store
+        .list_payout_watches(Chain::Wcash, 10)
+        .await
+        .expect("reorged payout is removed from normal observation")
+        .is_empty());
     assert!(matches!(
         store
             .mark_confirmed_payout_reorged(
