@@ -1,14 +1,19 @@
 //! Strict, Testnet-only daemon configuration and protected credential loading.
 
 use std::{
-    fs::{self, File},
-    io::{Read, Take},
+    ffi::OsStr,
+    fs::File,
+    io::Read,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     str::FromStr,
 };
 
 use num_bigint::BigUint;
+use rustix::{
+    fs::{fstat, openat, statat, AtFlags, FileType, Mode, OFlags, Stat, CWD},
+    process::geteuid,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -161,15 +166,16 @@ impl RuntimeConfig {
 
     /// Reads an exact 256-bit portal secret from a protected binary file.
     pub fn portal_secret(path: &Path) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
-        let bytes = Zeroizing::new(read_protected(path, 32, true)?);
-        let value: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| ConfigError::CredentialLength)?;
+        let bytes = read_protected(path, 32, true)?;
+        if bytes.len() != 32 {
+            return Err(ConfigError::CredentialLength);
+        }
+        let mut value = Zeroizing::new([0_u8; 32]);
+        value.copy_from_slice(&bytes);
         if value.iter().all(|byte| *byte == 0) {
             return Err(ConfigError::WeakCredential);
         }
-        Ok(Zeroizing::new(value))
+        Ok(value)
     }
 }
 
@@ -320,7 +326,7 @@ fn require_absolute(path: &Path) -> Result<(), ConfigError> {
 }
 
 fn read_utf8_credential(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
-    let bytes = Zeroizing::new(read_protected(path, MAX_CREDENTIAL_BYTES, true)?);
+    let bytes = read_protected(path, MAX_CREDENTIAL_BYTES, true)?;
     let value = std::str::from_utf8(&bytes).map_err(|_| ConfigError::InvalidEncoding)?;
     let value = value.trim_end_matches(['\r', '\n']);
     if value.is_empty() || value.chars().any(char::is_control) {
@@ -329,38 +335,143 @@ fn read_utf8_credential(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
     Ok(Zeroizing::new(value.to_owned()))
 }
 
-fn read_protected(path: &Path, maximum: u64, secret: bool) -> Result<Vec<u8>, ConfigError> {
+fn read_protected(
+    path: &Path,
+    maximum: u64,
+    secret: bool,
+) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
     require_absolute(path)?;
-    let before = fs::symlink_metadata(path).map_err(|_| ConfigError::Unavailable)?;
-    if !before.file_type().is_file() || before.file_type().is_symlink() || before.len() > maximum {
+    let trusted_uid = geteuid().as_raw();
+    let parent = open_protected_parent(path, trusted_uid)?;
+    let leaf = path.file_name().ok_or(ConfigError::UnsafePath)?;
+    let before =
+        statat(&parent, leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfigError::Unavailable)?;
+    validate_leaf(&before, maximum, secret, trusted_uid)?;
+
+    let descriptor = openat(
+        &parent,
+        leaf,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| ConfigError::UnsafeFile)?;
+    let opened = fstat(&descriptor).map_err(|_| ConfigError::Unavailable)?;
+    validate_leaf(&opened, maximum, secret, trusted_uid)?;
+    if !same_security_metadata(&before, &opened) {
         return Err(ConfigError::UnsafeFile);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let forbidden = if secret { 0o077 } else { 0o022 };
-        if before.nlink() != 1 || before.permissions().mode() & forbidden != 0 {
-            return Err(ConfigError::UnsafeFile);
-        }
-    }
-    let file = File::open(path).map_err(|_| ConfigError::Unavailable)?;
-    let opened = file.metadata().map_err(|_| ConfigError::Unavailable)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.dev() != opened.dev() || before.ino() != opened.ino() {
-            return Err(ConfigError::UnsafeFile);
-        }
-    }
-    let mut bytes = Vec::new();
-    let mut bounded: Take<File> = file.take(maximum.saturating_add(1));
+
+    let file = File::from(descriptor);
+    let mut bytes = Zeroizing::new(Vec::new());
+    let mut bounded = (&file).take(maximum.saturating_add(1));
     bounded
         .read_to_end(&mut bytes)
         .map_err(|_| ConfigError::Unavailable)?;
     if bytes.len() as u64 > maximum {
         return Err(ConfigError::UnsafeFile);
     }
+
+    let after = fstat(&file).map_err(|_| ConfigError::Unavailable)?;
+    validate_leaf(&after, maximum, secret, trusted_uid)?;
+    if !same_security_metadata(&opened, &after) || after.st_size != bytes.len() as i64 {
+        return Err(ConfigError::UnsafeFile);
+    }
     Ok(bytes)
+}
+
+fn open_protected_parent(path: &Path, trusted_uid: u32) -> Result<File, ConfigError> {
+    let parent = path.parent().ok_or(ConfigError::UnsafePath)?;
+    let root = openat(
+        CWD,
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| ConfigError::Unavailable)?;
+    validate_parent(
+        &fstat(&root).map_err(|_| ConfigError::Unavailable)?,
+        trusted_uid,
+    )?;
+    let mut directory = File::from(root);
+
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory = open_protected_directory(&directory, name, trusted_uid)?;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(ConfigError::UnsafePath);
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn open_protected_directory(
+    parent: &File,
+    name: &OsStr,
+    trusted_uid: u32,
+) -> Result<File, ConfigError> {
+    let descriptor = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| ConfigError::UnsafeFile)?;
+    validate_parent(
+        &fstat(&descriptor).map_err(|_| ConfigError::Unavailable)?,
+        trusted_uid,
+    )?;
+    Ok(File::from(descriptor))
+}
+
+fn validate_parent(metadata: &Stat, trusted_uid: u32) -> Result<(), ConfigError> {
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir()
+        || !is_trusted_owner(metadata.st_uid, trusted_uid)
+        || metadata.st_mode & 0o022 != 0
+    {
+        return Err(ConfigError::UnsafeFile);
+    }
+    Ok(())
+}
+
+fn validate_leaf(
+    metadata: &Stat,
+    maximum: u64,
+    secret: bool,
+    trusted_uid: u32,
+) -> Result<(), ConfigError> {
+    let forbidden = if secret { 0o077 } else { 0o022 };
+    if !FileType::from_raw_mode(metadata.st_mode).is_file()
+        || metadata.st_nlink != 1
+        || !is_trusted_owner(metadata.st_uid, trusted_uid)
+        || metadata.st_mode & forbidden != 0
+        || metadata.st_size < 0
+        || metadata.st_size as u64 > maximum
+    {
+        return Err(ConfigError::UnsafeFile);
+    }
+    Ok(())
+}
+
+fn same_security_metadata(left: &Stat, right: &Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+fn is_trusted_owner(owner_uid: u32, service_uid: u32) -> bool {
+    owner_uid == 0 || owner_uid == service_uid
 }
 
 /// Configuration failure with no credential contents in its display text.
@@ -407,21 +518,29 @@ pub enum ConfigError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::io::Write;
+    use std::{fs, io::Write};
 
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use tempfile::TempDir;
 
     use super::*;
 
     fn write_file(directory: &TempDir, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
-        let path = directory.path().join(name);
-        let mut file = File::create(&path).expect("fixture file");
+        let path = protected_root(directory).join(name);
+        write_path(&path, bytes, mode);
+        path
+    }
+
+    fn write_path(path: &Path, bytes: &[u8], mode: u32) {
+        let mut file = File::create(path).expect("fixture file");
         file.write_all(bytes).expect("fixture write");
         #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("fixture permissions");
-        path
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("fixture permissions");
+    }
+
+    fn protected_root(directory: &TempDir) -> PathBuf {
+        fs::canonicalize(directory.path()).expect("canonical fixture root")
     }
 
     fn fixture(directory: &TempDir, network: &str) -> String {
@@ -473,7 +592,7 @@ maximum_network_fee_zat = 1000000
 maximum_network_fee_bps = 100
 policy_version = 1
 "#,
-            root = directory.path().display(),
+            root = protected_root(directory).display(),
             one = "01".repeat(32),
             two = "02".repeat(32),
             three = "03".repeat(32),
@@ -541,6 +660,106 @@ policy_version = 1
         let secret = write_file(&directory, "secret", &[0; 32], 0o644);
         assert!(matches!(
             RuntimeConfig::portal_secret(&secret),
+            Err(ConfigError::UnsafeFile)
+        ));
+    }
+
+    #[test]
+    fn leaf_and_parent_symlinks_fail_closed() {
+        let directory = TempDir::new().expect("temp dir");
+        let root = protected_root(&directory);
+        let secret = write_file(&directory, "secret", &[7; 32], 0o600);
+        let leaf_link = root.join("secret-link");
+        symlink(&secret, &leaf_link).expect("leaf symlink");
+        assert!(matches!(
+            RuntimeConfig::portal_secret(&leaf_link),
+            Err(ConfigError::UnsafeFile)
+        ));
+
+        let real_parent = root.join("real-parent");
+        fs::create_dir(&real_parent).expect("real parent");
+        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o700))
+            .expect("real parent permissions");
+        write_path(&real_parent.join("nested-secret"), &[8; 32], 0o600);
+        let parent_link = root.join("parent-link");
+        symlink(&real_parent, &parent_link).expect("parent symlink");
+        assert!(matches!(
+            RuntimeConfig::portal_secret(&parent_link.join("nested-secret")),
+            Err(ConfigError::UnsafeFile)
+        ));
+    }
+
+    #[test]
+    fn writable_parent_and_hardlinked_leaf_fail_closed() {
+        let directory = TempDir::new().expect("temp dir");
+        let root = protected_root(&directory);
+        let writable_parent = root.join("writable-parent");
+        fs::create_dir(&writable_parent).expect("writable parent");
+        write_path(&writable_parent.join("secret"), &[7; 32], 0o600);
+        fs::set_permissions(&writable_parent, fs::Permissions::from_mode(0o777))
+            .expect("unsafe parent permissions");
+        assert!(matches!(
+            RuntimeConfig::portal_secret(&writable_parent.join("secret")),
+            Err(ConfigError::UnsafeFile)
+        ));
+
+        let original = write_file(&directory, "hardlink-source", &[8; 32], 0o600);
+        let linked = root.join("hardlink-target");
+        fs::hard_link(&original, &linked).expect("hard link");
+        assert!(matches!(
+            RuntimeConfig::portal_secret(&original),
+            Err(ConfigError::UnsafeFile)
+        ));
+        assert!(matches!(
+            RuntimeConfig::portal_secret(&linked),
+            Err(ConfigError::UnsafeFile)
+        ));
+    }
+
+    #[test]
+    fn opened_descriptor_metadata_is_revalidated() {
+        let directory = TempDir::new().expect("temp dir");
+        let secret = write_file(&directory, "metadata-secret", &[9; 32], 0o600);
+        let file = File::open(&secret).expect("open fixture");
+        let before = fstat(&file).expect("initial metadata");
+        validate_leaf(&before, 32, true, geteuid().as_raw()).expect("initially protected");
+
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644))
+            .expect("weaken permissions");
+        let after = fstat(&file).expect("changed metadata");
+        assert!(matches!(
+            validate_leaf(&after, 32, true, geteuid().as_raw()),
+            Err(ConfigError::UnsafeFile)
+        ));
+        assert!(!same_security_metadata(&before, &after));
+    }
+
+    #[test]
+    fn only_root_or_effective_service_uid_is_trusted() {
+        let service_uid = geteuid().as_raw();
+        let foreign_uid = if service_uid == 1 { 2 } else { 1 };
+        assert!(is_trusted_owner(0, service_uid));
+        assert!(is_trusted_owner(service_uid, service_uid));
+        assert!(!is_trusted_owner(foreign_uid, service_uid));
+
+        let directory = TempDir::new().expect("temp dir");
+        let secret = write_file(&directory, "foreign-owner", &[9; 32], 0o600);
+        let file = File::open(secret).expect("open fixture");
+        let mut foreign_leaf = fstat(&file).expect("leaf metadata");
+        foreign_leaf.st_uid = foreign_uid;
+        assert!(matches!(
+            validate_leaf(&foreign_leaf, 32, true, service_uid),
+            Err(ConfigError::UnsafeFile)
+        ));
+
+        let mut foreign_parent = fstat(
+            open_protected_parent(&protected_root(&directory).join("x"), service_uid)
+                .expect("protected parent"),
+        )
+        .expect("parent metadata");
+        foreign_parent.st_uid = foreign_uid;
+        assert!(matches!(
+            validate_parent(&foreign_parent, service_uid),
             Err(ConfigError::UnsafeFile)
         ));
     }
