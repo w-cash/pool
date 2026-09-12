@@ -1,3 +1,5 @@
+[builder]
+
 [consensus]
 network = "test"
 
