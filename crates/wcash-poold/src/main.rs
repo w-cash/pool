@@ -10,7 +10,9 @@ mod bootstrap;
 mod config;
 mod edge;
 mod payout;
+pub mod payout_runtime;
 mod service;
+pub mod settlement;
 pub mod wcash_observation;
 mod wec_wallet_transport;
 
