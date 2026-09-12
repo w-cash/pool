@@ -11,8 +11,11 @@ stream exactly match the deployment row.
 
 ## Safety boundaries
 
-- Every row is deployment-scoped; Testnet and Mainnet identities cannot share
-  cursors, credentials, nonce ranges, policies, balances, or payout batches.
+- Accounts, credentials, policies, balances, and payouts are deployment-scoped;
+  Testnet and Mainnet accounting cannot cross. Nonce uniqueness is deliberately
+  broader: one global cursor is keyed by the exact Wolf backend instance,
+  journal stream, negotiated profile, and encoded namespace so rolling
+  deployment IDs cannot allocate overlapping prefixes.
 - Mining bearer tokens use a random selector and 256-bit secret, with only an
   exact Argon2id verifier stored. Tokens are revocable and mining-only.
 - Wolf events are applied contiguously, with canonical-payload replay checks.
@@ -30,9 +33,12 @@ stream exactly match the deployment row.
   The store—not an API caller—derives the checkpoint UUID and streaming ledger
   root used by the isolated signer request. Stale roots and wallet mismatches
   fail closed; mismatches freeze that chain.
-- Nonce ranges are atomically reserved by profile and namespace before their
-  one-shot allocator is constructed. A crash may waste a range but cannot
-  cause the database to reissue it.
+- A fresh process UUID must hold a short database-clock lease before it can
+  reserve nonce ranges. Lease takeover increments a generation and resumes the
+  permanent global cursor; stale holders fail closed. Reservation and cursor
+  advance are one transaction, audit rows are append-only, and database
+  triggers reject rewind, deletion, or an advance without an exact contiguous
+  reservation. A crash may waste a range but cannot cause its reissue.
 
 ## Journal migration
 

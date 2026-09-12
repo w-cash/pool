@@ -22,8 +22,8 @@ pub use auth::{
 pub use portal::PostgresPoolDataSource;
 pub use postgres::{
     AccountCredentialRecord, AuthenticatedPortalSession, Chain, ChainPolicy, DeploymentIdentity,
-    DeploymentNetwork, NewPortalSessionRecord, NonceRange, PayoutBatch, PayoutBatchState,
-    PayoutConfigurationReadiness, PayoutConfirmation, PayoutInstruction, PayoutReorg,
-    PostgresStore, ProjectionResult, ReceiverKind, SignedPayoutArtifact, StoreError,
+    DeploymentNetwork, NewPortalSessionRecord, NonceNamespaceClaim, NonceRange, PayoutBatch,
+    PayoutBatchState, PayoutConfigurationReadiness, PayoutConfirmation, PayoutInstruction,
+    PayoutReorg, PostgresStore, ProjectionResult, ReceiverKind, SignedPayoutArtifact, StoreError,
     WalletObservation, WalletReconciliation,
 };

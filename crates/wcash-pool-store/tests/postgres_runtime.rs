@@ -5,11 +5,14 @@
 // first violated test invariant so later statements cannot obscure the cause.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::time::Duration;
+
 use num_bigint::BigUint;
 use sqlx::{postgres::PgPoolOptions, Row};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    task::JoinSet,
 };
 use uuid::Uuid;
 use wcash_pool_backend_client::{BackendClient, BackendClientConfig, ExpectedBackend};
@@ -377,6 +380,95 @@ async fn reconcile_wallet(
         .await
 }
 
+async fn assert_nonce_fencing_migration_preserves_legacy_floor(pool: &sqlx::PgPool) {
+    let mut fixture = pool.begin().await.expect("migration fixture starts");
+    sqlx::raw_sql(
+        "DROP SCHEMA IF EXISTS nonce_migration_fixture CASCADE; \
+         CREATE SCHEMA nonce_migration_fixture; \
+         SET LOCAL search_path TO nonce_migration_fixture",
+    )
+    .execute(&mut *fixture)
+    .await
+    .expect("isolated migration fixture schema initializes");
+    sqlx::raw_sql(include_str!("../migrations/0001_runtime_accounting.sql"))
+        .execute(&mut *fixture)
+        .await
+        .expect("legacy accounting schema applies");
+    sqlx::raw_sql(include_str!("../migrations/0002_portal_read_models.sql"))
+        .execute(&mut *fixture)
+        .await
+        .expect("legacy portal schema applies");
+
+    let backend_instance = Uuid::new_v4();
+    let journal_stream = Uuid::new_v4();
+    let first_deployment = Uuid::new_v4();
+    let second_deployment = Uuid::new_v4();
+    for (deployment_id, marker, chain_id) in [
+        (first_deployment, 0x11_u8, 101_i64),
+        (second_deployment, 0x21_u8, 102_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO deployments \
+             (id,network,wcash_genesis,zcash_genesis,chain_id,wcash_payout_commitment, \
+              zcash_payout_commitment,backend_instance,journal_stream) \
+             VALUES ($1,'testnet',$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(deployment_id)
+        .bind([marker; 32].as_slice())
+        .bind([marker.wrapping_add(1); 32].as_slice())
+        .bind(chain_id)
+        .bind([marker.wrapping_add(2); 32].as_slice())
+        .bind([marker.wrapping_add(3); 32].as_slice())
+        .bind(backend_instance)
+        .bind(journal_stream)
+        .execute(&mut *fixture)
+        .await
+        .expect("legacy deployment inserts");
+    }
+    sqlx::query(
+        "INSERT INTO nonce_cursors (deployment_id,profile,namespace,next_counter) \
+         VALUES ($1,4,9,10),($2,4,9,20)",
+    )
+    .bind(first_deployment)
+    .bind(second_deployment)
+    .execute(&mut *fixture)
+    .await
+    .expect("legacy cursors insert");
+    sqlx::query(
+        "INSERT INTO nonce_range_leases \
+         (deployment_id,id,pool_instance,profile,namespace,range_start,range_end) \
+         VALUES ($1,$3,$4,4,9,10,12),($2,$5,$6,4,9,20,25)",
+    )
+    .bind(first_deployment)
+    .bind(second_deployment)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&mut *fixture)
+    .await
+    .expect("legacy reservations insert");
+
+    sqlx::raw_sql(include_str!("../migrations/0003_global_nonce_fencing.sql"))
+        .execute(&mut *fixture)
+        .await
+        .expect("global nonce fencing migration applies over legacy rows");
+    let migrated_floor = sqlx::query_scalar::<_, i64>(
+        "SELECT next_counter FROM nonce_namespace_fences \
+         WHERE backend_instance=$1 AND journal_stream=$2 AND profile=4 AND namespace=9",
+    )
+    .bind(backend_instance)
+    .bind(journal_stream)
+    .fetch_one(&mut *fixture)
+    .await
+    .expect("migrated global floor reads");
+    assert_eq!(migrated_floor, 25);
+    fixture
+        .rollback()
+        .await
+        .expect("migration fixture rolls back cleanly");
+}
+
 #[tokio::test]
 #[allow(clippy::expect_used)]
 async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
@@ -388,6 +480,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .connect(&database_url)
         .await
         .expect("isolated PostgreSQL is available");
+    assert_nonce_fencing_migration_preserves_legacy_floor(&admin).await;
     sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
         .execute(&admin)
         .await
@@ -664,14 +757,120 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     ));
 
     let lease = wcash_pool_core::NonceNamespaceLease::new(7).expect("valid namespace");
+    let holder_a = Uuid::new_v4();
+    assert!(matches!(
+        store
+            .claim_nonce_namespace(
+                holder_a,
+                NonceProfile::FourByte,
+                lease,
+                Duration::from_millis(1_500),
+            )
+            .await,
+        Err(StoreError::InvalidNonceLeaseDuration)
+    ));
+    let claim_a = store
+        .claim_nonce_namespace(
+            holder_a,
+            NonceProfile::FourByte,
+            lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("first deployment claims the global namespace");
+    assert_eq!(
+        store
+            .claim_nonce_namespace(
+                holder_a,
+                NonceProfile::FourByte,
+                lease,
+                Duration::from_secs(300),
+            )
+            .await
+            .expect("an exact claim retry is idempotent"),
+        claim_a
+    );
     let first = store
-        .reserve_nonce_range(Uuid::new_v4(), NonceProfile::FourByte, lease, 2)
+        .reserve_nonce_range(&claim_a, 2)
         .await
         .expect("first range reserves");
-    let second = store
-        .reserve_nonce_range(Uuid::new_v4(), NonceProfile::FourByte, lease, 3)
+
+    let mut rolling_identity = store_identity.clone();
+    rolling_identity.id = Uuid::new_v4();
+    rolling_identity.chain_id = rolling_identity
+        .chain_id
+        .checked_add(100)
+        .expect("test chain id remains bounded");
+    let rolling_store = PostgresStore::connect(&database_url, 4, rolling_identity.clone())
         .await
-        .expect("second range reserves");
+        .expect("rolling deployment store connects");
+    rolling_store
+        .bind_deployment()
+        .await
+        .expect("rolling deployment binds to the same backend journal");
+    let holder_b = Uuid::new_v4();
+    assert!(matches!(
+        rolling_store
+            .claim_nonce_namespace(
+                holder_b,
+                NonceProfile::FourByte,
+                lease,
+                Duration::from_secs(300),
+            )
+            .await,
+        Err(StoreError::NonceNamespaceAlreadyHeld)
+    ));
+
+    sqlx::query(
+        "UPDATE nonce_namespace_fences \
+         SET lease_acquired_at=clock_timestamp() - INTERVAL '2 seconds', \
+             lease_expires_at=clock_timestamp() - INTERVAL '1 second' \
+         WHERE backend_instance=$1 AND journal_stream=$2 AND profile=4 AND namespace=7",
+    )
+    .bind(store_identity.backend_instance)
+    .bind(store_identity.journal_stream)
+    .execute(&admin)
+    .await
+    .expect("test advances the authoritative database lease clock");
+    let claim_b = rolling_store
+        .claim_nonce_namespace(
+            holder_b,
+            NonceProfile::FourByte,
+            lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("takeover succeeds only after expiry");
+    assert!(claim_b.generation() > claim_a.generation());
+    assert!(matches!(
+        store.reserve_nonce_range(&claim_a, 1).await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+    assert!(matches!(
+        store
+            .renew_nonce_namespace(&claim_a, Duration::from_secs(300))
+            .await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+    assert!(matches!(
+        store.release_nonce_namespace(&claim_a).await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+    assert!(matches!(
+        store.release_nonce_namespace(&claim_b).await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+
+    let renewed_b = rolling_store
+        .renew_nonce_namespace(&claim_b, Duration::from_secs(300))
+        .await
+        .expect("the exact owner renews its live claim");
+    assert_eq!(renewed_b.generation(), claim_b.generation());
+    assert!(renewed_b.expires_at() >= claim_b.expires_at());
+    let second = rolling_store
+        .reserve_nonce_range(&renewed_b, 3)
+        .await
+        .expect("takeover resumes after the previous cursor");
     assert_eq!((first.start(), first.end()), (0, 2));
     assert_eq!((second.start(), second.end()), (2, 5));
     assert_eq!(first.profile(), NonceProfile::FourByte);
@@ -679,6 +878,78 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert!(allocator.allocate().is_ok());
     assert!(allocator.allocate().is_ok());
     assert!(allocator.allocate().is_err());
+
+    let mut reservations = JoinSet::new();
+    for count in 1..=8 {
+        let concurrent_store = rolling_store.clone();
+        let concurrent_claim = renewed_b.clone();
+        reservations.spawn(async move {
+            concurrent_store
+                .reserve_nonce_range(&concurrent_claim, count)
+                .await
+        });
+    }
+    let mut concurrent_ranges = Vec::new();
+    while let Some(result) = reservations.join_next().await {
+        let range = result
+            .expect("reservation task does not panic")
+            .expect("concurrent reservation succeeds");
+        concurrent_ranges.push((range.start(), range.end()));
+    }
+    concurrent_ranges.sort_unstable();
+    let mut expected_start = 5;
+    for (start, end) in &concurrent_ranges {
+        assert_eq!(*start, expected_start, "reservations remain contiguous");
+        assert!(*end > *start, "every reservation remains nonempty");
+        expected_start = *end;
+    }
+    assert_eq!(expected_start, 41);
+
+    rolling_store
+        .release_nonce_namespace(&renewed_b)
+        .await
+        .expect("the exact owner releases its live claim");
+    assert!(matches!(
+        rolling_store
+            .renew_nonce_namespace(&renewed_b, Duration::from_secs(300))
+            .await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+    assert!(matches!(
+        rolling_store.release_nonce_namespace(&renewed_b).await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+    let reclaimed_a = store
+        .claim_nonce_namespace(
+            holder_a,
+            NonceProfile::FourByte,
+            lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("released namespace can be reclaimed with a new generation");
+    assert!(reclaimed_a.generation() > renewed_b.generation());
+    let resumed = store
+        .reserve_nonce_range(&reclaimed_a, 1)
+        .await
+        .expect("release and reacquisition cannot rewind the cursor");
+    assert_eq!((resumed.start(), resumed.end()), (41, 42));
+    assert!(matches!(
+        rolling_store.reserve_nonce_range(&renewed_b, 1).await,
+        Err(StoreError::NonceNamespaceLeaseLost)
+    ));
+    assert!(
+        sqlx::query(
+            "UPDATE nonce_namespace_fences SET next_counter=0 \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=4 AND namespace=7",
+        )
+        .bind(store_identity.backend_instance)
+        .bind(store_identity.journal_stream)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "the database rejects cursor rewind outside the application"
+    );
 
     // One multi-row INSERT is accepted at commit only when its final sum is zero.
     let conserved_id = Uuid::new_v4();
@@ -1395,13 +1666,21 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
 
     let counts = sqlx::query(
         "SELECT \
-           (SELECT COUNT(*) FROM nonce_range_leases WHERE deployment_id=$1) AS leases, \
+           (SELECT COUNT(*) FROM nonce_global_range_reservations \
+             WHERE backend_instance=$2 AND journal_stream=$3 \
+               AND profile=4 AND namespace=7) AS ranges, \
+           (SELECT COUNT(*) FROM nonce_namespace_claim_events \
+             WHERE backend_instance=$2 AND journal_stream=$3 \
+               AND profile=4 AND namespace=7) AS claim_events, \
            (SELECT COUNT(*) FROM payout_batches WHERE deployment_id=$1) AS batches",
     )
     .bind(store.deployment_id())
+    .bind(store_identity.backend_instance)
+    .bind(store_identity.journal_stream)
     .fetch_one(&admin)
     .await
     .expect("audit counts load");
-    assert_eq!(counts.get::<i64, _>("leases"), 2);
+    assert_eq!(counts.get::<i64, _>("ranges"), 11);
+    assert_eq!(counts.get::<i64, _>("claim_events"), 5);
     assert_eq!(counts.get::<i64, _>("batches"), 3);
 }
