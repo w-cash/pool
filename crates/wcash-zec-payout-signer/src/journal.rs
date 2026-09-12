@@ -95,6 +95,13 @@ pub(crate) enum StoredStage {
         transaction_id: String,
         network_fee_zat: u64,
     },
+    /// Exact bytes produced by prepare-only execution and not submitted by
+    /// this journal state.
+    Prepared {
+        raw_transaction: String,
+        transaction_id: String,
+        network_fee_zat: u64,
+    },
     BroadcastUnresolved {
         raw_transaction: String,
         transaction_id: String,
@@ -120,7 +127,7 @@ impl StoredStage {
             Self::ProvedVerified { .. } => PipelineStage::ProvedVerified,
             Self::Signed { .. } => PipelineStage::Signed,
             Self::SignedVerified { .. } => PipelineStage::SignedVerified,
-            Self::Extracted { .. } => PipelineStage::Extracted,
+            Self::Extracted { .. } | Self::Prepared { .. } => PipelineStage::Extracted,
             Self::BroadcastUnresolved { .. } => PipelineStage::BroadcastUnresolved,
             Self::Rejected { .. } => PipelineStage::Rejected,
             Self::Completed { .. } => PipelineStage::Completed,
@@ -133,6 +140,9 @@ impl StoredStage {
                 network_fee_zat, ..
             }
             | Self::Extracted {
+                network_fee_zat, ..
+            }
+            | Self::Prepared {
                 network_fee_zat, ..
             }
             | Self::BroadcastUnresolved {
@@ -194,6 +204,11 @@ impl StoredStage {
                 Ok(())
             }
             Self::Extracted {
+                raw_transaction,
+                transaction_id,
+                network_fee_zat,
+            }
+            | Self::Prepared {
                 raw_transaction,
                 transaction_id,
                 network_fee_zat,

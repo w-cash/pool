@@ -442,6 +442,69 @@ fn exact_multi_output_success_is_store_compatible_and_redacted() {
 }
 
 #[test]
+fn prepare_is_durable_and_never_reaches_the_node() {
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    let request = request(fixture.account);
+    let prepared = make_signer(&fixture, wallet.clone())
+        .prepare(&request)
+        .expect("exact bytes are prepared");
+    assert_eq!(prepared.receipt.transaction_id, TXID);
+    assert_eq!(wallet.counts().3, 0, "prepare must not broadcast");
+
+    let recovered = make_signer(&fixture, wallet.clone())
+        .recover_prepared(&request)
+        .expect("journal recovery succeeds")
+        .expect("prepared artifact exists");
+    assert_eq!(recovered.payout, prepared);
+    assert_eq!(wallet.counts().1, 1, "recovery must not re-sign");
+    assert_eq!(wallet.counts().3, 0, "recovery must not broadcast");
+}
+
+#[test]
+fn recovery_finds_wallet_commit_after_sign_returned_before_journal_write() {
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    let request = request(fixture.account);
+    let interrupted = make_signer(&fixture, wallet.clone())
+        .with_checkpoint_hook(Arc::new(InterruptOnce::new(Checkpoint::SigningReturned)));
+    assert_eq!(
+        interrupted.prepare(&request),
+        Err(WecPayoutError::Interrupted)
+    );
+    assert_eq!(wallet.counts().1, 1);
+    assert_eq!(wallet.counts().3, 0);
+
+    let recovered = make_signer(&fixture, wallet.clone())
+        .recover_prepared(&request)
+        .expect("seedless wallet recovery succeeds")
+        .expect("wallet-persisted artifact is adopted");
+    assert_eq!(recovered.payout.receipt.transaction_id, TXID);
+    assert_eq!(wallet.counts().1, 1, "recovery must never sign again");
+    assert_eq!(wallet.counts().3, 0, "recovery must never broadcast");
+}
+
+#[test]
+fn recovery_returns_identical_ambiguous_and_completed_bytes_without_node_calls() {
+    for outcome in [Err(BroadcastFailure::Timeout), accepted()] {
+        let fixture = Fixture::new();
+        let wallet = Arc::new(MockWallet::new(fixture.account));
+        wallet.push_broadcast(outcome);
+        let request = request(fixture.account);
+        let signer = make_signer(&fixture, wallet.clone());
+        let _result = signer.execute(&request);
+        let before = wallet.broadcasts();
+        let recovered = make_signer(&fixture, wallet.clone())
+            .recover_prepared(&request)
+            .expect("journal recovery succeeds")
+            .expect("exact artifact remains recoverable");
+        assert_eq!(recovered.payout.receipt.transaction_id, TXID);
+        assert_eq!(wallet.broadcasts(), before, "recovery cannot call the node");
+        assert_eq!(wallet.counts().1, 1);
+    }
+}
+
+#[test]
 fn every_success_crash_boundary_resumes_without_duplicate_signing() {
     let checkpoints = [
         Checkpoint::StagePersisted(WecPipelineStage::Reserved),
@@ -492,9 +555,15 @@ fn unresolved_broadcast_boundaries_replay_only_exact_bytes() {
             first.execute(&request(fixture.account)).unwrap_err(),
             WecPayoutError::Interrupted
         );
-        make_signer(&fixture, wallet.clone())
-            .execute(&request(fixture.account))
-            .expect("exact rebroadcast succeeds");
+        let retry = make_signer(&fixture, wallet.clone()).execute(&request(fixture.account));
+        if checkpoint == Checkpoint::StagePersisted(WecPipelineStage::BroadcastUnresolved) {
+            assert_eq!(retry, Err(WecPayoutError::BroadcastAmbiguous));
+            make_signer(&fixture, wallet.clone())
+                .execute(&request(fixture.account))
+                .expect("second exact retry succeeds");
+        } else {
+            retry.expect("exact rebroadcast succeeds");
+        }
         let calls = wallet.broadcasts();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], calls[1]);

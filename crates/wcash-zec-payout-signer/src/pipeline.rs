@@ -122,8 +122,10 @@ impl fmt::Debug for ZecPayoutRequest {
     }
 }
 
-/// Successful ZEC payout plus the exact signer artifact required by the
-/// PostgreSQL settlement boundary after any crash or exact retry.
+/// Exact signed ZEC payout artifact required by the PostgreSQL settlement
+/// boundary after any crash or exact retry. [`ZecPcztSigner::prepare`] returns
+/// it before broadcast; [`ZecPcztSigner::execute`] returns it only after a
+/// resolved broadcast.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ZecPayoutExecution {
     /// Portal-compatible public receipt.
@@ -137,6 +139,13 @@ pub struct ZecPayoutExecution {
     pub signed_transaction: Vec<u8>,
     /// Exact fee verified from the signed PCZT.
     pub network_fee_zat: u64,
+}
+
+/// Prepare-only journal recovery result used to order startup reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZecPreparedRecovery {
+    /// Exact durable payout bytes.
+    pub payout: ZecPayoutExecution,
 }
 
 impl ZecPayoutExecution {
@@ -319,7 +328,100 @@ impl ZecPcztSigner {
                 portal_commitment,
                 pipeline_commitment,
                 output_total_zat,
+                true,
             )
+        })
+    }
+
+    /// Creates or recovers the exact signed transaction and durably journals
+    /// its consensus bytes without broadcasting them.
+    ///
+    /// Existing unresolved/completed journal entries return their original
+    /// bytes, allowing a database that crashed before `mark_signed` to recover
+    /// without creating a replacement transaction.
+    pub fn prepare(
+        &self,
+        request: &ZecPayoutRequest,
+    ) -> Result<ZecPayoutExecution, ZecPayoutError> {
+        crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        let (portal_commitment, pipeline_commitment, output_total_zat) =
+            self.validate_request(request)?;
+        let _process_guard = lock_without_poison(&self.process_lock);
+        self.journal.with_exclusive_lock(|| {
+            self.execute_locked(
+                request,
+                portal_commitment,
+                pipeline_commitment,
+                output_total_zat,
+                false,
+            )
+        })
+    }
+
+    /// Inspects the signer journal without creating, proving, signing,
+    /// extracting, or broadcasting anything.
+    ///
+    /// Only a complete raw transaction can be recovered. Legacy `extracted`
+    /// state is conservatively ambiguous because the old executor could crash
+    /// after node submission before advancing its journal.
+    pub fn recover_prepared(
+        &self,
+        request: &ZecPayoutRequest,
+    ) -> Result<Option<ZecPreparedRecovery>, ZecPayoutError> {
+        crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        let (portal_commitment, pipeline_commitment, output_total_zat) =
+            self.validate_request(request)?;
+        let _process_guard = lock_without_poison(&self.process_lock);
+        self.journal.with_exclusive_lock(|| {
+            let Some(record) = self.journal.load(request.batch.batch_id)? else {
+                return Ok(None);
+            };
+            if record.pipeline_commitment != pipeline_commitment
+                || record.portal_commitment != portal_commitment
+                || record.output_total_zat != output_total_zat
+            {
+                return Err(ZecPayoutError::IdempotencyConflict);
+            }
+            let (raw_transaction, transaction_id, network_fee_zat) = match &record.stage {
+                StoredStage::Prepared {
+                    raw_transaction,
+                    transaction_id,
+                    network_fee_zat,
+                } => (raw_transaction, transaction_id, *network_fee_zat),
+                StoredStage::Extracted {
+                    raw_transaction,
+                    transaction_id,
+                    network_fee_zat,
+                }
+                | StoredStage::BroadcastUnresolved {
+                    raw_transaction,
+                    transaction_id,
+                    network_fee_zat,
+                }
+                | StoredStage::Completed {
+                    raw_transaction,
+                    transaction_id,
+                    network_fee_zat,
+                } => (raw_transaction, transaction_id, *network_fee_zat),
+                StoredStage::Rejected { .. } => {
+                    return Err(ZecPayoutError::BroadcastRejected);
+                }
+                StoredStage::Reserved
+                | StoredStage::Created { .. }
+                | StoredStage::CreatedVerified { .. }
+                | StoredStage::Proved { .. }
+                | StoredStage::ProvedVerified { .. }
+                | StoredStage::Signed { .. }
+                | StoredStage::SignedVerified { .. } => return Ok(None),
+            };
+            Ok(Some(ZecPreparedRecovery {
+                payout: execution(
+                    &record,
+                    transaction_id.clone(),
+                    raw_transaction.clone(),
+                    network_fee_zat,
+                )?,
+            }))
         })
     }
 
@@ -329,6 +431,7 @@ impl ZecPcztSigner {
         portal_commitment: [u8; 32],
         pipeline_commitment: [u8; 32],
         output_total_zat: u64,
+        broadcast: bool,
     ) -> Result<ZecPayoutExecution, ZecPayoutError> {
         let mut record = match self.journal.load(request.batch.batch_id)? {
             Some(record) => {
@@ -485,9 +588,31 @@ impl ZecPcztSigner {
                     let extracted = self.extract_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::Extracted)?;
                     extracted.validate_against(&approved_transaction_id)?;
-                    record.stage = StoredStage::Extracted {
+                    record.stage = StoredStage::Prepared {
                         raw_transaction: extracted.hex,
                         transaction_id: extracted.txid,
+                        network_fee_zat,
+                    };
+                    self.persist(&record)?;
+                }
+                StoredStage::Prepared {
+                    raw_transaction,
+                    transaction_id,
+                    network_fee_zat,
+                } => {
+                    if !broadcast {
+                        return execution(
+                            &record,
+                            transaction_id,
+                            raw_transaction,
+                            network_fee_zat,
+                        );
+                    }
+                    // Cross an explicit durable ambiguity boundary before the
+                    // first node RPC. A crash can only retry these exact bytes.
+                    record.stage = StoredStage::BroadcastUnresolved {
+                        raw_transaction,
+                        transaction_id,
                         network_fee_zat,
                     };
                     self.persist(&record)?;
@@ -501,15 +626,8 @@ impl ZecPcztSigner {
                     raw_transaction,
                     transaction_id,
                     network_fee_zat,
-                } => match self.broadcast(&raw_transaction, &transaction_id) {
-                    BroadcastOutcome::Accepted | BroadcastOutcome::AlreadyKnown => {
-                        self.rpc_checkpoint(PipelineStage::Completed)?;
-                        record.stage = StoredStage::Completed {
-                            raw_transaction: raw_transaction.clone(),
-                            transaction_id: transaction_id.clone(),
-                            network_fee_zat,
-                        };
-                        self.persist(&record)?;
+                } => {
+                    if !broadcast {
                         return execution(
                             &record,
                             transaction_id,
@@ -517,23 +635,40 @@ impl ZecPcztSigner {
                             network_fee_zat,
                         );
                     }
-                    BroadcastOutcome::Rejected => {
-                        self.rpc_checkpoint(PipelineStage::Rejected)?;
-                        record.stage = StoredStage::Rejected { transaction_id };
-                        self.persist(&record)?;
-                        return Err(ZecPayoutError::BroadcastRejected);
+                    match self.broadcast(&raw_transaction, &transaction_id) {
+                        BroadcastOutcome::Accepted | BroadcastOutcome::AlreadyKnown => {
+                            self.rpc_checkpoint(PipelineStage::Completed)?;
+                            record.stage = StoredStage::Completed {
+                                raw_transaction: raw_transaction.clone(),
+                                transaction_id: transaction_id.clone(),
+                                network_fee_zat,
+                            };
+                            self.persist(&record)?;
+                            return execution(
+                                &record,
+                                transaction_id,
+                                raw_transaction,
+                                network_fee_zat,
+                            );
+                        }
+                        BroadcastOutcome::Rejected => {
+                            self.rpc_checkpoint(PipelineStage::Rejected)?;
+                            record.stage = StoredStage::Rejected { transaction_id };
+                            self.persist(&record)?;
+                            return Err(ZecPayoutError::BroadcastRejected);
+                        }
+                        BroadcastOutcome::Ambiguous => {
+                            self.rpc_checkpoint(PipelineStage::BroadcastUnresolved)?;
+                            record.stage = StoredStage::BroadcastUnresolved {
+                                raw_transaction,
+                                transaction_id,
+                                network_fee_zat,
+                            };
+                            self.persist(&record)?;
+                            return Err(ZecPayoutError::BroadcastAmbiguous);
+                        }
                     }
-                    BroadcastOutcome::Ambiguous => {
-                        self.rpc_checkpoint(PipelineStage::BroadcastUnresolved)?;
-                        record.stage = StoredStage::BroadcastUnresolved {
-                            raw_transaction,
-                            transaction_id,
-                            network_fee_zat,
-                        };
-                        self.persist(&record)?;
-                        return Err(ZecPayoutError::BroadcastAmbiguous);
-                    }
-                },
+                }
                 StoredStage::Rejected { .. } => {
                     return Err(ZecPayoutError::BroadcastRejected);
                 }

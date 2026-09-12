@@ -68,6 +68,13 @@ impl StoredArtifact {
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub(crate) enum StoredStage {
     Reserved,
+    /// Exact bytes created by the prepare-only API. No broadcaster has seen
+    /// them, so startup may reconcile the wallet before SQL adopts them.
+    Prepared {
+        artifact: StoredArtifact,
+    },
+    /// Legacy pre-split stage. A crash may have happened after submission but
+    /// before the old executor advanced its journal, so it is ambiguous.
     Signed {
         artifact: StoredArtifact,
     },
@@ -87,7 +94,7 @@ impl StoredStage {
     pub(crate) const fn public_stage(&self) -> WecPipelineStage {
         match self {
             Self::Reserved => WecPipelineStage::Reserved,
-            Self::Signed { .. } => WecPipelineStage::Signed,
+            Self::Prepared { .. } | Self::Signed { .. } => WecPipelineStage::Signed,
             Self::BroadcastUnresolved { .. } => WecPipelineStage::BroadcastUnresolved,
             Self::Rejected { .. } => WecPipelineStage::Rejected,
             Self::Completed { .. } => WecPipelineStage::Completed,
@@ -97,7 +104,8 @@ impl StoredStage {
     pub(crate) fn artifact(&self) -> Option<&StoredArtifact> {
         match self {
             Self::Reserved => None,
-            Self::Signed { artifact }
+            Self::Prepared { artifact }
+            | Self::Signed { artifact }
             | Self::BroadcastUnresolved { artifact }
             | Self::Rejected { artifact }
             | Self::Completed { artifact, .. } => Some(artifact),

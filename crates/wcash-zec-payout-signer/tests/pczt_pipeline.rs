@@ -933,6 +933,81 @@ fn beta_three_rpc_pipeline_is_exact_and_replay_is_side_effect_free() {
 }
 
 #[test]
+fn prepare_and_recovery_never_submit_to_zebra() {
+    let root = TestDirectory::new();
+    let (config, request, pczt) = fixture(&root);
+    let zallet = Arc::new(HappyZallet::new(pczt.clone()));
+    let zebra = Arc::new(ScriptedZebra::new([]));
+    let signer = ZecPcztSigner::new(config.clone(), zallet.clone(), zebra.clone())
+        .expect("safe signer can start");
+    let prepared = signer.prepare(&request).expect("PCZT is prepared");
+    assert_eq!(prepared.transaction_id, pczt.transaction_id);
+    assert!(zebra.calls().is_empty(), "prepare must not broadcast");
+
+    let wallet_calls = zallet.calls().len();
+    let recovered = ZecPcztSigner::new(config, zallet.clone(), zebra.clone())
+        .expect("signer restarts")
+        .recover_prepared(&request)
+        .expect("journal recovery succeeds")
+        .expect("prepared artifact exists");
+    assert_eq!(recovered.payout, prepared);
+    assert_eq!(zallet.calls().len(), wallet_calls);
+    assert!(zebra.calls().is_empty(), "recovery must not broadcast");
+}
+
+#[test]
+fn extracted_checkpoint_recovers_identical_bytes_without_resigning() {
+    let root = TestDirectory::new();
+    let (config, request, pczt) = fixture(&root);
+    let zallet = Arc::new(HappyZallet::new(pczt.clone()));
+    let zebra = Arc::new(ScriptedZebra::new([]));
+    let interrupted = ZecPcztSigner::new(config.clone(), zallet.clone(), zebra.clone())
+        .expect("safe signer can start")
+        .with_checkpoint_hook(Arc::new(InterruptOnce {
+            target: Checkpoint::StagePersisted(PipelineStage::Extracted),
+            fired: AtomicBool::new(false),
+        }));
+    assert_eq!(
+        interrupted.prepare(&request),
+        Err(ZecPayoutError::Interrupted)
+    );
+    let wallet_calls = zallet.calls().len();
+    let recovered = ZecPcztSigner::new(config, zallet.clone(), zebra.clone())
+        .expect("signer restarts")
+        .recover_prepared(&request)
+        .expect("journal recovery succeeds")
+        .expect("extracted bytes were durable");
+    assert_eq!(recovered.payout.transaction_id, pczt.transaction_id);
+    assert_eq!(
+        zallet.calls().len(),
+        wallet_calls,
+        "recovery cannot re-sign"
+    );
+    assert!(zebra.calls().is_empty());
+}
+
+#[test]
+fn unresolved_and_completed_journals_recover_without_new_node_calls() {
+    for step in [ZebraStep::Timeout, ZebraStep::Accepted] {
+        let root = TestDirectory::new();
+        let (config, request, pczt) = fixture(&root);
+        let zallet = Arc::new(HappyZallet::new(pczt.clone()));
+        let zebra = Arc::new(ScriptedZebra::new([step]));
+        let signer = ZecPcztSigner::new(config.clone(), zallet.clone(), zebra.clone())
+            .expect("safe signer can start");
+        let _result = signer.execute(&request);
+        let node_calls = zebra.calls().len();
+        let recovered = ZecPcztSigner::new(config, zallet, zebra.clone())
+            .expect("signer restarts")
+            .recover_prepared(&request)
+            .expect("journal recovery succeeds")
+            .expect("exact artifact remains recoverable");
+        assert_eq!(recovered.payout.transaction_id, pczt.transaction_id);
+        assert_eq!(zebra.calls().len(), node_calls);
+    }
+}
+
+#[test]
 fn every_external_and_durable_boundary_resumes_to_the_same_transaction() {
     let checkpoints = [
         Checkpoint::StagePersisted(PipelineStage::Reserved),
