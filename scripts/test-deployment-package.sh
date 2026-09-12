@@ -314,6 +314,204 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" wallet-bootstrap \
     }
 grep -Fq 'WCASH_EXPECTED_SIGNER_ACCOUNT=BOOTSTRAP_DISCOVERY_REQUIRED' \
     "$temporary/wallet-bootstrap-output/wcash-wallet-bootstrap.env"
+
+wallet_protocol_fixture="$temporary/wallet-protocol-v2"
+mkdir -p "$wallet_protocol_fixture"
+wallet_account=33333333-3333-4333-8333-333333333333
+wallet_genesis=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+wallet_commitment=4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60
+python3 - \
+    "$wallet_protocol_fixture" \
+    "$wallet_account" \
+    "$wallet_genesis" \
+    "$wallet_commitment" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+account, genesis, commitment = sys.argv[2:]
+root.joinpath("init.json").write_text(
+    json.dumps(
+        {
+            "account_id": account,
+            "birthday_height": 1,
+            "address": "wutest1realistic-ironwood-collector-fixture",
+            "transparent_coinbase_address": "wttest1realistic-coinbase-fixture",
+            "created": True,
+        }
+    )
+    + "\n",
+    encoding="utf-8",
+)
+root.joinpath("identity-v2.json").write_text(
+    json.dumps(
+        {
+            "protocol_version": 2,
+            "network": "testnet",
+            "genesis_hash": genesis,
+            "branch_id": "b3cfd27e",
+            "account_id": account,
+            "collector_payout_commitment": commitment,
+            "fund_source": "ironwood",
+            "synchronized": True,
+        }
+    )
+    + "\n",
+    encoding="utf-8",
+)
+value_fields = {
+    "ironwood_total_zat",
+    "ironwood_spendable_zat",
+    "ironwood_locked_zat",
+    "ironwood_pending_change_zat",
+    "ironwood_pending_spendability_zat",
+    "sapling_total_zat",
+    "orchard_total_zat",
+    "transparent_total_zat",
+    "transparent_coinbase_total_zat",
+    "transparent_coinbase_spendable_zat",
+    "transparent_coinbase_pending_zat",
+    "transparent_regular_total_zat",
+}
+account_balance = {field: 0 for field in value_fields}
+account_balance["account_id"] = account
+root.joinpath("balance.json").write_text(
+    json.dumps(
+        {
+            "chain_tip_height": 48,
+            "fully_scanned_height": 48,
+            "synchronized": True,
+            "accounts": [account_balance],
+        }
+    )
+    + "\n",
+    encoding="utf-8",
+)
+
+identity_bool = json.loads(root.joinpath("identity-v2.json").read_text(encoding="utf-8"))
+identity_bool["protocol_version"] = True
+root.joinpath("identity-bool-protocol.json").write_text(
+    json.dumps(identity_bool) + "\n", encoding="utf-8"
+)
+
+init_bool = json.loads(root.joinpath("init.json").read_text(encoding="utf-8"))
+init_bool["birthday_height"] = True
+root.joinpath("init-bool-birthday.json").write_text(
+    json.dumps(init_bool) + "\n", encoding="utf-8"
+)
+
+balance_bool_tip = json.loads(root.joinpath("balance.json").read_text(encoding="utf-8"))
+balance_bool_tip["chain_tip_height"] = True
+root.joinpath("balance-bool-tip.json").write_text(
+    json.dumps(balance_bool_tip) + "\n", encoding="utf-8"
+)
+
+balance_bool_scan = json.loads(root.joinpath("balance.json").read_text(encoding="utf-8"))
+balance_bool_scan["fully_scanned_height"] = True
+root.joinpath("balance-bool-scan.json").write_text(
+    json.dumps(balance_bool_scan) + "\n", encoding="utf-8"
+)
+
+balance_bool_value = json.loads(root.joinpath("balance.json").read_text(encoding="utf-8"))
+balance_bool_value["accounts"][0]["ironwood_total_zat"] = False
+root.joinpath("balance-bool-value.json").write_text(
+    json.dumps(balance_bool_value) + "\n", encoding="utf-8"
+)
+PY
+
+wallet_validator="$repo_root/scripts/deploy/validate-wcash-wallet-bootstrap.py"
+python3 "$wallet_validator" \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/balance.json" \
+    "$wallet_protocol_fixture/identity-v2.json" \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    1 \
+    "$wallet_genesis" \
+    "$wallet_account" \
+    "$wallet_commitment" \
+    >"$wallet_protocol_fixture/authority-output.json"
+cmp -s \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/authority-output.json" \
+    || {
+        printf 'deployment-package-test: wallet protocol-v2 authority output is unstable\n' >&2
+        exit 1
+    }
+
+assert_wallet_protocol_rejected() {
+    local label=$1
+    local init=$2
+    local balance=$3
+    local identity=$4
+    local rejected_authority="$wallet_protocol_fixture/authority-rejected-$label.json"
+    if python3 "$wallet_validator" \
+        "$init" \
+        "$balance" \
+        "$identity" \
+        "$rejected_authority" \
+        1 \
+        "$wallet_genesis" \
+        "$wallet_account" \
+        "$wallet_commitment" >/dev/null 2>&1; then
+        printf 'deployment-package-test: wallet bootstrap accepted malformed %s output\n' \
+            "$label" >&2
+        exit 1
+    fi
+    [[ ! -e $rejected_authority ]] || {
+        printf 'deployment-package-test: rejected wallet output wrote authority state\n' >&2
+        exit 1
+    }
+}
+
+assert_wallet_protocol_rejected \
+    bool-protocol \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/balance.json" \
+    "$wallet_protocol_fixture/identity-bool-protocol.json"
+assert_wallet_protocol_rejected \
+    bool-birthday \
+    "$wallet_protocol_fixture/init-bool-birthday.json" \
+    "$wallet_protocol_fixture/balance.json" \
+    "$wallet_protocol_fixture/identity-v2.json"
+assert_wallet_protocol_rejected \
+    bool-tip \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/balance-bool-tip.json" \
+    "$wallet_protocol_fixture/identity-v2.json"
+assert_wallet_protocol_rejected \
+    bool-scan \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/balance-bool-scan.json" \
+    "$wallet_protocol_fixture/identity-v2.json"
+assert_wallet_protocol_rejected \
+    bool-balance \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/balance-bool-value.json" \
+    "$wallet_protocol_fixture/identity-v2.json"
+
+for rejected_version in 1 4294967295; do
+    rejected_identity="$wallet_protocol_fixture/identity-v$rejected_version.json"
+    python3 - \
+        "$wallet_protocol_fixture/identity-v2.json" \
+        "$rejected_identity" \
+        "$rejected_version" <<'PY'
+import json
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:3])
+identity = json.loads(source.read_text(encoding="utf-8"))
+identity["protocol_version"] = int(sys.argv[3], 10)
+output.write_text(json.dumps(identity) + "\n", encoding="utf-8")
+PY
+    assert_wallet_protocol_rejected \
+        "protocol-$rejected_version" \
+        "$wallet_protocol_fixture/init.json" \
+        "$wallet_protocol_fixture/balance.json" \
+        "$rejected_identity"
+done
+
 if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --settings "$temporary/discovery.env" \
     --source-root "$repo_root" \
