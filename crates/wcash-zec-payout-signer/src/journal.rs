@@ -57,20 +57,25 @@ pub(crate) enum StoredStage {
     SignedVerified {
         pczt: String,
         privacy_policy: String,
+        network_fee_zat: u64,
     },
     Extracted {
         raw_transaction: String,
         transaction_id: String,
+        network_fee_zat: u64,
     },
     BroadcastUnresolved {
         raw_transaction: String,
         transaction_id: String,
+        network_fee_zat: u64,
     },
     Rejected {
         transaction_id: String,
     },
     Completed {
+        raw_transaction: String,
         transaction_id: String,
+        network_fee_zat: u64,
     },
 }
 
@@ -117,6 +122,7 @@ impl StoredStage {
             | Self::SignedVerified {
                 pczt,
                 privacy_policy,
+                network_fee_zat: _,
             } => {
                 if pczt.is_empty()
                     || pczt.len() > MAX_PCZT_BYTES
@@ -135,17 +141,25 @@ impl StoredStage {
             Self::Extracted {
                 raw_transaction,
                 transaction_id,
+                network_fee_zat,
             }
             | Self::BroadcastUnresolved {
                 raw_transaction,
                 transaction_id,
+                network_fee_zat,
+            }
+            | Self::Completed {
+                raw_transaction,
+                transaction_id,
+                network_fee_zat,
             } => {
+                if *network_fee_zat == 0 {
+                    return Err(ZecPayoutError::JournalCorrupt);
+                }
                 validate_raw_transaction(raw_transaction)?;
                 validate_transaction_id(transaction_id)
             }
-            Self::Rejected { transaction_id } | Self::Completed { transaction_id } => {
-                validate_transaction_id(transaction_id)
-            }
+            Self::Rejected { transaction_id } => validate_transaction_id(transaction_id),
         }
     }
 }
