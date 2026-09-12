@@ -1,0 +1,33 @@
+[package]
+name = "wcash-pool-store"
+description = "Durable identity, authorization, nonce, and monetary projection for ZecWec"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+argon2.workspace = true
+hex.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+wcash-pool-backend-client = { path = "../wcash-pool-backend-client" }
+wcash-pool-core = { path = "../wcash-pool-core" }
+wcash-pool-edge = { path = "../wcash-pool-edge" }
+wcash-pool-protocol = { path = "../wcash-pool-protocol" }
+zeroize.workspace = true
+
+[lints]
+workspace = true

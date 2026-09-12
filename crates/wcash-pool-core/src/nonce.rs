@@ -106,6 +106,7 @@ pub struct NoncePrefixAllocator {
     profile: NonceProfile,
     lease: NonceNamespaceLease,
     next: Mutex<u64>,
+    end_exclusive: u64,
 }
 
 impl NoncePrefixAllocator {
@@ -120,6 +121,7 @@ impl NoncePrefixAllocator {
             profile,
             lease,
             next: Mutex::new(0),
+            end_exclusive: capacity(profile),
         }
     }
 
@@ -142,6 +144,37 @@ impl NoncePrefixAllocator {
             profile: cursor.profile,
             lease,
             next: Mutex::new(cursor.next),
+            end_exclusive: capacity(cursor.profile),
+        })
+    }
+
+    /// Restores only a transactionally reserved sub-range of one namespace.
+    ///
+    /// The durable authority must advance its global cursor to `end_exclusive`
+    /// before constructing this allocator. A crash can then waste prefixes but
+    /// can never cause another process to reissue them.
+    pub fn restore_reserved(
+        cursor: NonceCursor,
+        lease: NonceNamespaceLease,
+        end_exclusive: u64,
+    ) -> Result<Self, NoncePrefixError> {
+        if cursor.lease != lease {
+            return Err(NoncePrefixError::LeaseMismatch {
+                cursor_namespace: cursor.lease.namespace(),
+                provided_namespace: lease.namespace(),
+            });
+        }
+        if end_exclusive <= cursor.next || end_exclusive > capacity(cursor.profile) {
+            return Err(NoncePrefixError::InvalidReservation {
+                start: cursor.next,
+                end_exclusive,
+            });
+        }
+        Ok(Self {
+            profile: cursor.profile,
+            lease,
+            next: Mutex::new(cursor.next),
+            end_exclusive,
         })
     }
 
@@ -158,7 +191,7 @@ impl NoncePrefixAllocator {
     /// Allocates the next unique prefix without wrapping.
     pub fn allocate(&self) -> Result<NoncePrefix, NoncePrefixError> {
         let mut next = self.next.lock().map_err(|_| NoncePrefixError::Poisoned)?;
-        if *next >= capacity(self.profile) {
+        if *next >= self.end_exclusive {
             return Err(NoncePrefixError::Exhausted(self.profile));
         }
         let value = *next;
@@ -239,6 +272,14 @@ pub enum NoncePrefixError {
         /// Namespace supplied by the current durable lease authority.
         provided_namespace: u8,
     },
+    /// A durable range was empty, inverted, or outside the nonce profile.
+    #[error("nonce reservation [{start}, {end_exclusive}) is invalid")]
+    InvalidReservation {
+        /// First prefix reserved for this process.
+        start: u64,
+        /// Exclusive upper fence persisted before use.
+        end_exclusive: u64,
+    },
 }
 
 #[cfg(test)]
@@ -294,6 +335,29 @@ mod tests {
             assert_eq!(prefix_bytes(&one)[1], 1);
             assert_eq!(prefix_bytes(&one).len(), profile.prefix_bytes());
         }
+    }
+
+    #[test]
+    fn durable_subrange_exhausts_without_entering_the_next_range() {
+        let lease = lease(23);
+        let allocator = NoncePrefixAllocator::restore_reserved(
+            NonceCursor::new(NonceProfile::FourByte, lease, 41).expect("cursor is in range"),
+            lease,
+            43,
+        )
+        .expect("reservation is valid");
+        assert_eq!(
+            prefix_value(&allocator.allocate().expect("41 is reserved")),
+            41
+        );
+        assert_eq!(
+            prefix_value(&allocator.allocate().expect("42 is reserved")),
+            42
+        );
+        assert_eq!(
+            allocator.allocate(),
+            Err(NoncePrefixError::Exhausted(NonceProfile::FourByte))
+        );
     }
 
     #[test]
