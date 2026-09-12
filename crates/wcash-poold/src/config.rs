@@ -7,6 +7,7 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     str::FromStr,
+    time::Duration,
 };
 
 use num_bigint::BigUint;
@@ -20,6 +21,7 @@ use zeroize::Zeroizing;
 
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_WCASH_WALLET_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Fully decoded, immutable Testnet service policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +76,14 @@ pub struct RuntimeConfig {
     pub wcash_wallet_database: PathBuf,
     /// Literal loopback Wcash compact-block endpoint.
     pub wcash_lightwalletd_endpoint: String,
+    /// Maximum compact blocks requested in one seedless wallet-sync batch.
+    pub wcash_wallet_sync_batch_size: u32,
+    /// Independent wall-clock limit for one complete seedless wallet sync.
+    pub wcash_wallet_sync_timeout: Duration,
+    /// Loopback Wcash validator JSON-RPC endpoint.
+    pub wcash_node_rpc: SocketAddr,
+    /// Protected Wcash validator JSON-RPC cookie.
+    pub wcash_node_cookie_file: PathBuf,
     /// Protected Wcash collector seed credential.
     pub wcash_wallet_seed_file: PathBuf,
     /// Required owner of the Wcash seed credential.
@@ -96,6 +106,8 @@ pub struct RuntimeConfig {
     pub zcash_signer_journal_directory: PathBuf,
     /// Exact Zallet collector account identity.
     pub zcash_signer_account: Uuid,
+    /// Exact non-hardened ZIP 32 index of the Zallet collector account.
+    pub zcash_signer_account_index: u32,
     /// Portal keyed-digest secret credential.
     pub portal_token_pepper_file: PathBuf,
     /// Portal TOTP encryption secret credential.
@@ -170,6 +182,10 @@ struct RawConfig {
     wcash_wallet_uid: u32,
     wcash_wallet_database: PathBuf,
     wcash_lightwalletd_endpoint: String,
+    wcash_wallet_sync_batch_size: u32,
+    wcash_wallet_sync_timeout_seconds: u64,
+    wcash_node_rpc: SocketAddr,
+    wcash_node_cookie_file: PathBuf,
     wcash_wallet_seed_file: PathBuf,
     wcash_seed_uid: u32,
     wcash_signer_journal_directory: PathBuf,
@@ -181,6 +197,7 @@ struct RawConfig {
     zcash_node_cookie_file: PathBuf,
     zcash_signer_journal_directory: PathBuf,
     zcash_signer_account: Uuid,
+    zcash_signer_account_index: u32,
     portal_token_pepper_file: PathBuf,
     portal_totp_key_file: PathBuf,
     wcash_policy: RawChainPolicy,
@@ -241,6 +258,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             &raw.wcash_wallet_database,
             &raw.wcash_wallet_seed_file,
             &raw.wcash_signer_journal_directory,
+            &raw.wcash_node_cookie_file,
             &raw.zallet_configuration,
             &raw.zallet_cookie_file,
             &raw.zcash_node_cookie_file,
@@ -269,11 +287,20 @@ impl TryFrom<RawConfig> for RuntimeConfig {
                 .wcash_lightwalletd_endpoint
                 .chars()
                 .any(char::is_whitespace)
+            || !(1..=16).contains(&raw.wcash_wallet_sync_batch_size)
+            || raw.wcash_wallet_sync_timeout_seconds == 0
+            || Duration::from_secs(raw.wcash_wallet_sync_timeout_seconds)
+                > MAX_WCASH_WALLET_SYNC_TIMEOUT
+            || !raw.wcash_node_rpc.ip().is_loopback()
+            || raw.wcash_node_rpc.port() == 0
             || !raw.zallet_rpc.ip().is_loopback()
             || raw.zallet_rpc.port() == 0
             || !raw.zcash_node_rpc.ip().is_loopback()
             || raw.zcash_node_rpc.port() == 0
             || raw.zallet_rpc == raw.zcash_node_rpc
+            || raw.wcash_node_rpc == raw.zallet_rpc
+            || raw.wcash_node_rpc == raw.zcash_node_rpc
+            || raw.zcash_signer_account_index >= (1 << 31)
         {
             return Err(ConfigError::InvalidPolicy);
         }
@@ -331,6 +358,10 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             wcash_wallet_uid: raw.wcash_wallet_uid,
             wcash_wallet_database: raw.wcash_wallet_database,
             wcash_lightwalletd_endpoint: raw.wcash_lightwalletd_endpoint,
+            wcash_wallet_sync_batch_size: raw.wcash_wallet_sync_batch_size,
+            wcash_wallet_sync_timeout: Duration::from_secs(raw.wcash_wallet_sync_timeout_seconds),
+            wcash_node_rpc: raw.wcash_node_rpc,
+            wcash_node_cookie_file: raw.wcash_node_cookie_file,
             wcash_wallet_seed_file: raw.wcash_wallet_seed_file,
             wcash_seed_uid: raw.wcash_seed_uid,
             wcash_signer_journal_directory: raw.wcash_signer_journal_directory,
@@ -342,6 +373,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             zcash_node_cookie_file: raw.zcash_node_cookie_file,
             zcash_signer_journal_directory: raw.zcash_signer_journal_directory,
             zcash_signer_account: raw.zcash_signer_account,
+            zcash_signer_account_index: raw.zcash_signer_account_index,
             portal_token_pepper_file: raw.portal_token_pepper_file,
             portal_totp_key_file: raw.portal_totp_key_file,
             wcash_policy: parse_chain_policy(raw.wcash_policy)?,
@@ -407,7 +439,7 @@ fn read_utf8_credential(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
     Ok(Zeroizing::new(value.to_owned()))
 }
 
-fn read_protected(
+pub(crate) fn read_protected(
     path: &Path,
     maximum: u64,
     secret: bool,
@@ -643,6 +675,10 @@ wcash_wallet_sha256 = "{five}"
 wcash_wallet_uid = 0
 wcash_wallet_database = "/var/lib/zecwec/wcash-wallet.sqlite"
 wcash_lightwalletd_endpoint = "http://127.0.0.1:38234"
+wcash_wallet_sync_batch_size = 16
+wcash_wallet_sync_timeout_seconds = 300
+wcash_node_rpc = "127.0.0.1:38232"
+wcash_node_cookie_file = "{root}/wcash-node.cookie"
 wcash_wallet_seed_file = "{root}/wcash-seed"
 wcash_seed_uid = 0
 wcash_signer_journal_directory = "/var/lib/zecwec/wec-payout-journal"
@@ -654,6 +690,7 @@ zcash_node_rpc = "127.0.0.1:18242"
 zcash_node_cookie_file = "{root}/zebra.cookie"
 zcash_signer_journal_directory = "/var/lib/zecwec/zec-payout-journal"
 zcash_signer_account = "66666666-6666-4666-8666-666666666666"
+zcash_signer_account_index = 0
 portal_token_pepper_file = "{root}/pepper"
 portal_totp_key_file = "{root}/totp"
 initial_share_target_be = "{six}"
@@ -747,6 +784,108 @@ policy_version = 1
             RuntimeConfig::portal_secret(&secret),
             Err(ConfigError::UnsafeFile)
         ));
+    }
+
+    #[test]
+    fn wcash_validator_endpoint_and_cookie_are_mandatory_and_loopback_only() {
+        let directory = TempDir::new().expect("temp dir");
+        let valid = fixture(&directory, "testnet");
+
+        let missing_endpoint = write_file(
+            &directory,
+            "missing-endpoint.toml",
+            valid
+                .replace("wcash_node_rpc = \"127.0.0.1:38232\"\n", "")
+                .as_bytes(),
+            0o600,
+        );
+        assert!(matches!(
+            RuntimeConfig::load(&missing_endpoint),
+            Err(ConfigError::Toml(_))
+        ));
+
+        let missing_cookie = write_file(
+            &directory,
+            "missing-cookie.toml",
+            valid
+                .replace(
+                    &format!(
+                        "wcash_node_cookie_file = \"{}/wcash-node.cookie\"\n",
+                        protected_root(&directory).display()
+                    ),
+                    "",
+                )
+                .as_bytes(),
+            0o600,
+        );
+        assert!(matches!(
+            RuntimeConfig::load(&missing_cookie),
+            Err(ConfigError::Toml(_))
+        ));
+
+        let public_endpoint = write_file(
+            &directory,
+            "public-validator.toml",
+            valid
+                .replace(
+                    "wcash_node_rpc = \"127.0.0.1:38232\"",
+                    "wcash_node_rpc = \"198.51.100.8:38232\"",
+                )
+                .as_bytes(),
+            0o600,
+        );
+        assert!(matches!(
+            RuntimeConfig::load(&public_endpoint),
+            Err(ConfigError::InvalidPolicy)
+        ));
+    }
+
+    #[test]
+    fn wcash_seedless_sync_policy_is_explicit_and_bounded() {
+        let directory = TempDir::new().expect("temp dir");
+        let valid = fixture(&directory, "testnet");
+
+        let missing = write_file(
+            &directory,
+            "missing-sync-timeout.toml",
+            valid
+                .replace("wcash_wallet_sync_timeout_seconds = 300\n", "")
+                .as_bytes(),
+            0o600,
+        );
+        assert!(matches!(
+            RuntimeConfig::load(&missing),
+            Err(ConfigError::Toml(_))
+        ));
+
+        for (name, from, to) in [
+            (
+                "zero-sync-batch.toml",
+                "wcash_wallet_sync_batch_size = 16",
+                "wcash_wallet_sync_batch_size = 0",
+            ),
+            (
+                "oversized-sync-batch.toml",
+                "wcash_wallet_sync_batch_size = 16",
+                "wcash_wallet_sync_batch_size = 17",
+            ),
+            (
+                "zero-sync-timeout.toml",
+                "wcash_wallet_sync_timeout_seconds = 300",
+                "wcash_wallet_sync_timeout_seconds = 0",
+            ),
+            (
+                "unbounded-sync-timeout.toml",
+                "wcash_wallet_sync_timeout_seconds = 300",
+                "wcash_wallet_sync_timeout_seconds = 901",
+            ),
+        ] {
+            let path = write_file(&directory, name, valid.replace(from, to).as_bytes(), 0o600);
+            assert!(matches!(
+                RuntimeConfig::load(&path),
+                Err(ConfigError::InvalidPolicy)
+            ));
+        }
     }
 
     #[test]

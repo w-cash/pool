@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
     thread,
     time::{Duration, Instant},
 };
@@ -27,7 +27,8 @@ use wcash_wec_payout_signer::{
 };
 use zeroize::Zeroizing;
 
-const PAYOUT_PROTOCOL_VERSION: u32 = 1;
+const PAYOUT_PROTOCOL_VERSION: u32 = 2;
+const PAYOUT_FAILURE_PROTOCOL_VERSION: u32 = 1;
 const PAYOUT_SIGN_FRAME_MAGIC: &[u8; 16] = b"WCASHPAYSIGNV1\0\0";
 const PAYOUT_SIGN_FRAME_HEADER_BYTES: usize = PAYOUT_SIGN_FRAME_MAGIC.len() + 2 + 4;
 const MAX_SIGN_REQUEST_BYTES: usize = 512 * 1_024;
@@ -162,6 +163,7 @@ pub struct WolfWalletTransport {
     program: PinnedWolfProgram,
     wallet_database: PathBuf,
     lightwalletd_endpoint: String,
+    invocation_lock: Arc<Mutex<()>>,
 }
 
 impl WolfWalletTransport {
@@ -181,6 +183,7 @@ impl WolfWalletTransport {
             program,
             wallet_database,
             lightwalletd_endpoint,
+            invocation_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -188,6 +191,35 @@ impl WolfWalletTransport {
         &self,
         subcommand: &'static str,
         needs_endpoint: bool,
+        input: Zeroizing<Vec<u8>>,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, InvokeError> {
+        let _guard = self.acquire_invocation()?;
+        self.invoke_wallet_locked(
+            subcommand,
+            needs_endpoint,
+            &[],
+            input,
+            timeout,
+            max_response_bytes,
+        )
+    }
+
+    fn acquire_invocation(&self) -> Result<MutexGuard<'_, ()>, InvokeError> {
+        self.invocation_lock
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => InvokeError::Busy,
+                TryLockError::Poisoned(_) => InvokeError::Preflight,
+            })
+    }
+
+    fn invoke_wallet_locked(
+        &self,
+        subcommand: &'static str,
+        needs_endpoint: bool,
+        additional_arguments: &[OsString],
         input: Zeroizing<Vec<u8>>,
         timeout: Duration,
         max_response_bytes: usize,
@@ -211,6 +243,7 @@ impl WolfWalletTransport {
             ]);
         }
         arguments.push(OsString::from(subcommand));
+        arguments.extend_from_slice(additional_arguments);
         if subcommand == "payout-sign" {
             arguments.push(OsString::from("--seed-stdin"));
         }
@@ -229,12 +262,36 @@ impl WolfWalletTransport {
     /// against its independently configured wallet authority.
     pub(super) fn invoke_observation(
         &self,
+        sync_timeout: Duration,
+        sync_batch_size: u32,
         timeout: Duration,
         max_response_bytes: usize,
     ) -> Result<Zeroizing<Vec<u8>>, NativeWalletError> {
-        self.invoke_wallet(
+        if !(1..=16).contains(&sync_batch_size) {
+            return Err(NativeWalletError::ProtocolViolation);
+        }
+        let _guard = self
+            .acquire_invocation()
+            .map_err(map_readonly_invoke_error)?;
+        let sync_arguments = [
+            OsString::from("--batch-size"),
+            OsString::from(sync_batch_size.to_string()),
+        ];
+        let sync_output = self
+            .invoke_wallet_locked(
+                "sync",
+                true,
+                &sync_arguments,
+                Zeroizing::new(Vec::new()),
+                sync_timeout,
+                max_response_bytes,
+            )
+            .map_err(map_readonly_invoke_error)?;
+        drop(sync_output);
+        self.invoke_wallet_locked(
             "payout-observe",
             true,
+            &[],
             Zeroizing::new(Vec::new()),
             timeout,
             max_response_bytes,
@@ -473,6 +530,7 @@ struct WireIdentityRef<'a> {
     genesis_hash: &'a str,
     branch_id: &'a str,
     account_id: String,
+    collector_payout_commitment: String,
     fund_source: &'static str,
     synchronized: bool,
 }
@@ -489,6 +547,7 @@ impl<'a> From<&'a WalletIdentity> for WireIdentityRef<'a> {
             genesis_hash: &identity.genesis_hash,
             branch_id: &identity.branch_id,
             account_id: identity.account_id.to_string(),
+            collector_payout_commitment: hex::encode(identity.collector_payout_commitment),
             fund_source: match identity.fund_source {
                 WalletFundSource::Ironwood => "ironwood",
                 WalletFundSource::Sapling => "sapling",
@@ -532,6 +591,7 @@ struct WireIdentity {
     genesis_hash: String,
     branch_id: String,
     account_id: String,
+    collector_payout_commitment: String,
     fund_source: String,
     synchronized: bool,
 }
@@ -636,11 +696,16 @@ fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWallet
         return Err(NativeWalletError::ProtocolViolation);
     }
     let account_id = parse_uuid(&identity.account_id)?;
+    let collector_payout_commitment = parse_hex32(&identity.collector_payout_commitment)?;
+    if collector_payout_commitment == [0; 32] {
+        return Err(NativeWalletError::ProtocolViolation);
+    }
     Ok(WalletIdentity {
         network: WalletNetwork::Testnet,
         genesis_hash: identity.genesis_hash,
         branch_id: identity.branch_id,
         account_id,
+        collector_payout_commitment,
         fund_source: WalletFundSource::Ironwood,
         synchronized: identity.synchronized,
     })
@@ -785,6 +850,7 @@ fn encode_sign_frame(
 #[derive(Clone, Copy, Debug)]
 enum InvokeError {
     Preflight,
+    Busy,
     Spawn,
     TimedOut,
     InputOutput,
@@ -872,7 +938,8 @@ fn run_child(
         let failure = serde_json::from_slice::<WireFailure>(&error.bytes)
             .ok()
             .filter(|failure| {
-                failure.protocol_version == PAYOUT_PROTOCOL_VERSION && !failure.error.is_empty()
+                failure.protocol_version == PAYOUT_FAILURE_PROTOCOL_VERSION
+                    && !failure.error.is_empty()
             })
             .map(|failure| failure.code);
         return Err(InvokeError::Exited(failure));
@@ -952,9 +1019,10 @@ fn terminate_child(child: &mut Child) {
 fn map_readonly_invoke_error(error: InvokeError) -> NativeWalletError {
     match error {
         InvokeError::TimedOut => NativeWalletError::Timeout,
-        InvokeError::Preflight | InvokeError::Spawn | InvokeError::InputOutput => {
-            NativeWalletError::Unavailable
-        }
+        InvokeError::Preflight
+        | InvokeError::Busy
+        | InvokeError::Spawn
+        | InvokeError::InputOutput => NativeWalletError::Unavailable,
         InvokeError::Exited(Some(WireFailureCode::IdempotencyConflict)) => {
             NativeWalletError::IdempotencyConflict
         }
@@ -976,7 +1044,9 @@ fn map_recovery_invoke_error(error: InvokeError) -> NativeWalletError {
 
 fn map_sign_invoke_error(error: InvokeError) -> NativeWalletError {
     match error {
-        InvokeError::Preflight | InvokeError::Spawn => NativeWalletError::Unavailable,
+        InvokeError::Preflight | InvokeError::Busy | InvokeError::Spawn => {
+            NativeWalletError::Unavailable
+        }
         InvokeError::Exited(Some(WireFailureCode::IdempotencyConflict)) => {
             NativeWalletError::IdempotencyConflict
         }
@@ -994,7 +1064,9 @@ fn map_sign_invoke_error(error: InvokeError) -> NativeWalletError {
 fn map_broadcast_invoke_error(error: InvokeError) -> BroadcastFailure {
     match error {
         InvokeError::TimedOut => BroadcastFailure::Timeout,
-        InvokeError::Preflight | InvokeError::Spawn => BroadcastFailure::Unavailable,
+        InvokeError::Preflight | InvokeError::Busy | InvokeError::Spawn => {
+            BroadcastFailure::Unavailable
+        }
         InvokeError::Exited(Some(WireFailureCode::Rejected)) => BroadcastFailure::Rejected,
         InvokeError::Protocol => BroadcastFailure::ProtocolViolation,
         InvokeError::InputOutput | InvokeError::ResponseLimit | InvokeError::Exited(_) => {
@@ -1114,6 +1186,55 @@ mod tests {
     }
 
     #[test]
+    fn payout_v2_identity_requires_one_canonical_nonzero_commitment() {
+        let valid = || {
+            serde_json::json!({
+                "protocol_version": 2,
+                "network": "testnet",
+                "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
+                "branch_id": WCASH_TESTNET_BRANCH_ID,
+                "account_id": "10000000-0000-4000-8000-000000000001",
+                "collector_payout_commitment": "66".repeat(32),
+                "fund_source": "ironwood",
+                "synchronized": true,
+            })
+        };
+        assert_eq!(
+            parse_wire_identity(&serde_json::to_vec(&valid()).unwrap())
+                .unwrap()
+                .collector_payout_commitment,
+            [0x66; 32]
+        );
+        for mutation in [
+            ("protocol_version", serde_json::json!(1)),
+            (
+                "collector_payout_commitment",
+                serde_json::json!("00".repeat(32)),
+            ),
+            (
+                "collector_payout_commitment",
+                serde_json::json!("AA".repeat(32)),
+            ),
+        ] {
+            let mut response = valid();
+            response[mutation.0] = mutation.1;
+            assert_eq!(
+                parse_wire_identity(&serde_json::to_vec(&response).unwrap()),
+                Err(NativeWalletError::ProtocolViolation)
+            );
+        }
+        let mut missing = valid();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("collector_payout_commitment");
+        assert_eq!(
+            parse_wire_identity(&serde_json::to_vec(&missing).unwrap()),
+            Err(NativeWalletError::ProtocolViolation)
+        );
+    }
+
+    #[test]
     fn signed_response_rejects_raw_transaction_digest_mismatch() {
         let response = WireSignedPayout {
             protocol_version: PAYOUT_PROTOCOL_VERSION,
@@ -1126,6 +1247,7 @@ mod tests {
                 genesis_hash: WCASH_TESTNET_GENESIS_HASH.to_owned(),
                 branch_id: WCASH_TESTNET_BRANCH_ID.to_owned(),
                 account_id: "20000000-0000-4000-8000-000000000002".to_owned(),
+                collector_payout_commitment: "66".repeat(32),
                 fund_source: "ironwood".to_owned(),
                 synchronized: true,
             },
@@ -1191,11 +1313,12 @@ mod tests {
     #[test]
     fn subprocess_identity_is_bounded_and_testnet_attested() {
         let identity = serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "network": "testnet",
             "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
             "branch_id": WCASH_TESTNET_BRANCH_ID,
             "account_id": "10000000-0000-4000-8000-000000000001",
+            "collector_payout_commitment": "66".repeat(32),
             "fund_source": "ironwood",
             "synchronized": true
         });
@@ -1208,9 +1331,57 @@ mod tests {
         assert_eq!(observed.network, WalletNetwork::Testnet);
         assert_eq!(observed.genesis_hash, WCASH_TESTNET_GENESIS_HASH);
         assert_eq!(observed.branch_id, WCASH_TESTNET_BRANCH_ID);
+        assert_eq!(observed.collector_payout_commitment, [0x66; 32]);
         assert_eq!(
             observed.account_id,
             Uuid::parse_str("10000000-0000-4000-8000-000000000001").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_runs_bounded_seedless_sync_first_with_no_interleaving() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical_directory = std::fs::canonicalize(directory.path()).unwrap();
+        let invocations = canonical_directory.join("invocations");
+        let quoted_invocations = invocations.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "printf '%s\\n' \"$*\" >> '{quoted_invocations}'\ncase \" $* \" in\n  *\" sync --batch-size 7 \"*) printf '%s' '{{}}' ;;\n  *\" payout-observe \"*) printf '%s' '{{\"observation\":true}}' ;;\n  *) exit 64 ;;\nesac"
+        );
+        let (_ignored, _program, transport) = fixture_transport(&script);
+        let output = transport
+            .invoke_observation(TEST_PROCESS_TIMEOUT, 7, TEST_PROCESS_TIMEOUT, 4_096)
+            .unwrap();
+        assert_eq!(&*output, br#"{"observation":true}"#);
+        let calls = std::fs::read_to_string(invocations).unwrap();
+        let calls = calls.lines().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].ends_with("sync --batch-size 7"));
+        assert!(calls[1].ends_with("payout-observe"));
+
+        let _guard = transport.acquire_invocation().unwrap();
+        assert_eq!(
+            transport.identity(TEST_PROCESS_TIMEOUT, 4_096),
+            Err(NativeWalletError::Unavailable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_sync_prevents_observation() {
+        let failure = serde_json::json!({
+            "protocol_version": 1,
+            "code": "unavailable",
+            "error": "fixture unavailable"
+        });
+        let script = format!(
+            "case \" $* \" in\n  *\" sync --batch-size 16 \"*) printf '%s' '{}' >&2; exit 1 ;;\n  *\" payout-observe \"*) exit 99 ;;\n  *) exit 64 ;;\nesac",
+            failure
+        );
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert_eq!(
+            transport.invoke_observation(TEST_PROCESS_TIMEOUT, 16, TEST_PROCESS_TIMEOUT, 4_096,),
+            Err(NativeWalletError::Unavailable)
         );
     }
 
@@ -1253,11 +1424,12 @@ mod tests {
     #[test]
     fn executable_mutation_fails_before_a_second_wallet_call() {
         let identity = serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "network": "testnet",
             "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
             "branch_id": WCASH_TESTNET_BRANCH_ID,
             "account_id": "10000000-0000-4000-8000-000000000001",
+            "collector_payout_commitment": "66".repeat(32),
             "fund_source": "ironwood",
             "synchronized": true
         });

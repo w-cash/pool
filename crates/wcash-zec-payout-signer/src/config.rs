@@ -103,6 +103,7 @@ pub struct ZecSignerConfig {
     journal_directory: PathBuf,
     zallet_configuration: PathBuf,
     account_id: Uuid,
+    expected_parent_payout_commitment: [u8; 32],
     min_confirmations: u32,
     max_outputs: usize,
     max_fee_zat: u64,
@@ -115,11 +116,13 @@ impl ZecSignerConfig {
         journal_directory: impl Into<PathBuf>,
         zallet_configuration: impl Into<PathBuf>,
         account_id: Uuid,
+        expected_parent_payout_commitment: [u8; 32],
     ) -> Result<Self, ZecPayoutError> {
         let config = Self {
             journal_directory: journal_directory.into(),
             zallet_configuration: zallet_configuration.into(),
             account_id,
+            expected_parent_payout_commitment,
             min_confirmations: MIN_COINBASE_CONFIRMATIONS,
             max_outputs: DEFAULT_MAX_OUTPUTS,
             max_fee_zat: 5_000_000,
@@ -164,6 +167,7 @@ impl ZecSignerConfig {
     pub(crate) fn validate_policy(&self) -> Result<(), ZecPayoutError> {
         self.rpc_limits.validate()?;
         if self.account_id.is_nil()
+            || self.expected_parent_payout_commitment == [0; 32]
             || self.journal_directory.as_os_str().is_empty()
             || self.zallet_configuration.as_os_str().is_empty()
             || self.min_confirmations < MIN_COINBASE_CONFIRMATIONS
@@ -178,6 +182,10 @@ impl ZecSignerConfig {
 
     pub(crate) const fn account_id(&self) -> Uuid {
         self.account_id
+    }
+
+    pub(crate) const fn expected_parent_payout_commitment(&self) -> [u8; 32] {
+        self.expected_parent_payout_commitment
     }
 
     pub(crate) const fn min_confirmations(&self) -> u32 {

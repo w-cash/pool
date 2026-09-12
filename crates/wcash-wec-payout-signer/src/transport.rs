@@ -46,6 +46,8 @@ pub struct WalletIdentity {
     pub branch_id: String,
     /// Exact collector account UUID.
     pub account_id: Uuid,
+    /// Domain-separated commitment to the exact canonical collector address.
+    pub collector_payout_commitment: [u8; 32],
     /// Pool from which the wallet will select value.
     pub fund_source: WalletFundSource,
     /// Whether the wallet has scanned the attested node tip.
