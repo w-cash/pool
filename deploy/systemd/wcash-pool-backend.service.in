@@ -1,10 +1,11 @@
 [Unit]
 Description=ZecWec Testnet authoritative merged-mining backend
-Documentation=file:///usr/local/share/zecwec-deploy/docs/zecwec-testnet-deployment.md
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
 Requires=wcash-pool-backend-init.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+BindsTo=wcash-pool-backend-init.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 After=network-online.target wcash-pool-backend-init.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 Wants=network-online.target
-ConditionPathIsExecutable=/opt/wcash/current/wcash-merge-miner
+ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-merge-miner
 
 [Service]
 Type=simple
@@ -12,14 +13,22 @@ User=wcash-pool-backend
 Group=wcash-pool-socket
 UMask=0077
 EnvironmentFile=/etc/wcash-pool/backend.env
+Environment=ZEC_AUTHORITY_CONFIG=/run/credentials/wcash-pool-backend.service/zec-authority-config
+Environment=ZEC_AUTHORITY_RESULT=/run/credentials/wcash-pool-backend.service/zec-initial-zero-result
+Environment=ZEC_AUTHORITY_ATTESTATION=/run/credentials/wcash-pool-backend.service/zec-initial-zero-attestation
 LoadCredential=wcash-rpc-cookie:@WCASH_RPC_COOKIE_SOURCE@
 LoadCredential=zcash-template-rpc-cookie:@ZCASH_TEMPLATE_COOKIE_SOURCE@
 LoadCredential=zcash-validator-rpc-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
 LoadCredential=wcash-payout-address:@WCASH_PAYOUT_ADDRESS_CREDENTIAL@
 @WCASH_IVK_LOAD_CREDENTIAL@
 LoadCredential=zcash-payout-address:@ZCASH_PAYOUT_ADDRESS_CREDENTIAL@
-ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh wcash-merge-miner
-ExecStart=/usr/local/libexec/zecwec/backend-entrypoint.sh serve
+LoadCredential=wcash-wallet-authority:@WCASH_WALLET_AUTHORITY@
+LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml
+LoadCredential=zec-initial-zero-result:@ZCASH_INITIAL_ZERO_RESULT@
+LoadCredential=zec-initial-zero-attestation:@ZCASH_INITIAL_ZERO_ATTESTATION@
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-merge-miner
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/zec-authority-bootstrap.sh verify
+ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/backend-entrypoint.sh serve
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=180s

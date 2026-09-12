@@ -1,0 +1,46 @@
+[Unit]
+Description=Initialize or verify the Wcash Testnet payout wallet
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+Requires=@WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@
+BindsTo=@WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@
+After=@WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@
+Before=wcash-pool-preflight.service wcash-pool.service
+ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-wallet
+ConditionPathExists=@WEC_SEED_FILE@
+
+[Service]
+Type=oneshot
+User=wcash-pool
+Group=wcash-pool
+UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
+EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-wallet
+ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/initialize-wcash-wallet.sh
+RemainAfterExit=yes
+TimeoutStartSec=1200s
+StateDirectory=wcash-pool
+StateDirectoryMode=0700
+RuntimeDirectory=wcash-wallet-operation
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

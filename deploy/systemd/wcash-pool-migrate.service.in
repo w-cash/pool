@@ -1,9 +1,9 @@
 [Unit]
 Description=Apply ZecWec Testnet pool database migrations
-Documentation=file:///usr/local/share/zecwec-deploy/docs/zecwec-testnet-deployment.md
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
 Requires=postgresql.service
 After=postgresql.service
-ConditionPathIsExecutable=/opt/wcash/current/wcash-poold
+ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/pool.migrate.toml
 
 [Service]
@@ -11,13 +11,14 @@ Type=oneshot
 User=wcash-pool
 Group=wcash-pool
 UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
 LoadCredential=database-url:@DATABASE_MIGRATOR_URL_CREDENTIAL@
 LoadCredential=portal-token-pepper:@PORTAL_TOKEN_PEPPER_CREDENTIAL@
 LoadCredential=portal-totp-key:@PORTAL_TOTP_KEY_CREDENTIAL@
-ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh wcash-poold
-ExecStartPre=/opt/wcash/current/wcash-poold config-check --config /etc/wcash-pool/pool.migrate.toml
-ExecStart=/opt/wcash/current/wcash-poold migrate --config /etc/wcash-pool/pool.migrate.toml
-ExecStartPost=/usr/local/libexec/zecwec/grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url @POSTGRES_RUNTIME_ROLE@
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
+ExecStartPre=@WCASH_RELEASE_ROOT@/wcash-poold config-check --config /etc/wcash-pool/pool.migrate.toml
+ExecStart=@WCASH_RELEASE_ROOT@/wcash-poold migrate --config /etc/wcash-pool/pool.migrate.toml
+ExecStartPost=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url @POSTGRES_RUNTIME_ROLE@
 RemainAfterExit=yes
 NoNewPrivileges=yes
 PrivateDevices=yes

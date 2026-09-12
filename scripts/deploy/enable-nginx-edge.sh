@@ -29,16 +29,23 @@ case "$mode" in
 esac
 require_private_regular_file "$settings"
 require_private_regular_file "$cidrs"
-"$ZECWEC_LIBEXEC/restrict-mining-firewall.sh" check "$settings" "$cidrs"
+"$script_dir/restrict-mining-firewall.sh" check "$settings" "$cidrs"
 
 certificate_keys=(MINING_TLS_CERT MINING_TLS_KEY)
 if [[ $mode == publish-portal ]]; then
-    certificate_keys+=(APEX_TLS_CERT APEX_TLS_KEY PORTAL_TLS_CERT PORTAL_TLS_KEY)
+    certificate_keys+=(
+        APEX_TLS_CERT
+        APEX_TLS_KEY
+        PORTAL_TLS_CERT
+        PORTAL_TLS_KEY
+        CLOUDFLARE_ORIGIN_PULL_CA
+    )
 fi
 for key in "${certificate_keys[@]}"; do
     path=$(read_setting "$settings" "$key")
-    require_absolute_path "$path"
-    [[ -f $path && ! -L $path ]] || die "TLS material is unavailable: $key"
+    private=false
+    [[ $key == *_KEY ]] && private=true
+    require_trusted_etc_file "$path" "$private"
 done
 
 portal_source=/etc/nginx/sites-available/zecwec-testnet-portal.conf
@@ -58,7 +65,8 @@ for binding in "$portal_link:$portal_source" "$stream_link:$stream_source"; do
     fi
 done
 if [[ $mode == publish-portal ]]; then
-    "$ZECWEC_LIBEXEC/health-check.sh" --quiet --settings "$settings" --cidrs "$cidrs"
+    require_command curl
+    "$script_dir/health-check.sh" --quiet --settings "$settings" --cidrs "$cidrs"
 fi
 
 created_portal=false
@@ -86,6 +94,21 @@ if ! systemctl reload nginx.service; then
     die "nginx reload failed; newly created links were removed"
 fi
 if [[ $mode == publish-portal ]]; then
+    portal_host=$(read_setting "$settings" PORTAL_HOST)
+    if curl --fail --silent --show-error --max-time 10 --noproxy '*' \
+        --header 'CF-Connecting-IP: 192.0.2.1' \
+        --resolve "$portal_host:443:127.0.0.1" \
+        "https://$portal_host/healthz" >/dev/null 2>&1; then
+        rm -f -- "$portal_link"
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx.service >/dev/null 2>&1 || true
+        die "the portal origin accepted a request without Cloudflare client authentication"
+    fi
+    if ! curl --fail --silent --show-error --max-time 15 \
+        "https://$portal_host/healthz" >/dev/null; then
+        rm -f -- "$portal_link"
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx.service >/dev/null 2>&1 || true
+        die "the Cloudflare Authenticated Origin Pull path did not pass its public health probe"
+    fi
     log "enabled the public Testnet portal after explicit E2E acknowledgement"
 else
     log "enabled only the source-restricted TLS Stratum edge; the public portal remains disabled"

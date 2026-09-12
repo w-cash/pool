@@ -1,0 +1,10 @@
+network = "testnet"
+zcash_genesis_wire = "@ZCASH_GENESIS_WIRE@"
+collector_payout_commitment = "@ZCASH_PAYOUT_COMMITMENT_WIRE@"
+collector_account = "@ZCASH_SIGNER_ACCOUNT@"
+collector_account_index = @ZCASH_SIGNER_ACCOUNT_INDEX@
+required_confirmations = @ZEC_REQUIRED_CONFIRMATIONS@
+zallet_rpc = "@ZALLET_RPC@"
+zallet_cookie_file = "/run/credentials/wcash-pool-zec-authority-bootstrap.service/zallet-cookie"
+zcash_node_rpc = "@ZCASH_NODE_RPC@"
+zcash_node_cookie_file = "/run/credentials/wcash-pool-zec-authority-bootstrap.service/zcash-node-cookie"

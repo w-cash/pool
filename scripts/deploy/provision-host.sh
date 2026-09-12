@@ -42,6 +42,7 @@ install -d -o root -g root -m 0755 /opt/wcash /opt/wcash/releases
 install -d -o root -g root -m 0755 /usr/local/share/zecwec-deploy "$ZECWEC_LIBEXEC"
 install -d -o root -g root -m 0755 "$ZECWEC_CONFIG_DIR"
 install -d -o root -g root -m 0700 "$ZECWEC_CREDENTIAL_DIR"
+install -d -o root -g root -m 0755 "$ZECWEC_CONFIG_DIR/tls"
 install -d -o wcash-pool -g wcash-pool -m 0700 /var/lib/wcash-pool
 install -d -o wcash-pool-backend -g wcash-pool-socket -m 0700 /var/lib/wcash-pool-backend
 install -d -o root -g wcash-pool -m 0710 /var/lib/wcash-pool-secrets

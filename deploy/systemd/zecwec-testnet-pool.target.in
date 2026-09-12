@@ -1,7 +1,7 @@
 [Unit]
 Description=ZecWec WEC/ZEC merged-mining Testnet pool
 Requires=wcash-pool.service
-Wants=wcash-pool-health.timer
+Wants=wcash-pool-health.timer zecwec-cookie-refresh.path
 After=wcash-pool.service
 
 [Install]

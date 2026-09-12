@@ -25,27 +25,35 @@ require_private_regular_file "$cidrs"
 target="$ZECWEC_RELEASE_ROOT/$version"
 [[ -d $target && ! -L $target ]] || die "rollback release is not installed"
 for binary in wcash-poold wcash-merge-miner wcash-wallet zallet; do
-    ZECWEC_RELEASE_PATH=$target "$ZECWEC_LIBEXEC/verify-release.sh" "$binary"
+    ZECWEC_RELEASE_PATH=$target "$target/deployment/scripts/deploy/verify-release.sh" "$binary"
 done
+ZECWEC_RELEASE_PATH=$target \
+    "$target/deployment/scripts/deploy/verify-release.sh" deployment-package
 
-systemctl stop wcash-pool.service wcash-pool-backend.service zecwec-zallet.service
+systemctl stop zecwec-cookie-refresh.path wcash-pool.service \
+    wcash-pool-backend.service zecwec-zallet.service
+ZECWEC_RELEASE_PATH=$target \
+    "$target/deployment/scripts/deploy/render-deployment.sh" finalize "$settings" "$authority"
 temporary=/opt/wcash/.current.rollback.$$
 trap 'rm -f -- "$temporary"' EXIT
 ln -s -- "$target" "$temporary"
 mv -Tf -- "$temporary" "$ZECWEC_CURRENT_RELEASE"
 trap - EXIT
 
-"$ZECWEC_LIBEXEC/render-deployment.sh" finalize "$settings" "$authority"
 systemctl restart zecwec-zallet.service
+systemctl restart wcash-pool-wallet-init.service
 systemctl restart wcash-pool-backend-init.service
 systemctl restart wcash-pool-backend.service
 systemctl restart wcash-pool-migrate.service
 systemctl restart wcash-pool-preflight.service
+"$target/deployment/scripts/deploy/refresh-runtime-credentials.sh" snapshot "$settings"
+systemctl start zecwec-cookie-refresh.path
 if ! systemctl start wcash-pool.service; then
     systemctl stop wcash-pool.service >/dev/null 2>&1 || true
     die "rollback target failed to start; pool remains stopped"
 fi
-if ! "$ZECWEC_LIBEXEC/health-check.sh" --settings "$settings" --cidrs "$cidrs"; then
+if ! "$target/deployment/scripts/deploy/health-check.sh" \
+    --settings "$settings" --cidrs "$cidrs"; then
     systemctl stop wcash-pool.service >/dev/null 2>&1 || true
     die "rollback target failed health checks; pool remains stopped"
 fi

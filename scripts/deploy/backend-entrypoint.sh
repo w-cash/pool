@@ -21,8 +21,98 @@ mode=$1
 : "${ZCASH_VALIDATOR_RPC_URL:?Zcash validator RPC URL is required}"
 : "${WCASH_POOL_BACKEND_SOCKET:?backend socket is required}"
 : "${WCASH_PAYOUT_MODE:?Wcash payout mode is required}"
-[[ $WCASH_PAYOUT_MODE == transparent || $WCASH_PAYOUT_MODE == ironwood ]] \
-    || die "Wcash payout mode must be transparent or ironwood"
+: "${ZECWEC_RELEASE_PATH:?immutable release path is required}"
+: "${WCASH_AUTHORITY_GENESIS_WIRE:?Wcash authority genesis is required}"
+: "${ZCASH_AUTHORITY_GENESIS_WIRE:?Zcash authority genesis is required}"
+: "${WCASH_AUTHORITY_PAYOUT_COMMITMENT:?Wcash payout commitment is required}"
+: "${ZCASH_AUTHORITY_PAYOUT_COMMITMENT:?Zcash payout commitment is required}"
+: "${WCASH_AUTHORITY_SIGNER_ACCOUNT:?Wcash signer account is required}"
+: "${WCASH_AUTHORITY_SHARE_TARGET_BE:?share-target ceiling is required}"
+: "${WCASH_AUTHORITY_CHAIN_ID:?Wcash chain identifier is required}"
+: "${WCASH_SHARE_JOURNAL:?share journal path is required}"
+: "${WCASH_POOL_BACKEND_IDENTITY:?backend identity path is required}"
+: "${WCASH_POOL_BACKEND_JOURNAL:?backend journal path is required}"
+[[ $WCASH_PAYOUT_MODE == ironwood ]] \
+    || die "the Testnet pool requires direct Ironwood Wcash coinbase payout"
+[[ $WCASH_SHARE_JOURNAL == "$STATE_DIRECTORY/share-journal-protocol-v2.jsonl" \
+    && $WCASH_POOL_BACKEND_IDENTITY == "$STATE_DIRECTORY/backend-identity-protocol-v2.json" \
+    && $WCASH_POOL_BACKEND_JOURNAL == "$STATE_DIRECTORY/backend-journal-protocol-v2.jsonl" ]] \
+    || die "backend authority paths do not match the reviewed protocol-v2 namespace"
+legacy_share_journal=/var/lib/wcash-pool/share-journal-v2.jsonl
+[[ ! -e $legacy_share_journal && ! -L $legacy_share_journal ]] \
+    || die "legacy share journal must be reviewed and archived before protocol-v2 initialization"
+
+wallet_authority="$CREDENTIALS_DIRECTORY/wcash-wallet-authority"
+[[ -f $wallet_authority && ! -L $wallet_authority ]] \
+    || die "Wcash wallet bootstrap authority is unavailable"
+wallet_authority_size=$(stat -c '%s' -- "$wallet_authority")
+((wallet_authority_size > 0 && wallet_authority_size <= 4096)) \
+    || die "Wcash wallet bootstrap authority has an invalid size"
+python3 - "$wallet_authority" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+import uuid
+
+path = pathlib.Path(sys.argv[1])
+try:
+    authority = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"Wcash wallet bootstrap authority is invalid: {error}") from None
+required = {
+    "schema_version",
+    "network",
+    "genesis_hash",
+    "branch_id",
+    "account_id",
+    "collector_payout_commitment",
+    "collector_address",
+    "transparent_coinbase_address",
+    "birthday_height",
+    "fund_source",
+    "synchronized",
+    "initial_balances_zero",
+}
+if not isinstance(authority, dict) or set(authority) != required:
+    raise SystemExit("Wcash wallet bootstrap authority has an unexpected schema")
+try:
+    account = uuid.UUID(authority["account_id"])
+except (AttributeError, TypeError, ValueError):
+    raise SystemExit("Wcash wallet bootstrap account is invalid") from None
+commitment = authority["collector_payout_commitment"]
+collector = authority["collector_address"]
+derived_commitment = hashlib.sha256(
+    b"Wcash/Wcash child payout address/v1\0" + collector.encode("utf-8")
+).hexdigest() if isinstance(collector, str) else ""
+if (
+    authority["schema_version"] != 1
+    or authority["network"] != "testnet"
+    or authority["genesis_hash"] != os.environ["WCASH_EXPECTED_GENESIS_HASH"]
+    or not isinstance(authority["branch_id"], str)
+    or re.fullmatch(r"[0-9a-f]{8}", authority["branch_id"]) is None
+    or account.int == 0
+    or str(account) != authority["account_id"]
+    or authority["account_id"] != os.environ["WCASH_AUTHORITY_SIGNER_ACCOUNT"]
+    or not isinstance(commitment, str)
+    or re.fullmatch(r"[0-9a-f]{64}", commitment) is None
+    or commitment != os.environ["WCASH_AUTHORITY_PAYOUT_COMMITMENT"]
+    or commitment != derived_commitment
+    or not collector
+    or len(collector) > 512
+    or not isinstance(authority["transparent_coinbase_address"], str)
+    or not authority["transparent_coinbase_address"]
+    or len(authority["transparent_coinbase_address"]) > 512
+    or not isinstance(authority["birthday_height"], int)
+    or authority["birthday_height"] < 1
+    or authority["fund_source"] != "ironwood"
+    or authority["synchronized"] is not True
+    or authority["initial_balances_zero"] is not True
+):
+    raise SystemExit("Wcash wallet bootstrap authority differs from the rendered policy")
+PY
 
 read_line() {
     local name=${1:?credential name is required}
@@ -60,23 +150,17 @@ WCASH_PAYOUT_ADDRESS=$(read_line wcash-payout-address)
 ZCASH_PAYOUT_ADDRESS=$(read_line zcash-payout-address)
 export WCASH_PAYOUT_ADDRESS ZCASH_PAYOUT_ADDRESS
 
-if [[ $WCASH_PAYOUT_MODE == ironwood ]]; then
-    ivk_source="$CREDENTIALS_DIRECTORY/wcash-payout-ivk"
-    [[ -f $ivk_source && ! -L $ivk_source ]] || die "Wcash payout IVK credential is unavailable"
-    ivk_temporary="$RUNTIME_DIRECTORY/.wcash-payout-ivk.new.$$"
-    trap 'rm -f -- "$ivk_temporary"' EXIT
-    umask 077
-    cp --no-preserve=mode,ownership,timestamps -- "$ivk_source" "$ivk_temporary"
-    chmod 0600 -- "$ivk_temporary"
-    mv -fT -- "$ivk_temporary" "$RUNTIME_DIRECTORY/wcash-payout-ivk"
-    trap - EXIT
-    WCASH_PAYOUT_IVK_FILE="$RUNTIME_DIRECTORY/wcash-payout-ivk"
-    export WCASH_PAYOUT_IVK_FILE
-else
-    [[ ! -e $RUNTIME_DIRECTORY/wcash-payout-ivk ]] \
-        || die "transparent payout runtime contains a stale incoming viewing key"
-    unset WCASH_PAYOUT_IVK_FILE
-fi
+ivk_source="$CREDENTIALS_DIRECTORY/wcash-payout-ivk"
+[[ -f $ivk_source && ! -L $ivk_source ]] || die "Wcash payout IVK credential is unavailable"
+ivk_temporary="$RUNTIME_DIRECTORY/.wcash-payout-ivk.new.$$"
+trap 'rm -f -- "$ivk_temporary"' EXIT
+umask 077
+cp --no-preserve=mode,ownership,timestamps -- "$ivk_source" "$ivk_temporary"
+chmod 0600 -- "$ivk_temporary"
+mv -fT -- "$ivk_temporary" "$RUNTIME_DIRECTORY/wcash-payout-ivk"
+trap - EXIT
+WCASH_PAYOUT_IVK_FILE="$RUNTIME_DIRECTORY/wcash-payout-ivk"
+export WCASH_PAYOUT_IVK_FILE
 
 WCASH_POOL_BACKEND_PEER_UID=$(id -u wcash-pool)
 WCASH_POOL_BACKEND_SOCKET_GID=$(getent group wcash-pool-socket | cut -d: -f3)
@@ -84,8 +168,12 @@ WCASH_POOL_BACKEND_SOCKET_GID=$(getent group wcash-pool-socket | cut -d: -f3)
 [[ $WCASH_POOL_BACKEND_SOCKET_GID =~ ^[0-9]+$ ]] || die "socket GID lookup failed"
 export WCASH_POOL_BACKEND_PEER_UID WCASH_POOL_BACKEND_SOCKET_GID
 
-binary=/opt/wcash/current/wcash-merge-miner
-[[ -x $binary && ! -L $binary ]] || die "backend binary is unavailable"
+binary="$ZECWEC_RELEASE_PATH/wcash-merge-miner"
+[[ $ZECWEC_RELEASE_PATH == /opt/wcash/releases/* && -d $ZECWEC_RELEASE_PATH \
+    && ! -L $ZECWEC_RELEASE_PATH \
+    && $(realpath -e -- "$ZECWEC_RELEASE_PATH") == "$ZECWEC_RELEASE_PATH" \
+    && -x $binary && ! -L $binary ]] \
+    || die "immutable backend binary is unavailable"
 
 arguments=(
     "$WCASH_RPC_URL"
@@ -99,32 +187,71 @@ if [[ $mode == serve ]]; then
 fi
 
 output=$("$binary" pool-backend-init "${arguments[@]}")
-authority="$STATE_DIRECTORY/backend-authority.json"
+authority="$STATE_DIRECTORY/backend-authority-protocol-v2.json"
 temporary="${authority}.new.$$"
 trap 'rm -f -- "$temporary"' EXIT
 printf '%s\n' "$output" >"$temporary"
 chmod 0600 "$temporary"
 python3 - "$temporary" <<'PY'
 import json
+import os
 import pathlib
+import re
 import sys
 import uuid
 
 path = pathlib.Path(sys.argv[1])
 value = json.loads(path.read_text(encoding="utf-8"))
-required = {"command", "result", "backend_instance", "journal_stream", "chain_id"}
-if not required.issubset(value):
-    raise SystemExit("backend authority response is incomplete")
+required = {
+    "command",
+    "result",
+    "backend_instance",
+    "journal_stream",
+    "event_seq",
+    "chain_id",
+    "listener_workers",
+    "wcash_genesis",
+    "zcash_genesis",
+    "wcash_payout_commitment",
+    "zcash_payout_commitment",
+    "share_target_ceiling",
+    "share_target_ceiling_byte_order",
+}
+if not isinstance(value, dict) or set(value) != required:
+    raise SystemExit("backend authority response has an unexpected schema")
 if value["command"] != "pool-backend-init" or value["result"] not in {
     "initialized", "resumed_identity", "already_initialized"
 }:
     raise SystemExit("backend authority response is invalid")
 backend = uuid.UUID(value["backend_instance"])
 journal = uuid.UUID(value["journal_stream"])
-if backend.int == 0 or journal.int == 0 or backend == journal:
+if (
+    backend.int == 0
+    or journal.int == 0
+    or backend == journal
+    or str(backend) != value["backend_instance"]
+    or str(journal) != value["journal_stream"]
+):
     raise SystemExit("backend authority identities are invalid")
-if not isinstance(value["chain_id"], int) or value["chain_id"] <= 0:
+expected = {
+    "wcash_genesis": os.environ["WCASH_AUTHORITY_GENESIS_WIRE"],
+    "zcash_genesis": os.environ["ZCASH_AUTHORITY_GENESIS_WIRE"],
+    "wcash_payout_commitment": os.environ["WCASH_AUTHORITY_PAYOUT_COMMITMENT"],
+    "zcash_payout_commitment": os.environ["ZCASH_AUTHORITY_PAYOUT_COMMITMENT"],
+    "share_target_ceiling": os.environ["WCASH_AUTHORITY_SHARE_TARGET_BE"],
+}
+if any(not re.fullmatch(r"[0-9a-f]{64}", item) for item in expected.values()):
+    raise SystemExit("configured backend authority contains invalid hexadecimal")
+if any(value[key] != expected_value for key, expected_value in expected.items()):
+    raise SystemExit("backend authority differs from the rendered Testnet policy")
+if value["share_target_ceiling_byte_order"] != "big_endian":
+    raise SystemExit("backend authority share target has ambiguous byte order")
+if value["chain_id"] != int(os.environ["WCASH_AUTHORITY_CHAIN_ID"], 10):
     raise SystemExit("backend authority chain is invalid")
+if value["listener_workers"] != int(os.environ["WCASH_POOL_BACKEND_LISTENERS"], 10):
+    raise SystemExit("backend authority listener count is invalid")
+if not isinstance(value["event_seq"], int) or value["event_seq"] < 0:
+    raise SystemExit("backend authority event sequence is invalid")
 PY
 mv -fT -- "$temporary" "$authority"
 trap - EXIT
