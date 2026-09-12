@@ -66,6 +66,45 @@ pub struct WecPayoutExecution {
     pub disposition: BroadcastDisposition,
 }
 
+/// Exact signed WEC payout durably prepared by the wallet, before any node
+/// broadcast is attempted.
+///
+/// This is the handoff artifact for an external accounting store: persist all
+/// of these facts atomically before giving `signed_transaction` to a node.
+#[derive(Clone, Eq, PartialEq)]
+pub struct WecPreparedPayout {
+    /// Portal-compatible facts, excluding any claim that broadcast occurred.
+    pub receipt: BroadcastReceipt,
+    /// Digest of the wallet-verified unsigned intent.
+    pub unsigned_digest: [u8; 32],
+    /// Decoded display-order transaction identifier.
+    pub transaction_id_bytes: [u8; 32],
+    /// Exact signed transaction bytes.
+    pub signed_transaction: Vec<u8>,
+    /// Exact network fee reconciled against WEC collector value.
+    pub network_fee_zat: u64,
+}
+
+/// Prepare-only journal recovery result used to order startup reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WecPreparedRecovery {
+    /// Exact durable payout bytes.
+    pub payout: WecPreparedPayout,
+}
+
+impl fmt::Debug for WecPreparedPayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WecPreparedPayout")
+            .field("receipt", &self.receipt)
+            .field("unsigned_digest", &self.unsigned_digest)
+            .field("transaction_id_bytes", &self.transaction_id_bytes)
+            .field("signed_transaction", &"[REDACTED]")
+            .field("network_fee_zat", &self.network_fee_zat)
+            .finish()
+    }
+}
+
 impl fmt::Debug for WecPayoutExecution {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -171,39 +210,108 @@ impl WecPayoutSigner {
             .with_exclusive_lock(|| self.execute_locked(request, validated))
     }
 
+    /// Creates or recovers the exact signed transaction and makes it durable in
+    /// the signer journal without broadcasting it.
+    ///
+    /// An exact retry after interruption returns the same bytes, including when
+    /// an older signer invocation had already reached an unresolved or completed
+    /// broadcast stage. This lets the accounting store durably record the
+    /// transaction before any new network effect.
+    pub fn prepare(&self, request: &WecPayoutRequest) -> Result<WecPreparedPayout, WecPayoutError> {
+        self.config.validate()?;
+        let validated = self.validate_request(request)?;
+        let _process_guard = lock_without_poison(&self.process_lock);
+        self.journal
+            .with_exclusive_lock(|| self.prepare_locked(request, validated))
+    }
+
+    /// Inspects the signer journal without creating, signing, or broadcasting.
+    ///
+    /// `None` means wallet reconciliation is safe before normal preparation.
+    /// Legacy `signed` records are conservatively marked ambiguous because the
+    /// old executor could crash after node submission while retaining that
+    /// stage.
+    pub fn recover_prepared(
+        &self,
+        request: &WecPayoutRequest,
+    ) -> Result<Option<WecPreparedRecovery>, WecPayoutError> {
+        self.config.validate()?;
+        let validated = self.validate_request(request)?;
+        let _process_guard = lock_without_poison(&self.process_lock);
+        self.journal.with_exclusive_lock(|| {
+            let Some(mut record) = self.journal.load(request.batch.batch_id)? else {
+                return Ok(None);
+            };
+            if record.pipeline_commitment != validated.pipeline_commitment
+                || record.portal_commitment != validated.portal_commitment
+                || record.output_total_zat != validated.output_total_zat
+            {
+                return Err(WecPayoutError::IdempotencyConflict);
+            }
+            if matches!(&record.stage, StoredStage::Reserved) {
+                let Some(artifact) = self.recover_existing(request, &validated)? else {
+                    return Ok(None);
+                };
+                record.stage = StoredStage::Prepared { artifact };
+                self.persist(&record)?;
+            }
+            match &record.stage {
+                StoredStage::Reserved => return Err(WecPayoutError::JournalCorrupt),
+                StoredStage::Prepared { .. }
+                | StoredStage::Signed { .. }
+                | StoredStage::BroadcastUnresolved { .. }
+                | StoredStage::Completed { .. } => {}
+                StoredStage::Rejected { .. } => {
+                    return Err(WecPayoutError::BroadcastRejected);
+                }
+            }
+            Ok(Some(WecPreparedRecovery {
+                payout: prepared_from_record(&record)?,
+            }))
+        })
+    }
+
+    fn prepare_locked(
+        &self,
+        request: &WecPayoutRequest,
+        validated: ValidatedRequest,
+    ) -> Result<WecPreparedPayout, WecPayoutError> {
+        let mut record = self.load_or_reserve(request, &validated)?;
+        loop {
+            match record.stage.clone() {
+                StoredStage::Reserved => {
+                    let artifact = self.create_or_recover(request, &validated)?;
+                    record.stage = StoredStage::Prepared { artifact };
+                    self.persist(&record)?;
+                }
+                StoredStage::Prepared { .. }
+                | StoredStage::Signed { .. }
+                | StoredStage::BroadcastUnresolved { .. }
+                | StoredStage::Completed { .. } => return prepared_from_record(&record),
+                StoredStage::Rejected { .. } => return Err(WecPayoutError::BroadcastRejected),
+            }
+        }
+    }
+
     fn execute_locked(
         &self,
         request: &WecPayoutRequest,
         validated: ValidatedRequest,
     ) -> Result<WecPayoutExecution, WecPayoutError> {
-        let mut record = match self.journal.load(request.batch.batch_id)? {
-            Some(record) => {
-                if record.pipeline_commitment != validated.pipeline_commitment
-                    || record.portal_commitment != validated.portal_commitment
-                    || record.output_total_zat != validated.output_total_zat
-                {
-                    return Err(WecPayoutError::IdempotencyConflict);
-                }
-                record
-            }
-            None => {
-                let record = JournalRecord {
-                    batch_id: request.batch.batch_id,
-                    pipeline_commitment: validated.pipeline_commitment,
-                    portal_commitment: validated.portal_commitment,
-                    output_total_zat: validated.output_total_zat,
-                    stage: StoredStage::Reserved,
-                };
-                self.persist(&record)?;
-                record
-            }
-        };
+        let mut record = self.load_or_reserve(request, &validated)?;
 
         loop {
             match record.stage.clone() {
                 StoredStage::Reserved => {
                     let artifact = self.create_or_recover(request, &validated)?;
-                    record.stage = StoredStage::Signed { artifact };
+                    record.stage = StoredStage::Prepared { artifact };
+                    self.persist(&record)?;
+                }
+                StoredStage::Prepared { artifact } => {
+                    // Persist an ambiguous state before the first node call.
+                    // A crash after this write is safely retried with the same
+                    // bytes even if it happened before the call began.
+                    record.stage = StoredStage::BroadcastUnresolved { artifact };
                     self.persist(&record)?;
                 }
                 StoredStage::Signed { artifact }
@@ -264,6 +372,35 @@ impl WecPayoutSigner {
                 StoredStage::Completed { disposition, .. } => {
                     return execution_from_record(&record, disposition.into());
                 }
+            }
+        }
+    }
+
+    fn load_or_reserve(
+        &self,
+        request: &WecPayoutRequest,
+        validated: &ValidatedRequest,
+    ) -> Result<JournalRecord, WecPayoutError> {
+        match self.journal.load(request.batch.batch_id)? {
+            Some(record) => {
+                if record.pipeline_commitment != validated.pipeline_commitment
+                    || record.portal_commitment != validated.portal_commitment
+                    || record.output_total_zat != validated.output_total_zat
+                {
+                    return Err(WecPayoutError::IdempotencyConflict);
+                }
+                Ok(record)
+            }
+            None => {
+                let record = JournalRecord {
+                    batch_id: request.batch.batch_id,
+                    pipeline_commitment: validated.pipeline_commitment,
+                    portal_commitment: validated.portal_commitment,
+                    output_total_zat: validated.output_total_zat,
+                    stage: StoredStage::Reserved,
+                };
+                self.persist(&record)?;
+                Ok(record)
             }
         }
     }
@@ -340,6 +477,55 @@ impl WecPayoutSigner {
             target_height: signed.target_height,
             expiry_height: signed.expiry_height,
         })
+    }
+
+    fn recover_existing(
+        &self,
+        request: &WecPayoutRequest,
+        validated: &ValidatedRequest,
+    ) -> Result<Option<StoredArtifact>, WecPayoutError> {
+        let limits = self.config.limits();
+        let identity = self
+            .wallet
+            .identity(limits.recovery_timeout(), limits.max_response_bytes())
+            .map_err(map_readonly_wallet_error)?;
+        self.verify_identity(&identity)?;
+        self.checkpoint(Checkpoint::IdentityReturned)?;
+        let signed = self
+            .wallet
+            .recover_exact(&WalletRecoveryCall {
+                batch_id: request.batch.batch_id,
+                request_commitment: validated.pipeline_commitment,
+                timeout: limits.recovery_timeout(),
+                max_response_bytes: limits.max_response_bytes(),
+            })
+            .map_err(map_recovery_error)?;
+        self.checkpoint(Checkpoint::RecoveryReturned)?;
+        let Some(signed) = signed else {
+            return Ok(None);
+        };
+        self.verify_signed(&signed, request, validated)?;
+        let inspected = self
+            .wallet
+            .inspect_persisted(&WalletInspectionCall {
+                batch_id: request.batch.batch_id,
+                request_commitment: validated.pipeline_commitment,
+                transaction_id: signed.transaction_id.clone(),
+                raw_transaction_hex: signed.raw_transaction_hex.clone(),
+                timeout: limits.inspection_timeout(),
+                max_response_bytes: limits.max_response_bytes(),
+            })
+            .map_err(map_inspection_error)?;
+        self.verify_inspection(&inspected, &signed, request, validated)?;
+        self.checkpoint(Checkpoint::InspectionReturned)?;
+        Ok(Some(StoredArtifact {
+            raw_transaction_hex: signed.raw_transaction_hex,
+            transaction_id: signed.transaction_id,
+            unsigned_digest: signed.unsigned_digest,
+            fee_zat: signed.fee_zat,
+            target_height: signed.target_height,
+            expiry_height: signed.expiry_height,
+        }))
     }
 
     fn validate_request(
@@ -599,6 +785,18 @@ fn execution_from_record(
     record: &JournalRecord,
     disposition: BroadcastDisposition,
 ) -> Result<WecPayoutExecution, WecPayoutError> {
+    let prepared = prepared_from_record(record)?;
+    Ok(WecPayoutExecution {
+        receipt: prepared.receipt,
+        unsigned_digest: prepared.unsigned_digest,
+        transaction_id_bytes: prepared.transaction_id_bytes,
+        signed_transaction: prepared.signed_transaction,
+        network_fee_zat: prepared.network_fee_zat,
+        disposition,
+    })
+}
+
+fn prepared_from_record(record: &JournalRecord) -> Result<WecPreparedPayout, WecPayoutError> {
     let artifact = record
         .stage
         .artifact()
@@ -610,7 +808,7 @@ fn execution_from_record(
     let transaction_id_bytes: [u8; 32] = transaction_id
         .try_into()
         .map_err(|_| WecPayoutError::JournalCorrupt)?;
-    Ok(WecPayoutExecution {
+    Ok(WecPreparedPayout {
         receipt: BroadcastReceipt {
             batch_id: record.batch_id,
             request_commitment: record.portal_commitment,
@@ -622,7 +820,6 @@ fn execution_from_record(
         transaction_id_bytes,
         signed_transaction,
         network_fee_zat: artifact.fee_zat,
-        disposition,
     })
 }
 

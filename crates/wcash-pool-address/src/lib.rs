@@ -50,7 +50,15 @@ impl TestnetAddressValidator {
         candidate: &str,
     ) -> Result<ValidatedDestination, AddressValidationError> {
         match self.wcash.validate_for(WcashNetwork::Testnet, candidate) {
-            Ok(validated) => validated.into_portal(candidate),
+            Ok(validated) => {
+                let destination = validated.into_portal(candidate)?;
+                // Launch payouts are Ironwood-only. Accepting a transparent
+                // WEC destination would let one account poison a whole batch.
+                if destination.receiver_kind() != ReceiverKind::Ironwood {
+                    return Err(AddressValidationError::UnsupportedReceiver);
+                }
+                Ok(destination)
+            }
             Err(CommandValidationError::Rejected) => {
                 if parse_supported_zcash(candidate, NetworkType::Test).is_ok() {
                     return Err(AddressValidationError::WrongAsset);
@@ -567,6 +575,11 @@ mod tests {
                 "printf '%s\\n' '{\"network\":\"testnet\",\"receiver_kind\":\"transparent_p2pkh\",\"canonical\":\"WTtestfixture\"}'\n",
                 "exit 0\n",
                 "fi\n",
+                "if [ \"$1 $2 $3\" = \"--network testnet validate-address\" ] && ",
+                "[ \"$candidate\" = \"WItestfixture\" ]; then\n",
+                "printf '%s\\n' '{\"network\":\"testnet\",\"receiver_kind\":\"ironwood\",\"canonical\":\"WItestfixture\"}'\n",
+                "exit 0\n",
+                "fi\n",
                 "if [ \"$1 $2 $3\" = \"--network regtest validate-address\" ] && ",
                 "[ \"$candidate\" = \"WRtestfixture\" ]; then\n",
                 "printf '%s\\n' '{\"network\":\"regtest\",\"receiver_kind\":\"ironwood\",\"canonical\":\"WRtestfixture\"}'\n",
@@ -593,10 +606,14 @@ mod tests {
         let (_directory, command) = command_fixture();
         let validator = TestnetAddressValidator::new(command);
         let wcash = validator
-            .validate(Asset::Wec, ChainNetwork::Testnet, "WTtestfixture")
+            .validate(Asset::Wec, ChainNetwork::Testnet, "WItestfixture")
             .expect("Wcash fixture is valid");
         assert_eq!(wcash.asset(), Asset::Wec);
-        assert_eq!(wcash.receiver_kind(), ReceiverKind::Transparent);
+        assert_eq!(wcash.receiver_kind(), ReceiverKind::Ironwood);
+        assert_eq!(
+            validator.validate(Asset::Wec, ChainNetwork::Testnet, "WTtestfixture"),
+            Err(AddressValidationError::UnsupportedReceiver)
+        );
         assert_eq!(
             validator.validate(Asset::Wec, ChainNetwork::Testnet, &testnet_transparent()),
             Err(AddressValidationError::WrongAsset)

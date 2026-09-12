@@ -15,9 +15,11 @@ use wcash_pool_store::{
 };
 use wcash_wec_payout_signer::{
     WalletFundSource, WecPayoutError, WecPayoutExecution, WecPayoutRequest, WecPayoutSigner,
+    WecPreparedPayout, WecPreparedRecovery,
 };
 use wcash_zec_payout_signer::{
     ZecFundSource, ZecPayoutError, ZecPayoutExecution, ZecPayoutRequest, ZecPcztSigner,
+    ZecPreparedRecovery,
 };
 
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
@@ -201,6 +203,22 @@ impl From<WecPayoutExecution> for RichPayoutExecution {
     }
 }
 
+impl From<WecPreparedPayout> for RichPayoutExecution {
+    fn from(prepared: WecPreparedPayout) -> Self {
+        Self::new(
+            prepared.receipt.batch_id,
+            prepared.receipt.asset,
+            prepared.receipt.request_commitment,
+            prepared.receipt.transaction_id,
+            prepared.transaction_id_bytes,
+            prepared.receipt.output_total_zat,
+            prepared.unsigned_digest,
+            prepared.signed_transaction,
+            prepared.network_fee_zat,
+        )
+    }
+}
+
 impl From<ZecPayoutExecution> for RichPayoutExecution {
     fn from(execution: ZecPayoutExecution) -> Self {
         Self::new(
@@ -290,20 +308,35 @@ impl SettlementStore for PostgresStore {
     }
 }
 
-/// A journaled chain signer which resolves the first broadcast before return.
+/// A journaled chain signer which prepares exact bytes without broadcasting.
 ///
-/// An ambiguous return must retain the exact batch binding and signed bytes in
-/// its own durable journal. A retry with the same batch must recover or submit
-/// those bytes and must never construct a replacement.
+/// The returned artifact must already be durable in the signer journal. A retry
+/// with the same batch must recover those bytes and must never construct a
+/// replacement. Network submission belongs exclusively to
+/// [`ExactTransactionBroadcaster`] after SQL has persisted the artifact.
 pub trait ExactExecutionSigner: Send + Sync {
     /// Chain exclusively served by this signer.
     fn chain(&self) -> Chain;
 
-    /// Executes or resumes one exact store-authored request.
-    fn execute_exact(
+    /// Prepares or recovers one exact store-authored request without broadcast.
+    fn prepare_exact(
         &self,
         request: &PayoutBatchRequest,
     ) -> BoundaryFuture<'_, RichPayoutExecution>;
+
+    /// Recovers a complete journal artifact without creating, signing, or
+    /// broadcasting. `None` proves the journal has no exact transaction yet.
+    fn recover_exact(
+        &self,
+        request: &PayoutBatchRequest,
+    ) -> BoundaryFuture<'_, Option<RecoveredPayoutExecution>>;
+}
+
+/// Exact signer-journal artifact recovered before wallet reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredPayoutExecution {
+    /// Durable signer artifact.
+    pub payout: RichPayoutExecution,
 }
 
 /// Chain submission boundary for transaction bytes already persisted in SQL.
@@ -336,7 +369,7 @@ impl ExactExecutionSigner for WecExecutionSigner {
         Chain::Wcash
     }
 
-    fn execute_exact(
+    fn prepare_exact(
         &self,
         request: &PayoutBatchRequest,
     ) -> BoundaryFuture<'_, RichPayoutExecution> {
@@ -345,7 +378,7 @@ impl ExactExecutionSigner for WecExecutionSigner {
         let request = request.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                signer.execute(&WecPayoutRequest {
+                signer.prepare(&WecPayoutRequest {
                     batch: request,
                     source_account,
                     fund_source: WalletFundSource::Ironwood,
@@ -354,6 +387,32 @@ impl ExactExecutionSigner for WecExecutionSigner {
             .await
             .map_err(|_| BoundaryFailure::Ambiguous)?
             .map(RichPayoutExecution::from)
+            .map_err(map_wec_error)
+        })
+    }
+
+    fn recover_exact(
+        &self,
+        request: &PayoutBatchRequest,
+    ) -> BoundaryFuture<'_, Option<RecoveredPayoutExecution>> {
+        let signer = Arc::clone(&self.signer);
+        let source_account = self.source_account;
+        let request = request.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                signer.recover_prepared(&WecPayoutRequest {
+                    batch: request,
+                    source_account,
+                    fund_source: WalletFundSource::Ironwood,
+                })
+            })
+            .await
+            .map_err(|_| BoundaryFailure::Ambiguous)?
+            .map(|recovered| {
+                recovered.map(|WecPreparedRecovery { payout }| RecoveredPayoutExecution {
+                    payout: payout.into(),
+                })
+            })
             .map_err(map_wec_error)
         })
     }
@@ -380,7 +439,7 @@ impl ExactExecutionSigner for ZecExecutionSigner {
         Chain::Zcash
     }
 
-    fn execute_exact(
+    fn prepare_exact(
         &self,
         request: &PayoutBatchRequest,
     ) -> BoundaryFuture<'_, RichPayoutExecution> {
@@ -389,7 +448,7 @@ impl ExactExecutionSigner for ZecExecutionSigner {
         let request = request.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                signer.execute(&ZecPayoutRequest {
+                signer.prepare(&ZecPayoutRequest {
                     batch: request,
                     source_account,
                     fund_source: ZecFundSource::Orchard,
@@ -398,6 +457,32 @@ impl ExactExecutionSigner for ZecExecutionSigner {
             .await
             .map_err(|_| BoundaryFailure::Ambiguous)?
             .map(RichPayoutExecution::from)
+            .map_err(map_zec_error)
+        })
+    }
+
+    fn recover_exact(
+        &self,
+        request: &PayoutBatchRequest,
+    ) -> BoundaryFuture<'_, Option<RecoveredPayoutExecution>> {
+        let signer = Arc::clone(&self.signer);
+        let source_account = self.source_account;
+        let request = request.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                signer.recover_prepared(&ZecPayoutRequest {
+                    batch: request,
+                    source_account,
+                    fund_source: ZecFundSource::Orchard,
+                })
+            })
+            .await
+            .map_err(|_| BoundaryFailure::Ambiguous)?
+            .map(|recovered| {
+                recovered.map(|ZecPreparedRecovery { payout }| RecoveredPayoutExecution {
+                    payout: payout.into(),
+                })
+            })
             .map_err(map_zec_error)
         })
     }
@@ -442,6 +527,16 @@ pub enum ResumeOutcome {
         /// Terminal state.
         state: PayoutBatchState,
     },
+}
+
+/// Whether startup may compare the wallet balance with the ledger before
+/// normal payout execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationGate {
+    /// No signer artifact can have changed the chain-visible wallet balance.
+    Safe,
+    /// Exact bytes are already SQL-bound and may be chain-visible.
+    ExternalEffectPending,
 }
 
 struct ChainBoundary {
@@ -528,6 +623,63 @@ impl SettlementOrchestrator {
         }
     }
 
+    /// Recovers only pre-existing external-effect ambiguity before startup
+    /// wallet reconciliation.
+    ///
+    /// A Draft with no signer artifact, or with a prepare-only artifact, is not
+    /// advanced here. This method never creates, proves, or signs. Legacy
+    /// artifacts are first copied into SQL Signed, then resolved through the
+    /// exact-byte broadcaster. Even prepare-only WEC signing can reserve wallet
+    /// value, so every complete artifact is wallet-effect ambiguity.
+    pub async fn recover_before_wallet_reconciliation(
+        &self,
+        chain: Chain,
+    ) -> Result<ReconciliationGate, SettlementError> {
+        let Some(batch) = self.store.oldest_resumable(chain).await? else {
+            return Ok(ReconciliationGate::Safe);
+        };
+        if batch.chain != chain {
+            return Err(SettlementError::Invariant("resumable batch chain"));
+        }
+        let boundary = self.boundary(chain);
+        match batch.state {
+            PayoutBatchState::Draft => {
+                let request = self.store.build_signer_request(batch.id).await?;
+                if request.batch_id != batch.id || request.asset != asset_for_chain(batch.chain) {
+                    return Err(SettlementError::Invariant("signer request batch binding"));
+                }
+                let recovered = boundary
+                    .signer
+                    .recover_exact(&request)
+                    .await
+                    .map_err(|failure| SettlementError::Boundary { chain, failure })?;
+                let Some(recovered) = recovered else {
+                    return Ok(ReconciliationGate::Safe);
+                };
+                recovered.payout.validate_against(&request)?;
+                let artifact = recovered.payout.as_store_artifact(chain);
+                self.store.mark_signed(&artifact).await?;
+                boundary
+                    .broadcaster
+                    .rebroadcast_exact(&artifact)
+                    .await
+                    .map_err(|failure| SettlementError::Boundary { chain, failure })?;
+                self.store.mark_broadcast(batch.id).await?;
+                Ok(ReconciliationGate::ExternalEffectPending)
+            }
+            PayoutBatchState::Signed => {
+                self.resume_signed(batch, boundary).await?;
+                Ok(ReconciliationGate::ExternalEffectPending)
+            }
+            PayoutBatchState::Broadcast => Ok(ReconciliationGate::ExternalEffectPending),
+            PayoutBatchState::Reorged
+            | PayoutBatchState::Confirmed
+            | PayoutBatchState::Cancelled => Err(SettlementError::Invariant(
+                "startup payout reconciliation state",
+            )),
+        }
+    }
+
     fn boundary(&self, chain: Chain) -> &ChainBoundary {
         match chain {
             Chain::Wcash => &self.wec,
@@ -546,7 +698,7 @@ impl SettlementOrchestrator {
         }
         let execution = boundary
             .signer
-            .execute_exact(&request)
+            .prepare_exact(&request)
             .await
             .map_err(|failure| SettlementError::Boundary {
                 chain: batch.chain,
@@ -687,6 +839,7 @@ mod tests {
         requests: HashMap<Uuid, PayoutBatchRequest>,
         artifacts: HashMap<Uuid, SignedPayoutArtifact>,
         transitions: Vec<&'static str>,
+        fail_mark_signed_before_commit: bool,
         fail_mark_signed_after_commit: bool,
         fail_mark_broadcast_before_commit: bool,
     }
@@ -754,6 +907,10 @@ mod tests {
                     .state
                     .lock()
                     .map_err(|_| SettlementError::Invariant("fake store lock"))?;
+                if state.fail_mark_signed_before_commit {
+                    state.fail_mark_signed_before_commit = false;
+                    return Err(injected("mark_signed"));
+                }
                 let batch = state
                     .batches
                     .get_mut(&artifact.chain.into())
@@ -817,7 +974,10 @@ mod tests {
     struct FakeSigner {
         chain: Chain,
         calls: Mutex<Vec<PayoutBatchRequest>>,
+        recovery_calls: Mutex<Vec<PayoutBatchRequest>>,
         results: Mutex<VecDeque<Result<RichPayoutExecution, BoundaryFailure>>>,
+        recovery_results:
+            Mutex<VecDeque<Result<Option<RecoveredPayoutExecution>, BoundaryFailure>>>,
     }
 
     impl FakeSigner {
@@ -828,7 +988,9 @@ mod tests {
             Self {
                 chain,
                 calls: Mutex::new(Vec::new()),
+                recovery_calls: Mutex::new(Vec::new()),
                 results: Mutex::new(results.into_iter().collect()),
+                recovery_results: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -837,6 +999,19 @@ mod tests {
                 .lock()
                 .map_or_else(|_| Vec::new(), |calls| calls.clone())
         }
+
+        fn recovery_calls(&self) -> Vec<PayoutBatchRequest> {
+            self.recovery_calls
+                .lock()
+                .map_or_else(|_| Vec::new(), |calls| calls.clone())
+        }
+
+        fn push_recovery(&self, result: Result<Option<RecoveredPayoutExecution>, BoundaryFailure>) {
+            self.recovery_results
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push_back(result);
+        }
     }
 
     impl ExactExecutionSigner for FakeSigner {
@@ -844,7 +1019,7 @@ mod tests {
             self.chain
         }
 
-        fn execute_exact(
+        fn prepare_exact(
             &self,
             request: &PayoutBatchRequest,
         ) -> BoundaryFuture<'_, RichPayoutExecution> {
@@ -859,6 +1034,24 @@ mod tests {
                     .map_err(|_| BoundaryFailure::Invariant)?
                     .pop_front()
                     .unwrap_or(Err(BoundaryFailure::Invariant))
+            })
+        }
+
+        fn recover_exact(
+            &self,
+            request: &PayoutBatchRequest,
+        ) -> BoundaryFuture<'_, Option<RecoveredPayoutExecution>> {
+            let request = request.clone();
+            Box::pin(async move {
+                self.recovery_calls
+                    .lock()
+                    .map_err(|_| BoundaryFailure::Invariant)?
+                    .push(request);
+                self.recovery_results
+                    .lock()
+                    .map_err(|_| BoundaryFailure::Invariant)?
+                    .pop_front()
+                    .unwrap_or(Ok(None))
             })
         }
     }
@@ -885,6 +1078,13 @@ mod tests {
             self.calls
                 .lock()
                 .map_or_else(|_| Vec::new(), |calls| calls.clone())
+        }
+
+        fn replace_results(&self, results: impl IntoIterator<Item = Result<(), BoundaryFailure>>) {
+            *self
+                .results
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = results.into_iter().collect();
         }
     }
 
@@ -1020,6 +1220,211 @@ mod tests {
             vec![byte; 96],
             10,
         )
+    }
+
+    fn recovered(request: &PayoutBatchRequest, byte: u8) -> RecoveredPayoutExecution {
+        RecoveredPayoutExecution {
+            payout: execution(request, byte),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_only_draft_without_artifact_is_safe_and_side_effect_free(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(vec![Ok(execution(&request, 0x10))])?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.batches.insert(ChainKey::Wec, batch(&request));
+            state.requests.insert(request.batch_id, request.clone());
+        }
+        assert_eq!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Wcash)
+                .await?,
+            ReconciliationGate::Safe
+        );
+        let recovery_calls = fixture.wec_signer.recovery_calls();
+        assert_eq!(recovery_calls.len(), 1);
+        assert_eq!(recovery_calls[0], request);
+        assert!(fixture.wec_signer.calls().is_empty());
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        assert!(fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .transitions
+            .is_empty());
+
+        fixture.orchestrator.resume_next(Chain::Wcash).await?;
+        assert_eq!(fixture.wec_signer.calls(), [request]);
+        assert_eq!(fixture.wec_broadcaster.calls().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovered_wallet_artifact_is_sql_bound_before_exact_broadcast(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(Vec::new())?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.batches.insert(ChainKey::Wec, batch(&request));
+            state.requests.insert(request.batch_id, request.clone());
+        }
+        fixture
+            .wec_signer
+            .push_recovery(Ok(Some(recovered(&request, 0x12))));
+        assert_eq!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Wcash)
+                .await?,
+            ReconciliationGate::ExternalEffectPending
+        );
+        let state = fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.transitions, ["signed", "broadcast"]);
+        drop(state);
+        assert!(fixture.wec_signer.calls().is_empty());
+        assert_eq!(fixture.wec_broadcaster.calls().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zec_recovered_artifact_uses_only_zec_sql_and_broadcast_boundaries(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Zec);
+        let fixture = Fixture::new(Vec::new())?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.batches.insert(ChainKey::Zec, batch(&request));
+            state.requests.insert(request.batch_id, request.clone());
+        }
+        fixture
+            .zec_signer
+            .push_recovery(Ok(Some(recovered(&request, 0x21))));
+        assert_eq!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Zcash)
+                .await?,
+            ReconciliationGate::ExternalEffectPending
+        );
+        assert!(fixture.wec_signer.calls().is_empty());
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        assert!(fixture.zec_signer.calls().is_empty());
+        assert_eq!(fixture.zec_broadcaster.calls().len(), 1);
+        let state = fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.transitions, ["signed", "broadcast"]);
+        assert_eq!(
+            state.artifacts[&request.batch_id].signed_transaction,
+            vec![0x21; 96]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_faults_never_broadcast_before_durable_signed_state(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(Vec::new())?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.batches.insert(ChainKey::Wec, batch(&request));
+            state.requests.insert(request.batch_id, request.clone());
+            state.fail_mark_signed_before_commit = true;
+        }
+        fixture
+            .wec_signer
+            .push_recovery(Ok(Some(recovered(&request, 0x13))));
+        assert!(matches!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Wcash)
+                .await,
+            Err(SettlementError::Persistence {
+                operation: "mark_signed",
+                ..
+            })
+        ));
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        assert!(fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .transitions
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_broadcast_leaves_exact_sql_signed_bytes(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(Vec::new())?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.batches.insert(ChainKey::Wec, batch(&request));
+            state.requests.insert(request.batch_id, request.clone());
+        }
+        fixture
+            .wec_signer
+            .push_recovery(Ok(Some(recovered(&request, 0x14))));
+        fixture
+            .wec_broadcaster
+            .replace_results([Err(BoundaryFailure::Ambiguous)]);
+        assert!(matches!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Wcash)
+                .await,
+            Err(SettlementError::Boundary {
+                failure: BoundaryFailure::Ambiguous,
+                ..
+            })
+        ));
+        let state = fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.transitions, ["signed"]);
+        assert_eq!(
+            state.artifacts[&request.batch_id].signed_transaction,
+            vec![0x14; 96]
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ pub use credential::{SecretSeed, SeedSource};
 pub use error::{WecPayoutError, WecPipelineStage};
 pub use pipeline::{
     Checkpoint, CheckpointHook, WecPayoutExecution, WecPayoutRequest, WecPayoutSigner,
+    WecPreparedPayout, WecPreparedRecovery,
 };
 pub use transport::{
     BroadcastDisposition, BroadcastFailure, BroadcastOutcome, NativeWalletError,

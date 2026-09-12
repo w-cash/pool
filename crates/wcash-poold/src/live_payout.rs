@@ -42,7 +42,7 @@ use crate::{
     settlement::{BoundaryFailure, BoundaryFuture, ExactTransactionBroadcaster},
 };
 
-const ZCASH_NU6_3_BRANCH_ID: &str = "37a5165b";
+pub(crate) const ZCASH_NU6_3_BRANCH_ID: &str = "37a5165b";
 const WALLET_OBSERVATION_DOMAIN: &[u8] = b"ZECWEC-ZALLET-OBSERVATION-V2\0";
 const OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 const MAX_COOKIE_BYTES: u64 = 1_024;
@@ -412,7 +412,7 @@ impl NodePayoutAuthority {
         })
     }
 
-    async fn verified_tip(&self) -> Result<VerifiedTip, ObservationFailure> {
+    pub(crate) async fn verified_tip(&self) -> Result<VerifiedTip, ObservationFailure> {
         let info = self
             .rpc
             .call("getblockchaininfo", json!([]), RpcLimits::ordinary())
@@ -590,6 +590,13 @@ impl NodePayoutAuthority {
                     AuthorityPayoutState::Mined(confirmation)
                 }
             }
+            ObservedTransaction::Orphan => {
+                if let Some(prior) = watch.prior_confirmation.as_ref() {
+                    AuthorityPayoutState::Reorged(reorg(prior, tip, observed_at))
+                } else {
+                    AuthorityPayoutState::Pending
+                }
+            }
             ObservedTransaction::Missing | ObservedTransaction::Mempool => {
                 if let Some(prior) = watch.prior_confirmation.as_ref() {
                     if tip.height < prior.block_height {
@@ -688,9 +695,9 @@ impl PayoutConfirmationAuthority for NodePayoutAuthority {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct VerifiedTip {
-    hash: [u8; 32],
-    height: u32,
+pub(crate) struct VerifiedTip {
+    pub(crate) hash: [u8; 32],
+    pub(crate) height: u32,
 }
 
 #[derive(Deserialize)]
@@ -720,6 +727,7 @@ struct DirectTip {
 enum ObservedTransaction {
     Missing,
     Mempool,
+    Orphan,
     Mined(PayoutConfirmation),
 }
 
@@ -741,19 +749,35 @@ fn parse_verbose_transaction(
     if transaction_id != expected_transaction_id || raw.is_empty() {
         return Err(ObservationFailure::Invariant);
     }
-    if object
+    let in_active_chain = object
         .get("in_active_chain")
-        .is_some_and(|value| value.as_bool() != Some(true))
-    {
-        return Err(ObservationFailure::Invariant);
-    }
+        .map(|value| value.as_bool().ok_or(ObservationFailure::Invariant))
+        .transpose()?;
 
     let height = object.get("height");
     let confirmations = object.get("confirmations");
     let block_hash = object.get("blockhash");
     match (height, confirmations, block_hash) {
-        (None, None, None) => Ok(ObservedTransaction::Mempool),
+        (None, None, None) => {
+            if in_active_chain == Some(true) {
+                return Err(ObservationFailure::Invariant);
+            }
+            Ok(ObservedTransaction::Mempool)
+        }
         (Some(height), Some(confirmations), Some(block_hash)) => {
+            if in_active_chain == Some(false) {
+                let valid_orphan = height.as_i64() == Some(-1)
+                    && confirmations.as_u64() == Some(0)
+                    && block_hash
+                        .as_str()
+                        .and_then(parse_display_hash_to_wire)
+                        .is_some_and(|hash| hash != [0; 32]);
+                return if valid_orphan {
+                    Ok(ObservedTransaction::Orphan)
+                } else {
+                    Err(ObservationFailure::Invariant)
+                };
+            }
             let height = height
                 .as_u64()
                 .and_then(|height| u32::try_from(height).ok())
@@ -1039,6 +1063,31 @@ impl ZalletObservationSource {
         })
     }
 
+    /// Proves that a newly provisioned, dedicated Zallet collector has no
+    /// mature, locked, pending, or dust value before it is bound to this pool.
+    ///
+    /// The ordinary observer intentionally does not impose this one-time gate:
+    /// after mining starts, pending coinbase rewards are expected.
+    pub(crate) async fn verify_fresh_zero(&self) -> Result<WalletObservation, ObservationFailure> {
+        let observation = self.observe_inner().await?;
+        let first_status = self.status().await?;
+        let value = self
+            .rpc
+            .call("z_getbalances", json!([0]), RpcLimits::ordinary())
+            .await
+            .map_err(map_observation_rpc_failure)?;
+        parse_fresh_zero_balances(&value, self.account_id)?;
+        let second_status = self.status().await?;
+        if first_status != second_status {
+            return Err(ObservationFailure::Unavailable);
+        }
+        let tip = first_status.ready_tip()?;
+        if tip.hash != observation.best_tip_hash || tip.height != observation.best_tip_height {
+            return Err(ObservationFailure::Unavailable);
+        }
+        Ok(observation)
+    }
+
     async fn status(&self) -> Result<ZalletStatus, ObservationFailure> {
         let value = self
             .rpc
@@ -1283,6 +1332,44 @@ struct DetailedAddress {
 struct PoolBalance {
     #[serde(rename = "valueZat")]
     value_zat: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshBalances {
+    accounts: Vec<FreshAccountBalance>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshAccountBalance {
+    account_uuid: String,
+    total: FreshTotalBalance,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshTotalBalance {
+    spendable: PoolBalance,
+}
+
+fn parse_fresh_zero_balances(
+    value: &Value,
+    expected_account: Uuid,
+) -> Result<(), ObservationFailure> {
+    let balances: FreshBalances =
+        serde_json::from_value(value.clone()).map_err(|_| ObservationFailure::Invariant)?;
+    let [account] = balances.accounts.as_slice() else {
+        return Err(ObservationFailure::Invariant);
+    };
+    let account_id = Uuid::parse_str(&account.account_uuid)
+        .ok()
+        .filter(|uuid| !uuid.is_nil() && uuid.to_string() == account.account_uuid)
+        .ok_or(ObservationFailure::Invariant)?;
+    if account_id != expected_account || account.total.spendable.value_zat != 0 {
+        return Err(ObservationFailure::Invariant);
+    }
+    Ok(())
 }
 
 fn parse_ironwood_balance(
@@ -1577,6 +1664,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validator_treats_zebra_mempool_false_as_pending() {
+        let mut steps = Vec::new();
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        steps.push(ok(
+            "getrawtransaction",
+            json!([hex::encode(TRANSACTION), 1]),
+            json!({
+                "txid": hex::encode(TRANSACTION),
+                "hex": "0102",
+                "in_active_chain": false,
+            }),
+        ));
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+        let snapshot = authority(Chain::Wcash, Arc::clone(&rpc))
+            .snapshot(&[watch()])
+            .await
+            .expect("Zebra mempool shape is valid");
+        assert!(matches!(
+            snapshot.payouts[0].state,
+            AuthorityPayoutState::Pending
+        ));
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn validator_models_zebra_orphan_as_pending_or_persistable_reorg() {
+        let orphan = json!({
+            "txid": hex::encode(TRANSACTION),
+            "hex": "0102",
+            "height": -1,
+            "confirmations": 0,
+            "blockhash": display_hash(BLOCK),
+            "in_active_chain": false,
+        });
+
+        let mut pending_steps = Vec::new();
+        push_tip(&mut pending_steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        pending_steps.push(ok(
+            "getrawtransaction",
+            json!([hex::encode(TRANSACTION), 1]),
+            orphan.clone(),
+        ));
+        push_tip(&mut pending_steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        let pending_rpc = Arc::new(ScriptedRpc::new(pending_steps));
+        let pending = authority(Chain::Wcash, Arc::clone(&pending_rpc))
+            .snapshot(&[watch()])
+            .await
+            .expect("orphan remains pending before first confirmation");
+        assert!(matches!(
+            pending.payouts[0].state,
+            AuthorityPayoutState::Pending
+        ));
+        pending_rpc.assert_drained();
+
+        let prior = PayoutConfirmation {
+            block_hash: [0x73; 32],
+            block_height: 97,
+            confirmations: 4,
+        };
+        let mut confirmed_watch = watch();
+        confirmed_watch.state = PayoutBatchState::Confirmed;
+        confirmed_watch.prior_confirmation = Some(prior.clone());
+        let mut reorg_steps = Vec::new();
+        push_tip(&mut reorg_steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        reorg_steps.push(ok(
+            "getrawtransaction",
+            json!([hex::encode(TRANSACTION), 1]),
+            orphan,
+        ));
+        push_tip(&mut reorg_steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        let reorg_rpc = Arc::new(ScriptedRpc::new(reorg_steps));
+        let reorged = authority(Chain::Wcash, Arc::clone(&reorg_rpc))
+            .snapshot(&[confirmed_watch])
+            .await
+            .expect("orphan produces durable reorg facts");
+        assert!(matches!(
+            &reorged.payouts[0].state,
+            AuthorityPayoutState::Reorged(PayoutReorg {
+                prior_confirmation,
+                replacement_tip_hash: TIP,
+                replacement_tip_height: 100,
+                ..
+            }) if prior_confirmation == &prior
+        ));
+        reorg_rpc.assert_drained();
+    }
+
+    #[test]
+    fn verbose_transaction_rejects_contradictory_active_chain_facts() {
+        let positive_but_inactive = json!({
+            "txid": hex::encode(TRANSACTION),
+            "hex": "0102",
+            "height": 98,
+            "confirmations": 3,
+            "blockhash": display_hash(BLOCK),
+            "in_active_chain": false,
+        });
+        assert!(matches!(
+            parse_verbose_transaction(&positive_but_inactive, TRANSACTION),
+            Err(ObservationFailure::Invariant)
+        ));
+        let active_but_unmined = json!({
+            "txid": hex::encode(TRANSACTION),
+            "hex": "0102",
+            "in_active_chain": true,
+        });
+        assert!(matches!(
+            parse_verbose_transaction(&active_but_unmined, TRANSACTION),
+            Err(ObservationFailure::Invariant)
+        ));
+    }
+
+    #[tokio::test]
     async fn startup_probe_requires_historical_verbose_lookup_and_submit_capability() {
         let genesis_transaction = [0x66; 32];
         let mut steps = Vec::new();
@@ -1831,6 +2032,102 @@ mod tests {
         assert_eq!(observation.best_tip_height, 100);
         assert_ne!(observation.wallet_state_digest, [0; 32]);
         rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn zallet_fresh_gate_includes_pending_and_dust_authority() {
+        let fingerprint = SeedFingerprint::from_seed(&[0x77; 32]).expect("valid test seed");
+        let commitment = validated_parent_payout_address_commitment(ZEC_COLLECTOR)
+            .expect("canonical Ironwood-capable Zcash Testnet UA");
+        let mut steps = vec![
+            ok("getwalletstatus", json!([]), zallet_status()),
+            ok(
+                "z_listaccounts",
+                json!([false]),
+                json!([{
+                    "account_uuid": ACCOUNT.to_string(),
+                    "name": "collector",
+                    "seedfp": fingerprint.to_string(),
+                    "zip32_account_index": 0,
+                    "account": 0,
+                }]),
+            ),
+            ok(
+                "z_getaccount",
+                json!([ACCOUNT.to_string()]),
+                json!({
+                    "account_uuid": ACCOUNT.to_string(),
+                    "name": "collector",
+                    "seedfp": fingerprint.to_string(),
+                    "zip32_account_index": 0,
+                    "addresses": [{
+                        "diversifier_index": 0,
+                        "ua": ZEC_COLLECTOR,
+                    }],
+                }),
+            ),
+            ok(
+                "z_getbalanceforaccount",
+                json!([ACCOUNT.to_string(), 100]),
+                json!({
+                    "pools": {},
+                    "minimum_confirmations": 100,
+                }),
+            ),
+            ok("getwalletstatus", json!([]), zallet_status()),
+            ok("getwalletstatus", json!([]), zallet_status()),
+            ok(
+                "z_getbalances",
+                json!([0]),
+                json!({
+                    "accounts": [{
+                        "account_uuid": ACCOUNT.to_string(),
+                        "total": { "spendable": { "valueZat": 0 } },
+                    }],
+                }),
+            ),
+            ok("getwalletstatus", json!([]), zallet_status()),
+        ];
+        let rpc = Arc::new(ScriptedRpc::new(std::mem::take(&mut steps)));
+        let observer =
+            ZalletObservationSource::with_client(rpc.clone(), ACCOUNT, 0, 100, commitment)
+                .expect("valid Zallet policy");
+        let observation = observer
+            .verify_fresh_zero()
+            .await
+            .expect("fresh dedicated collector is proven empty");
+        assert_eq!(observation.wallet_spendable_zat, 0);
+        rpc.assert_drained();
+
+        for invalid in [
+            json!({
+                "accounts": [{
+                    "account_uuid": ACCOUNT.to_string(),
+                    "total": {
+                        "spendable": { "valueZat": 0 },
+                        "pending": { "valueZat": 1 },
+                    },
+                }],
+            }),
+            json!({
+                "accounts": [{
+                    "account_uuid": ACCOUNT.to_string(),
+                    "ironwood": { "spendable": { "valueZat": 1 } },
+                    "total": { "spendable": { "valueZat": 1 } },
+                }],
+            }),
+            json!({
+                "accounts": [{
+                    "account_uuid": Uuid::new_v4().to_string(),
+                    "total": { "spendable": { "valueZat": 0 } },
+                }],
+            }),
+        ] {
+            assert_eq!(
+                parse_fresh_zero_balances(&invalid, ACCOUNT),
+                Err(ObservationFailure::Invariant)
+            );
+        }
     }
 
     #[test]

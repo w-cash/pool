@@ -19,7 +19,7 @@ pub use error::{PipelineStage, ZecPayoutError};
 pub use pipeline::{
     parent_payout_address_commitment, validated_parent_payout_address_commitment, Checkpoint,
     CheckpointHook, ZecFundSource, ZecPayoutExecution, ZecPayoutRequest, ZecPcztSigner,
-    PARENT_PAYOUT_COMMITMENT_DOMAIN,
+    ZecPreparedRecovery, PARENT_PAYOUT_COMMITMENT_DOMAIN,
 };
 pub use rpc::{JsonRpcTransport, RpcCall, RpcTransportError};
 pub use transport::{LoopbackHttpTransport, LoopbackTransportError};

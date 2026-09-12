@@ -31,7 +31,10 @@ use crate::{
         AutomaticPayoutRuntime, ObservationFailure, PayoutConfirmationAuthority, PayoutLoopPolicy,
         PayoutRuntimeError, WalletObservationSource, WcashObservationSource,
     },
-    settlement::{SettlementError, SettlementOrchestrator, WecExecutionSigner, ZecExecutionSigner},
+    settlement::{
+        ReconciliationGate, ResumeOutcome, SettlementError, SettlementOrchestrator,
+        WecExecutionSigner, ZecExecutionSigner,
+    },
     wcash_observation::WcashWalletObserver,
     wec_wallet_transport::{PinnedWolfProgram, WolfWalletTransport},
 };
@@ -515,17 +518,9 @@ async fn build_payout_services(
     .await?;
     verify_backend_authority(jobs, wcash_verified.tip, zcash_verified.tip)?;
 
-    // A collector can only join this accounting namespace when its exact
-    // spendable balance is already represented by the sealed ledger. Fresh
-    // Testnet deployment therefore requires fresh empty dedicated accounts;
-    // pre-existing funds fail closed and durably freeze that chain rather than
-    // being silently treated as pool assets.
-    record_startup_reconciliation(&store, &wcash_verified.observation).await?;
-    record_startup_reconciliation(&store, &zcash_verified.observation).await?;
-
     // The Wcash observation above performs the required seedless sync under
-    // the same transport lock. Check both spend-capable signer identities only
-    // after that sync and exact wallet/node/ledger binding have succeeded.
+    // the same transport lock. Check both spend-capable signer identities
+    // before asking either journal to recover an unfinished payout.
     portal
         .readiness_bounded(SIGNER_READINESS_TIMEOUT)
         .await
@@ -544,6 +539,40 @@ async fn build_payout_services(
         )),
         Arc::new(RpcExactBroadcaster::new(Arc::clone(&zcash_authority))),
     )?);
+
+    // Signer journals are an earlier durable boundary than PostgreSQL. Recover
+    // them before comparing wallet balances: a crash can leave SQL Draft while
+    // the wallet already holds exact signed bytes (or an older release already
+    // broadcast them). Recovery first copies those bytes into SQL Signed and
+    // uses the authoritative node broadcaster; it never signs a replacement.
+    let wec_gate = settlement
+        .recover_before_wallet_reconciliation(Chain::Wcash)
+        .await?;
+    let zec_gate = settlement
+        .recover_before_wallet_reconciliation(Chain::Zcash)
+        .await?;
+
+    // With no in-flight external effect, a collector can join this accounting
+    // namespace only when its spendable balance is represented by the sealed
+    // ledger. Signed/Broadcast batches deliberately skip this snapshot: SQL
+    // already classifies their wallet balance as ambiguous until confirmation.
+    if wec_gate == ReconciliationGate::Safe {
+        record_startup_reconciliation(&store, &wcash_verified.observation).await?;
+    }
+    if zec_gate == ReconciliationGate::Safe {
+        record_startup_reconciliation(&store, &zcash_verified.observation).await?;
+    }
+
+    // Only after a safe wallet/ledger snapshot may an ordinary Draft create or
+    // sign new bytes. Ambiguous legacy and existing SQL states were already
+    // resolved above and remain under authoritative confirmation monitoring.
+    if wec_gate == ReconciliationGate::Safe {
+        require_nonterminal_startup_outcome(settlement.resume_next(Chain::Wcash).await?)?;
+    }
+    if zec_gate == ReconciliationGate::Safe {
+        require_nonterminal_startup_outcome(settlement.resume_next(Chain::Zcash).await?)?;
+    }
+
     let policy = PayoutLoopPolicy {
         poll_interval: PAYOUT_POLL_INTERVAL,
         retry_initial: PAYOUT_RETRY_INITIAL,
@@ -572,6 +601,17 @@ async fn build_payout_services(
         settlement_driver,
     )?);
     Ok(PayoutServices { portal, wec, zec })
+}
+
+fn require_nonterminal_startup_outcome(outcome: ResumeOutcome) -> Result<(), ServiceError> {
+    match outcome {
+        ResumeOutcome::Idle
+        | ResumeOutcome::Broadcast { .. }
+        | ResumeOutcome::AwaitingConfirmation { .. } => Ok(()),
+        ResumeOutcome::FrozenAfterReorg { .. } | ResumeOutcome::Terminal { .. } => {
+            Err(ServiceError::PayoutAuthorityUnavailable)
+        }
+    }
 }
 
 async fn verify_observer_authority(
