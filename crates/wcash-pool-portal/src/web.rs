@@ -168,12 +168,8 @@ async fn healthz() -> Json<Value> {
 
 async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     state.store.readiness().await?;
-    state
-        .validator
-        .readiness(Asset::Wec, state.config.network)?;
-    state
-        .validator
-        .readiness(Asset::Zec, state.config.network)?;
+    address_validator_readiness(&state, Asset::Wec).await?;
+    address_validator_readiness(&state, Asset::Zec).await?;
     state.payout.readiness()?;
     Ok(Json(json!({
         "ready": true,
@@ -552,9 +548,7 @@ async fn update_payout_setting(
     if threshold_zat == 0 || threshold_zat > 2_100_000_000_000_000 {
         return Err(AppError::Validation("invalid payout threshold"));
     }
-    let destination = state
-        .validator
-        .validate(asset, state.config.network, candidate.trim())?;
+    let destination = validate_payout_destination(&state, asset, candidate).await?;
     if destination.asset() != asset || destination.network() != state.config.network {
         return Err(AppError::Validation(
             "address authority returned inconsistent data",
@@ -578,6 +572,28 @@ async fn update_payout_setting(
         })
         .await?;
     Ok(Json(setting))
+}
+
+async fn address_validator_readiness(state: &Arc<AppState>, asset: Asset) -> Result<(), AppError> {
+    let validator = Arc::clone(&state.validator);
+    let network = state.config.network;
+    tokio::task::spawn_blocking(move || validator.readiness(asset, network))
+        .await
+        .map_err(|_| AppError::Internal)??;
+    Ok(())
+}
+
+async fn validate_payout_destination(
+    state: &Arc<AppState>,
+    asset: Asset,
+    candidate: String,
+) -> Result<crate::ValidatedDestination, AppError> {
+    let validator = Arc::clone(&state.validator);
+    let network = state.config.network;
+    tokio::task::spawn_blocking(move || validator.validate(asset, network, candidate.trim()))
+        .await
+        .map_err(|_| AppError::Internal)?
+        .map_err(AppError::from)
 }
 
 #[derive(Deserialize)]
