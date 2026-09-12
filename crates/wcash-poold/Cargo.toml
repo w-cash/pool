@@ -13,6 +13,7 @@ publish = false
 clap.workspace = true
 hex.workspace = true
 num-bigint.workspace = true
+rustix.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

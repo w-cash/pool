@@ -2338,6 +2338,7 @@ dependencies = [
  "clap",
  "hex",
  "num-bigint",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",
