@@ -24,6 +24,8 @@ pub struct PortalConfig {
     pub login_lock_secs: u64,
     /// Permit self-service account registration.
     pub allow_registration: bool,
+    /// Process-wide limit for memory-hard portal credential operations.
+    pub argon2_operation_slots: usize,
 }
 
 impl PortalConfig {
@@ -38,6 +40,7 @@ impl PortalConfig {
             max_login_attempts: 5,
             login_lock_secs: 15 * 60,
             allow_registration: true,
+            argon2_operation_slots: 2,
         }
     }
 
@@ -65,6 +68,9 @@ impl PortalConfig {
         }
         if !(60..=24 * 60 * 60).contains(&self.login_lock_secs) {
             return Err(ConfigError::LoginLock);
+        }
+        if !(1..=8).contains(&self.argon2_operation_slots) {
+            return Err(ConfigError::PasswordOperationSlots);
         }
         Ok(())
     }
@@ -94,6 +100,9 @@ pub enum ConfigError {
     /// Invalid account-lock duration.
     #[error("login lock duration must be between one minute and one day")]
     LoginLock,
+    /// Invalid memory-hard password-operation concurrency.
+    #[error("password operation slots must be between one and eight")]
+    PasswordOperationSlots,
 }
 
 /// Process secret material loaded from a protected deployment secret source.

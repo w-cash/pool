@@ -20,9 +20,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     security::{
@@ -31,9 +31,9 @@ use crate::{
         SecurityError,
     },
     AccountSummary, AddressValidationError, AddressValidator, Asset, Clock, ConfigError,
-    NewSession, PageRequest, PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource,
-    PortalConfig, PortalRepository, PortalSecrets, RepositoryError, SignerError, SystemClock,
-    TestnetPayoutBoundary,
+    MinerTelemetrySource, NewSession, PageRequest, PayoutPreferenceChange, PayoutSettingSummary,
+    PoolDataSource, PortalConfig, PortalRepository, PortalSecrets, RepositoryError, SignerError,
+    SystemClock, TestnetPayoutBoundary, UnavailableMinerTelemetry,
 };
 
 const SESSION_COOKIE: &str = "__Host-zecwec_session";
@@ -57,8 +57,10 @@ struct AppState {
     store: Arc<dyn PortalRepository>,
     validator: Arc<dyn AddressValidator>,
     pool_data: Arc<dyn PoolDataSource>,
+    miner_telemetry: Arc<dyn MinerTelemetrySource>,
     payout: Arc<TestnetPayoutBoundary>,
     clock: Arc<dyn Clock>,
+    argon2_slots: Arc<Semaphore>,
     dummy_password_hash: String,
 }
 
@@ -72,12 +74,34 @@ impl PortalApp {
         pool_data: Arc<dyn PoolDataSource>,
         payout: Arc<TestnetPayoutBoundary>,
     ) -> Result<Self, PortalBuildError> {
-        Self::with_clock(
+        Self::new_with_telemetry(
             config,
             secrets,
             store,
             validator,
             pool_data,
+            Arc::new(UnavailableMinerTelemetry),
+            payout,
+        )
+    }
+
+    /// Creates a Testnet portal with authenticated live miner telemetry.
+    pub fn new_with_telemetry(
+        config: PortalConfig,
+        secrets: PortalSecrets,
+        store: Arc<dyn PortalRepository>,
+        validator: Arc<dyn AddressValidator>,
+        pool_data: Arc<dyn PoolDataSource>,
+        miner_telemetry: Arc<dyn MinerTelemetrySource>,
+        payout: Arc<TestnetPayoutBoundary>,
+    ) -> Result<Self, PortalBuildError> {
+        Self::with_clock_and_telemetry(
+            config,
+            secrets,
+            store,
+            validator,
+            pool_data,
+            miner_telemetry,
             payout,
             Arc::new(SystemClock),
         )
@@ -93,12 +117,37 @@ impl PortalApp {
         payout: Arc<TestnetPayoutBoundary>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, PortalBuildError> {
+        Self::with_clock_and_telemetry(
+            config,
+            secrets,
+            store,
+            validator,
+            pool_data,
+            Arc::new(UnavailableMinerTelemetry),
+            payout,
+            clock,
+        )
+    }
+
+    /// Creates a portal with deterministic time and live miner telemetry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_clock_and_telemetry(
+        config: PortalConfig,
+        secrets: PortalSecrets,
+        store: Arc<dyn PortalRepository>,
+        validator: Arc<dyn AddressValidator>,
+        pool_data: Arc<dyn PoolDataSource>,
+        miner_telemetry: Arc<dyn MinerTelemetrySource>,
+        payout: Arc<TestnetPayoutBoundary>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, PortalBuildError> {
         config.validate()?;
         secrets.validate()?;
         if config.network != crate::ChainNetwork::Testnet {
             return Err(PortalBuildError::MainnetDisabled);
         }
         let dummy_password_hash = hash_password("dummy credential never authenticates")?;
+        let argon2_slots = Arc::new(Semaphore::new(config.argon2_operation_slots));
         Ok(Self {
             state: Arc::new(AppState {
                 config,
@@ -106,8 +155,10 @@ impl PortalApp {
                 store,
                 validator,
                 pool_data,
+                miner_telemetry,
                 payout,
                 clock,
+                argon2_slots,
                 dummy_password_hash,
             }),
         })
@@ -123,6 +174,8 @@ impl PortalApp {
             .route("/assets/forms.css", get(form_styles))
             .route("/assets/app.js", get(script))
             .route("/api/v1/overview", get(overview))
+            .route("/api/v1/balances", get(balances))
+            .route("/api/v1/telemetry", get(miner_telemetry))
             .route("/api/v1/rewards", get(reward_history))
             .route("/api/v1/blocks", get(found_blocks))
             .route("/api/v1/payouts", get(payout_history))
@@ -225,6 +278,27 @@ async fn overview(State(state): State<Arc<AppState>>) -> Json<crate::PoolOvervie
     Json(state.pool_data.overview())
 }
 
+async fn balances(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let balances = state.store.balances(auth.session.account_id).await?;
+    Ok(Json(json!({ "balances": balances })))
+}
+
+async fn miner_telemetry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<crate::MinerTelemetrySummary>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(
+        state
+            .miner_telemetry
+            .account_snapshot(auth.session.account_id),
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryQuery {
@@ -302,14 +376,9 @@ async fn register(
         return Err(AppError::Forbidden);
     }
     let username = canonical_username(&request.username)?;
-    let password_hash = tokio::task::spawn_blocking(move || {
-        let mut password = request.password;
-        let result = hash_password(&password);
-        password.zeroize();
-        result
-    })
-    .await
-    .map_err(|_| AppError::Internal)??;
+    let password = Zeroizing::new(request.password);
+    let password_hash =
+        run_password_operation(&state, move || hash_password(password.as_str())).await??;
     let account_id = Uuid::new_v4();
     state
         .store
@@ -347,14 +416,10 @@ async fn login(
         || state.dummy_password_hash.clone(),
         |value| value.password_hash.clone(),
     );
-    let mut password = request.password;
-    let password_valid = tokio::task::spawn_blocking(move || {
-        let valid = verify_password(&password, &encoded);
-        password.zeroize();
-        valid
-    })
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let password = Zeroizing::new(request.password);
+    let password_valid =
+        run_password_operation(&state, move || verify_password(password.as_str(), &encoded))
+            .await?;
     let now = state.clock.now();
 
     let Some(account) = account else {
@@ -494,6 +559,9 @@ async fn create_worker(
     let auth = authenticate(&state, &headers).await?;
     require_mutation(&state, &headers, &auth)?;
     let label = canonical_worker_label(&request.label)?;
+    // Hold one shared Argon2 admission slot while the repository generates the
+    // worker verifier on its blocking executor. Saturation fails immediately.
+    let _argon2_permit = argon2_operation_slot(&state.argon2_slots)?;
     let worker = state
         .store
         .provision_worker(
@@ -765,7 +833,7 @@ async fn confirm_totp(
 async fn require_reauthentication(
     state: &AppState,
     auth: &Authenticated,
-    mut password: String,
+    password: String,
     mut totp_code: Option<String>,
 ) -> Result<(), AppError> {
     let account = state
@@ -774,13 +842,9 @@ async fn require_reauthentication(
         .await?
         .ok_or(AppError::Unauthorized)?;
     let encoded = account.password_hash.clone();
-    let password_valid = tokio::task::spawn_blocking(move || {
-        let valid = verify_password(&password, &encoded);
-        password.zeroize();
-        valid
-    })
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let password = Zeroizing::new(password);
+    let password_valid =
+        run_password_operation(state, move || verify_password(password.as_str(), &encoded)).await?;
     let now = state.clock.now();
     let locked = account.locked_until.is_some_and(|until| until > now);
     let totp_valid = if let Some(sealed) = account.totp_secret.as_deref() {
@@ -847,6 +911,29 @@ fn require_origin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError>
         return Err(AppError::Forbidden);
     }
     Ok(())
+}
+
+async fn run_password_operation<T, Operation>(
+    state: &AppState,
+    operation: Operation,
+) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    Operation: FnOnce() -> T + Send + 'static,
+{
+    let permit = argon2_operation_slot(&state.argon2_slots)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|_| AppError::Internal)
+}
+
+fn argon2_operation_slot(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, AppError> {
+    Arc::clone(slots)
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)
 }
 
 fn require_mutation(
@@ -971,6 +1058,8 @@ enum AppError {
     Validation(&'static str),
     #[error("service unavailable")]
     Unavailable,
+    #[error("credential service busy")]
+    Busy,
     #[error("internal error")]
     Internal,
 }
@@ -1019,6 +1108,7 @@ impl From<SignerError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let retry_after = matches!(&self, Self::Busy);
         let (status, code, message) = match self {
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -1053,12 +1143,46 @@ impl IntoResponse for AppError {
                 "unavailable",
                 "Required validation service is unavailable.",
             ),
+            Self::Busy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "busy",
+                "Credential capacity is busy. Retry shortly.",
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "The request could not be completed.",
             ),
         };
-        (status, Json(json!({ "error": code, "message": message }))).into_response()
+        let mut response =
+            (status, Json(json!({ "error": code, "message": message }))).into_response();
+        if retry_after {
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argon2_slots_reject_excess_work_without_waiting() -> Result<(), &'static str> {
+        let slots = Arc::new(Semaphore::new(1));
+        let _permit = argon2_operation_slot(&slots).map_err(|_| "first operation rejected")?;
+        let error = match argon2_operation_slot(&slots) {
+            Err(error) => error,
+            Ok(_) => return Err("second operation was admitted"),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("retry-after"),
+            Some(&HeaderValue::from_static("1"))
+        );
+        Ok(())
     }
 }

@@ -23,10 +23,12 @@ use uuid::Uuid;
 use wcash_pool_portal::{
     mask_destination, AccountCredential, AddressValidationError, AddressValidator, Asset,
     AuthenticatedSession, BroadcastReceipt, ChainNetwork, Clock, DisabledPayoutSigner,
-    IsolatedPayoutSigner, NewSession, PayoutBatchRequest, PayoutPreferenceChange,
-    PayoutSettingSummary, PoolDataSource, PortalApp, PortalConfig, PortalRepository, PortalSecrets,
-    ProvisionedWorker, ReceiverKind, RepositoryError, RepositoryFuture, SignerError,
-    TestnetPayoutBoundary, UnavailablePoolData, ValidatedDestination, WorkerSummary,
+    IsolatedPayoutSigner, MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary,
+    MinerTelemetrySource, MinerTelemetrySummary, NewSession, Page, PageRequest, PayoutBatchRequest,
+    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PortalApp, PortalConfig,
+    PortalRepository, PortalSecrets, ProvisionedWorker, ReceiverKind, RepositoryError,
+    RepositoryFuture, RewardSummary, SignerError, TestnetPayoutBoundary, UnavailableMinerTelemetry,
+    UnavailablePoolData, ValidatedDestination, WorkerSummary,
 };
 
 const ORIGIN: &str = "https://testnet.zecwec.com";
@@ -70,6 +72,11 @@ struct MemoryState {
     sessions: HashMap<[u8; 32], SavedSession>,
     workers: HashMap<Uuid, (Uuid, String, u64, Option<u64>)>,
     payouts: HashMap<(Uuid, Asset), PayoutState>,
+    read_models_available: bool,
+    balances: HashMap<Uuid, Vec<MinerBalanceSummary>>,
+    rewards: HashMap<Uuid, Vec<RewardSummary>>,
+    blocks: HashMap<Uuid, Vec<MinerBlockSummary>>,
+    payout_history: HashMap<Uuid, Vec<MinerPayoutSummary>>,
 }
 
 #[derive(Default)]
@@ -467,6 +474,112 @@ impl PortalRepository for MemoryRepository {
             .map_err(|_| RepositoryError::Unavailable);
         Box::pin(async move { result })
     }
+
+    fn balances(&self, account_id: Uuid) -> RepositoryFuture<'_, Vec<MinerBalanceSummary>> {
+        let result = self
+            .0
+            .lock()
+            .map_err(|_| RepositoryError::Unavailable)
+            .and_then(|state| {
+                state
+                    .read_models_available
+                    .then(|| state.balances.get(&account_id).cloned().unwrap_or_default())
+                    .ok_or(RepositoryError::Unavailable)
+            });
+        Box::pin(async move { result })
+    }
+
+    fn reward_history(
+        &self,
+        account_id: Uuid,
+        page: PageRequest,
+    ) -> RepositoryFuture<'_, Page<RewardSummary>> {
+        let result = self
+            .0
+            .lock()
+            .map_err(|_| RepositoryError::Unavailable)
+            .and_then(|state| {
+                state
+                    .read_models_available
+                    .then(|| private_page(state.rewards.get(&account_id), page, |item| item.cursor))
+                    .ok_or(RepositoryError::Unavailable)
+            });
+        Box::pin(async move { result })
+    }
+
+    fn found_blocks(
+        &self,
+        account_id: Uuid,
+        page: PageRequest,
+    ) -> RepositoryFuture<'_, Page<MinerBlockSummary>> {
+        let result = self
+            .0
+            .lock()
+            .map_err(|_| RepositoryError::Unavailable)
+            .and_then(|state| {
+                state
+                    .read_models_available
+                    .then(|| private_page(state.blocks.get(&account_id), page, |item| item.cursor))
+                    .ok_or(RepositoryError::Unavailable)
+            });
+        Box::pin(async move { result })
+    }
+
+    fn payout_history(
+        &self,
+        account_id: Uuid,
+        page: PageRequest,
+    ) -> RepositoryFuture<'_, Page<MinerPayoutSummary>> {
+        let result = self
+            .0
+            .lock()
+            .map_err(|_| RepositoryError::Unavailable)
+            .and_then(|state| {
+                state
+                    .read_models_available
+                    .then(|| {
+                        private_page(state.payout_history.get(&account_id), page, |item| {
+                            item.cursor
+                        })
+                    })
+                    .ok_or(RepositoryError::Unavailable)
+            });
+        Box::pin(async move { result })
+    }
+}
+
+fn private_page<T: Clone>(
+    values: Option<&Vec<T>>,
+    request: PageRequest,
+    cursor: impl Fn(&T) -> u64,
+) -> Page<T> {
+    let mut items = values
+        .into_iter()
+        .flatten()
+        .filter(|item| request.before.is_none_or(|before| cursor(item) < before))
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| std::cmp::Reverse(cursor(item)));
+    let next_before = if items.len() > usize::from(request.limit) {
+        items.truncate(usize::from(request.limit));
+        items.last().map(&cursor)
+    } else {
+        None
+    };
+    Page { items, next_before }
+}
+
+#[derive(Default)]
+struct MemoryTelemetry(Mutex<HashMap<Uuid, MinerTelemetrySummary>>);
+
+impl MinerTelemetrySource for MemoryTelemetry {
+    fn account_snapshot(&self, account_id: Uuid) -> MinerTelemetrySummary {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|state| state.get(&account_id).cloned())
+            .unwrap_or_default()
+    }
 }
 
 fn payout_summary(state: &PayoutState) -> PayoutSettingSummary {
@@ -581,13 +694,22 @@ fn portal_with_repository(
     clock: Arc<FixedClock>,
     repository: Arc<MemoryRepository>,
 ) -> axum::Router {
+    portal_with_repository_and_telemetry(clock, repository, Arc::new(UnavailableMinerTelemetry))
+}
+
+fn portal_with_repository_and_telemetry(
+    clock: Arc<FixedClock>,
+    repository: Arc<MemoryRepository>,
+    telemetry: Arc<dyn MinerTelemetrySource>,
+) -> axum::Router {
     clock.0.store(1_800_000_000, Ordering::SeqCst);
-    PortalApp::with_clock(
+    PortalApp::with_clock_and_telemetry(
         PortalConfig::testnet(),
         PortalSecrets::new([3; 32], [7; 32]),
         repository,
         Arc::new(FixtureValidator),
         Arc::new(UnavailablePoolData),
+        telemetry,
         Arc::new(TestnetPayoutBoundary::new(Arc::new(ReadySigner))),
         clock,
     )
@@ -696,6 +818,51 @@ async fn static_ui_and_health_are_hardened() {
     ] {
         assert!(html.contains(page));
     }
+
+    let script_response = app
+        .clone()
+        .oneshot(
+            Request::get("/assets/app.js")
+                .body(Body::empty())
+                .expect("script request"),
+        )
+        .await
+        .expect("script response");
+    let script = String::from_utf8(
+        to_bytes(script_response.into_body(), 256 * 1024)
+            .await
+            .expect("script body")
+            .to_vec(),
+    )
+    .expect("utf8 script");
+    for route in ["/api/v1/balances", "/api/v1/telemetry"] {
+        assert!(script.contains(route));
+    }
+    assert!(script.contains("/api/v1/${kind}"));
+    for history in ["rewards", "blocks", "payouts"] {
+        assert!(script.contains(history));
+    }
+    assert!(script.contains("textContent"));
+    assert!(!script.contains("innerHTML"));
+    assert!(script.contains("authGeneration"));
+    assert!(script.contains("workerSecret.textContent = \"\""));
+    assert!(script.contains("#totp-form"));
+    let worker_table = script
+        .split_once("function renderWorkerTelemetry()")
+        .and_then(|(_, tail)| tail.split_once("async function refreshPayoutSettings"))
+        .map(|(table, _)| table)
+        .unwrap_or_default();
+    assert_eq!(worker_table.matches("telemetry?.accepted").count(), 1);
+    let positions = [
+        "telemetry?.accepted",
+        "telemetry?.stale",
+        "telemetry?.invalid",
+        "telemetry?.duplicate",
+        "telemetry?.last_share_at",
+    ]
+    .map(|field| worker_table.find(field).unwrap_or(usize::MAX));
+    assert!(positions.iter().all(|position| *position < usize::MAX));
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
 
     let ready = app
         .oneshot(
@@ -972,7 +1139,13 @@ async fn readiness_times_out_without_blocking_tokio_workers() {
 #[tokio::test]
 async fn private_history_routes_require_authentication_and_bounded_pages() {
     let app = portal(Arc::new(FixedClock::default()));
-    for route in ["/api/v1/rewards", "/api/v1/blocks", "/api/v1/payouts"] {
+    for route in [
+        "/api/v1/balances",
+        "/api/v1/telemetry",
+        "/api/v1/rewards",
+        "/api/v1/blocks",
+        "/api/v1/payouts",
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -1006,6 +1179,232 @@ async fn private_history_routes_require_authentication_and_bounded_pages() {
         .await
         .expect("valid page response");
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn private_read_models_are_successful_empty_and_account_isolated() {
+    let repository = Arc::new(MemoryRepository::default());
+    let telemetry = Arc::new(MemoryTelemetry::default());
+    let app = portal_with_repository_and_telemetry(
+        Arc::new(FixedClock::default()),
+        Arc::clone(&repository),
+        telemetry.clone(),
+    );
+    let (owner_session, _, _) = register_and_login(&app, "historyowner").await;
+    let (other_session, _, _) = register_and_login(&app, "historyother").await;
+    let (owner_id, other_id) = {
+        let state = repository.0.lock().expect("repository state");
+        (
+            state.accounts["historyowner"].id,
+            state.accounts["historyother"].id,
+        )
+    };
+    let unsafe_text = "<img src=x onerror=alert(1)>";
+    let batch_id = Uuid::from_u128(0xfeed);
+    {
+        let mut state = repository.0.lock().expect("repository state");
+        state.read_models_available = true;
+        state.balances.insert(
+            owner_id,
+            vec![
+                MinerBalanceSummary {
+                    asset: Asset::Wec,
+                    immature_zat: 100,
+                    payable_zat: 200,
+                    pending_zat: 300,
+                    total_zat: 600,
+                },
+                MinerBalanceSummary {
+                    asset: Asset::Zec,
+                    immature_zat: 10,
+                    payable_zat: 20,
+                    pending_zat: 30,
+                    total_zat: 60,
+                },
+            ],
+        );
+        state.balances.insert(
+            other_id,
+            vec![
+                MinerBalanceSummary {
+                    asset: Asset::Wec,
+                    immature_zat: 0,
+                    payable_zat: 0,
+                    pending_zat: 0,
+                    total_zat: 0,
+                },
+                MinerBalanceSummary {
+                    asset: Asset::Zec,
+                    immature_zat: 0,
+                    payable_zat: 0,
+                    pending_zat: 0,
+                    total_zat: 0,
+                },
+            ],
+        );
+        state.rewards.insert(
+            owner_id,
+            vec![RewardSummary {
+                cursor: 9,
+                asset: Asset::Wec,
+                block_height: 44,
+                block_hash: unsafe_text.to_owned(),
+                amount_zat: 123,
+                state: "mature".to_owned(),
+            }],
+        );
+        state.blocks.insert(
+            owner_id,
+            vec![MinerBlockSummary {
+                cursor: 8,
+                asset: Asset::Zec,
+                height: 45,
+                block_hash: "11".repeat(32),
+                reward_zat: 456,
+                state: "submitted".to_owned(),
+            }],
+        );
+        state.payout_history.insert(
+            owner_id,
+            vec![MinerPayoutSummary {
+                cursor: 7,
+                batch_id,
+                asset: Asset::Wec,
+                amount_zat: 321,
+                state: "confirmed".to_owned(),
+                transaction_id: Some("22".repeat(32)),
+                confirmation_height: Some(46),
+            }],
+        );
+    }
+    telemetry.0.lock().expect("telemetry state").insert(
+        owner_id,
+        MinerTelemetrySummary {
+            available: true,
+            updated_at: Some(1_800_000_000),
+            active_workers: 1,
+            accepted: 12,
+            stale: 2,
+            invalid: 1,
+            duplicate: 3,
+            workers: Vec::new(),
+        },
+    );
+
+    let owner_balances = json_response(
+        app.clone()
+            .oneshot(
+                Request::get("/api/v1/balances")
+                    .header("cookie", &owner_session)
+                    .body(Body::empty())
+                    .expect("owner balances"),
+            )
+            .await
+            .expect("owner balances response"),
+    )
+    .await;
+    assert_eq!(owner_balances["balances"][0]["total_zat"], 600);
+
+    let owner_rewards = json_response(
+        app.clone()
+            .oneshot(
+                Request::get("/api/v1/rewards?limit=50")
+                    .header("cookie", &owner_session)
+                    .body(Body::empty())
+                    .expect("owner rewards"),
+            )
+            .await
+            .expect("owner rewards response"),
+    )
+    .await;
+    assert_eq!(owner_rewards["items"][0]["block_hash"], unsafe_text);
+
+    let owner_blocks = json_response(
+        app.clone()
+            .oneshot(
+                Request::get("/api/v1/blocks?limit=50")
+                    .header("cookie", &owner_session)
+                    .body(Body::empty())
+                    .expect("owner blocks"),
+            )
+            .await
+            .expect("owner blocks response"),
+    )
+    .await;
+    assert_eq!(owner_blocks["items"][0]["state"], "submitted");
+
+    let owner_payouts = json_response(
+        app.clone()
+            .oneshot(
+                Request::get("/api/v1/payouts?limit=50")
+                    .header("cookie", &owner_session)
+                    .body(Body::empty())
+                    .expect("owner payouts"),
+            )
+            .await
+            .expect("owner payouts response"),
+    )
+    .await;
+    assert_eq!(owner_payouts["items"][0]["batch_id"], batch_id.to_string());
+    assert_eq!(owner_payouts["items"][0]["transaction_id"], "22".repeat(32));
+
+    let owner_telemetry = json_response(
+        app.clone()
+            .oneshot(
+                Request::get("/api/v1/telemetry")
+                    .header("cookie", &owner_session)
+                    .body(Body::empty())
+                    .expect("owner telemetry"),
+            )
+            .await
+            .expect("owner telemetry response"),
+    )
+    .await;
+    assert_eq!(owner_telemetry["accepted"], 12);
+
+    for route in ["/api/v1/rewards", "/api/v1/blocks", "/api/v1/payouts"] {
+        let other = json_response(
+            app.clone()
+                .oneshot(
+                    Request::get(route)
+                        .header("cookie", &other_session)
+                        .body(Body::empty())
+                        .expect("other account request"),
+                )
+                .await
+                .expect("other account response"),
+        )
+        .await;
+        assert_eq!(other["items"], json!([]));
+        assert!(!other.to_string().contains(unsafe_text));
+        assert!(!other.to_string().contains(&batch_id.to_string()));
+    }
+    let other_balances = json_response(
+        app.clone()
+            .oneshot(
+                Request::get("/api/v1/balances")
+                    .header("cookie", &other_session)
+                    .body(Body::empty())
+                    .expect("other balances"),
+            )
+            .await
+            .expect("other balances response"),
+    )
+    .await;
+    assert_eq!(other_balances["balances"][0]["total_zat"], 0);
+    let other_telemetry = json_response(
+        app.oneshot(
+            Request::get("/api/v1/telemetry")
+                .header("cookie", other_session)
+                .body(Body::empty())
+                .expect("other telemetry"),
+        )
+        .await
+        .expect("other telemetry response"),
+    )
+    .await;
+    assert_eq!(other_telemetry["accepted"], 0);
+    assert!(!other_telemetry.to_string().contains("historyowner"));
 }
 
 #[tokio::test]

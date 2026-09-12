@@ -1,3 +1,19 @@
+# The key is authoritative only because both HTTPS virtual hosts require
+# Cloudflare Authenticated Origin Pulls before evaluating these zones.
+limit_req_zone $http_cf_connecting_ip zone=zecwec_portal_requests:10m rate=20r/s;
+
+# An empty key is not accounted by limit_req. Only methods which launch an
+# Argon2 password/token operation consume the stricter credential budget.
+map "$request_method:$uri" $zecwec_credential_client {
+    default "";
+    "POST:/api/v1/auth/register" $http_cf_connecting_ip;
+    "POST:/api/v1/auth/login" $http_cf_connecting_ip;
+    "POST:/api/v1/workers" $http_cf_connecting_ip;
+    ~^PUT:/api/v1/settings/payouts/[^/]+$ $http_cf_connecting_ip;
+    "POST:/api/v1/security/totp/begin" $http_cf_connecting_ip;
+}
+limit_req_zone $zecwec_credential_client zone=zecwec_portal_credentials:10m rate=6r/m;
+
 upstream zecwec_testnet_portal {
     server @PORTAL_LISTEN@;
     keepalive 16;
@@ -53,8 +69,11 @@ server {
     proxy_connect_timeout 3s;
     proxy_read_timeout 30s;
     proxy_send_timeout 30s;
+    limit_req_status 429;
 
     location / {
+        limit_req zone=zecwec_portal_requests burst=40 nodelay;
+        limit_req zone=zecwec_portal_credentials burst=4 nodelay;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;

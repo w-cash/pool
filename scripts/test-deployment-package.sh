@@ -226,8 +226,20 @@ portal = (root / "nginx/zecwec-testnet-portal.conf").read_text(encoding="utf-8")
 assert portal.count("ssl_verify_client on;") == 2
 assert portal.count("ssl_client_certificate /etc/wcash-pool/tls/cloudflare-origin-pull-ca.pem;") == 2
 assert "proxy_set_header X-Forwarded-For $http_cf_connecting_ip;" in portal
+assert "limit_req_zone $zecwec_credential_client zone=zecwec_portal_credentials:10m rate=6r/m;" in portal
+assert "limit_req zone=zecwec_portal_credentials burst=4 nodelay;" in portal
+assert "limit_req_status 429;" in portal
+assert '\"POST:/api/v1/workers\" $http_cf_connecting_ip;' in portal
 assert "return 444;" in portal
 PY
+
+grep -Fq 'stage-portal)' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+grep -Fq -- '--ack-cloudflare-access' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+grep -Fq 'Cloudflare Access did not deny the anonymous staging probe' \
+    "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+grep -Fq 'public_status != 200' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+grep -Fq 'public_body != '\''{"status":"ok"}'\''' \
+    "$repo_root/scripts/deploy/enable-nginx-edge.sh"
 
 mkdir -p "$temporary/config-check-credentials"
 chmod 0700 "$temporary/config-check-credentials"

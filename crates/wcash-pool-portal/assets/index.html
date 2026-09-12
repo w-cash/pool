@@ -61,14 +61,20 @@
       <div id="page-overview" class="page active">
         <div class="page-head"><div><p class="eyebrow">Pool account</p><h1>Overview</h1></div><span id="data-state" class="status warning">Connecting</span></div>
         <div class="metric-grid">
-          <article class="metric"><span>Pool hashrate</span><strong id="pool-hashrate">—</strong><small>solutions / second</small></article>
-          <article class="metric"><span>Active workers</span><strong id="active-workers">—</strong><small>private to your account</small></article>
+          <article class="metric"><span>Pool hashrate</span><strong id="pool-hashrate">Loading</strong><small id="pool-hashrate-note">public pool estimate</small></article>
+          <article class="metric"><span>Pool active workers</span><strong id="pool-active-workers">Loading</strong><small>all accounts · last 5 minutes</small></article>
           <article class="metric"><span>Wcash height</span><strong id="wcash-height">—</strong><small>WEC settlement chain</small></article>
           <article class="metric"><span>Zcash height</span><strong id="zcash-height">—</strong><small>ZEC parent chain</small></article>
         </div>
+        <div class="metric-grid private-metrics" aria-label="Private account share telemetry">
+          <article class="metric"><span>Your online workers</span><strong id="miner-active-workers">Loading</strong><small>authorized connections</small></article>
+          <article class="metric"><span>Accepted shares</span><strong id="accepted-shares">Loading</strong><small>current service run</small></article>
+          <article class="metric"><span>Stale shares</span><strong id="stale-shares">Loading</strong><small>current service run</small></article>
+          <article class="metric"><span>Invalid / duplicate</span><strong id="rejected-shares">Loading</strong><small>current service run</small></article>
+        </div>
         <div class="two-column">
-          <article class="asset-card wec"><div><span class="coin">W</span><h2>WEC</h2></div><p>Independent Testnet balance</p><strong>—</strong><small>Accounting projector not connected</small><p id="wec-fee">Pool fee —</p></article>
-          <article class="asset-card zec"><div><span class="coin">Z</span><h2>ZEC</h2></div><p>Independent Testnet balance</p><strong>—</strong><small>Accounting projector not connected</small><p id="zec-fee">Pool fee —</p></article>
+          <article class="asset-card wec"><div><span class="coin">W</span><h2>WEC</h2></div><p>Your independent Testnet balance</p><strong id="wec-balance">Loading</strong><dl class="balance-lines"><div><dt>Immature</dt><dd id="wec-immature">—</dd></div><div><dt>Payable</dt><dd id="wec-payable">—</dd></div><div><dt>Pending payout</dt><dd id="wec-pending">—</dd></div></dl><p id="wec-fee">Pool fee —</p></article>
+          <article class="asset-card zec"><div><span class="coin">Z</span><h2>ZEC</h2></div><p>Your independent Testnet balance</p><strong id="zec-balance">Loading</strong><dl class="balance-lines"><div><dt>Immature</dt><dd id="zec-immature">—</dd></div><div><dt>Payable</dt><dd id="zec-payable">—</dd></div><div><dt>Pending payout</dt><dd id="zec-pending">—</dd></div></dl><p id="zec-fee">Pool fee —</p></article>
         </div>
       </div>
 
@@ -78,12 +84,12 @@
           <form id="worker-form" class="inline-form"><label>Worker label<input name="label" placeholder="z15-01" maxlength="32" required></label><button class="button primary">Create token</button></form>
           <div id="worker-secret" class="secret-box hidden" role="status"></div>
         </div>
-        <div class="panel table-wrap"><table><thead><tr><th>Worker</th><th>Mining username</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody id="workers-body"><tr><td colspan="5" class="empty">No workers yet.</td></tr></tbody></table></div>
+        <div class="panel table-wrap"><table><thead><tr><th>Worker</th><th>Mining username</th><th>Status</th><th>Accepted</th><th>Stale</th><th>Invalid</th><th>Duplicate</th><th>Last share</th><th></th></tr></thead><tbody id="workers-body"><tr><td colspan="9" class="empty">Loading workers…</td></tr></tbody></table></div>
       </div>
 
-      <div id="page-rewards" class="page"><div class="page-head"><div><p class="eyebrow">PPLNS</p><h1>Rewards</h1></div></div><div class="panel empty-state"><h2>Accounting connection required</h2><p>Reward estimates and immutable allocation events appear only after the durable projector is connected.</p></div></div>
-      <div id="page-blocks" class="page"><div class="page-head"><div><p class="eyebrow">Merged mining</p><h1>Blocks</h1></div></div><div class="panel empty-state"><h2>No verified block feed</h2><p>WEC, ZEC, and dual winners will appear here with confirmation and reorganization state.</p></div></div>
-      <div id="page-payouts" class="page"><div class="page-head"><div><p class="eyebrow">Settlement</p><h1>Payouts</h1></div></div><div class="panel empty-state"><h2>Signer deliberately unavailable</h2><p>No transaction is shown as paid until the isolated signer returns a reconciled on-chain transaction identifier.</p></div></div>
+      <div id="page-rewards" class="page"><div class="page-head"><div><p class="eyebrow">PPLNS</p><h1>Rewards</h1></div><span id="rewards-state" class="status warning" role="status">Loading</span></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Block</th><th>Block hash</th><th>Your allocation</th><th>State</th></tr></thead><tbody id="rewards-body"><tr><td colspan="5" class="empty">Loading reward history…</td></tr></tbody></table></div><button id="rewards-more" class="button secondary history-more hidden" type="button">Load older rewards</button></div>
+      <div id="page-blocks" class="page"><div class="page-head"><div><p class="eyebrow">Merged mining</p><h1>Blocks</h1></div><span id="blocks-state" class="status warning" role="status">Loading</span></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Height</th><th>Block hash</th><th>Coinbase reward</th><th>Lifecycle</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty">Loading found blocks…</td></tr></tbody></table></div><button id="blocks-more" class="button secondary history-more hidden" type="button">Load older blocks</button></div>
+      <div id="page-payouts" class="page"><div class="page-head"><div><p class="eyebrow">Settlement</p><h1>Payouts</h1></div><span id="payouts-state" class="status warning" role="status">Loading</span></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Amount</th><th>Status</th><th>Batch</th><th>Transaction ID</th><th>Confirmed at</th></tr></thead><tbody id="payouts-body"><tr><td colspan="6" class="empty">Loading payout history…</td></tr></tbody></table></div><button id="payouts-more" class="button secondary history-more hidden" type="button">Load older payouts</button></div>
 
       <div id="page-settings" class="page">
         <div class="page-head"><div><p class="eyebrow">Account security</p><h1>Settings</h1></div></div>

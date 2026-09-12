@@ -294,11 +294,14 @@ Each WEC and ZEC card shows:
   batch;
 - the last payout state and transaction identifier when one is public.
 
-The worker page shows live, 5-minute, 1-hour, and 24-hour hashrate; accepted,
-stale, invalid, and duplicate work; assigned difficulty; last share; firmware
-label; and online, offline, or dead state. Alerts cover offline workers and a
-sustained rejection-rate increase without exposing full worker labels in push
-notifications.
+The complete product worker page will show live, 5-minute, 1-hour, and 24-hour
+hashrate; accepted, stale, invalid, and duplicate work; assigned difficulty;
+last share; firmware label; and online, offline, or dead state. The initial
+Testnet portal intentionally exposes only online connections, last-share time,
+and process-lifetime outcome counters until a calibrated, durable hashrate
+projector is implemented. It must never relabel share counts as solutions per
+second. Alerts remain a later milestone and must not expose full worker labels
+in notifications.
 
 The block page labels every result `WEC`, `ZEC`, or `DUAL` and shows observed,
 immature, mature, payable, paid, orphaned, quarantined, or requeued state as

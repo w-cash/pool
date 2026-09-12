@@ -471,6 +471,43 @@ async fn assert_nonce_fencing_migration_preserves_legacy_floor(pool: &sqlx::PgPo
         .expect("migration fixture rolls back cleanly");
 }
 
+async fn assert_portal_winner_migration_backfills_existing_rows(pool: &sqlx::PgPool) {
+    let mut fixture = pool.begin().await.expect("portal migration fixture starts");
+    let schema = format!("portal_migration_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema},pg_catalog; \
+         CREATE TABLE winners (deployment_id UUID NOT NULL, marker BIGINT NOT NULL); \
+         INSERT INTO winners (deployment_id,marker) VALUES \
+           ('11111111-1111-4111-8111-111111111111',1), \
+           ('11111111-1111-4111-8111-111111111111',2)"
+    ))
+    .execute(&mut *fixture)
+    .await
+    .expect("populated legacy winners table seeds");
+    sqlx::raw_sql(include_str!("../migrations/0004_portal_miner_views.sql"))
+        .execute(&mut *fixture)
+        .await
+        .expect("portal cursor migration applies over populated winners");
+    let sequences =
+        sqlx::query_scalar::<_, i64>("SELECT portal_sequence FROM winners ORDER BY marker")
+            .fetch_all(&mut *fixture)
+            .await
+            .expect("backfilled portal sequences read");
+    assert_eq!(sequences.len(), 2);
+    assert!(sequences[0] > 0);
+    assert!(sequences[1] > sequences[0]);
+    assert!(
+        sqlx::query("UPDATE winners SET portal_sequence=portal_sequence+1 WHERE marker=1")
+            .execute(&mut *fixture)
+            .await
+            .is_err()
+    );
+    fixture
+        .rollback()
+        .await
+        .expect("portal migration fixture rolls back cleanly");
+}
+
 #[tokio::test]
 #[allow(clippy::expect_used)]
 async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
@@ -483,6 +520,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .await
         .expect("isolated PostgreSQL is available");
     assert_nonce_fencing_migration_preserves_legacy_floor(&admin).await;
+    assert_portal_winner_migration_backfills_existing_rows(&admin).await;
     sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
         .execute(&admin)
         .await
@@ -623,7 +661,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
             },
         },
     ];
-    for event in &events {
+    for (index, event) in events.iter().enumerate() {
         assert_eq!(
             store
                 .project_event(&authority, event)
@@ -631,6 +669,34 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
                 .expect("authoritative event projects atomically"),
             ProjectionResult::Applied
         );
+        if index == 1 {
+            let submitted = PortalRepository::found_blocks(
+                &store,
+                event_worker.account_id.get(),
+                PageRequest {
+                    before: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("submitted winners are immediately visible");
+            assert_eq!(submitted.items.len(), 2);
+            assert!(submitted
+                .items
+                .iter()
+                .all(|winner| winner.state == "submitted"));
+            let not_allocated = PortalRepository::reward_history(
+                &store,
+                event_worker.account_id.get(),
+                PageRequest {
+                    before: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("reward projection is proven empty before observation");
+            assert!(not_allocated.items.is_empty());
+        }
     }
     assert_eq!(store.last_event_seq().await.unwrap(), 7);
     let event_balances = sqlx::query(
@@ -679,6 +745,22 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     .unwrap();
     assert_eq!(wcash_state, "orphaned");
     assert_eq!(zcash_state, "matured");
+    let mature_balances = PortalRepository::balances(&store, event_worker.account_id.get())
+        .await
+        .expect("mature private balances load");
+    let mature_wec = mature_balances
+        .iter()
+        .find(|balance| balance.asset == Asset::Wec)
+        .expect("mature WEC balance exists");
+    assert_eq!(mature_wec.total_zat, 0);
+    let mature_zec = mature_balances
+        .iter()
+        .find(|balance| balance.asset == Asset::Zec)
+        .expect("mature ZEC balance exists");
+    assert_eq!(mature_zec.immature_zat, 0);
+    assert_eq!(mature_zec.payable_zat, zcash_winner.reward_zat);
+    assert_eq!(mature_zec.pending_zat, 0);
+    assert_eq!(mature_zec.total_zat, zcash_winner.reward_zat);
 
     let ledger_count_before_replay = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ledger_transactions WHERE deployment_id=$1",
@@ -1557,6 +1639,23 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     .is_err());
 
     let historic_account = event_worker.account_id.get();
+    let balances = PortalRepository::balances(&store, historic_account)
+        .await
+        .expect("post-reorg private balances load");
+    assert_eq!(balances.len(), 2);
+    let wec_balance = balances
+        .iter()
+        .find(|balance| balance.asset == Asset::Wec)
+        .expect("WEC balance exists");
+    assert_eq!(wec_balance.total_zat, 0);
+    let zec_balance = balances
+        .iter()
+        .find(|balance| balance.asset == Asset::Zec)
+        .expect("ZEC balance exists");
+    assert_eq!(zec_balance.immature_zat, 0);
+    assert_eq!(zec_balance.payable_zat, 0);
+    assert_eq!(zec_balance.pending_zat, 0);
+    assert_eq!(zec_balance.total_zat, 0);
     let rewards = PortalRepository::reward_history(
         &store,
         historic_account,

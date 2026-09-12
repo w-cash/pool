@@ -9,8 +9,8 @@ use std::{fmt, future::Future, pin::Pin};
 use uuid::Uuid;
 
 use crate::{
-    Asset, ChainNetwork, MinerBlockSummary, MinerPayoutSummary, Page, PageRequest,
-    PayoutSettingSummary, RewardSummary, ValidatedDestination, WorkerSummary,
+    Asset, ChainNetwork, MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, Page,
+    PageRequest, PayoutSettingSummary, RewardSummary, ValidatedDestination, WorkerSummary,
 };
 
 /// Boxed repository operation used by object-safe asynchronous adapters.
@@ -261,6 +261,11 @@ pub trait PortalRepository: Send + Sync {
         network: ChainNetwork,
         now: u64,
     ) -> RepositoryFuture<'_, Option<ValidatedDestination>>;
+
+    /// Returns this account's WEC and ZEC ledger liabilities.
+    fn balances(&self, _account_id: Uuid) -> RepositoryFuture<'_, Vec<MinerBalanceSummary>> {
+        Box::pin(async { Err(RepositoryError::Unavailable) })
+    }
 
     /// Returns one account's reward allocations with bounded keyset pagination.
     fn reward_history(

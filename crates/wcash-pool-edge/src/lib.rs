@@ -17,6 +17,7 @@ mod router;
 mod stream;
 #[cfg(unix)]
 mod submission;
+mod telemetry;
 
 pub use config::{ConnectionLimits, EdgeConfig, EdgeConfigError};
 pub use connection::{
@@ -36,3 +37,4 @@ pub use submission::{
     BackendEventConsumer, BackendEventConsumerError, ShareRouter, ShareRouterConfig,
     ShareRouterConfigError, ShareRouterError, ShareRouterHandle,
 };
+pub use telemetry::{MinerTelemetrySink, NoopMinerTelemetry, ShareOutcome};

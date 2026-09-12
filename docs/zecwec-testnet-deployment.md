@@ -6,7 +6,8 @@ This runbook deploys one account-based WEC/ZEC merged-mining **Testnet** pool:
 
 - account registration, login, TOTP, workers, revocable mining tokens;
 - independent WEC and ZEC payout destinations and histories;
-- accepted-share, hashrate, block, reward, and payout observations;
+- accepted/stale/invalid/duplicate share counters plus block, reward, and
+  payout observations; calibrated hashrate projection remains unavailable;
 - one ZIP-301 work stream with independent Wcash and Zcash winner handling;
 - PPLNS accounting with zero launch fee and chain-separated settlement.
 
@@ -79,6 +80,13 @@ response. This is mandatory because the DNS-only mining hostname reveals the
 same origin IP. The mining hostname must remain DNS-only unless a paid
 Cloudflare product explicitly supports generic TCP proxying. ASIC TLS needs a
 publicly trusted certificate such as Let's Encrypt.
+
+The origin applies a general request limit and a stricter credential-operation
+limit keyed by Cloudflare's authenticated `CF-Connecting-IP`. The application
+also uses a small process-wide, non-queueing semaphore around every portal
+Argon2 password hash, token hash, or verification and returns HTTP 429 with
+`Retry-After` when the memory-hard work budget is full. These independent
+bounds remain required even when Cloudflare edge rate limiting is enabled.
 
 The reviewed DNS contract is deliberately narrow: `zecwec.com` and
 `testnet.zecwec.com` are proxied web records; `testnet-mine.zecwec.com` is a
@@ -416,8 +424,10 @@ sudo scripts/deploy/enable-nginx-edge.sh \
   /etc/wcash-pool/miner-cidrs
 ```
 
-This deliberately leaves the portal nginx site disabled. Use an SSH tunnel to
-the loopback portal for pre-launch registration, payout, and dashboard tests.
+This deliberately leaves the portal nginx site disabled. An SSH tunnel may be
+used for service diagnostics, but it is not browser E2E evidence: it does not
+exercise the canonical HTTPS origin, `Secure`/`__Host-` cookies, or Cloudflare
+Authenticated Origin Pulls.
 
 If an older pool uses a different unit name but still occupies either mining
 port, archive and disable that unit before continuing. The listener-free
@@ -437,6 +447,26 @@ preflight, enables only the source-restricted TLS Stratum listener, starts the
 pool, and stops `wcash-pool.service` if post-start health fails. Runtime payout
 recovery and reconciliation finish before the pool process binds that listener.
 
+Before the browser gate, create a Cloudflare Access application covering
+`testnet.zecwec.com/*`, allow only the named Testnet operator identity, and
+verify the default policy denies every other identity. Then stage the portal:
+
+```bash
+sudo scripts/deploy/enable-nginx-edge.sh \
+  stage-portal \
+  /etc/wcash-pool/deployment.env \
+  /etc/wcash-pool/miner-cidrs \
+  --ack-cloudflare-access
+```
+
+This command enables the HTTPS origin only after local health succeeds. It
+proves the origin rejects a direct request without Cloudflare client
+authentication and proves an anonymous request through Cloudflare receives
+only a redirect, 401, or 403 from Access. Any failed probe removes the newly
+enabled portal link and reloads nginx. The authorized operator can now run the
+complete browser flow at the canonical HTTPS hostname with real cookie and
+origin semantics while the portal remains unavailable to the public.
+
 Before telling an operator to point an ASIC, prove all of the following:
 
 - both Wcash nodes agree on canonical tip and genesis;
@@ -453,8 +483,9 @@ Before telling an operator to point an ASIC, prove all of the following:
 - a real Testnet payout for each funded asset is confirmed and visible in the
   miner's portal history.
 
-After every gate above has evidence recorded, enable the public portal with an
-explicit operator acknowledgement:
+After every gate above has evidence recorded, remove the Cloudflare Access
+application, confirm the zone still uses Full (strict) and Authenticated Origin
+Pulls, then enable the public portal with an explicit operator acknowledgement:
 
 ```bash
 sudo scripts/deploy/enable-nginx-edge.sh \
