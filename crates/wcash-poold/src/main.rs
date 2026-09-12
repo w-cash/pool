@@ -1,14 +1,17 @@
 //! Wcash pool service entry point.
 //!
-//! The public service is deliberately unavailable until the local mining
-//! backend, durable share path, and miner edge pass the documented testnet
-//! gates. This binary exposes a machine-readable readiness probe without
-//! opening a network listener.
+//! The service starts fail-closed: every durable store, authoritative backend,
+//! payout signer, and address authority must pass its Testnet fence before a
+//! miner or portal listener is opened.
 
 #![forbid(unsafe_code)]
 
 mod bootstrap;
 mod config;
+mod edge;
+mod payout;
+mod service;
+mod wec_wallet_transport;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -47,8 +50,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Report whether this revision may serve miners.
-    Readiness,
+    /// Run the fail-closed Testnet pool until SIGINT or SIGTERM.
+    Serve {
+        /// Absolute path to the protected Testnet policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -101,16 +108,23 @@ async fn main() -> ExitCode {
                         shares,
                         authentication,
                         nonces,
+                        nonce_claim,
                         timeline,
                     } = started;
+                    let shutdown = shares.shutdown().await;
+                    let release = store.release_nonce_namespace(&nonce_claim).await;
                     drop((store, jobs, authentication, nonces, timeline));
-                    match shares.shutdown().await {
-                        Ok(()) => {
+                    match (shutdown, release) {
+                        (Ok(()), Ok(())) => {
                             println!("{{\"preflight\":true,\"network\":\"testnet\"}}");
                             ExitCode::SUCCESS
                         }
-                        Err(error) => {
+                        (Err(error), _) => {
                             eprintln!("preflight shutdown failed: {error}");
+                            ExitCode::from(NOT_READY_EXIT_CODE)
+                        }
+                        (Ok(()), Err(error)) => {
+                            eprintln!("preflight nonce release failed: {error}");
                             ExitCode::from(NOT_READY_EXIT_CODE)
                         }
                     }
@@ -125,12 +139,19 @@ async fn main() -> ExitCode {
                 ExitCode::from(NOT_READY_EXIT_CODE)
             }
         },
-        Command::Readiness => {
-            println!(
-                "{{\"ready\":false,\"stage\":\"foundation\",\"reason\":\"public miner service is not implemented\"}}"
-            );
-            ExitCode::from(NOT_READY_EXIT_CODE)
-        }
+        Command::Serve { config } => match config::RuntimeConfig::load(&config) {
+            Ok(runtime) => match service::run(runtime).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("service stopped: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            },
+            Err(error) => {
+                eprintln!("configuration rejected: {error}");
+                ExitCode::from(NOT_READY_EXIT_CODE)
+            }
+        },
     }
 }
 
@@ -141,11 +162,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_readiness_but_no_serve_command() {
+    fn exposes_explicit_testnet_service_commands() {
         assert!(matches!(
-            Cli::try_parse_from(["wcash-poold", "readiness"]),
+            Cli::try_parse_from(["wcash-poold", "serve", "--config", "/tmp/pool.toml"]),
             Ok(Cli {
-                command: Command::Readiness
+                command: Command::Serve { .. }
             })
         ));
         assert!(Cli::try_parse_from(["wcash-poold", "serve"]).is_err());
