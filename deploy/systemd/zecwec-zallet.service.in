@@ -2,9 +2,10 @@
 Description=Persistent ZecWec Testnet Zcash collector wallet
 Documentation=https://github.com/zcash/zallet
 Requires=@ZCASH_VALIDATOR_UNIT@
+BindsTo=@ZCASH_VALIDATOR_UNIT@
 After=network-online.target @ZCASH_VALIDATOR_UNIT@
 Wants=network-online.target
-ConditionPathIsExecutable=/opt/wcash/current/zallet
+ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/zallet
 ConditionPathExists=@ZALLET_CONFIG_FILE@
 
 [Service]
@@ -12,10 +13,11 @@ Type=simple
 User=zecwec-zallet
 Group=zecwec-zallet
 UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
 LoadCredential=validator-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
-ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh zallet
-ExecStart=/opt/wcash/current/zallet --datadir @ZALLET_STATE_DIR@ --config @ZALLET_CONFIG_FILE@ start
-ExecStartPost=/usr/local/libexec/zecwec/wait-zallet-ready.sh @ZALLET_RPC@
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh zallet
+ExecStart=@WCASH_RELEASE_ROOT@/zallet --datadir @ZALLET_STATE_DIR@ --config @ZALLET_CONFIG_FILE@ start
+ExecStartPost=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/wait-zallet-ready.sh @ZALLET_RPC@
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=300s

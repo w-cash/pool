@@ -46,6 +46,18 @@ require_safe_name() {
         || die "$label has an unsafe representation"
 }
 
+resolve_release_root() {
+    local candidate=${1:-$ZECWEC_CURRENT_RELEASE}
+    require_absolute_path "$candidate"
+    [[ -e $candidate || -L $candidate ]] || die "selected release is unavailable"
+    local resolved
+    resolved=$(realpath -e -- "$candidate")
+    [[ $resolved =~ ^/opt/wcash/releases/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ \
+        && -d $resolved && ! -L $resolved ]] \
+        || die "selected release is not one canonical immutable version directory"
+    printf '%s' "$resolved"
+}
+
 require_private_regular_file() {
     local path=${1:?path is required}
     require_absolute_path "$path"
@@ -56,6 +68,26 @@ require_private_regular_file() {
     links=$(stat -c '%h' -- "$path")
     [[ $owner == 0 && $mode == 600 && $links == 1 ]] \
         || die "protected input must be root-owned, mode 0600, with one link"
+}
+
+require_trusted_etc_file() {
+    local path=${1:?path is required}
+    local private=${2:-false}
+    require_absolute_path "$path"
+    [[ $path == /etc/* && -f $path ]] || die "trusted file must resolve below /etc"
+    local resolved
+    resolved=$(realpath -e -- "$path")
+    [[ $resolved == /etc/* && -f $resolved && ! -L $resolved ]] \
+        || die "trusted file resolves outside /etc or is not regular"
+    local owner mode links forbidden
+    owner=$(stat -Lc '%u' -- "$path")
+    mode=$(stat -Lc '%a' -- "$path")
+    links=$(stat -Lc '%h' -- "$path")
+    forbidden=022
+    $private && forbidden=077
+    [[ $owner == 0 && $links == 1 && $mode =~ ^[0-7]{3,4}$ \
+        && $((8#$mode & 8#$forbidden)) -eq 0 ]] \
+        || die "trusted file ownership, mode, or link count is unsafe"
 }
 
 install_private_file() {

@@ -22,19 +22,29 @@ service is the only expected non-backend member of that group.
 
 1. Build the four release binaries on a reviewed x86-64 builder and create an
    exact `SHA256SUMS` file: `wcash-poold`, `wcash-merge-miner`, `wcash-wallet`,
-   and the Zallet beta.3 binary used by the deployment.
+   and the Zallet beta.3 binary used by the deployment. Installation snapshots
+   this deployment package beside the binaries and verifies a second manifest.
 2. Copy `deploy/config/deployment.env.example` to a protected operator file,
    replace every `CHANGE_ME` value, and review the two genesis byte orders.
+   Leave only the five exact wallet-discovery sentinels until the fresh wallets
+   provide their public account UUIDs, Zallet account index, and payout
+   commitments.
 3. Run `scripts/deploy/provision-host.sh`. If an old service uses the
    `wcash-pool.service` name, archive and disable it now with
    `disable-legacy-pool.sh`; the renderer refuses to overwrite it.
 4. Run `scripts/deploy/install-release.sh`. It does not start a public service.
-5. Install the Wcash seed with `install-protected-seed.sh`; install the backend
-   payout credentials with `install-backend-credentials.sh`.
+5. Install a fresh, dedicated Wcash collector seed with
+   `install-protected-seed.sh` and prepare its address/IVK plus a fresh Zcash
+   Ironwood address without installing them into runtime yet.
 6. Run `provision-postgres.sh`. It creates or reconciles independent database
    roles and protected connection credentials without printing passwords.
-7. Run `render-deployment.sh bootstrap`, initialize or restore Zallet, then
-   start `wcash-pool-backend-init.service` exactly as described in the runbook.
+7. Run `render-deployment.sh wallet-bootstrap`, initialize and fully sync the
+   Wcash wallet through its supervised one-shot unit, and review its emitted
+   public authority. Perform the reviewed Zallet handover into a fresh empty
+   account. Replace all discovery sentinels, install the matching collector
+   credentials, then run `render-deployment.sh bootstrap`. The native ZEC
+   authority gate must seal its initial-zero evidence before the backend can
+   initialize. Archive any incompatible legacy share journal first.
 8. Run `render-deployment.sh finalize`; inspect both generated pool policies,
    run `wcash-pool-migrate.service`, and run `preflight.sh`.
 9. Apply `restrict-mining-firewall.sh` with explicit ASIC source CIDRs. It
@@ -43,6 +53,11 @@ service is the only expected non-backend member of that group.
     source-restricted mining; the portal site stays disabled. Only after the
     end-to-end payout/restart/reorg gate passes may an operator acknowledge
     portal publication, add more source CIDRs, or publish mining DNS.
+
+The portal origin is not directly reachable even though mining DNS reveals the
+server IP. Its nginx virtual host requires Cloudflare Authenticated Origin
+Pulls and forwards only Cloudflare's overwritten client-IP header. Plain HTTP
+returns no application response.
 
 See [`docs/zecwec-testnet-deployment.md`](../docs/zecwec-testnet-deployment.md)
 for the exact runbook, security invariants, rollback procedure, and outstanding

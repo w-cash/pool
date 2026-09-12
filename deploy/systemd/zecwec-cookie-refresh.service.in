@@ -1,0 +1,32 @@
+[Unit]
+Description=Refresh ZecWec Testnet systemd credential snapshots
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+After=@WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/refresh-runtime-credentials.sh reconcile /etc/wcash-pool/deployment.env
+TimeoutStartSec=3300s
+StateDirectory=zecwec-cookie-refresh
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

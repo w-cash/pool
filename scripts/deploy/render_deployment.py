@@ -44,6 +44,7 @@ REQUIRED = {
     "ZCASH_TEMPLATE_RPC_URL",
     "ZCASH_VALIDATOR_RPC_URL",
     "WCASH_LIGHTWALLETD_ENDPOINT",
+    "WCASH_LIGHTWALLETD_UNIT",
     "ZALLET_RPC",
     "ZCASH_NODE_RPC",
     "WCASH_NODE_UNIT",
@@ -60,6 +61,9 @@ REQUIRED = {
     "ZALLET_STATE_DIR",
     "ZALLET_CONFIG_FILE",
     "WCASH_WALLET_DATABASE",
+    "WCASH_WALLET_BIRTHDAY",
+    "WCASH_WALLET_SYNC_BATCH_SIZE",
+    "WCASH_WALLET_SYNC_TIMEOUT_SECONDS",
     "WEC_SIGNER_JOURNAL",
     "ZEC_SIGNER_JOURNAL",
     "WCASH_PAYOUT_ADDRESS_CREDENTIAL",
@@ -95,6 +99,7 @@ REQUIRED = {
     "ZEC_MAXIMUM_NETWORK_FEE_BPS",
     "ZEC_POLICY_VERSION",
     "ZCASH_SIGNER_ACCOUNT_INDEX",
+    "CLOUDFLARE_ORIGIN_PULL_CA",
     "APEX_TLS_CERT",
     "APEX_TLS_KEY",
     "PORTAL_TLS_CERT",
@@ -118,7 +123,7 @@ PATH_KEYS = {
         or key.endswith("_KEY")
         or key in {"BACKEND_SOCKET"}
     )
-}
+} | {"CLOUDFLARE_ORIGIN_PULL_CA"}
 
 HEX_KEYS = {
     "WCASH_GENESIS_DISPLAY",
@@ -150,6 +155,9 @@ INTEGER_RANGES = {
     "AUTHENTICATION_PARALLELISM": (1, 32),
     "BACKEND_LISTENERS": (1, 16),
     "WCASH_VALIDATION_LIMIT": (1, 1024),
+    "WCASH_WALLET_BIRTHDAY": (1, 2**32 - 1),
+    "WCASH_WALLET_SYNC_BATCH_SIZE": (1, 16),
+    "WCASH_WALLET_SYNC_TIMEOUT_SECONDS": (30, 900),
     "WEC_PPLNS_WINDOW_WORK": (1, 2**256 - 1),
     "WEC_PAYOUT_THRESHOLD_ZAT": (1, 2**64 - 1),
     "WEC_REQUIRED_CONFIRMATIONS": (100, 1_000_000),
@@ -167,15 +175,33 @@ INTEGER_RANGES = {
     "ZCASH_SIGNER_ACCOUNT_INDEX": (0, 2**31 - 1),
 }
 
-BOOTSTRAP_TEMPLATES = {
-    "deploy/config/backend.env.in": "backend.env",
+DISCOVERY_SENTINEL = "BOOTSTRAP_DISCOVERY_REQUIRED"
+DISCOVERABLE_UUID_KEYS = {"WCASH_SIGNER_ACCOUNT", "ZCASH_SIGNER_ACCOUNT"}
+DISCOVERABLE_HEX_KEYS = {
+    "WCASH_PAYOUT_COMMITMENT_WIRE",
+    "ZCASH_PAYOUT_COMMITMENT_WIRE",
+}
+DISCOVERABLE_INTEGER_KEYS = {"ZCASH_SIGNER_ACCOUNT_INDEX"}
+
+WALLET_BOOTSTRAP_TEMPLATES = {
+    "deploy/config/wcash-wallet-bootstrap.env.in": "wcash-wallet-bootstrap.env",
     "deploy/config/zallet.testnet.toml.in": "zallet.toml",
+    "deploy/systemd/wcash-pool-wallet-init.service.in": "systemd/wcash-pool-wallet-init.service",
+    "deploy/systemd/zecwec-zallet.service.in": "systemd/zecwec-zallet.service",
+}
+
+DEPLOYMENT_TEMPLATES = {
+    **WALLET_BOOTSTRAP_TEMPLATES,
+    "deploy/config/zec-authority.testnet.toml.in": "zec-authority.testnet.toml",
+    "deploy/config/backend.env.in": "backend.env",
+    "deploy/systemd/wcash-pool-zec-authority-bootstrap.service.in": "systemd/wcash-pool-zec-authority-bootstrap.service",
     "deploy/systemd/wcash-pool-backend-init.service.in": "systemd/wcash-pool-backend-init.service",
     "deploy/systemd/wcash-pool-backend.service.in": "systemd/wcash-pool-backend.service",
-    "deploy/systemd/zecwec-zallet.service.in": "systemd/zecwec-zallet.service",
     "deploy/systemd/wcash-pool-migrate.service.in": "systemd/wcash-pool-migrate.service",
     "deploy/systemd/wcash-pool.service.in": "systemd/wcash-pool.service",
     "deploy/systemd/wcash-pool-preflight.service.in": "systemd/wcash-pool-preflight.service",
+    "deploy/systemd/zecwec-cookie-refresh.path.in": "systemd/zecwec-cookie-refresh.path",
+    "deploy/systemd/zecwec-cookie-refresh.service.in": "systemd/zecwec-cookie-refresh.service",
     "deploy/systemd/wcash-pool-health.service.in": "systemd/wcash-pool-health.service",
     "deploy/systemd/wcash-pool-health.timer.in": "systemd/wcash-pool-health.timer",
     "deploy/systemd/zecwec-testnet-pool.target.in": "systemd/zecwec-testnet-pool.target",
@@ -188,7 +214,7 @@ def fail(message: str) -> NoReturn:
     raise SystemExit(f"render-deployment: {message}")
 
 
-def read_settings(path: pathlib.Path) -> dict[str, str]:
+def read_settings(path: pathlib.Path, phase: str) -> dict[str, str]:
     if not path.is_file() or path.is_symlink():
         fail("settings must be a regular, non-symlink file")
     values: dict[str, str] = {}
@@ -214,6 +240,14 @@ def read_settings(path: pathlib.Path) -> dict[str, str]:
         fail(f"unexpected settings: {', '.join(unexpected)}")
     if any("CHANGE_ME" in values[key] for key in REQUIRED):
         fail("every CHANGE_ME value must be replaced")
+    sentinel_keys = {key for key, value in values.items() if value == DISCOVERY_SENTINEL}
+    allowed_sentinels = (
+        DISCOVERABLE_UUID_KEYS | DISCOVERABLE_HEX_KEYS | DISCOVERABLE_INTEGER_KEYS
+    )
+    if sentinel_keys - allowed_sentinels:
+        fail("bootstrap discovery sentinel is not valid for this setting")
+    if sentinel_keys and phase != "wallet-bootstrap":
+        fail("bootstrap discovery values must be replaced before authority initialization")
     return values
 
 
@@ -250,25 +284,34 @@ def validate_loopback_url(value: str, key: str) -> None:
         fail(f"{key} must use a literal loopback address and nonzero port")
 
 
-def validate(values: dict[str, str]) -> None:
+def validate(values: dict[str, str], phase: str) -> None:
     for key in PATH_KEYS:
         validate_path(values[key], key)
 
     for key in HEX_KEYS:
+        if phase == "wallet-bootstrap" and values[key] == DISCOVERY_SENTINEL:
+            continue
         if not re.fullmatch(r"[0-9a-f]{64}", values[key]) or int(values[key], 16) == 0:
             fail(f"{key} must be nonzero lowercase 32-byte hexadecimal")
 
     for key in UUID_KEYS:
+        if phase == "wallet-bootstrap" and values[key] == DISCOVERY_SENTINEL:
+            continue
         try:
             parsed = uuid.UUID(values[key])
         except ValueError:
             fail(f"{key} must be a canonical UUID")
         if parsed.int == 0 or str(parsed) != values[key]:
             fail(f"{key} must be a canonical nonzero UUID")
-    if len({values[key] for key in UUID_KEYS}) != len(UUID_KEYS):
+    configured_uuids = [
+        values[key] for key in UUID_KEYS if values[key] != DISCOVERY_SENTINEL
+    ]
+    if len(set(configured_uuids)) != len(configured_uuids):
         fail("deployment, pool, and signer UUIDs must be distinct")
 
     for key, (minimum, maximum) in INTEGER_RANGES.items():
+        if phase == "wallet-bootstrap" and values[key] == DISCOVERY_SENTINEL:
+            continue
         try:
             number = int(values[key], 10)
         except ValueError:
@@ -280,8 +323,8 @@ def validate(values: dict[str, str]) -> None:
         fail("MAXIMUM_MINERS_PER_IP must not exceed MAXIMUM_MINERS")
     if int(values["INITIAL_SHARE_TARGET_BE"], 16) > int(values["EASIEST_SHARE_TARGET_BE"], 16):
         fail("initial share target must not be easier than the safety ceiling")
-    if values["WCASH_PAYOUT_MODE"] not in {"transparent", "ironwood"}:
-        fail("WCASH_PAYOUT_MODE must be transparent or ironwood")
+    if values["WCASH_PAYOUT_MODE"] != "ironwood":
+        fail("WCASH_PAYOUT_MODE must be ironwood for the Testnet pool")
 
     for prefix in ("WCASH", "ZCASH"):
         display = bytes.fromhex(values[f"{prefix}_GENESIS_DISPLAY"])
@@ -332,7 +375,12 @@ def validate(values: dict[str, str]) -> None:
     if (wcash_backend.hostname, wcash_backend.port) != (str(wcash_node_ip), wcash_node_port):
         fail("WCASH_NODE_RPC must match the Wcash backend RPC origin")
 
-    for key in ("WCASH_NODE_UNIT", "ZCASH_TEMPLATE_UNIT", "ZCASH_VALIDATOR_UNIT"):
+    for key in (
+        "WCASH_NODE_UNIT",
+        "WCASH_LIGHTWALLETD_UNIT",
+        "ZCASH_TEMPLATE_UNIT",
+        "ZCASH_VALIDATOR_UNIT",
+    ):
         if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}\.service", values[key]):
             fail(f"{key} must be a concrete systemd service name")
     for key in ("POSTGRES_DATABASE", "POSTGRES_MIGRATOR_ROLE", "POSTGRES_RUNTIME_ROLE"):
@@ -359,6 +407,7 @@ def validate(values: dict[str, str]) -> None:
         "PORTAL_TOTP_KEY_CREDENTIAL": "/etc/wcash-pool/credentials/portal-totp-key",
         "DATABASE_MIGRATOR_URL_CREDENTIAL": "/etc/wcash-pool/credentials/database-url-migrator",
         "DATABASE_RUNTIME_URL_CREDENTIAL": "/etc/wcash-pool/credentials/database-url-runtime",
+        "CLOUDFLARE_ORIGIN_PULL_CA": "/etc/wcash-pool/tls/cloudflare-origin-pull-ca.pem",
     }
     for key, expected in exact_paths.items():
         if values[key] != expected:
@@ -387,7 +436,7 @@ def load_authority(
     path: pathlib.Path,
     chain_id: int,
     listener_workers: int,
-    share_target: str,
+    expected: dict[str, str],
 ) -> dict[str, str]:
     if not path.is_file() or path.is_symlink():
         fail("finalize requires the backend authority file")
@@ -397,17 +446,37 @@ def load_authority(
         journal = uuid.UUID(authority["journal_stream"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         fail("backend authority file is invalid")
+    required = {
+        "command",
+        "result",
+        "backend_instance",
+        "journal_stream",
+        "event_seq",
+        "chain_id",
+        "listener_workers",
+        "wcash_genesis",
+        "zcash_genesis",
+        "wcash_payout_commitment",
+        "zcash_payout_commitment",
+        "share_target_ceiling",
+        "share_target_ceiling_byte_order",
+    }
+    if set(authority) != required:
+        fail("backend authority has an unexpected schema")
     if (
         authority.get("command") != "pool-backend-init"
         or authority.get("result")
         not in {"initialized", "resumed_identity", "already_initialized"}
         or authority.get("chain_id") != chain_id
         or authority.get("listener_workers") != listener_workers
-        or authority.get("share_target_ceiling") != share_target
+        or authority.get("share_target_ceiling_byte_order") != "big_endian"
         or not isinstance(authority.get("event_seq"), int)
         or authority["event_seq"] < 0
     ):
         fail("backend authority does not match the configured chain")
+    for key, configured in expected.items():
+        if authority.get(key) != configured:
+            fail(f"backend authority field does not match the configured chain: {key}")
     if (
         backend.int == 0
         or journal.int == 0
@@ -448,30 +517,43 @@ def render(template: pathlib.Path, output: pathlib.Path, values: dict[str, str])
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("bootstrap", "finalize"))
+    parser.add_argument("phase", choices=("wallet-bootstrap", "bootstrap", "finalize"))
     parser.add_argument("--settings", required=True, type=pathlib.Path)
     parser.add_argument("--authority", type=pathlib.Path)
     parser.add_argument("--source-root", required=True, type=pathlib.Path)
-    parser.add_argument("--release-root", default="/opt/wcash/current", type=pathlib.Path)
+    parser.add_argument("--release-root", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--pool-uid", required=True, type=int)
     args = parser.parse_args()
 
-    values = read_settings(args.settings)
-    validate(values)
+    values = read_settings(args.settings, args.phase)
+    validate(values, args.phase)
+    try:
+        release_root = args.release_root.resolve(strict=True)
+    except OSError:
+        fail("release root is unavailable")
+    if release_root != args.release_root or not release_root.is_dir() or release_root.is_symlink():
+        fail("release root must be one exact canonical directory, never a symlink")
     values["POOL_UID"] = str(args.pool_uid)
-    values["WCASH_WALLET_SHA256"] = hash_file(args.release_root / "wcash-wallet")
+    values["WCASH_RELEASE_ROOT"] = str(release_root)
+    values["WCASH_WALLET_AUTHORITY"] = "/var/lib/wcash-pool/wcash-wallet-authority.json"
+    values["ZCASH_INITIAL_ZERO_RESULT"] = (
+        "/var/lib/wcash-pool-backend/zec-collector-initial-zero.json"
+    )
+    values["ZCASH_INITIAL_ZERO_ATTESTATION"] = (
+        "/var/lib/wcash-pool-backend/zec-collector-initial-zero.attestation"
+    )
+    values["WCASH_WALLET_SHA256"] = hash_file(release_root / "wcash-wallet")
     values["ZCASH_VALIDATOR_RPC_SOCKET"] = urllib.parse.urlsplit(
         values["ZCASH_VALIDATOR_RPC_URL"]
     ).netloc
     values["STRATUM_PORT"] = values["STRATUM_LISTEN"].rsplit(":", 1)[1]
     values["WCASH_IVK_LOAD_CREDENTIAL"] = (
         f'LoadCredential=wcash-payout-ivk:{values["WCASH_PAYOUT_IVK_CREDENTIAL"]}'
-        if values["WCASH_PAYOUT_MODE"] == "ironwood"
-        else ""
     )
 
     runtime_dir = "/run/credentials/wcash-pool.service"
+    preflight_dir = "/run/credentials/wcash-pool-preflight.service"
     migrate_dir = "/run/credentials/wcash-pool-migrate.service"
     values.update(
         {
@@ -485,7 +567,12 @@ def main() -> None:
         }
     )
 
-    for source, destination in BOOTSTRAP_TEMPLATES.items():
+    templates = (
+        WALLET_BOOTSTRAP_TEMPLATES
+        if args.phase == "wallet-bootstrap"
+        else DEPLOYMENT_TEMPLATES
+    )
+    for source, destination in templates.items():
         render(args.source_root / source, args.output / destination, values)
 
     if args.phase == "finalize":
@@ -496,11 +583,30 @@ def main() -> None:
                 args.authority,
                 int(values["WCASH_CHAIN_ID"]),
                 int(values["BACKEND_LISTENERS"]),
-                values["INITIAL_SHARE_TARGET_BE"],
+                {
+                    "wcash_genesis": values["WCASH_GENESIS_WIRE"],
+                    "zcash_genesis": values["ZCASH_GENESIS_WIRE"],
+                    "wcash_payout_commitment": values["WCASH_PAYOUT_COMMITMENT_WIRE"],
+                    "zcash_payout_commitment": values["ZCASH_PAYOUT_COMMITMENT_WIRE"],
+                    "share_target_ceiling": values["EASIEST_SHARE_TARGET_BE"],
+                },
             )
         )
         pool_template = args.source_root / "deploy/config/pool.testnet.toml.in"
         render(pool_template, args.output / "pool.runtime.toml", values)
+        preflight_values = dict(values)
+        preflight_values.update(
+            {
+                "DATABASE_URL_RUNTIME_PATH": f"{preflight_dir}/database-url",
+                "ZALLET_CONFIG_RUNTIME_PATH": f"{preflight_dir}/zallet-config",
+                "ZALLET_COOKIE_RUNTIME_PATH": f"{preflight_dir}/zallet-cookie",
+                "WCASH_COOKIE_RUNTIME_PATH": f"{preflight_dir}/wcash-node-cookie",
+                "ZCASH_COOKIE_RUNTIME_PATH": f"{preflight_dir}/zcash-node-cookie",
+                "PORTAL_PEPPER_RUNTIME_PATH": f"{preflight_dir}/portal-token-pepper",
+                "PORTAL_TOTP_RUNTIME_PATH": f"{preflight_dir}/portal-totp-key",
+            }
+        )
+        render(pool_template, args.output / "pool.preflight.toml", preflight_values)
         migrate_values = dict(values)
         migrate_values.update(
             {
@@ -515,12 +621,21 @@ def main() -> None:
         )
         render(pool_template, args.output / "pool.migrate.toml", migrate_values)
 
+    release_policy = args.output / "release.env"
+    release_policy.write_text(
+        f"ZECWEC_RELEASE_PATH={release_root}\nZECWEC_DEPLOYMENT_SCHEMA=1\n",
+        encoding="utf-8",
+    )
+    os.chmod(release_policy, stat.S_IRUSR | stat.S_IWUSR)
+
     manifest = {
         "network": "testnet",
         "phase": args.phase,
         "deployment_id": values["DEPLOYMENT_ID"],
         "pool_instance": values["POOL_INSTANCE"],
         "wcash_wallet_sha256": values["WCASH_WALLET_SHA256"],
+        "release_root": str(release_root),
+        "deployment_schema": 1,
         "files": sorted(
             str(path.relative_to(args.output))
             for path in args.output.rglob("*")

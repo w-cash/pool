@@ -25,10 +25,21 @@ require_command grep
 require_command ss
 require_command systemctl
 require_private_regular_file "$settings"
+release_policy=/etc/wcash-pool/release.env
+[[ -f $release_policy && ! -L $release_policy \
+    && $(stat -c '%u:%a:%h' -- "$release_policy") == 0:644:1 ]] \
+    || die "rendered release policy is unavailable or unsafe"
+release_root=$(resolve_release_root "$(read_setting "$release_policy" ZECWEC_RELEASE_PATH)")
+[[ $(read_setting "$release_policy" ZECWEC_DEPLOYMENT_SCHEMA) == 1 ]] \
+    || die "rendered deployment schema is unsupported"
 for binary in wcash-poold wcash-merge-miner wcash-wallet zallet; do
-    "$ZECWEC_LIBEXEC/verify-release.sh" "$binary"
+    ZECWEC_RELEASE_PATH=$release_root \
+        "$release_root/deployment/scripts/deploy/verify-release.sh" "$binary"
 done
-for service in postgresql.service zecwec-zallet.service wcash-pool-backend.service wcash-pool.service; do
+ZECWEC_RELEASE_PATH=$release_root \
+    "$release_root/deployment/scripts/deploy/verify-release.sh" deployment-package
+for service in postgresql.service zecwec-zallet.service wcash-pool-backend.service \
+    wcash-pool.service zecwec-cookie-refresh.path; do
     systemctl is-active --quiet "$service" || die "service is not active: $service"
 done
 
@@ -48,5 +59,5 @@ if systemctl is-active --quiet nginx.service; then
     ss -H -ltn "sport = :$tls_port" | grep -q . || die "TLS Stratum listener is unavailable"
 fi
 
-"$ZECWEC_LIBEXEC/restrict-mining-firewall.sh" check "$settings" "$cidrs" >/dev/null
+"$script_dir/restrict-mining-firewall.sh" check "$settings" "$cidrs" >/dev/null
 $quiet || printf '{"healthy":true,"network":"testnet","pool":"zecwec"}\n'

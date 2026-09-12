@@ -46,4 +46,4 @@ trap 'rm -f -- "$temporary"' EXIT
 install -o wcash-pool -g wcash-pool -m 0600 -- "$source_seed" "$temporary"
 mv -fT -- "$temporary" "$destination"
 trap - EXIT
-log "installed the protected Wcash seed; back it up offline before continuing"
+log "installed the dedicated Wcash collector seed; prove its Ironwood balance is zero and back it up offline before continuing"

@@ -16,16 +16,16 @@ cidrs=$2
 require_private_regular_file "$settings"
 require_private_regular_file "$cidrs"
 
-"$ZECWEC_LIBEXEC/restrict-mining-firewall.sh" apply "$settings" "$cidrs"
-"$ZECWEC_LIBEXEC/preflight.sh" "$settings"
-"$ZECWEC_LIBEXEC/enable-nginx-edge.sh" stratum-only "$settings" "$cidrs"
+"$script_dir/restrict-mining-firewall.sh" apply "$settings" "$cidrs"
+"$script_dir/preflight.sh" "$settings"
+"$script_dir/enable-nginx-edge.sh" stratum-only "$settings" "$cidrs"
 
 if ! systemctl start zecwec-testnet-pool.target; then
     systemctl stop zecwec-testnet-pool.target wcash-pool-health.timer wcash-pool.service \
         >/dev/null 2>&1 || true
     die "pool start failed; public pool service was stopped"
 fi
-if ! "$ZECWEC_LIBEXEC/health-check.sh" --settings "$settings" --cidrs "$cidrs"; then
+if ! "$script_dir/health-check.sh" --settings "$settings" --cidrs "$cidrs"; then
     systemctl stop zecwec-testnet-pool.target wcash-pool-health.timer wcash-pool.service \
         >/dev/null 2>&1 || true
     die "post-start health failed; public pool service was stopped"
