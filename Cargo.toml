@@ -7,6 +7,7 @@ members = [
     "crates/wcash-pool-store",
     "crates/wcash-pool-protocol",
     "crates/wcash-pool-portal",
+    "crates/wcash-zec-payout-signer",
     "crates/wcash-poold",
 ]
 resolver = "2"
@@ -34,13 +35,14 @@ num-bigint = "0.4.6"
 num-traits = "0.2.19"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1.0.225", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = { version = "1.0.145", features = ["arbitrary_precision"] }
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "migrate", "macros", "json"] }
 subtle = "2.6.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+toml = "0.8.23"
 tower = { version = "0.5.2", features = ["util"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 zeroize = "1.8.1"
