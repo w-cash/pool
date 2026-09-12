@@ -5,9 +5,9 @@ use std::{io, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time};
 use wcash_pool_address::{TestnetAddressValidator, WcashCommandValidator};
 use wcash_pool_portal::{
-    serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
-    PoolDataSource, PortalApp, PortalBuildError, PortalConfig, PortalRepository, PortalSecrets,
-    TestnetPayoutBoundary,
+    serve_until_shutdown, AddressValidator, Asset, ChainNetwork, DisabledPayoutSigner,
+    IsolatedPayoutSigner, PoolDataSource, PortalApp, PortalBuildError, PortalConfig,
+    PortalRepository, PortalSecrets, TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
     Chain, NonceNamespaceClaim, PostgresPoolDataSource, PostgresStore, StoreError,
@@ -16,7 +16,9 @@ use wcash_wec_payout_signer::{
     SeedSource, WalletFundSource, WalletNetwork, WecPayoutSigner, WecSignerConfig,
     WCASH_TESTNET_BRANCH_ID,
 };
-use wcash_zec_payout_signer::{LoopbackHttpTransport, ZecPcztSigner, ZecSignerConfig};
+use wcash_zec_payout_signer::{
+    validate_zallet_configuration, LoopbackHttpTransport, ZecPcztSigner, ZecSignerConfig,
+};
 
 use crate::{
     bootstrap::{self, BootstrapError, MiningBootstrap},
@@ -84,19 +86,20 @@ pub async fn run(config: RuntimeConfig) -> Result<(), ServiceError> {
     combine_service_and_cleanup(service_result, cleanup_result)
 }
 
-/// Exercises the complete non-listening service dependency graph once.
+/// Exercises the non-listening, probe-only service dependency graph once.
 ///
 /// Unlike [`run`], this path starts no share, payout, portal, refresh, nonce,
-/// or socket task. The backend connection and nonce lease are released by the
-/// bootstrap before signer and validator probes run, and every remaining
-/// resource is owned by this future and dropped before it returns.
+/// or socket task. It never constructs signer journals or payout runtimes and
+/// never creates, recovers, signs, observes, synchronizes, or broadcasts a
+/// transaction. Durable payout recovery remains part of [`run`] after this
+/// service-manager probe succeeds. Every resource is dropped before return.
 pub async fn preflight(config: &RuntimeConfig) -> Result<(), ServiceError> {
     let started = bootstrap::preflight(config).await?;
     let mut probe = LivePreflightProbe {
         config,
         started,
         validator: None,
-        payouts: None,
+        payout_boundary: None,
     };
     exercise_preflight(&mut probe).await
 }
@@ -117,7 +120,7 @@ struct LivePreflightProbe<'a> {
     config: &'a RuntimeConfig,
     started: bootstrap::MiningPreflight,
     validator: Option<Arc<dyn AddressValidator>>,
-    payouts: Option<PayoutServices>,
+    payout_boundary: Option<Arc<TestnetPayoutBoundary>>,
 }
 
 impl PreflightProbe for LivePreflightProbe<'_> {
@@ -129,19 +132,17 @@ impl PreflightProbe for LivePreflightProbe<'_> {
     }
 
     async fn payout_composition(&mut self) -> Result<(), ServiceError> {
-        let payouts = build_payout_services(
-            self.config,
-            Arc::clone(&self.started.store),
-            &self.started.jobs,
-        )
-        .await?;
-        self.payouts = Some(payouts);
+        self.payout_boundary =
+            Some(build_probe_only_payout_boundary(self.config, &self.started.jobs).await?);
         Ok(())
     }
 
     async fn portal_composition(&mut self) -> Result<(), ServiceError> {
         let validator = self.validator.clone().ok_or(ServiceError::Invariant)?;
-        let payouts = self.payouts.as_ref().ok_or(ServiceError::Invariant)?;
+        let payout = self
+            .payout_boundary
+            .clone()
+            .ok_or(ServiceError::Invariant)?;
         let pool_data = PostgresPoolDataSource::new(self.started.store.as_ref().clone());
         pool_data.refresh().await?;
         let portal = build_preflight_portal(
@@ -149,7 +150,7 @@ impl PreflightProbe for LivePreflightProbe<'_> {
             Arc::clone(&self.started.store),
             validator,
             pool_data,
-            Arc::clone(&payouts.portal),
+            payout,
         )?;
         drop(portal);
         Ok(())
@@ -375,6 +376,115 @@ struct PayoutServices {
     portal: Arc<TestnetPayoutBoundary>,
     wec: Arc<AutomaticPayoutRuntime>,
     zec: Arc<AutomaticPayoutRuntime>,
+}
+
+/// Builds the payout-facing portal dependency after configuration and
+/// read-only chain authority checks, without constructing any signer journal,
+/// settlement orchestrator, wallet observer, or automatic payout runtime.
+///
+/// In particular, this path cannot create, recover, sign, rebroadcast, or
+/// reconcile a payout. Those durable transitions remain exclusive to
+/// [`build_payout_services`] during actual service startup.
+async fn build_probe_only_payout_boundary(
+    config: &RuntimeConfig,
+    jobs: &wcash_pool_edge::JobRouter,
+) -> Result<Arc<TestnetPayoutBoundary>, ServiceError> {
+    validate_probe_only_payout_configuration(config)?;
+
+    let wcash_rpc = Arc::new(
+        LoopbackJsonRpc::new(config.wcash_node_rpc, config.wcash_node_cookie_file.clone())
+            .map_err(|_| ServiceError::PayoutAuthorityConfiguration)?,
+    );
+    let zcash_rpc = Arc::new(
+        LoopbackJsonRpc::new(config.zcash_node_rpc, config.zcash_node_cookie_file.clone())
+            .map_err(|_| ServiceError::PayoutAuthorityConfiguration)?,
+    );
+    let wcash_authority = NodePayoutAuthority::new(Chain::Wcash, wcash_rpc, config.wcash_genesis)?;
+    let zcash_authority = NodePayoutAuthority::new(Chain::Zcash, zcash_rpc, config.zcash_genesis)?;
+    let (wcash_tip, zcash_tip) = tokio::join!(
+        wcash_authority.preflight_probe(),
+        zcash_authority.preflight_probe()
+    );
+    let wcash_tip = wcash_tip.map_err(map_authority_failure)?;
+    let zcash_tip = zcash_tip.map_err(map_authority_failure)?;
+    verify_backend_authority(
+        jobs,
+        AuthorityTip {
+            hash: wcash_tip.hash,
+            height: wcash_tip.height,
+        },
+        AuthorityTip {
+            hash: zcash_tip.hash,
+            height: zcash_tip.height,
+        },
+    )?;
+
+    // Preflight composes the portal without giving it an execution-capable
+    // signer. No listener is opened, and the boundary is dropped on return.
+    Ok(Arc::new(TestnetPayoutBoundary::new(Arc::new(
+        DisabledPayoutSigner,
+    ))))
+}
+
+fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<(), ServiceError> {
+    let pinned = PinnedWolfProgram::verify(
+        config.wcash_wallet_program.clone(),
+        config.wcash_wallet_sha256,
+        config.wcash_wallet_uid,
+    )
+    .map_err(|_| ServiceError::SignerConfiguration)?;
+    let wallet = WolfWalletTransport::new(
+        pinned,
+        config.wcash_wallet_database.clone(),
+        config.wcash_lightwalletd_endpoint.clone(),
+    )
+    .map_err(|_| ServiceError::SignerConfiguration)?;
+    wallet
+        .probe_readonly_boundary()
+        .map_err(|_| ServiceError::SignerConfiguration)?;
+
+    let seed =
+        SeedSource::protected_file(config.wcash_wallet_seed_file.clone(), config.wcash_seed_uid);
+    seed.validate_protected_metadata()
+        .map_err(|_| ServiceError::SignerConfiguration)?;
+    let _wec = WecSignerConfig::new(
+        config.wcash_signer_journal_directory.clone(),
+        config.wcash_signer_account,
+        config.wcash_payout_commitment,
+        seed,
+    )
+    .and_then(|configured| {
+        configured.with_confirmations(config.wcash_policy.required_confirmations)
+    })
+    .and_then(|configured| {
+        configured.with_max_outputs(config.wcash_policy.maximum_payout_outputs as usize)
+    })
+    .and_then(|configured| configured.with_max_fee_zat(config.wcash_policy.maximum_network_fee_zat))
+    .map_err(|_| ServiceError::SignerConfiguration)?;
+
+    validate_zallet_configuration(&config.zallet_configuration)
+        .map_err(|_| ServiceError::SignerConfiguration)?;
+    let _zallet = LoopbackHttpTransport::new(config.zallet_rpc, config.zallet_cookie_file.clone())
+        .map_err(|_| ServiceError::SignerConfiguration)?;
+    let _zebra =
+        LoopbackHttpTransport::new(config.zcash_node_rpc, config.zcash_node_cookie_file.clone())
+            .map_err(|_| ServiceError::SignerConfiguration)?;
+    let _zec = ZecSignerConfig::new(
+        config.zcash_signer_journal_directory.clone(),
+        config.zallet_configuration.clone(),
+        config.zcash_signer_account,
+        config.zcash_payout_commitment,
+    )
+    .and_then(|configured| {
+        configured.with_min_confirmations(config.zcash_policy.required_confirmations)
+    })
+    .and_then(|configured| {
+        configured.with_max_outputs(config.zcash_policy.maximum_payout_outputs as usize)
+    })
+    .and_then(|configured| configured.with_max_fee_zat(config.zcash_policy.maximum_network_fee_zat))
+    .map_err(|_| ServiceError::SignerConfiguration)?;
+
+    Ok(())
 }
 
 async fn build_payout_services(
@@ -980,12 +1090,35 @@ pub enum ServiceError {
 mod tests {
     #![allow(clippy::expect_used, clippy::panic)]
 
+    #[cfg(unix)]
+    use std::{
+        fs,
+        net::SocketAddr,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        str::FromStr,
+        time::Duration,
+    };
+
+    #[cfg(unix)]
+    use num_bigint::BigUint;
+    #[cfg(unix)]
+    use sha2::{Digest, Sha256};
+    #[cfg(unix)]
+    use tempfile::TempDir;
+    #[cfg(unix)]
+    use uuid::Uuid;
+    #[cfg(unix)]
+    use wcash_zec_payout_signer::ZALLET_API_VERSION;
+
     use super::{
         backend_tip_facts_match, combine_service_and_cleanup, exercise_preflight,
-        retain_first_error, AuthorityTip, PreflightProbe, ServiceError,
-        MAX_WEC_IN_FLIGHT_PASS_SECS, PAYOUT_MAXIMUM_CONFIRMATION_WATCHES,
+        retain_first_error, validate_probe_only_payout_configuration, AuthorityTip, PreflightProbe,
+        ServiceError, MAX_WEC_IN_FLIGHT_PASS_SECS, PAYOUT_MAXIMUM_CONFIRMATION_WATCHES,
         REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT, SERVICE_DRAIN_TIMEOUT,
     };
+    #[cfg(unix)]
+    use crate::config::{ChainRuntimePolicy, RuntimeConfig};
 
     #[derive(Clone, Copy)]
     enum BrokenPreflightGate {
@@ -1071,6 +1204,142 @@ mod tests {
             .await
             .expect("every required dependency is healthy");
         assert_eq!(healthy.calls, ["address", "payout", "portal"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payout_preflight_cannot_invoke_wallet_effects_or_create_runtime_state() {
+        let root = TempDir::new().expect("temporary preflight root");
+        let root = fs::canonicalize(root.path()).expect("canonical preflight root");
+        let marker = root.join("wallet-was-invoked");
+        let program_bytes = format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexit 97\n",
+            marker.display()
+        )
+        .into_bytes();
+        let program = write_probe_file(&root, "wcash-wallet", &program_bytes, 0o700);
+        let wallet_database = write_probe_file(&root, "wallet.sqlite", b"probe-only", 0o600);
+        let seed_bytes = format!("{}\n", "42".repeat(32)).into_bytes();
+        let seed = write_probe_file(&root, "wcash-seed", &seed_bytes, 0o600);
+        let zallet = write_probe_file(
+            &root,
+            "zallet.toml",
+            format!(
+                "[consensus]\nnetwork = \"test\"\n[external]\nbroadcast = false\n[features]\nas_of_version = \"{ZALLET_API_VERSION}\"\n[rpc]\nbind = [\"127.0.0.1:28232\"]\n"
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let zallet_cookie = write_probe_file(&root, "zallet.cookie", b"user:password", 0o600);
+        let zcash_cookie = write_probe_file(&root, "zcash.cookie", b"user:password", 0o600);
+        let wcash_cookie = write_probe_file(&root, "wcash.cookie", b"user:password", 0o600);
+        let database_url =
+            write_probe_file(&root, "database-url", b"postgresql://pool@/zecwec", 0o600);
+        let pepper = write_probe_file(&root, "pepper", &[0x81; 32], 0o600);
+        let totp = write_probe_file(&root, "totp", &[0x82; 32], 0o600);
+        let wec_journal = root.join("wec-journal");
+        let zec_journal = root.join("zec-journal");
+        let wallet_digest: [u8; 32] = Sha256::digest(&program_bytes).into();
+        let before = directory_names(&root);
+
+        let policy = ChainRuntimePolicy {
+            pplns_window_work: BigUint::from(1_u8),
+            payout_threshold_zat: 100_000_000,
+            required_confirmations: 100,
+            maximum_payout_outputs: 50,
+            maximum_network_fee_zat: 1_000_000,
+            maximum_network_fee_bps: 100,
+            policy_version: 1,
+        };
+        let config = RuntimeConfig {
+            deployment_id: Uuid::from_u128(1),
+            pool_instance: Uuid::from_u128(2),
+            backend_instance: Uuid::from_u128(3),
+            journal_stream: Uuid::from_u128(4),
+            chain_id: 1_991_772_603,
+            wcash_genesis: [1; 32],
+            zcash_genesis: [2; 32],
+            wcash_payout_commitment: [3; 32],
+            zcash_payout_commitment: [4; 32],
+            backend_socket: root.join("backend.sock"),
+            database_url_file: database_url,
+            stratum_listen: SocketAddr::from_str("0.0.0.0:28237").expect("stratum address"),
+            portal_listen: SocketAddr::from_str("127.0.0.1:8080").expect("portal address"),
+            portal_origin: "https://testnet.zecwec.com".to_owned(),
+            nonce_namespace: 1,
+            nonce_reservation: 1_000_000,
+            database_connections: 8,
+            maximum_miners: 1_024,
+            maximum_miners_per_ip: 8,
+            authentication_parallelism: 4,
+            wcash_wallet_program: program,
+            wcash_wallet_sha256: wallet_digest,
+            wcash_wallet_uid: rustix::process::geteuid().as_raw(),
+            wcash_wallet_database: wallet_database.clone(),
+            wcash_lightwalletd_endpoint: "http://127.0.0.1:38234".to_owned(),
+            wcash_wallet_sync_batch_size: 16,
+            wcash_wallet_sync_timeout: Duration::from_secs(300),
+            wcash_node_rpc: SocketAddr::from_str("127.0.0.1:38232").expect("Wcash RPC address"),
+            wcash_node_cookie_file: wcash_cookie,
+            wcash_wallet_seed_file: seed.clone(),
+            wcash_seed_uid: rustix::process::geteuid().as_raw(),
+            wcash_signer_journal_directory: wec_journal.clone(),
+            wcash_signer_account: Uuid::from_u128(5),
+            zallet_configuration: zallet,
+            zallet_rpc: SocketAddr::from_str("127.0.0.1:28232").expect("Zallet RPC address"),
+            zallet_cookie_file: zallet_cookie,
+            zcash_node_rpc: SocketAddr::from_str("127.0.0.1:18242").expect("Zcash RPC address"),
+            zcash_node_cookie_file: zcash_cookie,
+            zcash_signer_journal_directory: zec_journal.clone(),
+            zcash_signer_account: Uuid::from_u128(6),
+            zcash_signer_account_index: 0,
+            portal_token_pepper_file: pepper,
+            portal_totp_key_file: totp,
+            wcash_policy: policy.clone(),
+            zcash_policy: policy,
+            initial_share_target_be: [6; 32],
+            easiest_share_target_be: [7; 32],
+        };
+
+        validate_probe_only_payout_configuration(&config)
+            .expect("probe-only payout configuration is valid");
+
+        assert_eq!(directory_names(&root), before);
+        assert!(!marker.exists(), "the wallet executable must not run");
+        assert!(
+            !wec_journal.exists(),
+            "WEC signer journal must not be created"
+        );
+        assert!(
+            !zec_journal.exists(),
+            "ZEC signer journal must not be created"
+        );
+        assert!(!root.join("wallet.sqlite-wal").exists());
+        assert!(!root.join("wallet.sqlite-shm").exists());
+        assert_eq!(
+            fs::read(wallet_database).expect("wallet database"),
+            b"probe-only"
+        );
+        assert_eq!(fs::read(seed).expect("seed credential"), seed_bytes);
+    }
+
+    #[cfg(unix)]
+    fn write_probe_file(root: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, bytes).expect("write probe fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .expect("set probe fixture permissions");
+        path
+    }
+
+    #[cfg(unix)]
+    fn directory_names(root: &Path) -> Vec<PathBuf> {
+        let mut names = fs::read_dir(root)
+            .expect("read probe directory")
+            .map(|entry| entry.expect("probe directory entry").path())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     #[test]

@@ -457,6 +457,15 @@ impl NodePayoutAuthority {
         })
     }
 
+    /// Verifies chain identity and one stable best tip using read-only RPCs.
+    ///
+    /// The service-manager preflight path must not exercise transaction lookup
+    /// or submission capabilities: those belong to the payout runtime after
+    /// `ExecStartPre` has completed.
+    pub(crate) async fn preflight_probe(&self) -> Result<VerifiedTip, ObservationFailure> {
+        self.verified_tip().await
+    }
+
     /// Proves the exact historical lookup and submission RPC capabilities used
     /// by crash recovery. The malformed transaction is intentionally fixed and
     /// can never enter a mempool; `-22` proves that the node recognized
@@ -1836,6 +1845,24 @@ mod tests {
                 .await,
             Err(ObservationFailure::Invariant)
         );
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn exec_start_pre_probe_uses_only_read_only_tip_authority() {
+        let mut steps = Vec::new();
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+
+        let tip = authority(Chain::Wcash, Arc::clone(&rpc))
+            .preflight_probe()
+            .await
+            .expect("read-only chain identity and tip are available");
+
+        assert_eq!(tip.hash, TIP);
+        assert_eq!(tip.height, 100);
+        // ScriptedRpc panics on any extra call, including transaction lookup,
+        // create, sign, recover, observe, sync, or sendrawtransaction.
         rpc.assert_drained();
     }
 

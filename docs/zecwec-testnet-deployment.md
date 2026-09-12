@@ -299,8 +299,11 @@ Review and back up both files with the backend authority. If the backend does
 not yet exist, every retry repeats the live zero-value check. Once the backend
 authority exists, service restarts and release rollback verify this immutable
 initial-zero evidence instead of requiring an earned collector to become
-empty again. Normal pool preflight still checks the current live identity,
-tip, Ironwood-only balance, and exact database reconciliation on every start.
+empty again. Probe-only preflight validates static payout boundaries and
+read-only chain tips without invoking or changing wallet state or touching a
+payout journal. Actual pool startup checks the current live identity,
+Ironwood-only balance, exact database reconciliation, and recovery state before
+any listener can open.
 
 ## 6. Initialize the immutable Wolf authority
 
@@ -352,23 +355,25 @@ instance, wallet collector commitments, and journal stream during startup.
 sudo scripts/deploy/preflight.sh /etc/wcash-pool/deployment.env
 ```
 
-This starts the loopback wallet and private backend, idempotently verifies the
-Wcash wallet, validates the immutable ZEC initial-zero evidence, runs
-migrations, grants the runtime role only its required DML, and runs the
-complete pool dependency graph without binding either the miner or portal
+This starts the supervised loopback wallet and private backend, idempotently
+verifies the Wcash wallet, validates the immutable ZEC initial-zero evidence,
+runs migrations, grants the runtime role only its required DML, and runs a
+probe-only pool dependency graph without binding either the miner or portal
 listener. The preflight policy uses
 `/run/credentials/wcash-pool-preflight.service`, never the runtime service's
-credential mount. On the first start, both dedicated collectors and the new
-ledger are zero. On funded restarts, the runtime verifies exact wallet/backend
-commitments, both node authorities, payout capabilities, current
-wallet-to-ledger reconciliation, and historical transaction lookup before it
-succeeds; it does not rerun a zero-balance bootstrap check.
+credential mount. The probe parses both signer policies, verifies protected
+credential metadata and wallet/config file boundaries, and binds the current
+read-only Wcash/Zcash chain tips to the backend generation. It deliberately
+does not construct a signer journal, invoke wallet create/sign/recover/observe/
+sync commands, call transaction-submission RPCs, or change payout state.
 
-Preflight does not create, sign, broadcast, confirm, or reorganize a real miner
-payout. It proves configuration and live dependency readiness without opening
-listeners; it is not payout E2E evidence. Public readiness still requires the
-two real Testnet payout transactions and restart/reorganization exercises in
-the ASIC gate below.
+After `ExecStartPre` returns, `wcash-poold serve` performs wallet observation,
+signer readiness, persisted-payout recovery, exact wallet-to-ledger
+reconciliation, historical lookup capability, and any required exact
+rebroadcast. All of those potentially durable actions occur before either
+listener is bound. Preflight alone is therefore not payout E2E evidence.
+Public readiness still requires the two real Testnet payout transactions and
+restart/reorganization exercises in the ASIC gate below.
 
 After success, a root-only path watcher fingerprints the three node cookies and
 the Zallet cookie without logging their contents. A rotation stops the public
@@ -427,9 +432,10 @@ sudo scripts/deploy/start-testnet-pool.sh \
   /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
 ```
 
-The command applies the source allowlist first, repeats listener-free preflight,
-enables only the source-restricted TLS Stratum listener, starts the pool, and
-stops `wcash-pool.service` if post-start health fails.
+The command applies the source allowlist first, repeats probe-only listener-free
+preflight, enables only the source-restricted TLS Stratum listener, starts the
+pool, and stops `wcash-pool.service` if post-start health fails. Runtime payout
+recovery and reconciliation finish before the pool process binds that listener.
 
 Before telling an operator to point an ASIC, prove all of the following:
 
@@ -491,10 +497,11 @@ The script verifies all four artifact digests and the release-paired deployment
 snapshot, stops the pool authorities and credential watcher, renders from that
 exact target release, atomically changes the selection link, verifies the
 immutable ZEC initial-zero evidence, reruns Wcash wallet verification,
-migration, full live ledger preflight, and credential snapshotting, and then
-starts the pool. A failed start or health check leaves the public pool service
-stopped. Database rollback is never automatic; the explicit schema-compatible
-acknowledgement is mandatory.
+migration, probe-only preflight, and credential snapshotting, and then starts
+the pool. Fail-closed service startup performs live payout recovery and
+reconciliation before it can bind a listener. A failed start or health check
+leaves the public pool service stopped. Database rollback is never automatic;
+the explicit schema-compatible acknowledgement is mandatory.
 
 Back up PostgreSQL, the two payout journals, Wcash wallet database, Wcash seed,
 Zallet datadir and encryption identity, the ZEC initial-zero evidence, and the
