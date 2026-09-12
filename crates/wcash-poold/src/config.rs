@@ -70,6 +70,32 @@ pub struct RuntimeConfig {
     pub wcash_wallet_sha256: [u8; 32],
     /// Required executable owner.
     pub wcash_wallet_uid: u32,
+    /// Persistent native Wcash collector wallet database.
+    pub wcash_wallet_database: PathBuf,
+    /// Literal loopback Wcash compact-block endpoint.
+    pub wcash_lightwalletd_endpoint: String,
+    /// Protected Wcash collector seed credential.
+    pub wcash_wallet_seed_file: PathBuf,
+    /// Required owner of the Wcash seed credential.
+    pub wcash_seed_uid: u32,
+    /// Crash-recovery journal for exact WEC payout artifacts.
+    pub wcash_signer_journal_directory: PathBuf,
+    /// Exact Wcash collector account identity.
+    pub wcash_signer_account: Uuid,
+    /// Protected Zallet configuration with wallet broadcast disabled.
+    pub zallet_configuration: PathBuf,
+    /// Loopback Zallet JSON-RPC endpoint.
+    pub zallet_rpc: SocketAddr,
+    /// Protected Zallet JSON-RPC cookie.
+    pub zallet_cookie_file: PathBuf,
+    /// Loopback Zebra JSON-RPC endpoint used for exact ZEC broadcast.
+    pub zcash_node_rpc: SocketAddr,
+    /// Protected Zebra JSON-RPC cookie.
+    pub zcash_node_cookie_file: PathBuf,
+    /// Crash-recovery journal for exact ZEC payout artifacts.
+    pub zcash_signer_journal_directory: PathBuf,
+    /// Exact Zallet collector account identity.
+    pub zcash_signer_account: Uuid,
     /// Portal keyed-digest secret credential.
     pub portal_token_pepper_file: PathBuf,
     /// Portal TOTP encryption secret credential.
@@ -142,6 +168,19 @@ struct RawConfig {
     wcash_wallet_program: PathBuf,
     wcash_wallet_sha256: String,
     wcash_wallet_uid: u32,
+    wcash_wallet_database: PathBuf,
+    wcash_lightwalletd_endpoint: String,
+    wcash_wallet_seed_file: PathBuf,
+    wcash_seed_uid: u32,
+    wcash_signer_journal_directory: PathBuf,
+    wcash_signer_account: Uuid,
+    zallet_configuration: PathBuf,
+    zallet_rpc: SocketAddr,
+    zallet_cookie_file: PathBuf,
+    zcash_node_rpc: SocketAddr,
+    zcash_node_cookie_file: PathBuf,
+    zcash_signer_journal_directory: PathBuf,
+    zcash_signer_account: Uuid,
     portal_token_pepper_file: PathBuf,
     portal_totp_key_file: PathBuf,
     wcash_policy: RawChainPolicy,
@@ -199,6 +238,13 @@ impl TryFrom<RawConfig> for RuntimeConfig {
         for path in [
             &raw.database_url_file,
             &raw.wcash_wallet_program,
+            &raw.wcash_wallet_database,
+            &raw.wcash_wallet_seed_file,
+            &raw.wcash_signer_journal_directory,
+            &raw.zallet_configuration,
+            &raw.zallet_cookie_file,
+            &raw.zcash_node_cookie_file,
+            &raw.zcash_signer_journal_directory,
             &raw.portal_token_pepper_file,
             &raw.portal_totp_key_file,
         ] {
@@ -218,8 +264,21 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             || !(1..=65_535).contains(&raw.maximum_miners)
             || !(1..=raw.maximum_miners).contains(&raw.maximum_miners_per_ip)
             || !(1..=32).contains(&raw.authentication_parallelism)
+            || raw.wcash_lightwalletd_endpoint.is_empty()
+            || raw
+                .wcash_lightwalletd_endpoint
+                .chars()
+                .any(char::is_whitespace)
+            || !raw.zallet_rpc.ip().is_loopback()
+            || raw.zallet_rpc.port() == 0
+            || !raw.zcash_node_rpc.ip().is_loopback()
+            || raw.zcash_node_rpc.port() == 0
+            || raw.zallet_rpc == raw.zcash_node_rpc
         {
             return Err(ConfigError::InvalidPolicy);
+        }
+        if raw.wcash_signer_account.is_nil() || raw.zcash_signer_account.is_nil() {
+            return Err(ConfigError::InvalidIdentity);
         }
         let wcash_genesis = decode_hex32("wcash_genesis", &raw.wcash_genesis)?;
         let zcash_genesis = decode_hex32("zcash_genesis", &raw.zcash_genesis)?;
@@ -270,6 +329,19 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             wcash_wallet_program: raw.wcash_wallet_program,
             wcash_wallet_sha256,
             wcash_wallet_uid: raw.wcash_wallet_uid,
+            wcash_wallet_database: raw.wcash_wallet_database,
+            wcash_lightwalletd_endpoint: raw.wcash_lightwalletd_endpoint,
+            wcash_wallet_seed_file: raw.wcash_wallet_seed_file,
+            wcash_seed_uid: raw.wcash_seed_uid,
+            wcash_signer_journal_directory: raw.wcash_signer_journal_directory,
+            wcash_signer_account: raw.wcash_signer_account,
+            zallet_configuration: raw.zallet_configuration,
+            zallet_rpc: raw.zallet_rpc,
+            zallet_cookie_file: raw.zallet_cookie_file,
+            zcash_node_rpc: raw.zcash_node_rpc,
+            zcash_node_cookie_file: raw.zcash_node_cookie_file,
+            zcash_signer_journal_directory: raw.zcash_signer_journal_directory,
+            zcash_signer_account: raw.zcash_signer_account,
             portal_token_pepper_file: raw.portal_token_pepper_file,
             portal_totp_key_file: raw.portal_totp_key_file,
             wcash_policy: parse_chain_policy(raw.wcash_policy)?,
@@ -569,6 +641,19 @@ authentication_parallelism = 4
 wcash_wallet_program = "/opt/wcash/bin/wcash-wallet"
 wcash_wallet_sha256 = "{five}"
 wcash_wallet_uid = 0
+wcash_wallet_database = "/var/lib/zecwec/wcash-wallet.sqlite"
+wcash_lightwalletd_endpoint = "http://127.0.0.1:38234"
+wcash_wallet_seed_file = "{root}/wcash-seed"
+wcash_seed_uid = 0
+wcash_signer_journal_directory = "/var/lib/zecwec/wec-payout-journal"
+wcash_signer_account = "55555555-5555-4555-8555-555555555555"
+zallet_configuration = "{root}/zallet.toml"
+zallet_rpc = "127.0.0.1:28232"
+zallet_cookie_file = "{root}/zallet.cookie"
+zcash_node_rpc = "127.0.0.1:18242"
+zcash_node_cookie_file = "{root}/zebra.cookie"
+zcash_signer_journal_directory = "/var/lib/zecwec/zec-payout-journal"
+zcash_signer_account = "66666666-6666-4666-8666-666666666666"
 portal_token_pepper_file = "{root}/pepper"
 portal_totp_key_file = "{root}/totp"
 initial_share_target_be = "{six}"

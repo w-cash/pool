@@ -30,4 +30,4 @@ pub use store::{
     AccountCredential, AuthenticatedSession, NewSession, PayoutPreferenceChange, PortalRepository,
     ProvisionedWorker, RepositoryError, RepositoryFuture,
 };
-pub use web::{serve, PortalApp, PortalBuildError};
+pub use web::{serve, serve_until_shutdown, PortalApp, PortalBuildError};

@@ -20,6 +20,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -147,6 +148,22 @@ impl PortalApp {
 /// Serves the portal on a caller-created listener, normally loopback behind nginx.
 pub async fn serve(listener: TcpListener, app: PortalApp) -> std::io::Result<()> {
     axum::serve(listener, app.router()).await
+}
+
+/// Serves the portal until the process-wide shutdown signal is observed, then
+/// drains in-flight HTTP requests before returning.
+pub async fn serve_until_shutdown(
+    listener: TcpListener,
+    app: PortalApp,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    axum::serve(listener, app.router())
+        .with_graceful_shutdown(async move {
+            if !*shutdown.borrow() {
+                let _ = shutdown.changed().await;
+            }
+        })
+        .await
 }
 
 /// Portal construction failure.
