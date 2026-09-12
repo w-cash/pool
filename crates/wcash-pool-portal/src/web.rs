@@ -559,9 +559,10 @@ async fn create_worker(
     let auth = authenticate(&state, &headers).await?;
     require_mutation(&state, &headers, &auth)?;
     let label = canonical_worker_label(&request.label)?;
-    // Hold one shared Argon2 admission slot while the repository generates the
-    // worker verifier on its blocking executor. Saturation fails immediately.
-    let _argon2_permit = argon2_operation_slot(&state.argon2_slots)?;
+    // Transfer one shared Argon2 admission slot into the repository's blocking
+    // verifier task. Saturation fails immediately, and HTTP cancellation
+    // cannot release the slot before memory-hard work actually exits.
+    let argon2_permit = argon2_operation_slot(&state.argon2_slots)?;
     let worker = state
         .store
         .provision_worker(
@@ -569,6 +570,7 @@ async fn create_worker(
             &auth.session.username,
             &label,
             state.clock.now(),
+            argon2_permit,
         )
         .await?;
     if worker.account_id != auth.session.account_id

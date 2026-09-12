@@ -6,6 +6,7 @@
 
 use std::{fmt, future::Future, pin::Pin};
 
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use crate::{
@@ -215,12 +216,17 @@ pub trait PortalRepository: Send + Sync {
     fn activate_pending_totp(&self, account_id: Uuid, now: u64) -> RepositoryFuture<'_, bool>;
 
     /// Atomically creates the worker and canonical Argon2id mining token.
+    ///
+    /// The implementation must move `argon2_permit` into the blocking
+    /// credential operation so cancelling this repository future cannot
+    /// release memory-hard capacity while that operation is still running.
     fn provision_worker<'a>(
         &'a self,
         account_id: Uuid,
         account_login: &'a str,
         worker_label: &'a str,
         now: u64,
+        argon2_permit: OwnedSemaphorePermit,
     ) -> RepositoryFuture<'a, ProvisionedWorker>;
 
     /// Returns public-safe workers; never token verifiers or plaintext tokens.
