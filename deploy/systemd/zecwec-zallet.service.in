@@ -5,7 +5,7 @@ Requires=@ZCASH_VALIDATOR_UNIT@
 BindsTo=@ZCASH_VALIDATOR_UNIT@
 After=network-online.target @ZCASH_VALIDATOR_UNIT@
 Wants=network-online.target
-ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/zallet
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/zallet
 ConditionPathExists=@ZALLET_CONFIG_FILE@
 
 [Service]
