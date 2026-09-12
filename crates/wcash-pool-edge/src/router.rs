@@ -412,6 +412,11 @@ impl JobRouter {
     }
 
     #[cfg(test)]
+    pub(crate) fn now_ms_for_test(&self) -> Result<u64, JobRouterError> {
+        Ok(self.timeline.now_ms()?)
+    }
+
+    #[cfg(test)]
     fn recover_for_test(
         &self,
         event_seq: u64,

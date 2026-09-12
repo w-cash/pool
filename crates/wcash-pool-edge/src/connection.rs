@@ -1398,6 +1398,10 @@ mod tests {
         let second_descriptor = descriptor(2);
         let second = BackendGeneration::from_descriptor(second_descriptor.clone())
             .expect("second descriptor is valid");
+        let event_anchor_ms = actor
+            .router
+            .now_ms_for_test()
+            .expect("test timeline is available after authorization");
         actor
             .router
             .apply_event_for_test(
@@ -1405,7 +1409,7 @@ mod tests {
                     event_seq: 2,
                     job: second_descriptor.clone(),
                 },
-                0,
+                event_anchor_ms,
             )
             .expect("changed-tip activation succeeds");
 
@@ -1424,7 +1428,7 @@ mod tests {
                     event_seq: 3,
                     job: third_descriptor,
                 },
-                0,
+                event_anchor_ms,
             )
             .expect("same-tip replacement succeeds");
 
