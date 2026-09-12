@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use uuid::Uuid;
 use wcash_pool_backend_client::{
     BackendClient, BackendClientConfig, ClientError, ExpectedBackend, MonotonicTimeline,
 };
@@ -14,8 +15,8 @@ use wcash_pool_edge::{
 };
 use wcash_pool_protocol::{CanonicalUuid, Hex32, NonceProfile, TargetBe};
 use wcash_pool_store::{
-    Chain, ChainPolicy, DeploymentIdentity, DeploymentNetwork, PostgresAuthenticationProvider,
-    PostgresStore, StoreError,
+    Chain, ChainPolicy, DeploymentIdentity, DeploymentNetwork, NonceNamespaceClaim, NonceRange,
+    PostgresAuthenticationProvider, PostgresStore, StoreError,
 };
 
 use crate::config::{ChainRuntimePolicy, ConfigError, RuntimeConfig};
@@ -24,6 +25,8 @@ const REPLAY_PAGE_ITEMS: u16 = 1_024;
 const JOB_UPDATE_CAPACITY: usize = 256;
 const MAXIMUM_RECENT_JOBS: usize = 16;
 const MAXIMUM_GENERATIONS_PER_PROCESS: usize = 65_536;
+/// Database-clock lease duration renewed by the serving process.
+pub const NONCE_NAMESPACE_LEASE_DURATION: Duration = Duration::from_secs(60);
 
 /// Live, identity-bound mining components created before any public socket opens.
 pub struct MiningBootstrap {
@@ -37,6 +40,8 @@ pub struct MiningBootstrap {
     pub authentication: Arc<PostgresAuthenticationProvider>,
     /// Transactionally reserved, process-local nonce-prefix allocator.
     pub nonces: Arc<NoncePrefixAllocator>,
+    /// Process-unique database claim fencing the allocator's namespace.
+    pub nonce_claim: NonceNamespaceClaim,
     /// Monotonic epoch used by every miner actor in this process.
     pub timeline: MonotonicTimeline,
 }
@@ -103,15 +108,41 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
     let authentication =
         Arc::new(store.authentication_provider(config.authentication_parallelism)?);
     let namespace = NonceNamespaceLease::new(config.nonce_namespace)?;
-    let reservation = store
-        .reserve_nonce_range(
-            config.pool_instance,
+    let nonce_claim = store
+        .claim_nonce_namespace(
+            Uuid::new_v4(),
             NonceProfile::FourByte,
             namespace,
-            config.nonce_reservation,
+            NONCE_NAMESPACE_LEASE_DURATION,
         )
         .await?;
-    let nonces = Arc::new(reservation.allocator()?);
+    let reservation = match reserve_nonce_tail(&store, &nonce_claim, config.nonce_reservation).await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let startup = BootstrapError::from(error);
+            return match store.release_nonce_namespace(&nonce_claim).await {
+                Ok(()) => Err(startup),
+                Err(cleanup) => Err(BootstrapError::NonceClaimCleanup {
+                    startup: Box::new(startup),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
+    };
+    let nonces = match reservation.allocator() {
+        Ok(allocator) => Arc::new(allocator),
+        Err(error) => {
+            let startup = BootstrapError::from(error);
+            return match store.release_nonce_namespace(&nonce_claim).await {
+                Ok(()) => Err(startup),
+                Err(cleanup) => Err(BootstrapError::NonceClaimCleanup {
+                    startup: Box::new(startup),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
+    };
 
     Ok(MiningBootstrap {
         store,
@@ -119,8 +150,36 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
         shares,
         authentication,
         nonces,
+        nonce_claim,
         timeline,
     })
+}
+
+/// Reserves the largest reviewed chunk obtainable near permanent namespace
+/// exhaustion. Every rejected attempt is a rolled-back transaction, and only
+/// `NonceNamespaceExhausted` permits a smaller retry.
+pub(crate) async fn reserve_nonce_tail(
+    store: &PostgresStore,
+    claim: &NonceNamespaceClaim,
+    requested: u64,
+) -> Result<NonceRange, StoreError> {
+    let mut attempt = requested;
+    loop {
+        match store.reserve_nonce_range(claim, attempt).await {
+            Ok(range) => return Ok(range),
+            Err(error @ StoreError::NonceNamespaceExhausted) => {
+                let Some(smaller) = smaller_nonce_reservation(attempt) else {
+                    return Err(error);
+                };
+                attempt = smaller;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn smaller_nonce_reservation(current: u64) -> Option<u64> {
+    (current > 1).then(|| (current / 2).max(1))
 }
 
 fn validate_initial_target_policy(
@@ -284,4 +343,25 @@ pub enum BootstrapError {
     /// An incomplete replay page did not advance its cursor.
     #[error("backend journal replay made no progress")]
     StalledReplay,
+    /// Nonce startup failed and the acquired database lease could not be released.
+    #[error("nonce startup failed ({startup}); namespace cleanup also failed ({cleanup})")]
+    NonceClaimCleanup {
+        /// Original reservation or allocator failure.
+        startup: Box<BootstrapError>,
+        /// Independent database failure while releasing the claim.
+        cleanup: Box<StoreError>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smaller_nonce_reservation;
+
+    #[test]
+    fn nonce_tail_backoff_terminates_at_one_without_skipping_it() {
+        assert_eq!(smaller_nonce_reservation(9), Some(4));
+        assert_eq!(smaller_nonce_reservation(4), Some(2));
+        assert_eq!(smaller_nonce_reservation(2), Some(1));
+        assert_eq!(smaller_nonce_reservation(1), None);
+    }
 }
