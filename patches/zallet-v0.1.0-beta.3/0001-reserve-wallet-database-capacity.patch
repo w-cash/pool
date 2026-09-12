@@ -1,5 +1,5 @@
 diff --git a/zallet-core/src/components/database/connection.rs b/zallet-core/src/components/database/connection.rs
-index 4eb08eb..b7b37b6 100644
+index 4eb08eb..e27e392 100644
 --- a/zallet-core/src/components/database/connection.rs
 +++ b/zallet-core/src/components/database/connection.rs
 @@ -1,8 +1,11 @@
@@ -15,12 +15,25 @@ index 4eb08eb..b7b37b6 100644
  
  use nonempty::NonEmpty;
  use rand::rngs::OsRng;
-@@ -45,11 +48,61 @@ pub(super) fn pool(path: impl AsRef<Path>, params: Network) -> Result<WalletPool
-     let config = deadpool_sqlite::Config::new(path.as_ref());
-     let manager = WalletManager::from_config(&config, params);
+@@ -42,14 +45,98 @@ use crate::{
+ };
+ 
+ pub(super) fn pool(path: impl AsRef<Path>, params: Network) -> Result<WalletPool, Error> {
+-    let config = deadpool_sqlite::Config::new(path.as_ref());
+-    let manager = WalletManager::from_config(&config, params);
++    build_pool(path, params, wallet_pool_config())
++}
++
++fn build_pool(
++    path: impl AsRef<Path>,
++    params: Network,
++    config: deadpool::managed::PoolConfig,
++) -> Result<WalletPool, Error> {
++    let database_config = deadpool_sqlite::Config::new(path.as_ref());
++    let manager = WalletManager::from_config(&database_config, params);
      WalletPool::builder(manager)
 -        .config(deadpool::managed::PoolConfig::default())
-+        .config(wallet_pool_config())
++        .config(config)
 +        .runtime(deadpool::Runtime::Tokio1)
          .build()
          .map_err(|e| ErrorKind::Generic.context(e).into())
@@ -65,14 +78,39 @@ index 4eb08eb..b7b37b6 100644
 +        assert_eq!(config.timeouts.wait, Some(WALLET_POOL_WAIT_TIMEOUT));
 +    }
 +
-+    #[test]
-+    fn configured_timeout_has_a_runtime() {
++    #[tokio::test]
++    async fn configured_pool_reserves_foreground_capacity_and_bounds_saturation() {
 +        let temporary = tempfile::tempdir().unwrap();
-+        let result = pool(
++        let mut config = wallet_pool_config_from(deadpool::managed::PoolConfig::new(4));
++        config.timeouts.wait = Some(Duration::from_millis(25));
++        let pool = build_pool(
 +            temporary.path().join("wallet.db"),
 +            Network::Consensus(zcash_protocol::consensus::Network::TestNetwork),
-+        );
-+        assert!(result.is_ok());
++            config,
++        )
++        .unwrap();
++
++        let mut handles = Vec::new();
++        for _ in 0..4 {
++            handles.push(pool.get().await.unwrap());
++        }
++        handles.push(pool.get().await.unwrap());
++        for _ in 5..MIN_WALLET_POOL_SIZE {
++            handles.push(pool.get().await.unwrap());
++        }
++        assert_eq!(handles.len(), MIN_WALLET_POOL_SIZE);
++
++        let error = match pool.get().await {
++            Ok(_) => panic!("ninth database handle exceeded configured capacity"),
++            Err(error) => error,
++        };
++        assert!(matches!(
++            error,
++            deadpool::managed::PoolError::Timeout(deadpool::managed::TimeoutType::Wait)
++        ));
++
++        drop(handles.pop());
++        assert!(pool.get().await.is_ok());
 +    }
 +}
 +

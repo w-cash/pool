@@ -58,19 +58,20 @@ export LC_ALL=C
 export TZ=UTC
 export RUSTFLAGS="--remap-path-prefix=$temporary=/build/zecwec-zallet"
 export CFLAGS="-ffile-prefix-map=$temporary=/build/zecwec-zallet -fdebug-prefix-map=$temporary=/build/zecwec-zallet"
-export CXXFLAGS="$CFLAGS"
+export CXXFLAGS="-include cstdint $CFLAGS"
 install -d -m 0700 "$cargo_home"
 rustc "+$toolchain" -vV >"$temporary/rustc-version"
 cargo "+$toolchain" -vV >"$temporary/cargo-version"
-cargo "+$toolchain" fmt --manifest-path "$source_dir/Cargo.toml" --all -- --check
-cargo "+$toolchain" test --locked --manifest-path "$source_dir/Cargo.toml" \
-    --package zallet-core pool_config_tests
-cargo "+$toolchain" test --locked --manifest-path "$source_dir/Cargo.toml" \
-    --package zallet-core components::sync::tests
-cargo "+$toolchain" build --locked --release \
-    --manifest-path "$source_dir/backends/zaino/Cargo.toml" \
-    --features rpc-cli,zcashd-import \
-    --bin zallet-zaino
+(
+    cd "$source_dir"
+    cargo "+$toolchain" fmt --all -- --check
+    cargo "+$toolchain" test --locked --package zallet-core pool_config_tests
+    cargo "+$toolchain" test --locked --package zallet-core components::sync::tests
+    cargo "+$toolchain" build --locked --release \
+        --manifest-path backends/zaino/Cargo.toml \
+        --features rpc-cli,zcashd-import \
+        --bin zallet-zaino
+)
 
 install -d -m 0755 "$output"
 install -m 0555 "$target_dir/release/zallet-zaino" "$output/zallet"
@@ -83,14 +84,27 @@ python3 - \
     "$base_commit" \
     "$patch_dir" \
     "$temporary/rustc-version" \
-    "$temporary/cargo-version" <<'PY'
+    "$temporary/cargo-version" \
+    "$source_dir" \
+    "$output/zallet" \
+    "$temporary" <<'PY'
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 
 output = pathlib.Path(sys.argv[1])
 patches = sorted(pathlib.Path(sys.argv[3]).glob("*.patch"))
+source_dir = pathlib.Path(sys.argv[6])
+binary = pathlib.Path(sys.argv[7])
+temporary = sys.argv[8].encode("utf-8")
+binary_bytes = binary.read_bytes()
+if temporary in binary_bytes:
+    raise SystemExit("build-zallet-testnet: binary contains its temporary build path")
+source_diff = subprocess.check_output(
+    ["git", "-C", str(source_dir), "diff", "--binary", "--no-ext-diff"]
+)
 record = {
     "schema_version": 1,
     "upstream": "https://github.com/zcash/zallet",
@@ -99,6 +113,9 @@ record = {
     "features": ["rpc-cli", "zcashd-import"],
     "rustc": pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").strip(),
     "cargo": pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").strip(),
+    "source_date_epoch": 1787546182,
+    "source_patch_sha256": hashlib.sha256(source_diff).hexdigest(),
+    "binary_sha256": hashlib.sha256(binary_bytes).hexdigest(),
     "patches": [
         {
             "name": patch.name,

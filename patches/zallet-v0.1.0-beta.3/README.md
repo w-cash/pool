@@ -30,4 +30,6 @@ Build the pinned backend with `scripts/build-zallet-testnet.sh`. The script
 fetches only the exact base commit, checks both patches before applying them,
 runs the low-core capacity regressions and sync tests, builds with both
 `rpc-cli` and `zcashd-import`, and writes a non-secret provenance record beside
-the output binary.
+the output binary. One successful build is a private Testnet candidate only.
+Public deployment remains blocked until two clean builds from distinct roots
+produce the same binary digest under the pinned, remapped build environment.

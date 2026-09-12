@@ -15,15 +15,22 @@ command -v shellcheck >/dev/null 2>&1 || {
 
 bash -n "$repo_root"/scripts/deploy/*.sh \
     "$repo_root/scripts/build-zallet-testnet.sh" \
+    "$repo_root/scripts/test-zallet-patches.sh" \
     "$repo_root/scripts/test-deployment-package.sh"
 shellcheck "$repo_root"/scripts/deploy/*.sh \
     "$repo_root/scripts/build-zallet-testnet.sh" \
+    "$repo_root/scripts/test-zallet-patches.sh" \
     "$repo_root/scripts/test-deployment-package.sh"
+"$repo_root/scripts/test-zallet-patches.sh" >/dev/null
 grep -Fq 'base_commit=987382f67e622915228686e9f956c6a9c9a7514c' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'toolchain=1.95.0' "$repo_root/scripts/build-zallet-testnet.sh"
 # shellcheck disable=SC2016
-grep -Fq 'cargo "+$toolchain" build --locked --release' \
+grep -Fq 'cd "$source_dir"' "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq -- '--manifest-path backends/zaino/Cargo.toml' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'export CXXFLAGS="-include cstdint $CFLAGS"' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq -- '--features rpc-cli,zcashd-import' \
     "$repo_root/scripts/build-zallet-testnet.sh"
