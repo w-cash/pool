@@ -16,6 +16,7 @@ mod service;
 pub mod settlement;
 pub mod wcash_observation;
 mod wec_wallet_transport;
+mod zec_authority_check;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -39,6 +40,12 @@ enum Command {
     /// Validate immutable policy and protected credential files without connecting.
     ConfigCheck {
         /// Absolute path to the protected Testnet policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Prove one finalized, empty Zcash Testnet collector before backend init.
+    ZecAuthorityCheck {
+        /// Absolute path to the standalone ZEC authority policy.
         #[arg(long)]
         config: PathBuf,
     },
@@ -83,6 +90,30 @@ async fn main() -> ExitCode {
                 }
                 Err(error) => {
                     eprintln!("configuration rejected: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            }
+        }
+        Command::ZecAuthorityCheck { config } => {
+            match zec_authority_check::ZecAuthorityConfig::load(&config) {
+                Ok(runtime) => match zec_authority_check::check(&runtime).await {
+                    Ok(summary) => match summary.to_json() {
+                        Ok(summary) => {
+                            println!("{summary}");
+                            ExitCode::SUCCESS
+                        }
+                        Err(error) => {
+                            eprintln!("ZEC authority rejected: {error}");
+                            ExitCode::from(NOT_READY_EXIT_CODE)
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("ZEC authority rejected: {error}");
+                        ExitCode::from(NOT_READY_EXIT_CODE)
+                    }
+                },
+                Err(error) => {
+                    eprintln!("ZEC authority rejected: {error}");
                     ExitCode::from(NOT_READY_EXIT_CODE)
                 }
             }
@@ -149,6 +180,18 @@ mod tests {
                 command: Command::Serve { .. }
             })
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "wcash-poold",
+                "zec-authority-check",
+                "--config",
+                "/tmp/zec-authority.toml"
+            ]),
+            Ok(Cli {
+                command: Command::ZecAuthorityCheck { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["wcash-poold", "zec-authority-check"]).is_err());
         assert!(Cli::try_parse_from(["wcash-poold", "serve"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["wcash-poold", "config-check", "--config", "/tmp/pool.toml"]),
