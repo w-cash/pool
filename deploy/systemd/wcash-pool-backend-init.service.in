@@ -4,7 +4,7 @@ Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deploym
 Requires=wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 BindsTo=wcash-pool-wallet-init.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 After=wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service @WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
-ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-merge-miner
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-merge-miner
 
 [Service]
 Type=oneshot

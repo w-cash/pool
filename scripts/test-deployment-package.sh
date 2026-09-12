@@ -215,6 +215,24 @@ assert "zec-authority-bootstrap.sh verify" in backend_unit
 
 preflight_unit = (root / "systemd/wcash-pool-preflight.service").read_text(encoding="utf-8")
 zallet_unit = (root / "systemd/zecwec-zallet.service").read_text(encoding="utf-8")
+executable_condition_units = {
+    "wcash-pool-backend-init.service",
+    "wcash-pool-backend.service",
+    "wcash-pool-migrate.service",
+    "wcash-pool-preflight.service",
+    "wcash-pool-wallet-init.service",
+    "wcash-pool-zec-authority-bootstrap.service",
+    "wcash-pool.service",
+    "zecwec-zallet.service",
+}
+found_executable_conditions = set()
+for service in (root / "systemd").glob("*.service"):
+    rendered_service = service.read_text(encoding="utf-8")
+    assert "ConditionPathIsExecutable=" not in rendered_service
+    if "ConditionFileIsExecutable=" in rendered_service:
+        assert rendered_service.count("ConditionFileIsExecutable=") == 1
+        found_executable_conditions.add(service.name)
+assert found_executable_conditions == executable_condition_units
 assert "pool.preflight.toml" in preflight_unit
 assert "/run/credentials/wcash-pool-preflight.service" not in pool_unit
 assert "TimeoutStopSec=1920s" in pool_unit

@@ -3,7 +3,7 @@ Description=Apply ZecWec Testnet pool database migrations
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
 Requires=postgresql.service
 After=postgresql.service
-ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/pool.migrate.toml
 
 [Service]

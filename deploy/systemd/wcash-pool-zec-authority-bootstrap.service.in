@@ -4,7 +4,7 @@ Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deploym
 Requires=zecwec-zallet.service @ZCASH_VALIDATOR_UNIT@
 After=zecwec-zallet.service @ZCASH_VALIDATOR_UNIT@
 Before=wcash-pool-backend-init.service
-ConditionPathIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/zec-authority.testnet.toml
 
 [Service]
