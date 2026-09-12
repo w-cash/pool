@@ -17,9 +17,8 @@ use wcash_wec_payout_signer::{
     WCASH_TESTNET_GENESIS_HASH,
 };
 
-use crate::wec_wallet_transport::WolfWalletTransport;
+use crate::wec_wallet_transport::{WolfWalletTransport, WCASH_WALLET_SUCCESS_PROTOCOL_VERSION};
 
-const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
 const OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 
 /// Static authority which every Wcash collector observation must match.
@@ -174,7 +173,7 @@ impl WcashWalletObserver {
             .valid_until
             .checked_sub(response.observed_at)
             .is_some_and(|seconds| seconds == OBSERVATION_VALIDITY_SECS);
-        if response.protocol_version != OBSERVATION_PROTOCOL_VERSION
+        if response.protocol_version != WCASH_WALLET_SUCCESS_PROTOCOL_VERSION
             || response_network != self.authority.network
             || response.genesis_hash != self.authority.genesis_hash
             || response.branch_id != self.authority.branch_id
@@ -287,7 +286,7 @@ mod tests {
 
     fn valid_response() -> Value {
         json!({
-            "protocol_version": 2,
+            "protocol_version": WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
             "network": "testnet",
             "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
             "branch_id": WCASH_TESTNET_BRANCH_ID,
@@ -467,6 +466,7 @@ mod tests {
         let (_directory, _program, observer) = fixture_observer("printf '{}'");
         let mutations = [
             ("protocol_version", json!(1)),
+            ("protocol_version", json!(u32::MAX)),
             ("network", json!("mainnet")),
             ("genesis_hash", json!("33".repeat(32))),
             ("branch_id", json!("deadbeef")),

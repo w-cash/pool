@@ -247,6 +247,14 @@ account fails closed. Subsequent
 payout observations run one serialized, seedless sync immediately before
 observation; no concurrent wallet-sync timer is deployed.
 
+The successful Wcash wallet machine protocol is exactly version 2. This covers
+`payout-identity`, payout request/response messages, and `payout-observe`; the
+initializer and runtime reject version 1 and every unknown version before
+creating authority or payout state. The authority file's `schema_version: 1`
+is an independent on-disk schema, and the wallet CLI's version-1 error envelope
+is an independent failure-only protocol. Neither is accepted as a successful
+wallet response.
+
 Start only the persistent Zallet wallet and verify its authenticated Testnet
 status:
 

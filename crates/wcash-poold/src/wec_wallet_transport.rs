@@ -27,7 +27,8 @@ use wcash_wec_payout_signer::{
 };
 use zeroize::Zeroizing;
 
-const PAYOUT_PROTOCOL_VERSION: u32 = 2;
+/// Exact protocol accepted for every successful Wcash wallet machine message.
+pub(crate) const WCASH_WALLET_SUCCESS_PROTOCOL_VERSION: u32 = 2;
 const PAYOUT_FAILURE_PROTOCOL_VERSION: u32 = 1;
 const PAYOUT_SIGN_FRAME_MAGIC: &[u8; 16] = b"WCASHPAYSIGNV1\0\0";
 const PAYOUT_SIGN_FRAME_HEADER_BYTES: usize = PAYOUT_SIGN_FRAME_MAGIC.len() + 2 + 4;
@@ -580,7 +581,7 @@ struct WireIdentityRef<'a> {
 impl<'a> From<&'a WalletIdentity> for WireIdentityRef<'a> {
     fn from(identity: &'a WalletIdentity) -> Self {
         Self {
-            protocol_version: PAYOUT_PROTOCOL_VERSION,
+            protocol_version: WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
             network: match identity.network {
                 WalletNetwork::Testnet => "testnet",
                 WalletNetwork::Regtest => "regtest",
@@ -729,7 +730,7 @@ fn parse_wire_identity(bytes: &[u8]) -> Result<WalletIdentity, NativeWalletError
 }
 
 fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWalletError> {
-    if identity.protocol_version != PAYOUT_PROTOCOL_VERSION
+    if identity.protocol_version != WCASH_WALLET_SUCCESS_PROTOCOL_VERSION
         || identity.network != "testnet"
         || identity.genesis_hash != WCASH_TESTNET_GENESIS_HASH
         || identity.branch_id != WCASH_TESTNET_BRANCH_ID
@@ -756,7 +757,7 @@ fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWallet
 fn parse_signed_payout(
     response: WireSignedPayout,
 ) -> Result<ParsedSignedPayout, NativeWalletError> {
-    if response.protocol_version != PAYOUT_PROTOCOL_VERSION
+    if response.protocol_version != WCASH_WALLET_SUCCESS_PROTOCOL_VERSION
         || response.branch_id != WCASH_TESTNET_BRANCH_ID
     {
         return Err(NativeWalletError::ProtocolViolation);
@@ -1231,7 +1232,7 @@ mod tests {
     fn payout_v2_identity_requires_one_canonical_nonzero_commitment() {
         let valid = || {
             serde_json::json!({
-                "protocol_version": 2,
+                "protocol_version": WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
                 "network": "testnet",
                 "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
                 "branch_id": WCASH_TESTNET_BRANCH_ID,
@@ -1249,6 +1250,7 @@ mod tests {
         );
         for mutation in [
             ("protocol_version", serde_json::json!(1)),
+            ("protocol_version", serde_json::json!(u32::MAX)),
             (
                 "collector_payout_commitment",
                 serde_json::json!("00".repeat(32)),
@@ -1279,12 +1281,12 @@ mod tests {
     #[test]
     fn signed_response_rejects_raw_transaction_digest_mismatch() {
         let response = WireSignedPayout {
-            protocol_version: PAYOUT_PROTOCOL_VERSION,
+            protocol_version: WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
             batch_id: "10000000-0000-4000-8000-000000000001".to_owned(),
             request_commitment: "11".repeat(32),
             request_facts_digest: "22".repeat(32),
             identity: WireIdentity {
-                protocol_version: PAYOUT_PROTOCOL_VERSION,
+                protocol_version: WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
                 network: "testnet".to_owned(),
                 genesis_hash: WCASH_TESTNET_GENESIS_HASH.to_owned(),
                 branch_id: WCASH_TESTNET_BRANCH_ID.to_owned(),
@@ -1355,7 +1357,7 @@ mod tests {
     #[test]
     fn subprocess_identity_is_bounded_and_testnet_attested() {
         let identity = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
             "network": "testnet",
             "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
             "branch_id": WCASH_TESTNET_BRANCH_ID,
@@ -1466,7 +1468,7 @@ mod tests {
     #[test]
     fn executable_mutation_fails_before_a_second_wallet_call() {
         let identity = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
             "network": "testnet",
             "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
             "branch_id": WCASH_TESTNET_BRANCH_ID,
