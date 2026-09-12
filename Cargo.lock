@@ -2328,16 +2328,19 @@ dependencies = [
 name = "wcash-zec-payout-signer"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base64",
  "hex",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "toml",
  "uuid",
  "wcash-pool-portal",
  "zcash_address",
  "zcash_protocol",
+ "zeroize",
 ]
 
 [[package]]

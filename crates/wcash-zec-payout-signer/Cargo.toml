@@ -10,6 +10,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,8 +19,12 @@ thiserror.workspace = true
 toml.workspace = true
 uuid.workspace = true
 wcash-pool-portal = { path = "../wcash-pool-portal" }
+zeroize.workspace = true
 zcash_address.workspace = true
 zcash_protocol.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
 
 [lints]
 workspace = true
