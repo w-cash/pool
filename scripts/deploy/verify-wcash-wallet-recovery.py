@@ -121,8 +121,15 @@ def validate_recovery(authority: dict, initialized: dict, identity: dict) -> Non
         )
     ):
         fail("recovery did not use a fresh isolated wallet database")
+    try:
+        recovered_account = uuid.UUID(initialized["account_id"])
+    except (AttributeError, TypeError, ValueError):
+        fail("restored wallet account is invalid")
+    if recovered_account.int == 0 or str(recovered_account) != initialized["account_id"]:
+        fail("restored wallet account is not canonical")
+    if identity["account_id"] != initialized["account_id"]:
+        fail("restored wallet outputs disagree on the database-local account")
     expected_initialized = {
-        "account_id": authority["account_id"],
         "birthday_height": authority["birthday_height"],
         "address": authority["collector_address"],
         "transparent_coinbase_address": authority["transparent_coinbase_address"],
@@ -134,7 +141,6 @@ def validate_recovery(authority: dict, initialized: dict, identity: dict) -> Non
         "network": authority["network"],
         "genesis_hash": authority["genesis_hash"],
         "branch_id": authority["branch_id"],
-        "account_id": authority["account_id"],
         "collector_payout_commitment": authority["collector_payout_commitment"],
         "fund_source": authority["fund_source"],
         "synchronized": True,
@@ -142,7 +148,7 @@ def validate_recovery(authority: dict, initialized: dict, identity: dict) -> Non
     if (
         type(identity["protocol_version"]) is not int
         or identity["synchronized"] is not True
-        or identity != expected_identity
+        or any(identity[field] != expected for field, expected in expected_identity.items())
     ):
         fail("restored wallet identity differs from the frozen authority")
 

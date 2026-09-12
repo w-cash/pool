@@ -723,6 +723,80 @@ python3 "$recovery_verifier" verify \
     "$wallet_protocol_fixture/recovery-attestation.json"
 python3 - \
     "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/identity-v2.json" \
+    "$wallet_protocol_fixture/recovery-init-fresh-account.json" \
+    "$wallet_protocol_fixture/recovery-identity-fresh-account.json" <<'PY'
+import json
+import pathlib
+import sys
+
+init_source, identity_source, init_output, identity_output = map(
+    pathlib.Path, sys.argv[1:]
+)
+recovered_account = "12345678-1234-4234-8234-123456789abc"
+initialized = json.loads(init_source.read_text(encoding="utf-8"))
+identity = json.loads(identity_source.read_text(encoding="utf-8"))
+initialized["account_id"] = recovered_account
+identity["account_id"] = recovered_account
+init_output.write_text(json.dumps(initialized) + "\n", encoding="utf-8")
+identity_output.write_text(json.dumps(identity) + "\n", encoding="utf-8")
+PY
+python3 "$recovery_verifier" seal \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/recovery-init-fresh-account.json" \
+    "$wallet_protocol_fixture/recovery-identity-fresh-account.json" \
+    "$wallet_protocol_fixture/recovery-attestation-fresh-account.json"
+cmp -s \
+    "$wallet_protocol_fixture/recovery-attestation.json" \
+    "$wallet_protocol_fixture/recovery-attestation-fresh-account.json" \
+    || {
+        printf 'deployment-package-test: database-local recovery account changed the collector attestation\n' >&2
+        exit 1
+    }
+python3 - \
+    "$wallet_protocol_fixture/recovery-identity-fresh-account.json" \
+    "$wallet_protocol_fixture/recovery-identity-mismatched-account.json" <<'PY'
+import json
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+value = json.loads(source.read_text(encoding="utf-8"))
+value["account_id"] = "87654321-4321-4321-8321-cba987654321"
+output.write_text(json.dumps(value) + "\n", encoding="utf-8")
+PY
+if python3 "$recovery_verifier" seal \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/recovery-init-fresh-account.json" \
+    "$wallet_protocol_fixture/recovery-identity-mismatched-account.json" \
+    "$wallet_protocol_fixture/rejected-account-mismatch-attestation.json" \
+    >/dev/null 2>&1; then
+    printf 'deployment-package-test: recovery accepted inconsistent database-local accounts\n' >&2
+    exit 1
+fi
+python3 - \
+    "$wallet_protocol_fixture/recovery-init-fresh-account.json" \
+    "$wallet_protocol_fixture/recovery-init-zero-account.json" <<'PY'
+import json
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+value = json.loads(source.read_text(encoding="utf-8"))
+value["account_id"] = "00000000-0000-0000-0000-000000000000"
+output.write_text(json.dumps(value) + "\n", encoding="utf-8")
+PY
+if python3 "$recovery_verifier" seal \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/recovery-init-zero-account.json" \
+    "$wallet_protocol_fixture/recovery-identity-fresh-account.json" \
+    "$wallet_protocol_fixture/rejected-zero-account-attestation.json" \
+    >/dev/null 2>&1; then
+    printf 'deployment-package-test: recovery accepted a zero database-local account\n' >&2
+    exit 1
+fi
+python3 - \
+    "$wallet_protocol_fixture/init.json" \
     "$wallet_protocol_fixture/recovery-init-not-fresh.json" <<'PY'
 import json
 import pathlib
