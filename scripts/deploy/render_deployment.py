@@ -198,6 +198,7 @@ DEPLOYMENT_TEMPLATES = {
     "deploy/systemd/wcash-pool-backend-init.service.in": "systemd/wcash-pool-backend-init.service",
     "deploy/systemd/wcash-pool-backend.service.in": "systemd/wcash-pool-backend.service",
     "deploy/systemd/wcash-pool-migrate.service.in": "systemd/wcash-pool-migrate.service",
+    "deploy/systemd/wcash-pool-custody-gate.service.in": "systemd/wcash-pool-custody-gate.service",
     "deploy/systemd/wcash-pool.service.in": "systemd/wcash-pool.service",
     "deploy/systemd/wcash-pool-preflight.service.in": "systemd/wcash-pool-preflight.service",
     "deploy/systemd/zecwec-cookie-refresh.path.in": "systemd/zecwec-cookie-refresh.path",

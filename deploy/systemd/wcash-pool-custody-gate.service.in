@@ -1,0 +1,34 @@
+[Unit]
+Description=Verify offline Wcash and Zcash collector custody before mining
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+Before=wcash-pool.service
+Conflicts=zecwec-zallet.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
+After=zecwec-zallet.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
+ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-offline-custody.sh /etc/wcash-pool/deployment.env
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+AmbientCapabilities=

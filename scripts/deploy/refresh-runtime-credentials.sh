@@ -27,14 +27,11 @@ declare -A cookie_paths=()
 cookie_paths[WCASH_RPC_COOKIE]=$(read_setting "$settings" WCASH_RPC_COOKIE_SOURCE)
 cookie_paths[ZCASH_TEMPLATE_COOKIE]=$(read_setting "$settings" ZCASH_TEMPLATE_COOKIE_SOURCE)
 cookie_paths[ZCASH_VALIDATOR_COOKIE]=$(read_setting "$settings" ZCASH_VALIDATOR_COOKIE_SOURCE)
-zallet_state=$(read_setting "$settings" ZALLET_STATE_DIR)
-cookie_paths[ZALLET_COOKIE]="$zallet_state/.cookie"
 
 cookie_names=(
     WCASH_RPC_COOKIE
     ZCASH_TEMPLATE_COOKIE
     ZCASH_VALIDATOR_COOKIE
-    ZALLET_COOKIE
 )
 
 validate_cookie() {
@@ -114,17 +111,14 @@ fi
 wcash_changed=false
 template_changed=false
 validator_changed=false
-zallet_changed=false
 [[ ${previous[WCASH_RPC_COOKIE]:-} == "${current[WCASH_RPC_COOKIE]}" ]] \
     || wcash_changed=true
 [[ ${previous[ZCASH_TEMPLATE_COOKIE]:-} == "${current[ZCASH_TEMPLATE_COOKIE]}" ]] \
     || template_changed=true
 [[ ${previous[ZCASH_VALIDATOR_COOKIE]:-} == "${current[ZCASH_VALIDATOR_COOKIE]}" ]] \
     || validator_changed=true
-[[ ${previous[ZALLET_COOKIE]:-} == "${current[ZALLET_COOKIE]}" ]] \
-    || zallet_changed=true
 
-if ! $wcash_changed && ! $template_changed && ! $validator_changed && ! $zallet_changed; then
+if ! $wcash_changed && ! $template_changed && ! $validator_changed; then
     exit 0
 fi
 
@@ -135,10 +129,6 @@ if systemctl is-active --quiet zecwec-testnet-pool.target \
 fi
 systemctl stop wcash-pool.service >/dev/null 2>&1 || true
 
-if $validator_changed && systemctl is-active --quiet zecwec-zallet.service; then
-    systemctl restart zecwec-zallet.service
-fi
-
 if $wcash_changed || $template_changed || $validator_changed; then
     if systemctl is-active --quiet wcash-pool-backend.service || $pool_should_run; then
         systemctl stop wcash-pool-backend.service >/dev/null 2>&1 || true
@@ -147,8 +137,7 @@ if $wcash_changed || $template_changed || $validator_changed; then
     fi
 fi
 
-# Zallet can rotate its own cookie while refreshing the validator credential.
-# Prove every source is stable before a pool process snapshots it.
+# Prove every node source is stable before a pool process snapshots it.
 declare -A before_pool=()
 read_current
 for name in "${cookie_names[@]}"; do

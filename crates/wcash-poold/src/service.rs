@@ -5,9 +5,9 @@ use std::{io, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time};
 use wcash_pool_address::{TestnetAddressValidator, WcashCommandValidator};
 use wcash_pool_portal::{
-    serve_until_shutdown, AddressValidator, Asset, ChainNetwork, DisabledPayoutSigner,
-    IsolatedPayoutSigner, MinerTelemetrySource, PoolDataSource, PortalApp, PortalBuildError,
-    PortalConfig, PortalRepository, PortalSecrets, TestnetPayoutBoundary,
+    serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
+    MinerTelemetrySource, PoolDataSource, PortalApp, PortalBuildError, PortalConfig,
+    PortalRepository, PortalSecrets, TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
     Chain, NonceNamespaceClaim, PostgresPoolDataSource, PostgresStore, StoreError,
@@ -22,7 +22,10 @@ use wcash_zec_payout_signer::{
 
 use crate::{
     bootstrap::{self, BootstrapError, MiningBootstrap},
-    config::{ConfigError, RuntimeConfig, MAX_WCASH_WALLET_SYNC_TIMEOUT},
+    config::{
+        AutomaticPayoutConfig, ConfigError, PayoutMode, RuntimeConfig,
+        MAX_WCASH_WALLET_SYNC_TIMEOUT,
+    },
     edge::{self, EdgeCounters, EdgeDependencies, EdgeRuntimeError},
     live_payout::{
         LivePayoutConfigError, LoopbackJsonRpc, NodePayoutAuthority, RpcExactBroadcaster,
@@ -182,8 +185,16 @@ async fn run_started(
 
     let validator = build_address_validator(config)?;
     verify_address_authority(Arc::clone(&validator)).await?;
-    let payout_services =
-        build_payout_services(config, Arc::clone(&started.store), &started.jobs).await?;
+    let payout_services = match config.payout_mode {
+        PayoutMode::Deferred => None,
+        PayoutMode::Automatic => {
+            Some(build_payout_services(config, Arc::clone(&started.store), &started.jobs).await?)
+        }
+    };
+    let payout_boundary = match &payout_services {
+        Some(services) => Arc::clone(&services.portal),
+        None => build_probe_only_payout_boundary(config, &started.jobs).await?,
+    };
 
     let pool_data = PostgresPoolDataSource::new(started.store.as_ref().clone());
     pool_data.refresh().await?;
@@ -194,7 +205,7 @@ async fn run_started(
         validator,
         pool_data.clone(),
         Arc::clone(&miner_telemetry),
-        Arc::clone(&payout_services.portal),
+        payout_boundary,
     )?;
 
     // Dependency checks can consume most of the bootstrap lease. Revalidate
@@ -267,13 +278,19 @@ async fn run_started(
         )
     });
 
-    let wec_payout_shutdown = shutdown_rx.clone();
-    let wec_payout = Arc::clone(&payout_services.wec);
-    tasks.spawn(async move { ServiceTask::WecPayout(wec_payout.run(wec_payout_shutdown).await) });
+    if let Some(payout_services) = payout_services {
+        let wec_payout_shutdown = shutdown_rx.clone();
+        let wec_payout = Arc::clone(&payout_services.wec);
+        tasks.spawn(
+            async move { ServiceTask::WecPayout(wec_payout.run(wec_payout_shutdown).await) },
+        );
 
-    let zec_payout_shutdown = shutdown_rx.clone();
-    let zec_payout = Arc::clone(&payout_services.zec);
-    tasks.spawn(async move { ServiceTask::ZecPayout(zec_payout.run(zec_payout_shutdown).await) });
+        let zec_payout_shutdown = shutdown_rx.clone();
+        let zec_payout = Arc::clone(&payout_services.zec);
+        tasks.spawn(
+            async move { ServiceTask::ZecPayout(zec_payout.run(zec_payout_shutdown).await) },
+        );
+    }
 
     let first_exit = {
         let shares = &bootstrap.as_ref().ok_or(ServiceError::Invariant)?.shares;
@@ -428,12 +445,17 @@ async fn build_probe_only_payout_boundary(
 
     // Preflight composes the portal without giving it an execution-capable
     // signer. No listener is opened, and the boundary is dropped on return.
-    Ok(Arc::new(TestnetPayoutBoundary::new(Arc::new(
-        DisabledPayoutSigner,
-    ))))
+    Ok(Arc::new(TestnetPayoutBoundary::deferred()))
 }
 
 fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<(), ServiceError> {
+    if config.payout_mode == PayoutMode::Deferred {
+        if config.automatic_payout.is_some() {
+            return Err(ServiceError::SignerConfiguration);
+        }
+        return Ok(());
+    }
+    let payout = automatic_payout(config)?;
     let pinned = PinnedWolfProgram::verify(
         config.wcash_wallet_program.clone(),
         config.wcash_wallet_sha256,
@@ -442,8 +464,8 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
     .map_err(|_| ServiceError::SignerConfiguration)?;
     let wallet = WolfWalletTransport::new(
         pinned,
-        config.wcash_wallet_database.clone(),
-        config.wcash_lightwalletd_endpoint.clone(),
+        payout.wcash_wallet_database.clone(),
+        payout.wcash_lightwalletd_endpoint.clone(),
     )
     .map_err(|_| ServiceError::SignerConfiguration)?;
     wallet
@@ -451,12 +473,12 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
         .map_err(|_| ServiceError::SignerConfiguration)?;
 
     let seed =
-        SeedSource::protected_file(config.wcash_wallet_seed_file.clone(), config.wcash_seed_uid);
+        SeedSource::protected_file(payout.wcash_wallet_seed_file.clone(), payout.wcash_seed_uid);
     seed.validate_protected_metadata()
         .map_err(|_| ServiceError::SignerConfiguration)?;
     let _wec = WecSignerConfig::new(
-        config.wcash_signer_journal_directory.clone(),
-        config.wcash_signer_account,
+        payout.wcash_signer_journal_directory.clone(),
+        payout.wcash_signer_account,
         config.wcash_payout_commitment,
         seed,
     )
@@ -469,17 +491,17 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
     .and_then(|configured| configured.with_max_fee_zat(config.wcash_policy.maximum_network_fee_zat))
     .map_err(|_| ServiceError::SignerConfiguration)?;
 
-    validate_zallet_configuration(&config.zallet_configuration)
+    validate_zallet_configuration(&payout.zallet_configuration)
         .map_err(|_| ServiceError::SignerConfiguration)?;
-    let _zallet = LoopbackHttpTransport::new(config.zallet_rpc, config.zallet_cookie_file.clone())
+    let _zallet = LoopbackHttpTransport::new(payout.zallet_rpc, payout.zallet_cookie_file.clone())
         .map_err(|_| ServiceError::SignerConfiguration)?;
     let _zebra =
         LoopbackHttpTransport::new(config.zcash_node_rpc, config.zcash_node_cookie_file.clone())
             .map_err(|_| ServiceError::SignerConfiguration)?;
     let _zec = ZecSignerConfig::new(
-        config.zcash_signer_journal_directory.clone(),
-        config.zallet_configuration.clone(),
-        config.zcash_signer_account,
+        payout.zcash_signer_journal_directory.clone(),
+        payout.zallet_configuration.clone(),
+        payout.zcash_signer_account,
         config.zcash_payout_commitment,
     )
     .and_then(|configured| {
@@ -494,11 +516,22 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
     Ok(())
 }
 
+fn automatic_payout(config: &RuntimeConfig) -> Result<&AutomaticPayoutConfig, ServiceError> {
+    if config.payout_mode != PayoutMode::Automatic {
+        return Err(ServiceError::SignerConfiguration);
+    }
+    config
+        .automatic_payout
+        .as_ref()
+        .ok_or(ServiceError::SignerConfiguration)
+}
+
 async fn build_payout_services(
     config: &RuntimeConfig,
     store: Arc<PostgresStore>,
     jobs: &wcash_pool_edge::JobRouter,
 ) -> Result<PayoutServices, ServiceError> {
+    let payout = automatic_payout(config)?;
     let pinned = PinnedWolfProgram::verify(
         config.wcash_wallet_program.clone(),
         config.wcash_wallet_sha256,
@@ -508,16 +541,16 @@ async fn build_payout_services(
     let wallet = Arc::new(
         WolfWalletTransport::new(
             pinned,
-            config.wcash_wallet_database.clone(),
-            config.wcash_lightwalletd_endpoint.clone(),
+            payout.wcash_wallet_database.clone(),
+            payout.wcash_lightwalletd_endpoint.clone(),
         )
         .map_err(|_| ServiceError::SignerConfiguration)?,
     );
     let wec_config = WecSignerConfig::new(
-        config.wcash_signer_journal_directory.clone(),
-        config.wcash_signer_account,
+        payout.wcash_signer_journal_directory.clone(),
+        payout.wcash_signer_account,
         config.wcash_payout_commitment,
-        SeedSource::protected_file(config.wcash_wallet_seed_file.clone(), config.wcash_seed_uid),
+        SeedSource::protected_file(payout.wcash_wallet_seed_file.clone(), payout.wcash_seed_uid),
     )
     .and_then(|configured| {
         configured.with_confirmations(config.wcash_policy.required_confirmations)
@@ -533,7 +566,7 @@ async fn build_payout_services(
     );
 
     let zallet = Arc::new(
-        LoopbackHttpTransport::new(config.zallet_rpc, config.zallet_cookie_file.clone())
+        LoopbackHttpTransport::new(payout.zallet_rpc, payout.zallet_cookie_file.clone())
             .map_err(|_| ServiceError::SignerConfiguration)?,
     );
     let zebra = Arc::new(
@@ -541,9 +574,9 @@ async fn build_payout_services(
             .map_err(|_| ServiceError::SignerConfiguration)?,
     );
     let zec_config = ZecSignerConfig::new(
-        config.zcash_signer_journal_directory.clone(),
-        config.zallet_configuration.clone(),
-        config.zcash_signer_account,
+        payout.zcash_signer_journal_directory.clone(),
+        payout.zallet_configuration.clone(),
+        payout.zcash_signer_account,
         config.zcash_payout_commitment,
     )
     .and_then(|configured| {
@@ -573,8 +606,8 @@ async fn build_payout_services(
         config.zcash_node_cookie_file.clone(),
     )?);
     let zallet_rpc = Arc::new(LoopbackJsonRpc::new(
-        config.zallet_rpc,
-        config.zallet_cookie_file.clone(),
+        payout.zallet_rpc,
+        payout.zallet_cookie_file.clone(),
     )?);
 
     let wcash_wallet = Arc::new(
@@ -584,11 +617,11 @@ async fn build_payout_services(
                 WalletNetwork::Testnet,
                 config.wcash_genesis,
                 WCASH_TESTNET_BRANCH_ID,
-                config.wcash_signer_account,
+                payout.wcash_signer_account,
                 WalletFundSource::Ironwood,
                 config.wcash_payout_commitment,
-                config.wcash_wallet_sync_timeout,
-                config.wcash_wallet_sync_batch_size,
+                payout.wcash_wallet_sync_timeout,
+                payout.wcash_wallet_sync_batch_size,
             )
             .map_err(|_| ServiceError::PayoutAuthorityConfiguration)?,
             Duration::from_secs(15),
@@ -598,8 +631,8 @@ async fn build_payout_services(
     );
     let zcash_wallet = Arc::new(ZalletObservationSource::new(
         zallet_rpc,
-        config.zcash_signer_account,
-        config.zcash_signer_account_index,
+        payout.zcash_signer_account,
+        payout.zcash_signer_account_index,
         config.zcash_policy.required_confirmations,
         config.zcash_payout_commitment,
     )?);
@@ -647,12 +680,12 @@ async fn build_payout_services(
         Arc::clone(&store) as Arc<dyn crate::settlement::SettlementStore>,
         Arc::new(WecExecutionSigner::new(
             Arc::clone(&wec),
-            config.wcash_signer_account,
+            payout.wcash_signer_account,
         )),
         Arc::new(RpcExactBroadcaster::new(Arc::clone(&wcash_authority))),
         Arc::new(ZecExecutionSigner::new(
             Arc::clone(&zec),
-            config.zcash_signer_account,
+            payout.zcash_signer_account,
         )),
         Arc::new(RpcExactBroadcaster::new(Arc::clone(&zcash_authority))),
     )?);
@@ -1136,7 +1169,7 @@ mod tests {
         REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT, SERVICE_DRAIN_TIMEOUT,
     };
     #[cfg(unix)]
-    use crate::config::{ChainRuntimePolicy, RuntimeConfig};
+    use crate::config::{AutomaticPayoutConfig, ChainRuntimePolicy, PayoutMode, RuntimeConfig};
 
     #[derive(Clone, Copy)]
     enum BrokenPreflightGate {
@@ -1293,24 +1326,27 @@ mod tests {
             wcash_wallet_program: program,
             wcash_wallet_sha256: wallet_digest,
             wcash_wallet_uid: rustix::process::geteuid().as_raw(),
-            wcash_wallet_database: wallet_database.clone(),
-            wcash_lightwalletd_endpoint: "http://127.0.0.1:38234".to_owned(),
-            wcash_wallet_sync_batch_size: 16,
-            wcash_wallet_sync_timeout: Duration::from_secs(300),
+            payout_mode: PayoutMode::Automatic,
+            automatic_payout: Some(AutomaticPayoutConfig {
+                wcash_wallet_database: wallet_database.clone(),
+                wcash_lightwalletd_endpoint: "http://127.0.0.1:38234".to_owned(),
+                wcash_wallet_sync_batch_size: 16,
+                wcash_wallet_sync_timeout: Duration::from_secs(300),
+                wcash_wallet_seed_file: seed.clone(),
+                wcash_seed_uid: rustix::process::geteuid().as_raw(),
+                wcash_signer_journal_directory: wec_journal.clone(),
+                wcash_signer_account: Uuid::from_u128(5),
+                zallet_configuration: zallet,
+                zallet_rpc: SocketAddr::from_str("127.0.0.1:28232").expect("Zallet RPC address"),
+                zallet_cookie_file: zallet_cookie,
+                zcash_signer_journal_directory: zec_journal.clone(),
+                zcash_signer_account: Uuid::from_u128(6),
+                zcash_signer_account_index: 0,
+            }),
             wcash_node_rpc: SocketAddr::from_str("127.0.0.1:38232").expect("Wcash RPC address"),
             wcash_node_cookie_file: wcash_cookie,
-            wcash_wallet_seed_file: seed.clone(),
-            wcash_seed_uid: rustix::process::geteuid().as_raw(),
-            wcash_signer_journal_directory: wec_journal.clone(),
-            wcash_signer_account: Uuid::from_u128(5),
-            zallet_configuration: zallet,
-            zallet_rpc: SocketAddr::from_str("127.0.0.1:28232").expect("Zallet RPC address"),
-            zallet_cookie_file: zallet_cookie,
             zcash_node_rpc: SocketAddr::from_str("127.0.0.1:18242").expect("Zcash RPC address"),
             zcash_node_cookie_file: zcash_cookie,
-            zcash_signer_journal_directory: zec_journal.clone(),
-            zcash_signer_account: Uuid::from_u128(6),
-            zcash_signer_account_index: 0,
             portal_token_pepper_file: pepper,
             portal_totp_key_file: totp,
             wcash_policy: policy.clone(),
@@ -1321,6 +1357,12 @@ mod tests {
 
         validate_probe_only_payout_configuration(&config)
             .expect("probe-only payout configuration is valid");
+
+        let mut deferred = config.clone();
+        deferred.payout_mode = PayoutMode::Deferred;
+        deferred.automatic_payout = None;
+        validate_probe_only_payout_configuration(&deferred)
+            .expect("deferred mining does not require payout authority");
 
         assert_eq!(directory_names(&root), before);
         assert!(!marker.exists(), "the wallet executable must not run");

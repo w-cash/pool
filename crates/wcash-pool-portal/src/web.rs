@@ -245,7 +245,8 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
     Ok(Json(json!({
         "ready": true,
         "component": "miner-portal",
-        "network": state.config.network
+        "network": state.config.network,
+        "payout_execution": state.payout.execution().as_str()
     })))
 }
 

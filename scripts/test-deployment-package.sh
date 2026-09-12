@@ -21,6 +21,24 @@ shellcheck "$repo_root"/scripts/deploy/*.sh \
     "$repo_root/scripts/build-zallet-testnet.sh" \
     "$repo_root/scripts/test-zallet-patches.sh" \
     "$repo_root/scripts/test-deployment-package.sh"
+
+mkdir -p "$temporary/fake-bin"
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nexit "$PGREP_TEST_STATUS"\n' >"$temporary/fake-bin/pgrep"
+chmod 0555 "$temporary/fake-bin/pgrep"
+current_user=$(id -un)
+PATH="$temporary/fake-bin:$PATH" PGREP_TEST_STATUS=1 bash -c \
+    'source "$1"; require_no_processes_for_user "$2" "test identity"' \
+    sh "$repo_root/scripts/deploy/common.sh" "$current_user"
+for rejected_pgrep_status in 0 2 3; do
+    if PATH="$temporary/fake-bin:$PATH" PGREP_TEST_STATUS=$rejected_pgrep_status bash -c \
+        'source "$1"; require_no_processes_for_user "$2" "test identity"' \
+        sh "$repo_root/scripts/deploy/common.sh" "$current_user" >/dev/null 2>&1; then
+        printf 'deployment-package-test: custody accepted pgrep status %s\n' \
+            "$rejected_pgrep_status" >&2
+        exit 1
+    fi
+done
 "$repo_root/scripts/test-zallet-patches.sh" >/dev/null
 grep -Fq 'base_commit=987382f67e622915228686e9f956c6a9c9a7514c' \
     "$repo_root/scripts/build-zallet-testnet.sh"
@@ -271,23 +289,36 @@ manifest = json.loads((root / "render-manifest.json").read_text(encoding="utf-8"
 
 assert runtime["network"] == "testnet"
 assert runtime["wcash_wallet_uid"] == 0
-assert runtime["wcash_seed_uid"] == 12345
+assert runtime["payout_mode"] == "deferred"
 assert runtime["nonce_reservation"] == 65536
 assert runtime["backend_instance"] == "55555555-5555-4555-8555-555555555555"
 assert runtime["journal_stream"] == "66666666-6666-4666-8666-666666666666"
 assert runtime["database_url_file"] == "/run/credentials/wcash-pool.service/database-url"
 assert runtime["wcash_node_rpc"] == "127.0.0.1:38232"
 assert runtime["wcash_node_cookie_file"] == "/run/credentials/wcash-pool.service/wcash-node-cookie"
-assert runtime["zcash_signer_account_index"] == 0
 assert migrate["database_url_file"] == "/run/credentials/wcash-pool-migrate.service/database-url"
 assert preflight["database_url_file"] == "/run/credentials/wcash-pool-preflight.service/database-url"
-assert preflight["zallet_cookie_file"] == "/run/credentials/wcash-pool-preflight.service/zallet-cookie"
 assert preflight["wcash_node_cookie_file"] == "/run/credentials/wcash-pool-preflight.service/wcash-node-cookie"
 assert runtime["wcash_wallet_program"] == str(root.parent / "release" / "wcash-wallet")
-assert runtime["wcash_wallet_sync_batch_size"] == 16
-assert runtime["wcash_wallet_sync_timeout_seconds"] == 900
-assert runtime["wcash_signer_account"] == "33333333-3333-4333-8333-333333333333"
-assert runtime["zcash_signer_account"] == "44444444-4444-4444-8444-444444444444"
+for policy in (runtime, migrate, preflight):
+    assert policy["payout_mode"] == "deferred"
+    for payout_only in (
+        "wcash_wallet_database",
+        "wcash_lightwalletd_endpoint",
+        "wcash_wallet_sync_batch_size",
+        "wcash_wallet_sync_timeout_seconds",
+        "wcash_wallet_seed_file",
+        "wcash_seed_uid",
+        "wcash_signer_journal_directory",
+        "wcash_signer_account",
+        "zallet_configuration",
+        "zallet_rpc",
+        "zallet_cookie_file",
+        "zcash_signer_journal_directory",
+        "zcash_signer_account",
+        "zcash_signer_account_index",
+    ):
+        assert payout_only not in policy
 assert zallet["consensus"]["network"] == "test"
 assert zallet["builder"] == {"limits": {}}
 assert zallet["external"]["broadcast"] is False
@@ -310,6 +341,21 @@ assert "User=wcash-pool\n" in pool_unit
 assert "SupplementaryGroups=wcash-pool-socket" in pool_unit
 assert "LoadCredential=database-url:" in pool_unit
 assert "LoadCredential=wcash-node-cookie:" in pool_unit
+assert "LoadCredential=zallet-" not in pool_unit
+assert (
+    "Conflicts=zecwec-zallet.service wcash-pool-wallet-init.service "
+    "wcash-pool-zec-authority-bootstrap.service"
+) in pool_unit
+assert (
+    "After=network-online.target postgresql.service wcash-pool-migrate.service "
+    "wcash-pool-backend.service wcash-pool-custody-gate.service "
+    "zecwec-zallet.service wcash-pool-wallet-init.service "
+    "wcash-pool-zec-authority-bootstrap.service"
+) in pool_unit
+assert "Requires=" in pool_unit and "wcash-pool-custody-gate.service" in pool_unit
+for forbidden_credential in ("wcash-seed", "zallet-cookie", "signer-journal"):
+    assert f"LoadCredential={forbidden_credential}" not in pool_unit
+assert "InaccessiblePaths=" in pool_unit
 assert "/opt/wcash/current" not in pool_unit
 assert str(root.parent / "release") in pool_unit
 assert "User=wcash-pool-backend\n" in backend_unit
@@ -323,6 +369,7 @@ assert "zec-authority-bootstrap.sh verify" in backend_unit
 
 preflight_unit = (root / "systemd/wcash-pool-preflight.service").read_text(encoding="utf-8")
 zallet_unit = (root / "systemd/zecwec-zallet.service").read_text(encoding="utf-8")
+backend_init_unit = (root / "systemd/wcash-pool-backend-init.service").read_text(encoding="utf-8")
 executable_condition_units = {
     "wcash-pool-backend-init.service",
     "wcash-pool-backend.service",
@@ -342,6 +389,12 @@ for service in (root / "systemd").glob("*.service"):
         found_executable_conditions.add(service.name)
 assert found_executable_conditions == executable_condition_units
 assert "pool.preflight.toml" in preflight_unit
+assert "LoadCredential=zallet-" not in preflight_unit
+assert "zecwec-zallet.service" not in preflight_unit
+assert "wcash-pool-wallet-init.service" not in preflight_unit
+assert "InaccessiblePaths=" in preflight_unit
+assert "wcash-pool-wallet-init.service" not in backend_init_unit
+assert "wcash-pool-zec-authority-bootstrap.service" not in backend_init_unit
 assert "/run/credentials/wcash-pool-preflight.service" not in pool_unit
 assert "TimeoutStopSec=1920s" in pool_unit
 assert "KillMode=mixed" in pool_unit
@@ -350,6 +403,31 @@ assert "TimeoutStartSec=1800s" in preflight_unit
 assert "TimeoutStartSec=1200s" in zallet_unit
 assert "ConditionFileIsExecutable=" in zallet_unit
 assert "ConditionPathIsExecutable=" not in zallet_unit
+assert "WantedBy=zecwec-testnet-pool.target" not in zallet_unit
+
+custody_gate_unit = (root / "systemd/wcash-pool-custody-gate.service").read_text(
+    encoding="utf-8"
+)
+assert "User=root\n" in custody_gate_unit
+assert "verify-offline-custody.sh /etc/wcash-pool/deployment.env" in custody_gate_unit
+assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID" in custody_gate_unit
+assert "Conflicts=zecwec-zallet.service" in custody_gate_unit
+assert (
+    "After=zecwec-zallet.service wcash-pool-wallet-init.service "
+    "wcash-pool-zec-authority-bootstrap.service"
+) in custody_gate_unit
+assert "ConditionPathExists=" not in custody_gate_unit
+assert "ConditionFileIsExecutable=" not in custody_gate_unit
+
+for mining_unit in (
+    pool_unit,
+    preflight_unit,
+    backend_unit,
+    backend_init_unit,
+    (root / "systemd/wcash-pool-migrate.service").read_text(encoding="utf-8"),
+):
+    assert "LoadCredential=wcash-seed" not in mining_unit
+    assert "LoadCredential=zallet-cookie" not in mining_unit
 
 wallet_init_unit = (root / "systemd/wcash-pool-wallet-init.service").read_text(encoding="utf-8")
 assert "EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env" in wallet_init_unit
@@ -404,6 +482,37 @@ grep -Fq 'Cloudflare Access did not deny the anonymous staging probe' \
 grep -Fq 'public_status != 200' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
 grep -Fq 'public_body != '\''{"status":"ok"}'\''' \
     "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+grep -Fq '"payout_execution": "deferred"' \
+    "$repo_root/scripts/deploy/health-check.sh"
+grep -Fq 'require_offline_collector_custody' \
+    "$repo_root/scripts/deploy/preflight.sh"
+grep -Fq 'require_offline_collector_custody' \
+    "$repo_root/scripts/deploy/health-check.sh"
+grep -Fq 'root:root:400:1)' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq -- '--ack-independent-offline-backup-recovery' \
+    "$repo_root/scripts/deploy/seal-wcash-custody.sh"
+grep -Fq 'runuser --user' \
+    "$repo_root/scripts/deploy/common.sh"
+grep -Fq 'usermod --gid wcash-pool --groups wcash-pool-socket wcash-pool' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq "usermod --gid zecwec-zallet --groups '' zecwec-zallet" \
+    "$repo_root/scripts/deploy/provision-host.sh"
+if grep -Fq 'ZALLET_COOKIE' "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"; then
+    printf 'deployment-package-test: deferred credential refresh retained Zallet coupling\n' >&2
+    exit 1
+fi
+if grep -Fq '@ZALLET_STATE_DIR@/.cookie' \
+    "$repo_root/deploy/systemd/zecwec-cookie-refresh.path.in"; then
+    printf 'deployment-package-test: deferred cookie path retained Zallet coupling\n' >&2
+    exit 1
+fi
+if grep -Eq 'systemctl (start|restart) zecwec-zallet' \
+    "$repo_root/scripts/deploy/preflight.sh" \
+    "$repo_root/scripts/deploy/rollback-release.sh"; then
+    printf 'deployment-package-test: deferred lifecycle can start Zallet\n' >&2
+    exit 1
+fi
 
 mkdir -p "$temporary/config-check-credentials"
 chmod 0700 "$temporary/config-check-credentials"
@@ -482,7 +591,7 @@ grep -Fq 'WCASH_EXPECTED_SIGNER_ACCOUNT=BOOTSTRAP_DISCOVERY_REQUIRED' \
 wallet_protocol_fixture="$temporary/wallet-protocol-v2"
 mkdir -p "$wallet_protocol_fixture"
 wallet_account=33333333-3333-4333-8333-333333333333
-wallet_genesis=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+wallet_genesis=0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
 wallet_commitment=4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60
 python3 - \
     "$wallet_protocol_fixture" \
@@ -602,6 +711,62 @@ cmp -s \
         printf 'deployment-package-test: wallet protocol-v2 authority output is unstable\n' >&2
         exit 1
     }
+
+recovery_verifier="$repo_root/scripts/deploy/verify-wcash-wallet-recovery.py"
+python3 "$recovery_verifier" seal \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/identity-v2.json" \
+    "$wallet_protocol_fixture/recovery-attestation.json"
+python3 "$recovery_verifier" verify \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/recovery-attestation.json"
+python3 - \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/recovery-init-not-fresh.json" <<'PY'
+import json
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+value = json.loads(source.read_text(encoding="utf-8"))
+value["created"] = False
+output.write_text(json.dumps(value) + "\n", encoding="utf-8")
+PY
+if python3 "$recovery_verifier" seal \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/recovery-init-not-fresh.json" \
+    "$wallet_protocol_fixture/identity-v2.json" \
+    "$wallet_protocol_fixture/rejected-recovery-attestation.json" \
+    >/dev/null 2>&1; then
+    printf 'deployment-package-test: recovery accepted a reused wallet database\n' >&2
+    exit 1
+fi
+[[ ! -e $wallet_protocol_fixture/rejected-recovery-attestation.json ]] || {
+    printf 'deployment-package-test: rejected recovery wrote an attestation\n' >&2
+    exit 1
+}
+python3 - \
+    "$wallet_protocol_fixture/identity-v2.json" \
+    "$wallet_protocol_fixture/recovery-identity-bool-version.json" <<'PY'
+import json
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+value = json.loads(source.read_text(encoding="utf-8"))
+value["protocol_version"] = True
+output.write_text(json.dumps(value) + "\n", encoding="utf-8")
+PY
+if python3 "$recovery_verifier" seal \
+    "$wallet_protocol_fixture/authority-v2.json" \
+    "$wallet_protocol_fixture/init.json" \
+    "$wallet_protocol_fixture/recovery-identity-bool-version.json" \
+    "$wallet_protocol_fixture/rejected-bool-recovery-attestation.json" \
+    >/dev/null 2>&1; then
+    printf 'deployment-package-test: recovery accepted a boolean protocol version\n' >&2
+    exit 1
+fi
 
 assert_wallet_protocol_rejected() {
     local label=$1

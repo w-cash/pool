@@ -35,8 +35,9 @@ id -u wcash-pool-backend >/dev/null 2>&1 \
 id -u zecwec-zallet >/dev/null 2>&1 \
     || useradd --system --gid zecwec-zallet --home-dir /var/lib/zecwec-zallet --shell /usr/sbin/nologin zecwec-zallet
 
-usermod --gid wcash-pool-socket wcash-pool-backend
-usermod --append --groups wcash-pool-socket wcash-pool
+usermod --gid wcash-pool --groups wcash-pool-socket wcash-pool
+usermod --gid wcash-pool-socket --groups '' wcash-pool-backend
+usermod --gid zecwec-zallet --groups '' zecwec-zallet
 
 install -d -o root -g root -m 0755 /opt/wcash /opt/wcash/releases
 install -d -o root -g root -m 0755 /usr/local/share/zecwec-deploy "$ZECWEC_LIBEXEC"
@@ -45,7 +46,22 @@ install -d -o root -g root -m 0700 "$ZECWEC_CREDENTIAL_DIR"
 install -d -o root -g root -m 0755 "$ZECWEC_CONFIG_DIR/tls"
 install -d -o wcash-pool -g wcash-pool -m 0700 /var/lib/wcash-pool
 install -d -o wcash-pool-backend -g wcash-pool-socket -m 0700 /var/lib/wcash-pool-backend
-install -d -o root -g wcash-pool -m 0710 /var/lib/wcash-pool-secrets
+wcash_seed=/var/lib/wcash-pool-secrets/wcash-seed
+if [[ -e $wcash_seed || -L $wcash_seed ]]; then
+    [[ -f $wcash_seed && ! -L $wcash_seed ]] \
+        || die "existing Wcash seed is unsafe"
+    case $(stat -c '%U:%G:%a:%h' -- "$wcash_seed") in
+        wcash-pool:wcash-pool:600:1)
+            install -d -o root -g wcash-pool -m 0710 /var/lib/wcash-pool-secrets
+            ;;
+        root:root:400:1)
+            install -d -o root -g root -m 0700 /var/lib/wcash-pool-secrets
+            ;;
+        *) die "existing Wcash seed ownership or mode is unsafe" ;;
+    esac
+else
+    install -d -o root -g wcash-pool -m 0710 /var/lib/wcash-pool-secrets
+fi
 install -d -o zecwec-zallet -g zecwec-zallet -m 0700 /var/lib/zecwec-zallet
 
 for directory in deploy scripts docs; do

@@ -208,6 +208,26 @@ impl IsolatedPayoutSigner for DisabledPayoutSigner {
 pub struct TestnetPayoutBoundary {
     signer: Arc<dyn IsolatedPayoutSigner>,
     readiness_slots: Arc<Semaphore>,
+    execution: PayoutExecution,
+}
+
+/// Public operational state of the payout execution boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PayoutExecution {
+    /// A separately isolated signer is configured and must pass readiness.
+    Enabled,
+    /// Mining liabilities accrue, but spending keys and payout workers are offline.
+    Deferred,
+}
+
+impl PayoutExecution {
+    /// Stable value exposed by the miner portal readiness response.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Deferred => "deferred",
+        }
+    }
 }
 
 impl TestnetPayoutBoundary {
@@ -216,7 +236,22 @@ impl TestnetPayoutBoundary {
         Self {
             signer,
             readiness_slots: Arc::new(Semaphore::new(1)),
+            execution: PayoutExecution::Enabled,
         }
+    }
+
+    /// Creates a mining-only boundary that never receives spending authority.
+    pub fn deferred() -> Self {
+        Self {
+            signer: Arc::new(DisabledPayoutSigner),
+            readiness_slots: Arc::new(Semaphore::new(1)),
+            execution: PayoutExecution::Deferred,
+        }
+    }
+
+    /// Returns the immutable execution policy for health and operator status.
+    pub const fn execution(&self) -> PayoutExecution {
+        self.execution
     }
 
     /// Checks the synchronous isolated signer on one cancellation-safe bounded
@@ -226,6 +261,9 @@ impl TestnetPayoutBoundary {
     pub async fn readiness_bounded(&self, timeout: Duration) -> Result<(), SignerError> {
         if timeout.is_zero() || timeout > Duration::from_secs(5) {
             return Err(SignerError::InvalidRequest);
+        }
+        if self.execution == PayoutExecution::Deferred {
+            return Ok(());
         }
         let permit =
             tokio::time::timeout(timeout, Arc::clone(&self.readiness_slots).acquire_owned())
@@ -245,6 +283,9 @@ impl TestnetPayoutBoundary {
 
     /// Validates and delegates an exact Testnet request.
     pub fn execute(&self, request: &PayoutBatchRequest) -> Result<BroadcastReceipt, SignerError> {
+        if self.execution == PayoutExecution::Deferred {
+            return Err(SignerError::NotConfigured);
+        }
         if request.network != ChainNetwork::Testnet {
             return Err(SignerError::WrongNetwork);
         }
@@ -273,6 +314,7 @@ impl fmt::Debug for TestnetPayoutBoundary {
             .debug_struct("TestnetPayoutBoundary")
             .field("signer", &"[ISOLATED]")
             .field("readiness_slots", &"[BOUNDED]")
+            .field("execution", &self.execution)
             .finish()
     }
 }
@@ -342,6 +384,20 @@ mod tests {
     #[test]
     fn disabled_signer_fails_closed() {
         let boundary = TestnetPayoutBoundary::new(Arc::new(DisabledPayoutSigner));
+        assert_eq!(
+            boundary.execute(&request(ChainNetwork::Testnet)),
+            Err(SignerError::NotConfigured)
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_boundary_is_mining_ready_but_cannot_execute() {
+        let boundary = TestnetPayoutBoundary::deferred();
+        assert_eq!(boundary.execution(), PayoutExecution::Deferred);
+        assert_eq!(
+            boundary.readiness_bounded(Duration::from_millis(10)).await,
+            Ok(())
+        );
         assert_eq!(
             boundary.execute(&request(ChainNetwork::Testnet)),
             Err(SignerError::NotConfigured)

@@ -24,8 +24,8 @@ pub use model::{
     ValidatedDestination, WorkerSummary, WorkerTelemetrySummary,
 };
 pub use signer::{
-    BroadcastReceipt, DisabledPayoutSigner, IsolatedPayoutSigner, PayoutBatchRequest, PayoutOutput,
-    SignerError, TestnetPayoutBoundary, MAX_PAYOUT_OUTPUTS,
+    BroadcastReceipt, DisabledPayoutSigner, IsolatedPayoutSigner, PayoutBatchRequest,
+    PayoutExecution, PayoutOutput, SignerError, TestnetPayoutBoundary, MAX_PAYOUT_OUTPUTS,
 };
 pub use store::{
     AccountCredential, AuthenticatedSession, NewSession, PayoutPreferenceChange, PortalRepository,

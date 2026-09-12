@@ -32,6 +32,98 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
 }
 
+require_unreadable_by_user() {
+    local path=${1:?path is required}
+    local user=${2:?user is required}
+    local label=${3:-protected path}
+    require_command runuser
+    [[ -e $path && ! -L $path ]] || die "$label is unavailable or unsafe"
+    local result
+    # $1 belongs to the deliberately isolated child shell.
+    # shellcheck disable=SC2016
+    if ! result=$(runuser --user "$user" -- /bin/sh -c \
+        'if /usr/bin/test -r "$1"; then printf readable; else printf unreadable; fi' \
+        sh "$path"); then
+        die "$label access probe could not enter the mining identity"
+    fi
+    [[ $result == unreadable ]] || die "$label is readable by the mining identity"
+}
+
+require_exact_user_groups() {
+    local user=${1:?user is required}
+    local expected=${2:?expected groups are required}
+    require_command id
+    local actual
+    actual=$(id -Gn "$user" | tr ' ' '\n' | LC_ALL=C sort | paste -sd, -) \
+        || die "could not establish service identity groups"
+    [[ $actual == "$expected" ]] || die "service identity has unexpected group membership"
+}
+
+require_no_processes_for_user() {
+    local user=${1:?user is required}
+    local label=${2:-service identity}
+    require_command id
+    require_command pgrep
+    local uid pgrep_status
+    uid=$(id -u "$user") || die "$label is unavailable"
+    if pgrep -u "$uid" >/dev/null 2>&1; then
+        die "$label has an active process outside the custody boundary"
+    else
+        pgrep_status=$?
+    fi
+    [[ $pgrep_status == 1 ]] || die "$label process inspection failed"
+}
+
+require_sealed_wcash_custody() {
+    local seed=${1:?seed path is required}
+    local authority=${2:?authority path is required}
+    local attestation=${3:?attestation path is required}
+    local parent
+    parent=$(dirname -- "$seed")
+    [[ -d $parent && ! -L $parent \
+        && $(stat -c '%U:%G:%a' -- "$parent") == root:root:700 ]] \
+        || die "sealed Wcash custody directory is unsafe"
+    [[ -f $seed && ! -L $seed \
+        && $(stat -c '%U:%G:%a:%h' -- "$seed") == root:root:400:1 ]] \
+        || die "sealed Wcash seed is unsafe"
+    [[ -f $attestation && ! -L $attestation \
+        && $(stat -c '%U:%G:%a:%h' -- "$attestation") == root:root:400:1 ]] \
+        || die "Wcash recovery attestation is unsafe"
+    [[ -f $authority && ! -L $authority \
+        && $(stat -c '%U:%G:%a:%h' -- "$authority") == root:root:400:1 ]] \
+        || die "frozen Wcash authority is unsafe"
+    require_unreadable_by_user "$parent" wcash-pool "sealed Wcash custody directory"
+    require_unreadable_by_user "$seed" wcash-pool "sealed Wcash seed"
+    require_unreadable_by_user "$authority" wcash-pool "frozen Wcash authority"
+    python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-wcash-wallet-recovery.py" \
+        verify "$authority" "$attestation"
+}
+
+require_offline_collector_custody() {
+    local settings=${1:?settings path is required}
+    local wcash_seed wcash_authority wcash_recovery_attestation
+    local zallet_state zallet_config
+    require_exact_user_groups wcash-pool wcash-pool,wcash-pool-socket
+    require_exact_user_groups wcash-pool-backend wcash-pool-socket
+    require_exact_user_groups zecwec-zallet zecwec-zallet
+    wcash_seed=$(read_setting "$settings" WEC_SEED_FILE)
+    wcash_authority=/var/lib/wcash-pool/wcash-wallet-authority.json
+    wcash_recovery_attestation=/var/lib/wcash-pool-secrets/wcash-wallet-recovery.attestation
+    require_sealed_wcash_custody \
+        "$wcash_seed" "$wcash_authority" "$wcash_recovery_attestation"
+    zallet_state=$(read_setting "$settings" ZALLET_STATE_DIR)
+    zallet_config=$(read_setting "$settings" ZALLET_CONFIG_FILE)
+    [[ $zallet_state == /var/lib/zecwec-zallet && -d $zallet_state && ! -L $zallet_state \
+        && $(stat -c '%U:%G:%a' -- "$zallet_state") == zecwec-zallet:zecwec-zallet:700 ]] \
+        || die "offline Zallet state directory is unsafe"
+    [[ $zallet_config == /etc/wcash-pool/zallet.toml \
+        && -f $zallet_config && ! -L $zallet_config \
+        && $(stat -c '%U:%G:%a:%h' -- "$zallet_config") == zecwec-zallet:zecwec-zallet:600:1 ]] \
+        || die "offline Zallet configuration is unsafe"
+    require_unreadable_by_user "$zallet_state" wcash-pool "offline Zallet state"
+    require_unreadable_by_user "$zallet_config" wcash-pool "offline Zallet configuration"
+}
+
 require_absolute_path() {
     local path=${1:?path is required}
     [[ $path == /* ]] || die "path must be absolute"

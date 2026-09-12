@@ -8,10 +8,10 @@ The package intentionally separates four authorities:
 
 - `wcash-pool-backend`: talks to the Wcash and Zcash template/validator nodes
   and owns the durable AuxPoW backend journal;
-- `wcash-pool`: accepts miners, maintains the PostgreSQL ledger, serves the
-  loopback portal, and invokes isolated payout signers;
-- `zecwec-zallet`: owns the persistent Zcash collector wallet and exposes RPC
-  on loopback with wallet broadcasting disabled;
+- `wcash-pool`: accepts miners, maintains the PostgreSQL liability ledger, and
+  serves the loopback portal without receiving either collector spending key;
+- `zecwec-zallet`: is a manual bootstrap and later payout tool. It creates and
+  proves the Zcash collector, then remains stopped while mining is live;
 - PostgreSQL: uses a schema-owning migration role and a non-DDL runtime role.
 
 The backend socket is `0660`, owned by the backend user and the
@@ -44,15 +44,23 @@ service is the only expected non-backend member of that group.
    account. Replace all discovery sentinels, install the matching collector
    credentials, then run `render-deployment.sh bootstrap`. The native ZEC
    authority gate must seal its initial-zero evidence before the backend can
-   initialize. Archive any incompatible legacy share journal first.
+   initialize. Independently restore both collectors from their protected
+   backups. Verify the recovered Wcash public identity and run
+   `seal-wcash-custody.sh`; this records a root-only recovery attestation and
+   removes host-DAC access to the seed from the mining identity. Then stop and
+   disable both wallet bootstrap services. Archive any incompatible legacy
+   share journal first.
 8. Run `render-deployment.sh finalize`; inspect both generated pool policies,
    run `wcash-pool-migrate.service`, and run `preflight.sh`.
 9. Apply `restrict-mining-firewall.sh` with explicit ASIC source CIDRs. It
    refuses world-open CIDRs.
 10. Start the private deployment and run `health-check.sh`. This enables only
-    source-restricted mining; the portal site stays disabled. Only after the
-    end-to-end payout/restart/reorg gate passes may an operator acknowledge
-    portal publication, add more source CIDRs, or publish mining DNS.
+    source-restricted mining; the portal site stays disabled and reports
+    `payout_execution=deferred`. Mature liabilities accumulate in PostgreSQL;
+    a separately reviewed, on-demand payout ceremony is required before funds
+    move. The mining unit conflicts with every wallet/bootstrap unit, and
+    preflight proves host DAC denies the mining identity access to both
+    custody stores.
 
 The portal origin is not directly reachable even though mining DNS reveals the
 server IP. Its nginx virtual host requires Cloudflare Authenticated Origin
