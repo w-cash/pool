@@ -55,7 +55,7 @@ def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
             return False
         decoded = json.loads(payload)
         return decoded.get("error") is None and isinstance(decoded.get("result"), dict)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
         return False
     finally:
         connection.close()
@@ -67,8 +67,8 @@ def main() -> None:
     parser.add_argument("--cookie", required=True, type=pathlib.Path)
     parser.add_argument("--deadline", type=int, default=240)
     args = parser.parse_args()
-    if not 1 <= args.deadline <= 600:
-        raise SystemExit("zallet-rpc-health: deadline must be in 1..=600 seconds")
+    if not 1 <= args.deadline <= 1200:
+        raise SystemExit("zallet-rpc-health: deadline must be in 1..=1200 seconds")
 
     try:
         host, port = parse_socket(args.socket)

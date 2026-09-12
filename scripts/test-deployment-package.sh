@@ -15,7 +15,33 @@ command -v shellcheck >/dev/null 2>&1 || {
 
 bash -n "$repo_root"/scripts/deploy/*.sh "$repo_root/scripts/test-deployment-package.sh"
 shellcheck "$repo_root"/scripts/deploy/*.sh "$repo_root/scripts/test-deployment-package.sh"
+grep -Fx -- '    --deadline 1080' \
+    "$repo_root/scripts/deploy/wait-zallet-ready.sh" >/dev/null
 PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile "$repo_root"/scripts/deploy/*.py
+PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/zallet_rpc_health.py" <<'PY'
+import http.client
+import importlib.util
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("zallet_rpc_health", source)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class IncompleteRpcResponse:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def request(self, *_args, **_kwargs):
+        raise http.client.IncompleteRead(b"", 1)
+
+    def close(self):
+        pass
+
+module.http.client.HTTPConnection = IncompleteRpcResponse
+assert module.probe("127.0.0.1", 1, "user:test-value", 0.1) is False
+PY
 cargo build --locked --quiet --manifest-path "$repo_root/Cargo.toml" \
     --package wcash-poold --bin wcash-poold
 
@@ -181,12 +207,14 @@ assert "LoadCredential=zec-initial-zero-attestation:/var/lib/wcash-pool-backend/
 assert "zec-authority-bootstrap.sh verify" in backend_unit
 
 preflight_unit = (root / "systemd/wcash-pool-preflight.service").read_text(encoding="utf-8")
+zallet_unit = (root / "systemd/zecwec-zallet.service").read_text(encoding="utf-8")
 assert "pool.preflight.toml" in preflight_unit
 assert "/run/credentials/wcash-pool-preflight.service" not in pool_unit
 assert "TimeoutStopSec=1920s" in pool_unit
 assert "KillMode=mixed" in pool_unit
 assert "TimeoutStartSec=1800s" in pool_unit
 assert "TimeoutStartSec=1800s" in preflight_unit
+assert "TimeoutStartSec=1200s" in zallet_unit
 
 wallet_init_unit = (root / "systemd/wcash-pool-wallet-init.service").read_text(encoding="utf-8")
 assert "EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env" in wallet_init_unit
