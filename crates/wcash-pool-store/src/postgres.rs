@@ -1,6 +1,6 @@
 //! PostgreSQL deployment fencing and append-only event projection.
 
-use std::{future::Future, pin::Pin, str::FromStr};
+use std::{future::Future, pin::Pin, str::FromStr, time::Duration};
 
 use futures_util::TryStreamExt;
 use num_bigint::BigUint;
@@ -29,6 +29,8 @@ const MAX_REPLAY_BATCH: usize = 1_024;
 const MAX_PPLNS_SHARES: i64 = 100_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
+const MIN_NONCE_NAMESPACE_LEASE_SECS: u64 = 1;
+const MAX_NONCE_NAMESPACE_LEASE_SECS: u64 = 5 * 60;
 const LEDGER_SNAPSHOT_DOMAIN: &[u8] = b"zecwec/ledger-snapshot/v1";
 
 /// Explicit chain environment for a deployment.
@@ -236,6 +238,57 @@ impl NonceRange {
         let cursor = NonceCursor::new(self.profile, self.namespace, self.start)?;
         NoncePrefixAllocator::restore_reserved(cursor, self.namespace, self.end)
             .map_err(StoreError::from)
+    }
+}
+
+/// Database-issued ownership proof for one global nonce-prefix namespace.
+///
+/// The ownership boundary is the exact Wolf backend installation and journal,
+/// not an accounting deployment. A lease generation changes on every takeover
+/// so a token retained by a stopped process cannot become valid again if a
+/// holder UUID is accidentally reused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NonceNamespaceClaim {
+    deployment_id: Uuid,
+    holder_id: Uuid,
+    profile: NonceProfile,
+    namespace: NonceNamespaceLease,
+    generation: u64,
+    expires_at: u64,
+}
+
+impl NonceNamespaceClaim {
+    /// Returns the process-lifetime UUID that owns this lease.
+    pub const fn holder_id(&self) -> Uuid {
+        self.holder_id
+    }
+
+    /// Returns the deployment recorded for operational audit.
+    pub const fn deployment_id(&self) -> Uuid {
+        self.deployment_id
+    }
+
+    /// Returns the negotiated nonce profile protected by this lease.
+    pub const fn profile(&self) -> NonceProfile {
+        self.profile
+    }
+
+    /// Returns the encoded nonce namespace protected by this lease.
+    pub const fn namespace(&self) -> NonceNamespaceLease {
+        self.namespace
+    }
+
+    /// Returns the monotonic database lease generation.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the database-clock expiry as Unix seconds.
+    ///
+    /// This value is informational. Every operation rechecks ownership and
+    /// expiry against the database clock inside its transaction.
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
     }
 }
 
@@ -2076,81 +2129,310 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// Atomically reserves a unique local counter range before any prefix can be
-    /// shown to a miner. A crash wastes the unused tail but never reuses it.
-    pub async fn reserve_nonce_range(
+    /// Claims exclusive ownership of a backend-global nonce namespace.
+    ///
+    /// `holder_id` must be a fresh UUID for this process lifetime. An exact
+    /// retry by the active holder is idempotent and returns the existing lease.
+    /// A different holder can take over only after database-clock expiry or an
+    /// explicit release, and takeover never resets the monotonic cursor.
+    pub async fn claim_nonce_namespace(
         &self,
-        pool_instance: Uuid,
+        holder_id: Uuid,
         profile: NonceProfile,
         namespace: NonceNamespaceLease,
-        count: u64,
-    ) -> Result<NonceRange, StoreError> {
-        if pool_instance.is_nil() || count == 0 {
+        lease_duration: Duration,
+    ) -> Result<NonceNamespaceClaim, StoreError> {
+        if holder_id.is_nil() {
             return Err(StoreError::InvalidNonceReservation);
         }
-        let capacity = match profile {
+        let lease_seconds = nonce_lease_seconds(lease_duration)?;
+        let profile_bytes = nonce_profile_bytes(profile)?;
+        let namespace_id = i16::from(namespace.namespace());
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO nonce_namespace_fences \
+             (backend_instance,journal_stream,profile,namespace,next_counter) \
+             VALUES ($1,$2,$3,$4,0) ON CONFLICT DO NOTHING",
+        )
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
+        .bind(profile_bytes)
+        .bind(namespace_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let row = sqlx::query(
+            "SELECT holder_id,holder_deployment_id,lease_generation, \
+                    EXTRACT(EPOCH FROM lease_expires_at)::BIGINT AS lease_expires_at, \
+                    COALESCE(lease_expires_at > clock_timestamp(),FALSE) AS lease_active \
+             FROM nonce_namespace_fences \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=$3 AND namespace=$4 \
+             FOR UPDATE",
+        )
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
+        .bind(profile_bytes)
+        .bind(namespace_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let active = row.try_get::<bool, _>("lease_active")?;
+        let current_holder = row.try_get::<Option<Uuid>, _>("holder_id")?;
+        let current_deployment = row.try_get::<Option<Uuid>, _>("holder_deployment_id")?;
+        if active {
+            if current_holder != Some(holder_id) || current_deployment != Some(self.identity.id) {
+                return Err(StoreError::NonceNamespaceAlreadyHeld);
+            }
+            let claim = NonceNamespaceClaim {
+                deployment_id: self.identity.id,
+                holder_id,
+                profile,
+                namespace,
+                generation: unix_u64(row.try_get::<i64, _>("lease_generation")?)?,
+                expires_at: unix_u64(
+                    row.try_get::<Option<i64>, _>("lease_expires_at")?
+                        .ok_or(StoreError::CorruptDatabaseState("nonce lease expiry"))?,
+                )?,
+            };
+            transaction.commit().await?;
+            return Ok(claim);
+        }
+
+        let previous_generation = row.try_get::<i64, _>("lease_generation")?;
+        let generation = previous_generation
+            .checked_add(1)
+            .ok_or(StoreError::NonceNamespaceLeaseGenerationExhausted)?;
+        let claimed = sqlx::query(
+            "UPDATE nonce_namespace_fences \
+             SET holder_id=$5,holder_deployment_id=$6,lease_generation=$7, \
+                 lease_acquired_at=clock_timestamp(), \
+                 lease_expires_at=clock_timestamp() + ($8 * INTERVAL '1 second'), \
+                 updated_at=clock_timestamp() \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=$3 AND namespace=$4 \
+             RETURNING EXTRACT(EPOCH FROM lease_expires_at)::BIGINT AS lease_expires_at",
+        )
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
+        .bind(profile_bytes)
+        .bind(namespace_id)
+        .bind(holder_id)
+        .bind(self.identity.id)
+        .bind(generation)
+        .bind(lease_seconds)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let expires_at = claimed.try_get::<i64, _>("lease_expires_at")?;
+        insert_nonce_claim_event(
+            &mut transaction,
+            &self.identity,
+            profile_bytes,
+            namespace_id,
+            holder_id,
+            generation,
+            "claimed",
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(NonceNamespaceClaim {
+            deployment_id: self.identity.id,
+            holder_id,
+            profile,
+            namespace,
+            generation: unix_u64(generation)?,
+            expires_at: unix_u64(expires_at)?,
+        })
+    }
+
+    /// Extends an active claim using the database clock.
+    ///
+    /// An expired claim cannot be revived by renewal; it must compete for a
+    /// fresh generation through [`Self::claim_nonce_namespace`].
+    pub async fn renew_nonce_namespace(
+        &self,
+        claim: &NonceNamespaceClaim,
+        lease_duration: Duration,
+    ) -> Result<NonceNamespaceClaim, StoreError> {
+        self.validate_nonce_claim(claim)?;
+        let lease_seconds = nonce_lease_seconds(lease_duration)?;
+        let profile_bytes = nonce_profile_bytes(claim.profile)?;
+        let namespace_id = i16::from(claim.namespace.namespace());
+        let generation =
+            i64::try_from(claim.generation).map_err(|_| StoreError::InvalidNonceReservation)?;
+        let mut transaction = self.pool.begin().await?;
+        let renewed = sqlx::query(
+            "UPDATE nonce_namespace_fences \
+             SET lease_expires_at=GREATEST( \
+                     lease_expires_at,clock_timestamp() + ($8 * INTERVAL '1 second')), \
+                 updated_at=clock_timestamp() \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=$3 AND namespace=$4 \
+               AND holder_id=$5 AND holder_deployment_id=$6 AND lease_generation=$7 \
+               AND lease_expires_at > clock_timestamp() \
+             RETURNING EXTRACT(EPOCH FROM lease_expires_at)::BIGINT AS lease_expires_at",
+        )
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
+        .bind(profile_bytes)
+        .bind(namespace_id)
+        .bind(claim.holder_id)
+        .bind(self.identity.id)
+        .bind(generation)
+        .bind(lease_seconds)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(StoreError::NonceNamespaceLeaseLost)?;
+        let expires_at = renewed.try_get::<i64, _>("lease_expires_at")?;
+        insert_nonce_claim_event(
+            &mut transaction,
+            &self.identity,
+            profile_bytes,
+            namespace_id,
+            claim.holder_id,
+            generation,
+            "renewed",
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(NonceNamespaceClaim {
+            expires_at: unix_u64(expires_at)?,
+            ..claim.clone()
+        })
+    }
+
+    /// Releases an active namespace claim without changing its cursor.
+    pub async fn release_nonce_namespace(
+        &self,
+        claim: &NonceNamespaceClaim,
+    ) -> Result<(), StoreError> {
+        self.validate_nonce_claim(claim)?;
+        let profile_bytes = nonce_profile_bytes(claim.profile)?;
+        let namespace_id = i16::from(claim.namespace.namespace());
+        let generation =
+            i64::try_from(claim.generation).map_err(|_| StoreError::InvalidNonceReservation)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query_scalar::<_, i64>(
+            "UPDATE nonce_namespace_fences \
+             SET holder_id=NULL,holder_deployment_id=NULL,lease_acquired_at=NULL, \
+                 lease_expires_at=NULL,last_released_at=clock_timestamp(), \
+                 updated_at=clock_timestamp() \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=$3 AND namespace=$4 \
+               AND holder_id=$5 AND holder_deployment_id=$6 AND lease_generation=$7 \
+               AND lease_expires_at > clock_timestamp() \
+             RETURNING next_counter",
+        )
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
+        .bind(profile_bytes)
+        .bind(namespace_id)
+        .bind(claim.holder_id)
+        .bind(self.identity.id)
+        .bind(generation)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(StoreError::NonceNamespaceLeaseLost)?;
+        insert_nonce_claim_event(
+            &mut transaction,
+            &self.identity,
+            profile_bytes,
+            namespace_id,
+            claim.holder_id,
+            generation,
+            "released",
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically reserves a unique local counter range under an active global
+    /// claim before any prefix can be shown to a miner. A crash wastes the
+    /// unused tail but never reuses it.
+    pub async fn reserve_nonce_range(
+        &self,
+        claim: &NonceNamespaceClaim,
+        count: u64,
+    ) -> Result<NonceRange, StoreError> {
+        self.validate_nonce_claim(claim)?;
+        if count == 0 {
+            return Err(StoreError::InvalidNonceReservation);
+        }
+        let capacity = match claim.profile {
             NonceProfile::FourByte => 1u64 << 24,
             NonceProfile::EightByte => 1u64 << 56,
         };
-        let profile_bytes = i16::try_from(profile.prefix_bytes())
-            .map_err(|_| StoreError::InvalidNonceReservation)?;
+        let profile_bytes = nonce_profile_bytes(claim.profile)?;
+        let namespace_id = i16::from(claim.namespace.namespace());
+        let generation =
+            i64::try_from(claim.generation).map_err(|_| StoreError::InvalidNonceReservation)?;
         let mut transaction = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO nonce_cursors (deployment_id,profile,namespace,next_counter) \
-             VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING",
-        )
-        .bind(self.identity.id)
-        .bind(profile_bytes)
-        .bind(i16::from(namespace.namespace()))
-        .execute(&mut *transaction)
-        .await?;
         let start = sqlx::query_scalar::<_, i64>(
-            "SELECT next_counter FROM nonce_cursors \
-             WHERE deployment_id=$1 AND profile=$2 AND namespace=$3 FOR UPDATE",
+            "SELECT next_counter FROM nonce_namespace_fences \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=$3 AND namespace=$4 \
+               AND holder_id=$5 AND holder_deployment_id=$6 AND lease_generation=$7 \
+               AND lease_expires_at > clock_timestamp() \
+             FOR UPDATE",
         )
-        .bind(self.identity.id)
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
         .bind(profile_bytes)
-        .bind(i16::from(namespace.namespace()))
-        .fetch_one(&mut *transaction)
-        .await?;
+        .bind(namespace_id)
+        .bind(claim.holder_id)
+        .bind(self.identity.id)
+        .bind(generation)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(StoreError::NonceNamespaceLeaseLost)?;
         let start = u64::try_from(start).map_err(|_| StoreError::InvalidNonceReservation)?;
         let end = start
             .checked_add(count)
             .filter(|end| *end <= capacity)
             .ok_or(StoreError::NonceNamespaceExhausted)?;
+        let id = Uuid::new_v4();
         sqlx::query(
-            "UPDATE nonce_cursors SET next_counter=$4 \
-             WHERE deployment_id=$1 AND profile=$2 AND namespace=$3",
+            "INSERT INTO nonce_global_range_reservations \
+             (backend_instance,journal_stream,profile,namespace,id,deployment_id,holder_id, \
+              lease_generation,range_start,range_end) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
         )
-        .bind(self.identity.id)
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
         .bind(profile_bytes)
-        .bind(i16::from(namespace.namespace()))
+        .bind(namespace_id)
+        .bind(id)
+        .bind(self.identity.id)
+        .bind(claim.holder_id)
+        .bind(generation)
+        .bind(i64::try_from(start).map_err(|_| StoreError::InvalidNonceReservation)?)
         .bind(i64::try_from(end).map_err(|_| StoreError::InvalidNonceReservation)?)
         .execute(&mut *transaction)
         .await?;
-        let id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO nonce_range_leases \
-             (deployment_id,id,pool_instance,profile,namespace,range_start,range_end) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "UPDATE nonce_namespace_fences SET next_counter=$5,updated_at=clock_timestamp() \
+             WHERE backend_instance=$1 AND journal_stream=$2 AND profile=$3 AND namespace=$4",
         )
-        .bind(self.identity.id)
-        .bind(id)
-        .bind(pool_instance)
+        .bind(self.identity.backend_instance)
+        .bind(self.identity.journal_stream)
         .bind(profile_bytes)
-        .bind(i16::from(namespace.namespace()))
-        .bind(i64::try_from(start).map_err(|_| StoreError::InvalidNonceReservation)?)
+        .bind(namespace_id)
         .bind(i64::try_from(end).map_err(|_| StoreError::InvalidNonceReservation)?)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
         Ok(NonceRange {
             id,
-            profile,
-            namespace,
+            profile: claim.profile,
+            namespace: claim.namespace,
             start,
             end,
         })
+    }
+
+    fn validate_nonce_claim(&self, claim: &NonceNamespaceClaim) -> Result<(), StoreError> {
+        if claim.deployment_id != self.identity.id
+            || claim.holder_id.is_nil()
+            || claim.generation == 0
+        {
+            return Err(StoreError::NonceNamespaceLeaseLost);
+        }
+        Ok(())
     }
 
     /// Projects one validated backend event and all accounting effects.
@@ -2256,6 +2538,54 @@ fn account_credential_from_row(
         security_version: u64::try_from(row.try_get::<i64, _>("security_version")?)
             .map_err(|_| StoreError::CorruptDatabaseState("account security version"))?,
     })
+}
+
+fn nonce_profile_bytes(profile: NonceProfile) -> Result<i16, StoreError> {
+    i16::try_from(profile.prefix_bytes()).map_err(|_| StoreError::InvalidNonceReservation)
+}
+
+fn nonce_lease_seconds(duration: Duration) -> Result<i64, StoreError> {
+    let seconds = duration.as_secs();
+    if duration.subsec_nanos() != 0
+        || !(MIN_NONCE_NAMESPACE_LEASE_SECS..=MAX_NONCE_NAMESPACE_LEASE_SECS).contains(&seconds)
+    {
+        return Err(StoreError::InvalidNonceLeaseDuration);
+    }
+    i64::try_from(seconds).map_err(|_| StoreError::InvalidNonceLeaseDuration)
+}
+
+async fn insert_nonce_claim_event(
+    transaction: &mut Transaction<'_, Postgres>,
+    identity: &DeploymentIdentity,
+    profile: i16,
+    namespace: i16,
+    holder_id: Uuid,
+    generation: i64,
+    event_kind: &str,
+) -> Result<(), StoreError> {
+    let result = sqlx::query(
+        "INSERT INTO nonce_namespace_claim_events \
+         (backend_instance,journal_stream,profile,namespace,deployment_id,holder_id, \
+          lease_generation,event_kind,lease_expires_at,next_counter) \
+         SELECT $1,$2,$3,$4,$5,$6,$7,$8,fence.lease_expires_at,fence.next_counter \
+           FROM nonce_namespace_fences fence \
+          WHERE fence.backend_instance=$1 AND fence.journal_stream=$2 \
+            AND fence.profile=$3 AND fence.namespace=$4",
+    )
+    .bind(identity.backend_instance)
+    .bind(identity.journal_stream)
+    .bind(profile)
+    .bind(namespace)
+    .bind(identity.id)
+    .bind(holder_id)
+    .bind(generation)
+    .bind(event_kind)
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(StoreError::CorruptDatabaseState("nonce claim audit"));
+    }
+    Ok(())
 }
 
 pub(crate) fn unix_i64(value: u64) -> Result<i64, StoreError> {
@@ -3748,6 +4078,18 @@ pub enum StoreError {
     /// A nonce reservation lacked an owner or positive count.
     #[error("invalid durable nonce reservation")]
     InvalidNonceReservation,
+    /// A namespace lease duration was fractional or outside the reviewed bound.
+    #[error("nonce namespace lease duration must be a whole 1..=300 seconds")]
+    InvalidNonceLeaseDuration,
+    /// Another live process currently owns this backend-global namespace.
+    #[error("nonce namespace is already held by another live process")]
+    NonceNamespaceAlreadyHeld,
+    /// The claim expired, was released, or was superseded by another process.
+    #[error("nonce namespace lease is no longer active")]
+    NonceNamespaceLeaseLost,
+    /// The monotonic acquisition generation exceeded PostgreSQL capacity.
+    #[error("nonce namespace lease generation is exhausted")]
+    NonceNamespaceLeaseGenerationExhausted,
     /// A nonce namespace has no remaining disjoint ranges.
     #[error("nonce namespace is exhausted")]
     NonceNamespaceExhausted,
