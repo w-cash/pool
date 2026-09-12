@@ -12,6 +12,9 @@ publish = false
 [dependencies]
 base64.workspace = true
 hex.workspace = true
+orchard = "=0.15.5"
+pczt = { version = "=0.9.3", features = ["io-finalizer", "signer", "tx-extractor", "zcp-builder"] }
+postcard = "=1.1.3"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -21,9 +24,16 @@ uuid.workspace = true
 wcash-pool-portal = { path = "../wcash-pool-portal" }
 zeroize.workspace = true
 zcash_address.workspace = true
+zcash_keys = { version = "=0.16.1", features = ["orchard"] }
+zcash_note_encryption = "=0.4.2"
+zcash_primitives = "=0.30.1"
 zcash_protocol.workspace = true
+zip32 = "=0.2.1"
 
 [dev-dependencies]
+incrementalmerkletree = "=0.8.2"
+pczt = { version = "=0.9.3", features = ["prover"] }
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
 tempfile = "3.23.0"
 
 [lints]

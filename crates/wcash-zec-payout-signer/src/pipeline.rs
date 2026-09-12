@@ -1,13 +1,28 @@
 //! Exact, resumable Zallet PCZT orchestration.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt,
+    io::Cursor,
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use serde::Deserialize;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use orchard::{
+    circuit::{OrchardCircuitVersion, VerifyingKey},
+    keys::FullViewingKey,
+    note::{NoteVersion, Rho},
+    Note,
+};
+use pczt::{
+    roles::{
+        signer::Signer as PcztSigner, tx_extractor::TransactionExtractor,
+        verifier::Verifier as PcztVerifier,
+    },
+    Pczt,
+};
+use serde::{de::IgnoredAny, Deserialize, Deserializer};
 use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -15,9 +30,20 @@ use wcash_pool_portal::{
     Asset, BroadcastReceipt, ChainNetwork, IsolatedPayoutSigner, PayoutBatchRequest, ReceiverKind,
     SignerError,
 };
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_note_encryption::{try_output_recovery_with_pkd_esk, Domain};
+use zcash_primitives::transaction::{Transaction, TxVersion};
+use zcash_protocol::{
+    consensus::{BranchId, TEST_NETWORK},
+    constants::{
+        testnet::COIN_TYPE as ZCASH_TESTNET_COIN_TYPE, V6_TX_VERSION, V6_VERSION_GROUP_ID,
+    },
+    memo::MemoBytes,
+};
+use zip32::{fingerprint::SeedFingerprint, AccountId, ChildIndex};
 
 use crate::{
-    address::validate_destination,
+    address::{decode_destination, validate_destination, Destination},
     journal::{Journal, JournalRecord, StoredStage},
     JsonRpcTransport, PipelineStage, RpcCall, ZecPayoutError, ZecSignerConfig, ZALLET_API_VERSION,
 };
@@ -30,7 +56,17 @@ const PCZT_PROVE: &str = "pczt_prove";
 const PCZT_SIGN: &str = "pczt_sign";
 const PCZT_EXTRACT: &str = "pczt_extract";
 const GET_WALLET_STATUS: &str = "getwalletstatus";
+const GET_ACCOUNT: &str = "z_getaccount";
+const GET_BALANCES: &str = "z_getbalances";
+const EXPORT_VIEWING_KEY: &str = "z_exportviewingkey";
 const SEND_RAW_TRANSACTION: &str = "sendrawtransaction";
+const ZCASH_NU6_3_BRANCH_ID: u32 = 0x37a5_165b;
+const PCZT_V2_HEADER: &[u8; 8] = b"PCZT\x02\0\0\0";
+const MAX_EXPIRY_DELTA: u32 = 100;
+const PROP_SEED_FINGERPRINT: &str = "zallet.v1.seed_fingerprint";
+const PROP_ACCOUNT_INDEX: &str = "zallet.v1.account_index";
+const PROP_PRIVACY_POLICY: &str = "zallet.v1.privacy_policy";
+const PROP_BACKEND_PROPOSAL_INFO: &str = "zcash_client_backend:proposal_info";
 
 /// The only source accepted for private collector payouts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,8 +125,9 @@ impl fmt::Debug for ZecPayoutRequest {
 pub struct ZecPayoutExecution {
     /// Portal-compatible public receipt.
     pub receipt: BroadcastReceipt,
-    /// Digest of the exact accounting intent independently verified by Zallet.
-    pub intent_digest: [u8; 32],
+    /// Zcash consensus shielded-signature hash of the exact transaction effects
+    /// approved before signing.
+    pub unsigned_digest: [u8; 32],
     /// Display-order transaction identifier bytes.
     pub transaction_id_bytes: [u8; 32],
     /// Exact signed transaction bytes that were submitted.
@@ -99,12 +136,23 @@ pub struct ZecPayoutExecution {
     pub network_fee_zat: u64,
 }
 
+impl ZecPayoutExecution {
+    /// Returns the Zcash consensus shielded-signature/effects digest.
+    ///
+    /// The `unsigned_digest` field name is retained for the settlement-store
+    /// interface; it is not the portal request commitment or a hash of mutable
+    /// PCZT role metadata.
+    pub const fn consensus_effects_digest(&self) -> [u8; 32] {
+        self.unsigned_digest
+    }
+}
+
 impl fmt::Debug for ZecPayoutExecution {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ZecPayoutExecution")
             .field("receipt", &self.receipt)
-            .field("intent_digest", &self.intent_digest)
+            .field("consensus_effects_digest", &self.unsigned_digest)
             .field("transaction_id_bytes", &self.transaction_id_bytes)
             .field("signed_transaction", &"[REDACTED]")
             .field("network_fee_zat", &self.network_fee_zat)
@@ -180,10 +228,15 @@ impl ZecPcztSigner {
         self
     }
 
-    /// Verifies the static fence and confirms that Zallet reports an unlocked,
-    /// synchronized wallet boundary.
+    /// Verifies the static Testnet fence, exact configured account, sync-engine
+    /// state, and availability of the account's exported viewing key.
     pub fn readiness(&self) -> Result<(), ZecPayoutError> {
         crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        self.wallet_context()?;
+        Ok(())
+    }
+
+    fn wallet_context(&self) -> Result<WalletContext, ZecPayoutError> {
         let value = self.wallet_call(
             GET_WALLET_STATUS,
             json!([]),
@@ -191,10 +244,54 @@ impl ZecPcztSigner {
         )?;
         let status: WalletStatus =
             serde_json::from_value(value).map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
-        if status.locked {
+        if !status.is_fully_synchronized() {
             return Err(ZecPayoutError::WalletRpcUnavailable);
         }
-        Ok(())
+
+        let value = self.wallet_call(
+            GET_ACCOUNT,
+            json!([self.config.account_id().to_string()]),
+            self.config.rpc_limits().ordinary_timeout(),
+        )?;
+        let account: WalletAccount =
+            serde_json::from_value(value).map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        let identity = account.signing_identity(self.config.account_id())?;
+
+        let value = self.wallet_call(
+            GET_BALANCES,
+            json!([self.config.min_confirmations()]),
+            self.config.rpc_limits().ordinary_timeout(),
+        )?;
+        let balances: WalletBalances =
+            serde_json::from_value(value).map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        balances.require_no_legacy_orchard(self.config.account_id())?;
+
+        let value = self.wallet_call(
+            EXPORT_VIEWING_KEY,
+            json!([identity.unified_address, false]),
+            self.config.rpc_limits().ordinary_timeout(),
+        )?;
+        let encoded_ufvk = value
+            .as_str()
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        let ufvk = UnifiedFullViewingKey::decode(&TEST_NETWORK, encoded_ufvk)
+            .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        let orchard_fvk = ufvk
+            .orchard()
+            .cloned()
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        if orchard_fvk
+            .scope_for_address(&identity.unified_receiver)
+            .is_none()
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        Ok(WalletContext {
+            node_height: status.node_tip.height,
+            seed_fingerprint: identity.seed_fingerprint,
+            account_index: identity.account_index,
+            orchard_fvk,
+        })
     }
 
     /// Executes or resumes one exact batch.
@@ -243,6 +340,8 @@ impl ZecPcztSigner {
                     pipeline_commitment,
                     portal_commitment,
                     output_total_zat,
+                    consensus_effects_digest: None,
+                    consensus_network_fee_zat: None,
                     stage: StoredStage::Reserved,
                 };
                 self.persist(&record)?;
@@ -267,14 +366,22 @@ impl ZecPcztSigner {
                     pczt,
                     privacy_policy,
                 } => {
+                    let wallet = self.wallet_context()?;
+                    let effects =
+                        self.verify_created_pczt(request, &privacy_policy, &pczt, &wallet)?;
                     let inspected = self.inspect_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::CreatedVerified)?;
-                    let _network_fee_zat = self.verify_inspection(
+                    let claimed_fee_zat = self.verify_inspection(
                         request,
                         &privacy_policy,
                         &inspected,
                         ProofRequirement::MayBeMissing,
                     )?;
+                    if claimed_fee_zat != effects.network_fee_zat {
+                        return Err(ZecPayoutError::WalletProtocolViolation);
+                    }
+                    record.consensus_effects_digest = Some(effects.digest);
+                    record.consensus_network_fee_zat = Some(effects.network_fee_zat);
                     record.stage = StoredStage::CreatedVerified {
                         pczt,
                         privacy_policy,
@@ -285,9 +392,11 @@ impl ZecPcztSigner {
                     pczt,
                     privacy_policy,
                 } => {
+                    self.verify_consensus_effects(&record, &pczt)?;
                     let proved = self.prove_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::Proved)?;
                     validate_pczt(&proved.pczt)?;
+                    self.verify_consensus_effects(&record, &proved.pczt)?;
                     let _proof_report = (
                         proved.sapling_proven,
                         proved.orchard_proven,
@@ -303,14 +412,18 @@ impl ZecPcztSigner {
                     pczt,
                     privacy_policy,
                 } => {
+                    self.verify_consensus_effects(&record, &pczt)?;
                     let inspected = self.inspect_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::ProvedVerified)?;
-                    let _network_fee_zat = self.verify_inspection(
+                    let network_fee_zat = self.verify_inspection(
                         request,
                         &privacy_policy,
                         &inspected,
                         ProofRequirement::Complete,
                     )?;
+                    if Some(network_fee_zat) != record.consensus_network_fee_zat {
+                        return Err(ZecPayoutError::WalletProtocolViolation);
+                    }
                     record.stage = StoredStage::ProvedVerified {
                         pczt,
                         privacy_policy,
@@ -321,10 +434,12 @@ impl ZecPcztSigner {
                     pczt,
                     privacy_policy,
                 } => {
+                    self.verify_consensus_effects(&record, &pczt)?;
                     let signed = self.sign_pczt(&pczt, &privacy_policy)?;
                     self.rpc_checkpoint(PipelineStage::Signed)?;
                     signed.validate()?;
                     validate_pczt(&signed.pczt)?;
+                    self.verify_consensus_effects(&record, &signed.pczt)?;
                     record.stage = StoredStage::Signed {
                         pczt: signed.pczt,
                         privacy_policy,
@@ -335,6 +450,7 @@ impl ZecPcztSigner {
                     pczt,
                     privacy_policy,
                 } => {
+                    self.verify_consensus_effects(&record, &pczt)?;
                     let inspected = self.inspect_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::SignedVerified)?;
                     let network_fee_zat = self.verify_inspection(
@@ -343,6 +459,9 @@ impl ZecPcztSigner {
                         &inspected,
                         ProofRequirement::Complete,
                     )?;
+                    if Some(network_fee_zat) != record.consensus_network_fee_zat {
+                        return Err(ZecPayoutError::WalletProtocolViolation);
+                    }
                     record.stage = StoredStage::SignedVerified {
                         pczt,
                         privacy_policy,
@@ -355,9 +474,11 @@ impl ZecPcztSigner {
                     privacy_policy: _,
                     network_fee_zat,
                 } => {
+                    self.verify_consensus_effects(&record, &pczt)?;
+                    let approved_transaction_id = extractable_consensus_txid(&pczt)?;
                     let extracted = self.extract_pczt(&pczt)?;
                     self.rpc_checkpoint(PipelineStage::Extracted)?;
-                    extracted.validate()?;
+                    extracted.validate_against(&approved_transaction_id)?;
                     record.stage = StoredStage::Extracted {
                         raw_transaction: extracted.hex,
                         transaction_id: extracted.txid,
@@ -569,6 +690,216 @@ impl ZecPcztSigner {
         Ok(result)
     }
 
+    fn verify_created_pczt(
+        &self,
+        request: &ZecPayoutRequest,
+        privacy_policy: &str,
+        pczt_base64: &str,
+        wallet: &WalletContext,
+    ) -> Result<VerifiedEffects, ZecPayoutError> {
+        let pczt = parse_pczt(pczt_base64)?;
+        let global = pczt.global();
+        let expiry_height = *global.expiry_height();
+        if *global.tx_version() != V6_TX_VERSION
+            || *global.version_group_id() != V6_VERSION_GROUP_ID
+            || *global.consensus_branch_id() != ZCASH_NU6_3_BRANCH_ID
+            || pczt_v2_coin_type(pczt_base64)? != ZCASH_TESTNET_COIN_TYPE
+            || expiry_height <= wallet.node_height
+            || expiry_height
+                > wallet
+                    .node_height
+                    .checked_add(MAX_EXPIRY_DELTA)
+                    .ok_or(ZecPayoutError::WalletProtocolViolation)?
+            || global.inputs_modifiable()
+            || global.outputs_modifiable()
+            || global.shielded_modifiable()
+            || global.has_sighash_single()
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+
+        let proprietary = global.proprietary();
+        let expected_account = wallet.account_index.to_le_bytes();
+        if proprietary.get(PROP_SEED_FINGERPRINT).map(Vec::as_slice)
+            != Some(wallet.seed_fingerprint.to_bytes().as_slice())
+            || proprietary.get(PROP_ACCOUNT_INDEX).map(Vec::as_slice)
+                != Some(expected_account.as_slice())
+            || proprietary.get(PROP_PRIVACY_POLICY).map(Vec::as_slice)
+                != Some(privacy_policy.as_bytes())
+            || proprietary
+                .get(PROP_BACKEND_PROPOSAL_INFO)
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+
+        // `fund_source = orchard` in beta.3 includes both Orchard-family pools.
+        // The pool policy is stricter: all value-bearing source effects must be
+        // Ironwood, with no transparent inputs and no legacy Sapling/Orchard data.
+        if !pczt.transparent().inputs().is_empty()
+            || !pczt.sapling().spends().is_empty()
+            || !pczt.sapling().outputs().is_empty()
+            || *pczt.sapling().value_sum() != 0
+            || !pczt.orchard().actions().is_empty()
+            || signed_value_sum(pczt.orchard().value_sum()) != 0
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+
+        let mut matched = vec![false; request.batch.outputs.len()];
+        let mut transparent_total = 0u64;
+        for output in pczt.transparent().outputs() {
+            let address = output
+                .user_address()
+                .as_deref()
+                .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+            let index = request
+                .batch
+                .outputs
+                .iter()
+                .enumerate()
+                .find_map(|(index, expected)| {
+                    (!matched[index]
+                        && expected.receiver_kind == ReceiverKind::Transparent
+                        && expected.canonical_address == address
+                        && expected.amount_zat == *output.value())
+                    .then_some(index)
+                })
+                .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+            let Destination::Transparent { script_pubkey } = decode_destination(address)? else {
+                return Err(ZecPayoutError::WalletProtocolViolation);
+            };
+            if output.script_pubkey() != &script_pubkey {
+                return Err(ZecPayoutError::WalletProtocolViolation);
+            }
+            transparent_total = transparent_total
+                .checked_add(*output.value())
+                .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+            matched[index] = true;
+        }
+
+        let expected_account_id = AccountId::try_from(wallet.account_index)
+            .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        let expected_coin_type = ChildIndex::hardened(ZCASH_TESTNET_COIN_TYPE);
+        let mut positive_change_outputs = 0usize;
+        let mut spend_total = 0u64;
+        let mut shielded_output_total = 0u64;
+        PcztVerifier::new(pczt.clone())
+            .with_ironwood::<(), _>(|bundle| {
+                bundle.verify_cross_address_restriction()?;
+                for action in bundle.actions() {
+                    if action.spend().dummy_sk().is_some() {
+                        return Err(pczt::roles::verifier::OrchardError::Custom(()));
+                    }
+                    action.verify_cv_net()?;
+                    action.output().verify_note_commitment(action.spend())?;
+
+                    let spend_value = action
+                        .spend()
+                        .value()
+                        .as_ref()
+                        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?
+                        .inner();
+                    let output_value = action
+                        .output()
+                        .value()
+                        .as_ref()
+                        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?
+                        .inner();
+                    spend_total = spend_total
+                        .checked_add(spend_value)
+                        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+                    shielded_output_total = shielded_output_total
+                        .checked_add(output_value)
+                        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+
+                    if spend_value > 0 {
+                        action.spend().verify_nullifier(Some(&wallet.orchard_fvk))?;
+                        action.spend().verify_rk(Some(&wallet.orchard_fvk))?;
+                        let derived_account =
+                            action
+                                .spend()
+                                .zip32_derivation()
+                                .as_ref()
+                                .and_then(|derivation| {
+                                    derivation.extract_account_index(
+                                        &wallet.seed_fingerprint,
+                                        expected_coin_type,
+                                    )
+                                });
+                        if derived_account != Some(expected_account_id) {
+                            return Err(pczt::roles::verifier::OrchardError::Custom(()));
+                        }
+                    }
+
+                    if output_value > 0 {
+                        verify_ironwood_ciphertext(action)?;
+                        let recipient = action
+                            .output()
+                            .recipient()
+                            .as_ref()
+                            .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+                        if let Some(address) = action.output().user_address().as_deref() {
+                            let index = request
+                                .batch
+                                .outputs
+                                .iter()
+                                .enumerate()
+                                .find_map(|(index, expected)| {
+                                    (!matched[index]
+                                        && expected.receiver_kind == ReceiverKind::Ironwood
+                                        && expected.canonical_address == address
+                                        && expected.amount_zat == output_value)
+                                        .then_some(index)
+                                })
+                                .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+                            let Destination::Ironwood {
+                                receiver: expected_receiver,
+                            } = decode_destination(address)
+                                .map_err(|_| pczt::roles::verifier::OrchardError::Custom(()))?
+                            else {
+                                return Err(pczt::roles::verifier::OrchardError::Custom(()));
+                            };
+                            if recipient.to_raw_address_bytes() != expected_receiver {
+                                return Err(pczt::roles::verifier::OrchardError::Custom(()));
+                            }
+                            matched[index] = true;
+                        } else {
+                            positive_change_outputs += 1;
+                            if positive_change_outputs > 1
+                                || wallet.orchard_fvk.scope_for_address(recipient).is_none()
+                            {
+                                return Err(pczt::roles::verifier::OrchardError::Custom(()));
+                            }
+                        }
+                    } else if action.output().user_address().is_some() {
+                        return Err(pczt::roles::verifier::OrchardError::Custom(()));
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+
+        if matched.iter().any(|is_matched| !is_matched) {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        let computed_value_sum = i128::from(spend_total) - i128::from(shielded_output_total);
+        let declared_value_sum = signed_value_sum(pczt.ironwood().value_sum());
+        if computed_value_sum != declared_value_sum {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        let fee = declared_value_sum - i128::from(transparent_total);
+        let network_fee_zat = u64::try_from(fee)
+            .ok()
+            .filter(|fee| *fee > 0 && *fee <= self.config.max_fee_zat())
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+
+        Ok(VerifiedEffects {
+            digest: consensus_effects_digest_from_pczt(pczt)?,
+            network_fee_zat,
+        })
+    }
+
     fn verify_inspection(
         &self,
         request: &ZecPayoutRequest,
@@ -581,21 +912,16 @@ impl ZecPcztSigner {
             .as_ref()
             .ok_or(ZecPayoutError::WalletProtocolViolation)?;
         if !inspected.wallet_created
-            || signing_hints.seed_fingerprint.is_empty()
-            || signing_hints.seed_fingerprint.len() > 128
-            || !signing_hints
+            || signing_hints
                 .seed_fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+                .parse::<SeedFingerprint>()
+                .is_err()
             || signing_hints.account_index >= (1 << 31)
             || inspected.privacy_policy.as_deref() != Some(privacy_policy)
             || inspected.tx_version == 0
             || inspected.expiry_height == 0
-            || inspected.consensus_branch_id.len() != 8
-            || !inspected
-                .consensus_branch_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+            || u32::from_str_radix(&inspected.consensus_branch_id, 16).ok()
+                != Some(ZCASH_NU6_3_BRANCH_ID)
             || inspected.fee_zat < 0
             || inspected.fee_zat > i128::from(self.config.max_fee_zat())
             || !inspected.transparent.inputs.is_empty()
@@ -675,6 +1001,22 @@ impl ZecPcztSigner {
             return Err(ZecPayoutError::WalletProtocolViolation);
         }
         u64::try_from(inspected.fee_zat).map_err(|_| ZecPayoutError::WalletProtocolViolation)
+    }
+
+    fn verify_consensus_effects(
+        &self,
+        record: &JournalRecord,
+        pczt: &str,
+    ) -> Result<(), ZecPayoutError> {
+        let expected = record
+            .consensus_effects_digest
+            .ok_or(ZecPayoutError::JournalCorrupt)?;
+        if pczt_v2_coin_type(pczt)? != ZCASH_TESTNET_COIN_TYPE
+            || consensus_effects_digest(pczt)? != expected
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        Ok(())
     }
 
     fn broadcast(&self, raw_transaction: &str, transaction_id: &str) -> BroadcastOutcome {
@@ -791,6 +1133,10 @@ fn execution(
         .ok_or(ZecPayoutError::JournalCorrupt)?;
     let signed_transaction =
         hex::decode(raw_transaction).map_err(|_| ZecPayoutError::JournalCorrupt)?;
+    let unsigned_digest = record
+        .consensus_effects_digest
+        .filter(|digest| *digest != [0; 32])
+        .ok_or(ZecPayoutError::JournalCorrupt)?;
     Ok(ZecPayoutExecution {
         receipt: BroadcastReceipt {
             batch_id: record.batch_id,
@@ -799,7 +1145,7 @@ fn execution(
             transaction_id,
             output_total_zat: record.output_total_zat,
         },
-        intent_digest: record.portal_commitment,
+        unsigned_digest,
         transaction_id_bytes,
         signed_transaction,
         network_fee_zat,
@@ -833,6 +1179,133 @@ fn validate_pczt(pczt: &str) -> Result<(), ZecPayoutError> {
         return Err(ZecPayoutError::WalletProtocolViolation);
     }
     Ok(())
+}
+
+fn parse_pczt(pczt_base64: &str) -> Result<Pczt, ZecPayoutError> {
+    validate_pczt(pczt_base64)?;
+    let encoded = BASE64_STANDARD
+        .decode(pczt_base64)
+        .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+    if encoded.is_empty() || BASE64_STANDARD.encode(&encoded) != pczt_base64 {
+        return Err(ZecPayoutError::WalletProtocolViolation);
+    }
+    Pczt::parse(&encoded).map_err(|_| ZecPayoutError::WalletProtocolViolation)
+}
+
+/// Reads the non-consensus SLIP-44 marker from the exact pinned PCZT v2 wire
+/// schema.
+///
+/// PCZT 0.9.3 does not expose `Global::coin_type()` in its logical public API,
+/// but serializes the marker in the leading global record. Ironwood is v2-only,
+/// so any other encoding fails closed. This compatibility decoder can be
+/// removed once the pinned PCZT API exposes the field directly.
+fn pczt_v2_coin_type(pczt_base64: &str) -> Result<u32, ZecPayoutError> {
+    let encoded = BASE64_STANDARD
+        .decode(pczt_base64)
+        .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+    let body = encoded
+        .strip_prefix(PCZT_V2_HEADER)
+        .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+    let (global, _remaining) = postcard::take_from_bytes::<PcztV2Global>(body)
+        .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+    Ok(global.coin_type)
+}
+
+fn signed_value_sum(&(magnitude, is_negative): &(u64, bool)) -> i128 {
+    if is_negative {
+        -i128::from(magnitude)
+    } else {
+        i128::from(magnitude)
+    }
+}
+
+fn verify_ironwood_ciphertext(
+    action: &orchard::pczt::Action,
+) -> Result<(), pczt::roles::verifier::OrchardError<()>> {
+    let spend = action.spend();
+    let output = action.output();
+    if *output.note_version() != NoteVersion::V3 {
+        return Err(pczt::roles::verifier::OrchardError::Custom(()));
+    }
+    let recipient = *output
+        .recipient()
+        .as_ref()
+        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+    let value = *output
+        .value()
+        .as_ref()
+        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+    let rho = Option::<Rho>::from(Rho::from_bytes(&spend.nullifier().to_bytes()))
+        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+    let rseed = *output
+        .rseed()
+        .as_ref()
+        .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+    let note = Option::<Note>::from(Note::from_parts(
+        recipient,
+        value,
+        rho,
+        rseed,
+        NoteVersion::V3,
+    ))
+    .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+    let domain = orchard::note_encryption::IronwoodDomain::for_pczt_action(action);
+    let recovered = try_output_recovery_with_pkd_esk(
+        &domain,
+        orchard::note_encryption::IronwoodDomain::get_pk_d(&note),
+        orchard::note_encryption::IronwoodDomain::derive_esk(&note)
+            .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?,
+        action,
+    )
+    .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
+    if recovered.0 != note
+        || recovered.1 != recipient
+        || recovered.2 != MemoBytes::empty().into_bytes()
+    {
+        return Err(pczt::roles::verifier::OrchardError::Custom(()));
+    }
+    Ok(())
+}
+
+/// Derives the Zcash consensus shielded-signature hash from a canonical PCZT.
+///
+/// This is the digest authorized by every shielded spend signature. It commits
+/// to transaction effects (including the consensus branch, expiry, inputs,
+/// recipients, amounts, and fee) while excluding proof and signature bytes, so
+/// it must remain identical through the prove and sign roles. The PCZT parser
+/// and signer are the same version used by the pinned Zallet beta.3 protocol.
+fn consensus_effects_digest(pczt_base64: &str) -> Result<[u8; 32], ZecPayoutError> {
+    consensus_effects_digest_from_pczt(parse_pczt(pczt_base64)?)
+}
+
+fn consensus_effects_digest_from_pczt(pczt: Pczt) -> Result<[u8; 32], ZecPayoutError> {
+    let digest = PcztSigner::new(pczt)
+        .map_err(|_| ZecPayoutError::WalletProtocolViolation)?
+        .shielded_sighash();
+    if digest == [0; 32] {
+        return Err(ZecPayoutError::WalletProtocolViolation);
+    }
+    Ok(digest)
+}
+
+/// Proves that the signed PCZT can produce a valid transaction and returns the
+/// nonmalleable identifier of its exact effects.
+///
+/// The extractor independently requires and verifies all proofs and spend
+/// authorizations before it creates a randomized binding signature. V6 excludes
+/// authorization material from its ZIP-244 transaction identifier, so the ID
+/// remains identical to any separately extracted transaction with these effects.
+fn extractable_consensus_txid(pczt_base64: &str) -> Result<String, ZecPayoutError> {
+    TransactionExtractor::new(parse_pczt(pczt_base64)?)
+        .with_orchard(ironwood_verifying_key())
+        .extract()
+        .map(|transaction| transaction.txid().to_string())
+        .map_err(|_| ZecPayoutError::WalletProtocolViolation)
+}
+
+fn ironwood_verifying_key() -> &'static VerifyingKey {
+    static VERIFYING_KEY: OnceLock<VerifyingKey> = OnceLock::new();
+    VERIFYING_KEY.get_or_init(|| VerifyingKey::build(OrchardCircuitVersion::PostNu6_3))
 }
 
 fn validate_privacy_policy(
@@ -874,9 +1347,204 @@ enum BroadcastOutcome {
     Ambiguous,
 }
 
+struct VerifiedEffects {
+    digest: [u8; 32],
+    network_fee_zat: u64,
+}
+
+struct WalletContext {
+    node_height: u32,
+    seed_fingerprint: SeedFingerprint,
+    account_index: u32,
+    orchard_fvk: FullViewingKey,
+}
+
+/// Serialized field order of `pczt::common::Global` in pinned PCZT v2.
 #[derive(Deserialize)]
+struct PcztV2Global {
+    #[serde(rename = "tx_version")]
+    _tx_version: u32,
+    #[serde(rename = "version_group_id")]
+    _version_group_id: u32,
+    #[serde(rename = "consensus_branch_id")]
+    _consensus_branch_id: u32,
+    #[serde(rename = "fallback_lock_time")]
+    _fallback_lock_time: Option<u32>,
+    #[serde(rename = "expiry_height")]
+    _expiry_height: u32,
+    coin_type: u32,
+    #[serde(rename = "tx_modifiable")]
+    _tx_modifiable: u8,
+    #[serde(rename = "proprietary")]
+    _proprietary: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WalletStatus {
+    node_tip: ChainTip,
+    wallet_tip: Option<ChainTip>,
+    fully_synced_height: Option<u32>,
+    #[serde(
+        default,
+        rename = "sync_work_remaining",
+        deserialize_with = "field_is_present"
+    )]
+    sync_work_remaining_present: bool,
     locked: bool,
+}
+
+impl WalletStatus {
+    fn is_fully_synchronized(&self) -> bool {
+        let Some(wallet_tip) = self.wallet_tip.as_ref() else {
+            return false;
+        };
+        !self.locked
+            && !self.sync_work_remaining_present
+            && valid_block_hash(&self.node_tip.blockhash)
+            && valid_block_hash(&wallet_tip.blockhash)
+            && self.node_tip == *wallet_tip
+            && self.fully_synced_height == Some(wallet_tip.height)
+    }
+}
+
+#[derive(Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ChainTip {
+    blockhash: String,
+    height: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletAccount {
+    account_uuid: Uuid,
+    #[serde(rename = "name")]
+    _name: Option<String>,
+    seedfp: Option<String>,
+    zip32_account_index: Option<u32>,
+    addresses: Vec<WalletAddress>,
+}
+
+impl WalletAccount {
+    fn signing_identity(
+        &self,
+        expected_account: Uuid,
+    ) -> Result<WalletSigningIdentity, ZecPayoutError> {
+        if self.account_uuid != expected_account {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        let seed_fingerprint = self
+            .seedfp
+            .as_deref()
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?
+            .parse::<SeedFingerprint>()
+            .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        let account_index = self
+            .zip32_account_index
+            .filter(|index| *index < (1 << 31))
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        let unified_address = self
+            .addresses
+            .iter()
+            .find_map(|address| address.ua.as_deref())
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        let Destination::Ironwood {
+            receiver: unified_receiver,
+        } = decode_destination(unified_address)?
+        else {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        };
+        let unified_receiver = Option::<orchard::Address>::from(
+            orchard::Address::from_raw_address_bytes(&unified_receiver),
+        )
+        .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        Ok(WalletSigningIdentity {
+            seed_fingerprint,
+            account_index,
+            unified_address: unified_address.to_owned(),
+            unified_receiver,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletAddress {
+    #[serde(rename = "diversifier_index")]
+    _diversifier_index: Option<u128>,
+    ua: Option<String>,
+    #[serde(rename = "sapling")]
+    _sapling: Option<String>,
+    #[serde(rename = "transparent")]
+    _transparent: Option<String>,
+}
+
+struct WalletSigningIdentity {
+    seed_fingerprint: SeedFingerprint,
+    account_index: u32,
+    unified_address: String,
+    unified_receiver: orchard::Address,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletBalances {
+    accounts: Vec<WalletAccountBalance>,
+    #[serde(default, rename = "legacy_transparent")]
+    _legacy_transparent: Option<Value>,
+    #[serde(default, rename = "legacy_transparent_watchonly")]
+    _legacy_transparent_watchonly: Option<Value>,
+}
+
+impl WalletBalances {
+    fn require_no_legacy_orchard(&self, expected_account: Uuid) -> Result<(), ZecPayoutError> {
+        let mut matches = self
+            .accounts
+            .iter()
+            .filter(|account| account.account_uuid == expected_account);
+        let account = matches
+            .next()
+            .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        if matches.next().is_some() || account.legacy_orchard_present {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletAccountBalance {
+    account_uuid: Uuid,
+    #[serde(default, rename = "transparent")]
+    _transparent: Option<Value>,
+    #[serde(default, rename = "transparent_watchonly")]
+    _transparent_watchonly: Vec<Value>,
+    #[serde(default, rename = "sapling")]
+    _sapling: Option<Value>,
+    #[serde(default, rename = "orchard", deserialize_with = "field_is_present")]
+    legacy_orchard_present: bool,
+    #[serde(default, rename = "ironwood")]
+    _ironwood: Option<Value>,
+    #[serde(rename = "total")]
+    _total: Value,
+}
+
+fn field_is_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
+}
+
+fn valid_block_hash(value: &str) -> bool {
+    value.len() == 64
+        && value != "0000000000000000000000000000000000000000000000000000000000000000"
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Deserialize)]
@@ -937,7 +1605,7 @@ struct ExtractResult {
 }
 
 impl ExtractResult {
-    fn validate(&self) -> Result<(), ZecPayoutError> {
+    fn validate_against(&self, approved_transaction_id: &str) -> Result<(), ZecPayoutError> {
         if !self.stored
             || self.hex.is_empty()
             || self.hex.len() > 4 * 1024 * 1024
@@ -951,6 +1619,31 @@ impl ExtractResult {
                 .txid
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+
+        let raw = hex::decode(&self.hex).map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        let mut cursor = Cursor::new(raw.as_slice());
+        let transaction = Transaction::read(&mut cursor, BranchId::Nu6_3)
+            .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        if usize::try_from(cursor.position()).ok() != Some(raw.len())
+            || transaction.txid().to_string() != self.txid
+            || self.txid != approved_transaction_id
+        {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        let mut canonical = Vec::with_capacity(raw.len());
+        transaction
+            .write(&mut canonical)
+            .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        if canonical != raw {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+
+        let transaction = transaction.into_data();
+        if transaction.version() != TxVersion::V6
+            || transaction.consensus_branch_id() != BranchId::Nu6_3
         {
             return Err(ZecPayoutError::WalletProtocolViolation);
         }

@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crate::{PipelineStage, ZecPayoutError};
 
-const SCHEMA_VERSION: u16 = 1;
-const JOURNAL_CHECKSUM_DOMAIN: &[u8] = b"zecwec/zec-pczt-journal/v1";
+const SCHEMA_VERSION: u16 = 2;
+const JOURNAL_CHECKSUM_DOMAIN: &[u8] = b"zecwec/zec-pczt-journal/v2";
 const MAX_JOURNAL_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_PCZT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RAW_TX_HEX_BYTES: usize = 4 * 1024 * 1024;
@@ -27,7 +27,38 @@ pub(crate) struct JournalRecord {
     pub(crate) pipeline_commitment: [u8; 32],
     pub(crate) portal_commitment: [u8; 32],
     pub(crate) output_total_zat: u64,
+    /// Consensus shielded-signature hash of the transaction effects. It is
+    /// absent until the created PCZT has passed independent effects validation.
+    pub(crate) consensus_effects_digest: Option<[u8; 32]>,
+    /// Fee independently derived from the same parsed transaction effects.
+    pub(crate) consensus_network_fee_zat: Option<u64>,
     pub(crate) stage: StoredStage,
+}
+
+impl JournalRecord {
+    fn validate(&self) -> Result<(), ZecPayoutError> {
+        let requires_effects_digest = !matches!(
+            self.stage,
+            StoredStage::Reserved | StoredStage::Created { .. }
+        );
+        match (
+            requires_effects_digest,
+            self.consensus_effects_digest,
+            self.consensus_network_fee_zat,
+        ) {
+            (false, None, None) => {}
+            (true, Some(digest), Some(fee)) if digest != [0; 32] && fee != 0 => {}
+            _ => return Err(ZecPayoutError::JournalCorrupt),
+        }
+        if self
+            .stage
+            .network_fee_zat()
+            .is_some_and(|fee| Some(fee) != self.consensus_network_fee_zat)
+        {
+            return Err(ZecPayoutError::JournalCorrupt);
+        }
+        self.stage.validate()
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -93,6 +124,30 @@ impl StoredStage {
             Self::BroadcastUnresolved { .. } => PipelineStage::BroadcastUnresolved,
             Self::Rejected { .. } => PipelineStage::Rejected,
             Self::Completed { .. } => PipelineStage::Completed,
+        }
+    }
+
+    const fn network_fee_zat(&self) -> Option<u64> {
+        match self {
+            Self::SignedVerified {
+                network_fee_zat, ..
+            }
+            | Self::Extracted {
+                network_fee_zat, ..
+            }
+            | Self::BroadcastUnresolved {
+                network_fee_zat, ..
+            }
+            | Self::Completed {
+                network_fee_zat, ..
+            } => Some(*network_fee_zat),
+            Self::Reserved
+            | Self::Created { .. }
+            | Self::CreatedVerified { .. }
+            | Self::Proved { .. }
+            | Self::ProvedVerified { .. }
+            | Self::Signed { .. }
+            | Self::Rejected { .. } => None,
         }
     }
 
@@ -273,12 +328,12 @@ impl Journal {
         {
             return Err(ZecPayoutError::JournalCorrupt);
         }
-        envelope.record.stage.validate()?;
+        envelope.record.validate()?;
         Ok(Some(envelope.record))
     }
 
     pub(crate) fn store(&self, record: &JournalRecord) -> Result<(), ZecPayoutError> {
-        record.stage.validate()?;
+        record.validate()?;
         let envelope = Envelope {
             schema_version: SCHEMA_VERSION,
             record: record.clone(),
