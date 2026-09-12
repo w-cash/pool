@@ -11,6 +11,7 @@ mod config;
 mod edge;
 mod payout;
 mod service;
+pub mod wcash_observation;
 mod wec_wallet_transport;
 
 use std::{path::PathBuf, process::ExitCode};
