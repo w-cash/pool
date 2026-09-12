@@ -110,6 +110,7 @@ impl Default for NativeCallLimits {
 pub struct WecSignerConfig {
     journal_directory: PathBuf,
     source_account: Uuid,
+    expected_payout_commitment: [u8; 32],
     seed_source: SeedSource,
     confirmations: u32,
     max_outputs: usize,
@@ -122,11 +123,13 @@ impl WecSignerConfig {
     pub fn new(
         journal_directory: impl Into<PathBuf>,
         source_account: Uuid,
+        expected_payout_commitment: [u8; 32],
         seed_source: SeedSource,
     ) -> Result<Self, WecPayoutError> {
         let config = Self {
             journal_directory: journal_directory.into(),
             source_account,
+            expected_payout_commitment,
             seed_source,
             confirmations: MIN_CONFIRMATIONS,
             max_outputs: DEFAULT_MAX_OUTPUTS,
@@ -174,6 +177,7 @@ impl WecSignerConfig {
                 .components()
                 .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
             || self.source_account.is_nil()
+            || self.expected_payout_commitment == [0; 32]
             || self.confirmations < MIN_CONFIRMATIONS
             || !(1..=MAX_NATIVE_OUTPUTS).contains(&self.max_outputs)
             || self.max_fee_zat == 0
@@ -190,6 +194,10 @@ impl WecSignerConfig {
 
     pub(crate) const fn source_account(&self) -> Uuid {
         self.source_account
+    }
+
+    pub(crate) const fn expected_payout_commitment(&self) -> [u8; 32] {
+        self.expected_payout_commitment
     }
 
     pub(crate) const fn seed_source(&self) -> &SeedSource {

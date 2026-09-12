@@ -19,7 +19,7 @@ use wcash_wec_payout_signer::{
 
 use crate::wec_wallet_transport::WolfWalletTransport;
 
-const OBSERVATION_PROTOCOL_VERSION: u32 = 1;
+const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
 const OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 
 /// Static authority which every Wcash collector observation must match.
@@ -30,6 +30,7 @@ struct ObservationAuthority {
     branch_id: String,
     account_id: Uuid,
     fund_source: WalletFundSource,
+    payout_commitment: [u8; 32],
 }
 
 /// Integrity-pinned, Testnet-only Wcash collector observer.
@@ -37,6 +38,8 @@ struct ObservationAuthority {
 pub struct WcashWalletObserver {
     wallet: WolfWalletTransport,
     authority: ObservationAuthority,
+    sync_timeout: Duration,
+    sync_batch_size: u32,
 }
 
 impl WcashWalletObserver {
@@ -47,6 +50,10 @@ impl WcashWalletObserver {
     /// deliberately reversed before comparison with Wolf's conventional
     /// display-order response, preventing an accidental order mismatch from
     /// becoming a second accepted identity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "this constructor atomically binds every independent wallet authority fact"
+    )]
     pub fn new(
         wallet: WolfWalletTransport,
         network: WalletNetwork,
@@ -54,6 +61,9 @@ impl WcashWalletObserver {
         branch_id: impl Into<String>,
         account_id: Uuid,
         fund_source: WalletFundSource,
+        payout_commitment: [u8; 32],
+        sync_timeout: Duration,
+        sync_batch_size: u32,
     ) -> Result<Self, WcashObservationConfigError> {
         let mut genesis_hash_display = genesis_hash_wire;
         genesis_hash_display.reverse();
@@ -64,6 +74,10 @@ impl WcashWalletObserver {
             || branch_id != WCASH_TESTNET_BRANCH_ID
             || account_id.is_nil()
             || fund_source != WalletFundSource::Ironwood
+            || payout_commitment == [0; 32]
+            || sync_timeout.is_zero()
+            || sync_timeout > Duration::from_secs(900)
+            || !(1..=16).contains(&sync_batch_size)
         {
             return Err(WcashObservationConfigError::AuthorityMismatch);
         }
@@ -75,7 +89,10 @@ impl WcashWalletObserver {
                 branch_id,
                 account_id,
                 fund_source,
+                payout_commitment,
             },
+            sync_timeout,
+            sync_batch_size,
         })
     }
 
@@ -91,7 +108,12 @@ impl WcashWalletObserver {
     ) -> Result<WalletObservation, WcashObservationError> {
         let output = self
             .wallet
-            .invoke_observation(timeout, max_response_bytes)
+            .invoke_observation(
+                self.sync_timeout,
+                self.sync_batch_size,
+                timeout,
+                max_response_bytes,
+            )
             .map_err(WcashObservationError::Wallet)?;
         let response: WireObservation = serde_json::from_slice(&output)
             .map_err(|_| WcashObservationError::Wallet(NativeWalletError::ProtocolViolation))?;
@@ -145,6 +167,9 @@ impl WcashWalletObserver {
         let best_tip_hash = parse_canonical_hex32(&response.best_tip_hash)
             .filter(|hash| *hash != [0; 32])
             .ok_or_else(invalid)?;
+        let payout_commitment = parse_canonical_hex32(&response.collector_payout_commitment)
+            .filter(|commitment| *commitment != [0; 32])
+            .ok_or_else(invalid)?;
         let valid_window = response
             .valid_until
             .checked_sub(response.observed_at)
@@ -155,6 +180,7 @@ impl WcashWalletObserver {
             || response.branch_id != self.authority.branch_id
             || account_id != self.authority.account_id
             || response_source != self.authority.fund_source
+            || payout_commitment != self.authority.payout_commitment
             || !response.synchronized
             || response.wallet_spendable_zat > MAX_CHAIN_VALUE_ZAT
             || response.best_tip_height == 0
@@ -184,6 +210,7 @@ struct WireObservation {
     branch_id: String,
     account_id: String,
     fund_source: String,
+    collector_payout_commitment: String,
     synchronized: bool,
     wallet_state_digest: String,
     wallet_spendable_zat: u64,
@@ -247,6 +274,7 @@ mod tests {
     use crate::wec_wallet_transport::PinnedWolfProgram;
 
     const ACCOUNT: &str = "10000000-0000-4000-8000-000000000001";
+    const PAYOUT_COMMITMENT: [u8; 32] = [0x6a; 32];
 
     fn genesis_wire() -> [u8; 32] {
         let mut bytes: [u8; 32] = hex::decode(WCASH_TESTNET_GENESIS_HASH)
@@ -259,12 +287,13 @@ mod tests {
 
     fn valid_response() -> Value {
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "network": "testnet",
             "genesis_hash": WCASH_TESTNET_GENESIS_HASH,
             "branch_id": WCASH_TESTNET_BRANCH_ID,
             "account_id": ACCOUNT,
             "fund_source": "ironwood",
+            "collector_payout_commitment": hex::encode(PAYOUT_COMMITMENT),
             "synchronized": true,
             "wallet_state_digest": "11".repeat(32),
             "wallet_spendable_zat": 625_000_000_u64,
@@ -298,6 +327,9 @@ mod tests {
             WCASH_TESTNET_BRANCH_ID,
             Uuid::parse_str(ACCOUNT).unwrap(),
             WalletFundSource::Ironwood,
+            PAYOUT_COMMITMENT,
+            Duration::from_secs(5),
+            16,
         )
         .unwrap();
         (directory, program_path, observer)
@@ -362,7 +394,17 @@ mod tests {
         ];
         for (network, genesis, branch, account, source) in cases {
             assert!(matches!(
-                WcashWalletObserver::new(wallet.clone(), network, genesis, branch, account, source,),
+                WcashWalletObserver::new(
+                    wallet.clone(),
+                    network,
+                    genesis,
+                    branch,
+                    account,
+                    source,
+                    PAYOUT_COMMITMENT,
+                    Duration::from_secs(5),
+                    16,
+                ),
                 Err(WcashObservationConfigError::AuthorityMismatch)
             ));
         }
@@ -398,7 +440,7 @@ mod tests {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(field_names.len(), 13);
+        assert_eq!(field_names.len(), 14);
         for field in field_names {
             let mut response = valid_response();
             response.as_object_mut().unwrap().remove(&field);
@@ -424,12 +466,13 @@ mod tests {
     fn altered_identity_state_tip_and_time_fields_fail_closed() {
         let (_directory, _program, observer) = fixture_observer("printf '{}'");
         let mutations = [
-            ("protocol_version", json!(2)),
+            ("protocol_version", json!(1)),
             ("network", json!("mainnet")),
             ("genesis_hash", json!("33".repeat(32))),
             ("branch_id", json!("deadbeef")),
             ("account_id", json!("20000000-0000-4000-8000-000000000002")),
             ("fund_source", json!("transparent")),
+            ("collector_payout_commitment", json!("00".repeat(32))),
             ("synchronized", json!(false)),
             ("wallet_state_digest", json!("00".repeat(32))),
             ("wallet_spendable_zat", json!(MAX_CHAIN_VALUE_ZAT + 1)),
@@ -486,7 +529,9 @@ mod tests {
             ))
         ));
 
-        let (_directory, _program, observer) = fixture_observer("exec /bin/sleep 5");
+        let (_directory, _program, observer) = fixture_observer(
+            "case \" $* \" in\n  *\" sync --batch-size 16 \"*) printf '{}' ;;\n  *\" payout-observe \"*) exec /bin/sleep 5 ;;\n  *) exit 64 ;;\nesac",
+        );
         let started = Instant::now();
         assert!(matches!(
             observer.observe(Duration::from_millis(25), 4_096),

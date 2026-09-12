@@ -46,6 +46,25 @@ pub struct MiningBootstrap {
     pub timeline: MonotonicTimeline,
 }
 
+/// Snapshot-bound dependencies exercised by preflight without starting a
+/// live share actor or retaining a database nonce lease.
+pub struct MiningPreflight {
+    /// Durable accounting store after deployment and policy binding.
+    pub store: Arc<PostgresStore>,
+    /// Exact current backend generation used for authority-tip binding.
+    pub jobs: JobRouter,
+    _authentication: Arc<PostgresAuthenticationProvider>,
+    _timeline: MonotonicTimeline,
+}
+
+struct PreparedBootstrap {
+    store: Arc<PostgresStore>,
+    jobs: JobRouter,
+    client: BackendClient,
+    authentication: Arc<PostgresAuthenticationProvider>,
+    timeline: MonotonicTimeline,
+}
+
 /// Applies append-only schema migrations without connecting to Wolf.
 pub async fn migrate(config: &RuntimeConfig) -> Result<(), BootstrapError> {
     let store = connect_store(config).await?;
@@ -58,6 +77,70 @@ pub async fn migrate(config: &RuntimeConfig) -> Result<(), BootstrapError> {
 /// Replays every authoritative event, closes the subscription race, and starts
 /// the one live share actor before returning public-listener dependencies.
 pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapError> {
+    let PreparedBootstrap {
+        store,
+        jobs,
+        client,
+        authentication,
+        timeline,
+    } = prepare(config).await?;
+    let (nonce_claim, nonces) = claim_nonce_allocator(&store, config).await?;
+    let share_config = ShareRouterConfig::new(
+        config.maximum_miners.min(4_096),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    )?;
+    let shares = match ShareRouter::spawn(
+        client,
+        jobs.clone(),
+        share_config,
+        Arc::clone(&store) as Arc<dyn wcash_pool_edge::BackendEventConsumer>,
+    )
+    .await
+    {
+        Ok(shares) => shares,
+        Err(error) => {
+            return fail_after_nonce_claim(&store, &nonce_claim, BootstrapError::from(error)).await;
+        }
+    };
+
+    Ok(MiningBootstrap {
+        store,
+        jobs,
+        shares,
+        authentication,
+        nonces,
+        nonce_claim,
+        timeline,
+    })
+}
+
+/// Exercises database, replay, authenticated job snapshot, authentication,
+/// and nonce allocation without spawning a live actor. The backend connection
+/// and nonce claim are both closed before this function returns.
+pub async fn preflight(config: &RuntimeConfig) -> Result<MiningPreflight, BootstrapError> {
+    let PreparedBootstrap {
+        store,
+        jobs,
+        client,
+        authentication,
+        timeline,
+    } = prepare(config).await?;
+    client.shutdown().await?;
+
+    let (nonce_claim, nonces) = claim_nonce_allocator(&store, config).await?;
+    drop(nonces);
+    store.release_nonce_namespace(&nonce_claim).await?;
+
+    Ok(MiningPreflight {
+        store,
+        jobs,
+        _authentication: authentication,
+        _timeline: timeline,
+    })
+}
+
+async fn prepare(config: &RuntimeConfig) -> Result<PreparedBootstrap, BootstrapError> {
     let store = Arc::new(connect_store(config).await?);
     store.bind_deployment().await?;
     bind_policies(&store, config).await?;
@@ -93,20 +176,22 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
         JOB_UPDATE_CAPACITY,
     )?;
     validate_initial_target_policy(&jobs, config)?;
-    let share_config = ShareRouterConfig::new(
-        config.maximum_miners.min(4_096),
-        Duration::from_secs(5),
-        Duration::from_secs(10),
-    )?;
-    let shares = ShareRouter::spawn(
-        client,
-        jobs.clone(),
-        share_config,
-        Arc::clone(&store) as Arc<dyn wcash_pool_edge::BackendEventConsumer>,
-    )
-    .await?;
     let authentication =
         Arc::new(store.authentication_provider(config.authentication_parallelism)?);
+
+    Ok(PreparedBootstrap {
+        store,
+        jobs,
+        client,
+        authentication,
+        timeline,
+    })
+}
+
+async fn claim_nonce_allocator(
+    store: &Arc<PostgresStore>,
+    config: &RuntimeConfig,
+) -> Result<(NonceNamespaceClaim, Arc<NoncePrefixAllocator>), BootstrapError> {
     let namespace = NonceNamespaceLease::new(config.nonce_namespace)?;
     let nonce_claim = store
         .claim_nonce_namespace(
@@ -116,43 +201,36 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
             NONCE_NAMESPACE_LEASE_DURATION,
         )
         .await?;
-    let reservation = match reserve_nonce_tail(&store, &nonce_claim, config.nonce_reservation).await
+    let reservation = match reserve_nonce_tail(store, &nonce_claim, config.nonce_reservation).await
     {
         Ok(reservation) => reservation,
         Err(error) => {
             let startup = BootstrapError::from(error);
-            return match store.release_nonce_namespace(&nonce_claim).await {
-                Ok(()) => Err(startup),
-                Err(cleanup) => Err(BootstrapError::NonceClaimCleanup {
-                    startup: Box::new(startup),
-                    cleanup: Box::new(cleanup),
-                }),
-            };
+            return fail_after_nonce_claim(store, &nonce_claim, startup).await;
         }
     };
     let nonces = match reservation.allocator() {
         Ok(allocator) => Arc::new(allocator),
         Err(error) => {
             let startup = BootstrapError::from(error);
-            return match store.release_nonce_namespace(&nonce_claim).await {
-                Ok(()) => Err(startup),
-                Err(cleanup) => Err(BootstrapError::NonceClaimCleanup {
-                    startup: Box::new(startup),
-                    cleanup: Box::new(cleanup),
-                }),
-            };
+            return fail_after_nonce_claim(store, &nonce_claim, startup).await;
         }
     };
+    Ok((nonce_claim, nonces))
+}
 
-    Ok(MiningBootstrap {
-        store,
-        jobs,
-        shares,
-        authentication,
-        nonces,
-        nonce_claim,
-        timeline,
-    })
+async fn fail_after_nonce_claim<T>(
+    store: &PostgresStore,
+    claim: &NonceNamespaceClaim,
+    startup: BootstrapError,
+) -> Result<T, BootstrapError> {
+    match store.release_nonce_namespace(claim).await {
+        Ok(()) => Err(startup),
+        Err(cleanup) => Err(BootstrapError::NonceClaimCleanup {
+            startup: Box::new(startup),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 /// Reserves the largest reviewed chunk obtainable near permanent namespace

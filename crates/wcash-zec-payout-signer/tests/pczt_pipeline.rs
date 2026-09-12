@@ -829,8 +829,13 @@ fn fixture(root: &TestDirectory) -> (ZecSignerConfig, ZecPayoutRequest, TestPczt
     let account = Uuid::new_v4();
     let pczt = test_pczt();
     let config_path = write_wallet_config(root.path(), None);
-    let config = ZecSignerConfig::new(root.path().join("journal"), config_path, account)
-        .expect("valid test signer configuration");
+    let config = ZecSignerConfig::new(
+        root.path().join("journal"),
+        config_path,
+        account,
+        wcash_zec_payout_signer::parent_payout_address_commitment(&pczt.source_unified_address),
+    )
+    .expect("valid test signer configuration");
     let request = ZecPayoutRequest {
         batch: PayoutBatchRequest {
             batch_id: Uuid::new_v4(),
@@ -1381,13 +1386,23 @@ fn readiness_rejects_incomplete_sync_and_ambiguous_account_identity() {
         .as_object_mut()
         .expect("account object")
         .remove("zip32_account_index");
-    let mut no_addresses = valid_account;
+    let mut no_addresses = valid_account.clone();
     no_addresses["addresses"] = json!([]);
+    let mut nonmatching_address = valid_account.clone();
+    nonmatching_address["addresses"][0]["ua"] = json!(test_ironwood_address(0x5a));
+    let mut duplicate_matching_address = valid_account;
+    let duplicate = duplicate_matching_address["addresses"][0].clone();
+    duplicate_matching_address["addresses"]
+        .as_array_mut()
+        .expect("addresses array")
+        .push(duplicate);
     for account in [
         wrong_account,
         missing_seed,
         missing_account_index,
         no_addresses,
+        nonmatching_address,
+        duplicate_matching_address,
     ] {
         let wallet = Arc::new(ReadinessZallet {
             status: healthy_status(),
@@ -1469,4 +1484,26 @@ bind=["0.0.0.0:1"]
             Err(ZecPayoutError::UnsafeWalletConfiguration)
         );
     }
+}
+
+#[test]
+fn parent_payout_commitment_is_domain_separated_and_required() {
+    assert_eq!(
+        hex::encode(wcash_zec_payout_signer::parent_payout_address_commitment(
+            "u1test-address"
+        )),
+        "7216074cdd20dba22c98f155b7cad07883de0a79b62d6584170948014695e427"
+    );
+
+    let root = TestDirectory::new();
+    let config_path = write_wallet_config(root.path(), None);
+    assert_eq!(
+        ZecSignerConfig::new(
+            root.path().join("journal"),
+            config_path,
+            Uuid::new_v4(),
+            [0; 32],
+        ),
+        Err(ZecPayoutError::InvalidRequest)
+    );
 }

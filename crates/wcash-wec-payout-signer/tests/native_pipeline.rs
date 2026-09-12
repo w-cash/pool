@@ -32,6 +32,7 @@ use wcash_wec_payout_signer::{
 
 const TXID: &str = "abababababababababababababababababababababababababababababababab";
 const RAW_TRANSACTION: &str = "06000000deadbeef";
+const COLLECTOR_COMMITMENT: [u8; 32] = [0x91; 32];
 
 struct Fixture {
     _directory: TempDir,
@@ -64,6 +65,7 @@ impl Fixture {
         WecSignerConfig::new(
             &self.journal,
             self.account,
+            COLLECTOR_COMMITMENT,
             SeedSource::protected_file(&self.seed, uid),
         )
         .expect("valid test config")
@@ -78,6 +80,7 @@ enum Tamper {
     OutputOrder,
     Network,
     Account,
+    PayoutCommitment,
     FundSource,
     RawDigest,
     Fee,
@@ -301,6 +304,9 @@ impl NativeWalletTransport for MockWallet {
             Tamper::OutputOrder => intent.ordered_outputs.swap(0, 1),
             Tamper::Network => intent.identity.network = WalletNetwork::Regtest,
             Tamper::Account => intent.identity.account_id = Uuid::from_u128(0x999),
+            Tamper::PayoutCommitment => {
+                intent.identity.collector_payout_commitment = [0x92; 32];
+            }
             Tamper::FundSource => intent.identity.fund_source = WalletFundSource::Transparent,
             Tamper::RawDigest => intent.raw_transaction_sha256[0] ^= 1,
             Tamper::Fee => intent.fee_zat += 1,
@@ -354,6 +360,7 @@ fn identity(account: Uuid) -> WalletIdentity {
         genesis_hash: WCASH_TESTNET_GENESIS_HASH.to_owned(),
         branch_id: WCASH_TESTNET_BRANCH_ID.to_owned(),
         account_id: account,
+        collector_payout_commitment: COLLECTOR_COMMITMENT,
         fund_source: WalletFundSource::Ironwood,
         synchronized: true,
     }
@@ -573,6 +580,7 @@ fn every_tampered_inspection_fact_fails_before_broadcast() {
         Tamper::OutputOrder,
         Tamper::Network,
         Tamper::Account,
+        Tamper::PayoutCommitment,
         Tamper::FundSource,
         Tamper::RawDigest,
         Tamper::Fee,
@@ -624,21 +632,28 @@ fn wrong_request_and_wallet_identities_fail_closed() {
         WecPayoutError::InvalidRequest
     );
 
-    for expected in [
+    for (index, expected) in [
         WecPayoutError::WrongNetwork,
+        WecPayoutError::WrongAccount,
         WecPayoutError::WrongAccount,
         WecPayoutError::WrongFundSource,
         WecPayoutError::WalletUnavailable,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let isolated = Fixture::new();
         let wallet = Arc::new(MockWallet::new(isolated.account));
-        wallet.mutate_identity(|identity| match expected {
-            WecPayoutError::WrongNetwork => identity.branch_id = "c3a6678a".to_owned(),
-            WecPayoutError::WrongAccount => identity.account_id = Uuid::from_u128(0x888),
-            WecPayoutError::WrongFundSource => {
+        wallet.mutate_identity(|identity| match (index, expected) {
+            (_, WecPayoutError::WrongNetwork) => identity.branch_id = "c3a6678a".to_owned(),
+            (1, WecPayoutError::WrongAccount) => identity.account_id = Uuid::from_u128(0x888),
+            (2, WecPayoutError::WrongAccount) => {
+                identity.collector_payout_commitment = [0x92; 32];
+            }
+            (_, WecPayoutError::WrongFundSource) => {
                 identity.fund_source = WalletFundSource::Sapling;
             }
-            WecPayoutError::WalletUnavailable => identity.synchronized = false,
+            (_, WecPayoutError::WalletUnavailable) => identity.synchronized = false,
             _ => unreachable!(),
         });
         assert_eq!(
@@ -807,6 +822,7 @@ fn policy_and_call_bounds_reject_unsafe_values() {
         WecSignerConfig::new(
             &fixture.journal,
             fixture.account,
+            COLLECTOR_COMMITMENT,
             SeedSource::protected_file(&fixture.seed, uid),
         )
         .unwrap()
@@ -816,8 +832,19 @@ fn policy_and_call_bounds_reject_unsafe_values() {
     );
     assert_eq!(
         WecSignerConfig::new(
+            &fixture.journal,
+            fixture.account,
+            [0; 32],
+            SeedSource::protected_file(&fixture.seed, uid),
+        )
+        .err(),
+        Some(WecPayoutError::InvalidRequest)
+    );
+    assert_eq!(
+        WecSignerConfig::new(
             "relative/journal",
             fixture.account,
+            COLLECTOR_COMMITMENT,
             SeedSource::protected_file(&fixture.seed, uid),
         )
         .err(),

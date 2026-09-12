@@ -9,6 +9,7 @@
 mod bootstrap;
 mod config;
 mod edge;
+mod live_payout;
 mod payout;
 pub mod payout_runtime;
 mod service;
@@ -47,7 +48,7 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Prove database, replay, snapshot, nonce, and authentication bootstrap.
+    /// Prove the complete non-listening Testnet service dependency graph.
     Preflight {
         /// Absolute path to the protected Testnet policy.
         #[arg(long)]
@@ -103,34 +104,10 @@ async fn main() -> ExitCode {
             }
         },
         Command::Preflight { config } => match config::RuntimeConfig::load(&config) {
-            Ok(runtime) => match bootstrap::start(&runtime).await {
-                Ok(started) => {
-                    let bootstrap::MiningBootstrap {
-                        store,
-                        jobs,
-                        shares,
-                        authentication,
-                        nonces,
-                        nonce_claim,
-                        timeline,
-                    } = started;
-                    let shutdown = shares.shutdown().await;
-                    let release = store.release_nonce_namespace(&nonce_claim).await;
-                    drop((store, jobs, authentication, nonces, timeline));
-                    match (shutdown, release) {
-                        (Ok(()), Ok(())) => {
-                            println!("{{\"preflight\":true,\"network\":\"testnet\"}}");
-                            ExitCode::SUCCESS
-                        }
-                        (Err(error), _) => {
-                            eprintln!("preflight shutdown failed: {error}");
-                            ExitCode::from(NOT_READY_EXIT_CODE)
-                        }
-                        (Ok(()), Err(error)) => {
-                            eprintln!("preflight nonce release failed: {error}");
-                            ExitCode::from(NOT_READY_EXIT_CODE)
-                        }
-                    }
+            Ok(runtime) => match service::preflight(&runtime).await {
+                Ok(()) => {
+                    println!("{{\"preflight\":true,\"network\":\"testnet\"}}");
+                    ExitCode::SUCCESS
                 }
                 Err(error) => {
                     eprintln!("preflight rejected: {error}");

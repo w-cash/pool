@@ -48,7 +48,10 @@ use crate::{
     JsonRpcTransport, PipelineStage, RpcCall, ZecPayoutError, ZecSignerConfig, ZALLET_API_VERSION,
 };
 
-const PIPELINE_COMMITMENT_DOMAIN: &[u8] = b"zecwec/zec-pczt-pipeline/v1";
+const PIPELINE_COMMITMENT_DOMAIN: &[u8] = b"zecwec/zec-pczt-pipeline/v2";
+/// Must remain byte-for-byte identical to
+/// `wcash_zcash_aux::PARENT_PAYOUT_COMMITMENT_DOMAIN`.
+pub const PARENT_PAYOUT_COMMITMENT_DOMAIN: &[u8] = b"Wcash/Zcash parent payout address/v1\0";
 const MAX_ZEC_ZAT: u64 = 2_100_000_000_000_000;
 const PCZT_CREATE: &str = "pczt_create";
 const PCZT_INSPECT: &str = "pczt_inspect";
@@ -255,7 +258,10 @@ impl ZecPcztSigner {
         )?;
         let account: WalletAccount =
             serde_json::from_value(value).map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
-        let identity = account.signing_identity(self.config.account_id())?;
+        let identity = account.signing_identity(
+            self.config.account_id(),
+            self.config.expected_parent_payout_commitment(),
+        )?;
 
         let value = self.wallet_call(
             GET_BALANCES,
@@ -591,6 +597,7 @@ impl ZecPcztSigner {
         hasher.update(PIPELINE_COMMITMENT_DOMAIN);
         hasher.update(portal_commitment);
         hasher.update(request.source_account.as_bytes());
+        hasher.update(self.config.expected_parent_payout_commitment());
         hasher.update([request.fund_source.commitment_tag()]);
         hasher.update(self.config.min_confirmations().to_be_bytes());
         hasher.update(
@@ -1430,6 +1437,7 @@ impl WalletAccount {
     fn signing_identity(
         &self,
         expected_account: Uuid,
+        expected_parent_payout_commitment: [u8; 32],
     ) -> Result<WalletSigningIdentity, ZecPayoutError> {
         if self.account_uuid != expected_account {
             return Err(ZecPayoutError::WalletProtocolViolation);
@@ -1444,11 +1452,19 @@ impl WalletAccount {
             .zip32_account_index
             .filter(|index| *index < (1 << 31))
             .ok_or(ZecPayoutError::WalletProtocolViolation)?;
-        let unified_address = self
-            .addresses
-            .iter()
-            .find_map(|address| address.ua.as_deref())
+        let mut matching_addresses = self.addresses.iter().filter_map(|address| {
+            address.ua.as_deref().and_then(|unified_address| {
+                (parent_payout_address_commitment(unified_address)
+                    == expected_parent_payout_commitment)
+                    .then_some(unified_address)
+            })
+        });
+        let unified_address = matching_addresses
+            .next()
             .ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        if matching_addresses.next().is_some() {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
         let Destination::Ironwood {
             receiver: unified_receiver,
         } = decode_destination(unified_address)?
@@ -1466,6 +1482,29 @@ impl WalletAccount {
             unified_receiver,
         })
     }
+}
+
+/// Domain-separated commitment used by Zebra's private parent-template
+/// payout-address attestation.
+pub fn parent_payout_address_commitment(encoded_address: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PARENT_PAYOUT_COMMITMENT_DOMAIN);
+    hasher.update(encoded_address.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Validates one canonical Zcash Testnet UA with an Ironwood-capable receiver
+/// before returning the parent-template commitment.
+pub fn validated_parent_payout_address_commitment(
+    encoded_address: &str,
+) -> Result<[u8; 32], ZecPayoutError> {
+    if !matches!(
+        decode_destination(encoded_address)?,
+        Destination::Ironwood { .. }
+    ) {
+        return Err(ZecPayoutError::WalletProtocolViolation);
+    }
+    Ok(parent_payout_address_commitment(encoded_address))
 }
 
 #[derive(Deserialize)]

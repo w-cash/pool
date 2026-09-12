@@ -21,7 +21,7 @@ use crate::{
     WCASH_TESTNET_GENESIS_HASH,
 };
 
-const PIPELINE_COMMITMENT_DOMAIN: &[u8] = b"zecwec/wec-payout-pipeline/v1";
+const PIPELINE_COMMITMENT_DOMAIN: &[u8] = b"zecwec/wec-payout-pipeline/v2";
 const OUTPUT_MEMO_DOMAIN: &[u8] = b"ZECWEC-WEC-PAYOUT-V1";
 const MAX_WEC_ZAT: u64 = 2_100_000_000_000_000;
 const MAX_RAW_TRANSACTION_HEX_BYTES: usize = 4 * 1024 * 1024;
@@ -418,6 +418,9 @@ impl WecPayoutSigner {
         if identity.account_id != self.config.source_account() {
             return Err(WecPayoutError::WrongAccount);
         }
+        if identity.collector_payout_commitment != self.config.expected_payout_commitment() {
+            return Err(WecPayoutError::WrongAccount);
+        }
         if identity.fund_source != WalletFundSource::Ironwood {
             return Err(WecPayoutError::WrongFundSource);
         }
@@ -542,6 +545,7 @@ fn pipeline_commitment(
     hasher.update(PIPELINE_COMMITMENT_DOMAIN);
     hasher.update(portal_commitment);
     hasher.update(request.source_account.as_bytes());
+    hasher.update(config.expected_payout_commitment());
     hasher.update([fund_source_tag(request.fund_source)]);
     hasher.update(config.confirmations().to_be_bytes());
     hasher.update(config.max_fee_zat().to_be_bytes());

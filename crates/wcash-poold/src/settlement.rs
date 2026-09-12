@@ -16,6 +16,9 @@ use wcash_pool_store::{
 use wcash_wec_payout_signer::{
     WalletFundSource, WecPayoutError, WecPayoutExecution, WecPayoutRequest, WecPayoutSigner,
 };
+use wcash_zec_payout_signer::{
+    ZecFundSource, ZecPayoutError, ZecPayoutExecution, ZecPayoutRequest, ZecPcztSigner,
+};
 
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 
@@ -198,6 +201,22 @@ impl From<WecPayoutExecution> for RichPayoutExecution {
     }
 }
 
+impl From<ZecPayoutExecution> for RichPayoutExecution {
+    fn from(execution: ZecPayoutExecution) -> Self {
+        Self::new(
+            execution.receipt.batch_id,
+            execution.receipt.asset,
+            execution.receipt.request_commitment,
+            execution.receipt.transaction_id,
+            execution.transaction_id_bytes,
+            execution.receipt.output_total_zat,
+            execution.unsigned_digest,
+            execution.signed_transaction,
+            execution.network_fee_zat,
+        )
+    }
+}
+
 /// Durable operations required by payout recovery.
 pub trait SettlementStore: Send + Sync {
     /// Loads the oldest incomplete batch for one chain.
@@ -336,6 +355,50 @@ impl ExactExecutionSigner for WecExecutionSigner {
             .map_err(|_| BoundaryFailure::Ambiguous)?
             .map(RichPayoutExecution::from)
             .map_err(map_wec_error)
+        })
+    }
+}
+
+/// Adapter exposing the Zcash PCZT signer's rich, journaled execution.
+pub struct ZecExecutionSigner {
+    signer: Arc<ZecPcztSigner>,
+    source_account: Uuid,
+}
+
+impl ZecExecutionSigner {
+    /// Binds execution to one Zallet collector account.
+    pub fn new(signer: Arc<ZecPcztSigner>, source_account: Uuid) -> Self {
+        Self {
+            signer,
+            source_account,
+        }
+    }
+}
+
+impl ExactExecutionSigner for ZecExecutionSigner {
+    fn chain(&self) -> Chain {
+        Chain::Zcash
+    }
+
+    fn execute_exact(
+        &self,
+        request: &PayoutBatchRequest,
+    ) -> BoundaryFuture<'_, RichPayoutExecution> {
+        let signer = Arc::clone(&self.signer);
+        let source_account = self.source_account;
+        let request = request.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                signer.execute(&ZecPayoutRequest {
+                    batch: request,
+                    source_account,
+                    fund_source: ZecFundSource::Orchard,
+                })
+            })
+            .await
+            .map_err(|_| BoundaryFailure::Ambiguous)?
+            .map(RichPayoutExecution::from)
+            .map_err(map_zec_error)
         })
     }
 }
@@ -492,6 +555,14 @@ impl SettlementOrchestrator {
         execution.validate_against(&request)?;
         let artifact = execution.as_store_artifact(batch.chain);
         self.store.mark_signed(&artifact).await?;
+        boundary
+            .broadcaster
+            .rebroadcast_exact(&artifact)
+            .await
+            .map_err(|failure| SettlementError::Boundary {
+                chain: batch.chain,
+                failure,
+            })?;
         self.store.mark_broadcast(batch.id).await?;
         Ok(ResumeOutcome::Broadcast {
             batch_id: batch.id,
@@ -572,6 +643,29 @@ fn map_wec_error(error: WecPayoutError) -> BoundaryFailure {
         | WecPayoutError::UnsafeCredential
         | WecPayoutError::JournalCorrupt
         | WecPayoutError::WalletProtocolViolation => BoundaryFailure::Invariant,
+    }
+}
+
+fn map_zec_error(error: ZecPayoutError) -> BoundaryFailure {
+    match error {
+        ZecPayoutError::WalletRpcUnavailable | ZecPayoutError::JournalUnavailable => {
+            BoundaryFailure::Retryable
+        }
+        ZecPayoutError::BroadcastAmbiguous | ZecPayoutError::Interrupted => {
+            BoundaryFailure::Ambiguous
+        }
+        ZecPayoutError::WalletRejected | ZecPayoutError::BroadcastRejected => {
+            BoundaryFailure::Rejected
+        }
+        ZecPayoutError::IdempotencyConflict => BoundaryFailure::Conflict,
+        ZecPayoutError::InvalidRequest
+        | ZecPayoutError::WrongAsset
+        | ZecPayoutError::WrongNetwork
+        | ZecPayoutError::WrongAccount
+        | ZecPayoutError::WrongFundSource
+        | ZecPayoutError::UnsafeWalletConfiguration
+        | ZecPayoutError::JournalCorrupt
+        | ZecPayoutError::WalletProtocolViolation => BoundaryFailure::Invariant,
     }
 }
 
@@ -956,6 +1050,9 @@ mod tests {
                 .map(|artifact| artifact.signed_transaction.as_slice()),
             Some(vec![0x11; 96].as_slice())
         );
+        let broadcasts = fixture.wec_broadcaster.calls();
+        assert_eq!(broadcasts.len(), 1);
+        assert_eq!(broadcasts[0].signed_transaction, vec![0x11; 96]);
         assert!(fixture.zec_signer.calls().is_empty());
         assert!(fixture.zec_broadcaster.calls().is_empty());
         Ok(())
@@ -975,6 +1072,7 @@ mod tests {
         assert!(fixture.wec_signer.calls().is_empty());
         assert!(fixture.wec_broadcaster.calls().is_empty());
         assert_eq!(fixture.zec_signer.calls().len(), 1);
+        assert_eq!(fixture.zec_broadcaster.calls().len(), 1);
         Ok(())
     }
 
@@ -1072,7 +1170,9 @@ mod tests {
         ));
         fixture.orchestrator.resume_next(Chain::Wcash).await?;
         assert_eq!(fixture.wec_signer.calls().len(), 1);
-        assert_eq!(fixture.wec_broadcaster.calls().len(), 1);
+        let calls = fixture.wec_broadcaster.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0] == calls[1]);
         Ok(())
     }
 
