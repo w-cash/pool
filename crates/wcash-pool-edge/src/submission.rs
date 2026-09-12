@@ -244,6 +244,14 @@ impl ShareRouter {
         self.handle.clone()
     }
 
+    /// Reports whether the owned backend actor has already terminated.
+    ///
+    /// A serving daemon uses this as a fail-closed readiness and shutdown
+    /// trigger; it must still call [`Self::shutdown`] to join a live actor.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
     /// Stops accepting work after draining commands queued before shutdown.
     ///
     /// The currently executing bounded backend exchange and shares ahead of the
