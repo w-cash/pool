@@ -5,8 +5,10 @@ use std::{
     io::{Read, Take},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    str::FromStr,
 };
 
+use num_bigint::BigUint;
 use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -67,6 +69,45 @@ pub struct RuntimeConfig {
     pub portal_token_pepper_file: PathBuf,
     /// Portal TOTP encryption secret credential.
     pub portal_totp_key_file: PathBuf,
+    /// Initial Wcash accounting policy.
+    pub wcash_policy: ChainRuntimePolicy,
+    /// Initial Zcash accounting policy.
+    pub zcash_policy: ChainRuntimePolicy,
+    /// Initial miner share target in canonical big-endian order.
+    pub initial_share_target_be: [u8; 32],
+    /// Easiest permitted miner share target in canonical big-endian order.
+    pub easiest_share_target_be: [u8; 32],
+}
+
+/// Explicit zero-fee launch policy for one independently settled chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainRuntimePolicy {
+    /// Exact normalized PPLNS window work.
+    pub pplns_window_work: BigUint,
+    /// Automatic payout floor in atomic units.
+    pub payout_threshold_zat: u64,
+    /// Conservative maturity and reorganization depth.
+    pub required_confirmations: u32,
+    /// Maximum recipients in one deterministic batch.
+    pub maximum_payout_outputs: u32,
+    /// Absolute transaction fee ceiling.
+    pub maximum_network_fee_zat: u64,
+    /// Relative transaction fee ceiling in basis points.
+    pub maximum_network_fee_bps: u16,
+    /// Immutable launch revision.
+    pub policy_version: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChainPolicy {
+    pplns_window_work: String,
+    payout_threshold_zat: u64,
+    required_confirmations: u32,
+    maximum_payout_outputs: u32,
+    maximum_network_fee_zat: u64,
+    maximum_network_fee_bps: u16,
+    policy_version: u64,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +139,10 @@ struct RawConfig {
     wcash_wallet_uid: u32,
     portal_token_pepper_file: PathBuf,
     portal_totp_key_file: PathBuf,
+    wcash_policy: RawChainPolicy,
+    zcash_policy: RawChainPolicy,
+    initial_share_target_be: String,
+    easiest_share_target_be: String,
 }
 
 impl RuntimeConfig {
@@ -177,12 +222,18 @@ impl TryFrom<RawConfig> for RuntimeConfig {
         let zcash_payout_commitment =
             decode_hex32("zcash_payout_commitment", &raw.zcash_payout_commitment)?;
         let wcash_wallet_sha256 = decode_hex32("wcash_wallet_sha256", &raw.wcash_wallet_sha256)?;
+        let initial_share_target_be =
+            decode_hex32("initial_share_target_be", &raw.initial_share_target_be)?;
+        let easiest_share_target_be =
+            decode_hex32("easiest_share_target_be", &raw.easiest_share_target_be)?;
         if [
             wcash_genesis,
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
             wcash_wallet_sha256,
+            initial_share_target_be,
+            easiest_share_target_be,
         ]
         .iter()
         .any(|value| value.iter().all(|byte| *byte == 0))
@@ -215,8 +266,36 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             wcash_wallet_uid: raw.wcash_wallet_uid,
             portal_token_pepper_file: raw.portal_token_pepper_file,
             portal_totp_key_file: raw.portal_totp_key_file,
+            wcash_policy: parse_chain_policy(raw.wcash_policy)?,
+            zcash_policy: parse_chain_policy(raw.zcash_policy)?,
+            initial_share_target_be,
+            easiest_share_target_be,
         })
     }
+}
+
+fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigError> {
+    let pplns_window_work =
+        BigUint::from_str(&raw.pplns_window_work).map_err(|_| ConfigError::InvalidPolicy)?;
+    if pplns_window_work == BigUint::default()
+        || raw.payout_threshold_zat == 0
+        || !(100..=1_000_000).contains(&raw.required_confirmations)
+        || !(1..=200).contains(&raw.maximum_payout_outputs)
+        || raw.maximum_network_fee_zat == 0
+        || !(1..=1_000).contains(&raw.maximum_network_fee_bps)
+        || raw.policy_version == 0
+    {
+        return Err(ConfigError::InvalidPolicy);
+    }
+    Ok(ChainRuntimePolicy {
+        pplns_window_work,
+        payout_threshold_zat: raw.payout_threshold_zat,
+        required_confirmations: raw.required_confirmations,
+        maximum_payout_outputs: raw.maximum_payout_outputs,
+        maximum_network_fee_zat: raw.maximum_network_fee_zat,
+        maximum_network_fee_bps: raw.maximum_network_fee_bps,
+        policy_version: raw.policy_version,
+    })
 }
 
 fn decode_hex32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
@@ -373,6 +452,26 @@ wcash_wallet_sha256 = "{five}"
 wcash_wallet_uid = 0
 portal_token_pepper_file = "{root}/pepper"
 portal_totp_key_file = "{root}/totp"
+initial_share_target_be = "{six}"
+easiest_share_target_be = "{seven}"
+
+[wcash_policy]
+pplns_window_work = "1000000"
+payout_threshold_zat = 100000000
+required_confirmations = 100
+maximum_payout_outputs = 50
+maximum_network_fee_zat = 1000000
+maximum_network_fee_bps = 100
+policy_version = 1
+
+[zcash_policy]
+pplns_window_work = "1000000"
+payout_threshold_zat = 100000000
+required_confirmations = 100
+maximum_payout_outputs = 50
+maximum_network_fee_zat = 1000000
+maximum_network_fee_bps = 100
+policy_version = 1
 "#,
             root = directory.path().display(),
             one = "01".repeat(32),
@@ -380,6 +479,8 @@ portal_totp_key_file = "{root}/totp"
             three = "03".repeat(32),
             four = "04".repeat(32),
             five = "05".repeat(32),
+            six = "06".repeat(32),
+            seven = "07".repeat(32),
         )
     }
 

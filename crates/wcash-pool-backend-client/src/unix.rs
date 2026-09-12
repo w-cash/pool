@@ -1735,7 +1735,13 @@ impl BackendClient {
         }
     }
 
-    fn authority(&self) -> BackendAuthority {
+    /// Returns the network, payout, and durable-journal authority established by
+    /// the validated hello exchange.
+    ///
+    /// Replay orchestration uses this value before entering live subscription
+    /// mode so historical events can be projected under the same authority that
+    /// will later bind the job snapshot.
+    pub fn authority(&self) -> BackendAuthority {
         BackendAuthority {
             wcash_genesis: self.config.expected.wcash_genesis.clone(),
             zcash_genesis: self.config.expected.zcash_genesis.clone(),

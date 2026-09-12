@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bootstrap;
 mod config;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -34,11 +35,24 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Apply schema migrations and bind immutable zero-fee accounting policy.
+    Migrate {
+        /// Absolute path to the protected Testnet policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Prove database, replay, snapshot, nonce, and authentication bootstrap.
+    Preflight {
+        /// Absolute path to the protected Testnet policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Report whether this revision may serve miners.
     Readiness,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::ConfigCheck { config } => {
             match config::RuntimeConfig::load(&config).and_then(|runtime| {
@@ -62,6 +76,55 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Migrate { config } => match config::RuntimeConfig::load(&config) {
+            Ok(runtime) => match bootstrap::migrate(&runtime).await {
+                Ok(()) => {
+                    println!("{{\"migrated\":true,\"network\":\"testnet\",\"fees_bps\":0}}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("migration rejected: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            },
+            Err(error) => {
+                eprintln!("configuration rejected: {error}");
+                ExitCode::from(NOT_READY_EXIT_CODE)
+            }
+        },
+        Command::Preflight { config } => match config::RuntimeConfig::load(&config) {
+            Ok(runtime) => match bootstrap::start(&runtime).await {
+                Ok(started) => {
+                    let bootstrap::MiningBootstrap {
+                        store,
+                        jobs,
+                        shares,
+                        authentication,
+                        nonces,
+                        timeline,
+                    } = started;
+                    drop((store, jobs, authentication, nonces, timeline));
+                    match shares.shutdown().await {
+                        Ok(()) => {
+                            println!("{{\"preflight\":true,\"network\":\"testnet\"}}");
+                            ExitCode::SUCCESS
+                        }
+                        Err(error) => {
+                            eprintln!("preflight shutdown failed: {error}");
+                            ExitCode::from(NOT_READY_EXIT_CODE)
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("preflight rejected: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            },
+            Err(error) => {
+                eprintln!("configuration rejected: {error}");
+                ExitCode::from(NOT_READY_EXIT_CODE)
+            }
+        },
         Command::Readiness => {
             println!(
                 "{{\"ready\":false,\"stage\":\"foundation\",\"reason\":\"public miner service is not implemented\"}}"
@@ -90,6 +153,18 @@ mod tests {
             Cli::try_parse_from(["wcash-poold", "config-check", "--config", "/tmp/pool.toml"]),
             Ok(Cli {
                 command: Command::ConfigCheck { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["wcash-poold", "migrate", "--config", "/tmp/pool.toml"]),
+            Ok(Cli {
+                command: Command::Migrate { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["wcash-poold", "preflight", "--config", "/tmp/pool.toml"]),
+            Ok(Cli {
+                command: Command::Preflight { .. }
             })
         ));
     }
