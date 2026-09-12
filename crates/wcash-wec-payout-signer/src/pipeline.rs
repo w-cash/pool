@@ -209,6 +209,8 @@ impl WecPayoutSigner {
                 StoredStage::Signed { artifact }
                 | StoredStage::BroadcastUnresolved { artifact } => {
                     let call = WalletBroadcastCall {
+                        batch_id: record.batch_id,
+                        request_commitment: record.pipeline_commitment,
                         transaction_id: artifact.transaction_id.clone(),
                         raw_transaction_hex: artifact.raw_transaction_hex.clone(),
                         timeout: self.config.limits().broadcast_timeout(),

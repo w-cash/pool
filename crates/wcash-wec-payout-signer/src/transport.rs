@@ -262,6 +262,10 @@ impl fmt::Debug for PersistedIntent {
 /// Exact-byte broadcast request to the attested Wcash node adapter.
 #[derive(Clone, Eq, PartialEq)]
 pub struct WalletBroadcastCall {
+    /// Stable payout identity already bound to the signed transaction.
+    pub batch_id: Uuid,
+    /// Exact signer commitment stored beside the signed transaction.
+    pub request_commitment: [u8; 32],
     /// Expected display-order transaction identifier.
     pub transaction_id: String,
     /// Previously journaled signed bytes.
@@ -276,6 +280,8 @@ impl fmt::Debug for WalletBroadcastCall {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WalletBroadcastCall")
+            .field("batch_id", &self.batch_id)
+            .field("request_commitment", &self.request_commitment)
             .field("transaction_id", &self.transaction_id)
             .field("raw_transaction_hex", &"[REDACTED]")
             .field("timeout", &self.timeout)
