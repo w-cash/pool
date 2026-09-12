@@ -1,0 +1,47 @@
+[Unit]
+Description=Initialize immutable ZecWec Testnet backend authority
+Documentation=file:///usr/local/share/zecwec-deploy/docs/zecwec-testnet-deployment.md
+Requires=@WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+After=@WCASH_NODE_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+ConditionPathIsExecutable=/opt/wcash/current/wcash-merge-miner
+
+[Service]
+Type=oneshot
+User=wcash-pool-backend
+Group=wcash-pool-socket
+UMask=0077
+EnvironmentFile=/etc/wcash-pool/backend.env
+LoadCredential=wcash-rpc-cookie:@WCASH_RPC_COOKIE_SOURCE@
+LoadCredential=zcash-template-rpc-cookie:@ZCASH_TEMPLATE_COOKIE_SOURCE@
+LoadCredential=zcash-validator-rpc-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
+LoadCredential=wcash-payout-address:@WCASH_PAYOUT_ADDRESS_CREDENTIAL@
+@WCASH_IVK_LOAD_CREDENTIAL@
+LoadCredential=zcash-payout-address:@ZCASH_PAYOUT_ADDRESS_CREDENTIAL@
+ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh wcash-merge-miner
+ExecStart=/usr/local/libexec/zecwec/backend-entrypoint.sh init
+RemainAfterExit=yes
+StateDirectory=wcash-pool-backend
+StateDirectoryMode=0700
+RuntimeDirectory=wcash-pool-backend-init
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

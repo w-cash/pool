@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the ZecWec Testnet pool health probe every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+RandomizedDelaySec=5s
+AccuracySec=5s
+Persistent=false
+Unit=wcash-pool-health.service
+
+[Install]
+WantedBy=timers.target

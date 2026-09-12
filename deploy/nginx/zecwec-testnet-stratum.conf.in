@@ -1,0 +1,29 @@
+# This complete `stream` block is installed but not enabled automatically.
+# Plaintext compatibility traffic reaches wcash-poold directly on port 3333;
+# nginx terminates TLS on 3443 and applies the real client-source limit before
+# forwarding over loopback. The pool's mining token has no portal authority.
+stream {
+    limit_conn_zone $binary_remote_addr zone=zecwec_stratum_source:10m;
+
+    log_format zecwec_stratum '$remote_addr [$time_local] '
+        '$protocol $status $bytes_sent $bytes_received $session_time';
+
+    upstream zecwec_testnet_stratum {
+        server 127.0.0.1:@STRATUM_PORT@;
+    }
+
+    server {
+        listen @STRATUM_TLS_PORT@ ssl;
+        listen [::]:@STRATUM_TLS_PORT@ ssl;
+        proxy_pass zecwec_testnet_stratum;
+        proxy_connect_timeout 5s;
+        proxy_timeout 10m;
+        limit_conn zecwec_stratum_source 8;
+
+        ssl_certificate @MINING_TLS_CERT@;
+        ssl_certificate_key @MINING_TLS_KEY@;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_cache shared:ZecWecStratumTLS:10m;
+        ssl_session_timeout 10m;
+    }
+}

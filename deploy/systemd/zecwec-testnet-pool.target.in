@@ -1,0 +1,8 @@
+[Unit]
+Description=ZecWec WEC/ZEC merged-mining Testnet pool
+Requires=wcash-pool.service
+Wants=wcash-pool-health.timer
+After=wcash-pool.service
+
+[Install]
+WantedBy=multi-user.target

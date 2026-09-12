@@ -1,0 +1,47 @@
+[Unit]
+Description=Persistent ZecWec Testnet Zcash collector wallet
+Documentation=https://github.com/zcash/zallet
+Requires=@ZCASH_VALIDATOR_UNIT@
+After=network-online.target @ZCASH_VALIDATOR_UNIT@
+Wants=network-online.target
+ConditionPathIsExecutable=/opt/wcash/current/zallet
+ConditionPathExists=@ZALLET_CONFIG_FILE@
+
+[Service]
+Type=simple
+User=zecwec-zallet
+Group=zecwec-zallet
+UMask=0077
+LoadCredential=validator-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
+ExecStartPre=/usr/local/libexec/zecwec/verify-release.sh zallet
+ExecStart=/opt/wcash/current/zallet --datadir @ZALLET_STATE_DIR@ --config @ZALLET_CONFIG_FILE@ start
+ExecStartPost=/usr/local/libexec/zecwec/wait-zallet-ready.sh @ZALLET_RPC@
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=300s
+TimeoutStopSec=60s
+StateDirectory=zecwec-zallet
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=zecwec-testnet-pool.target
