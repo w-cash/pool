@@ -12,4 +12,4 @@ readonly libexec=/usr/local/libexec/zecwec
 exec python3 "$libexec/zallet_rpc_health.py" \
     --socket "$1" \
     --cookie "$STATE_DIRECTORY/.cookie" \
-    --deadline 240
+    --deadline 1080
