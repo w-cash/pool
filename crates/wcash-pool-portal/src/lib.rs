@@ -18,8 +18,9 @@ pub use clock::{Clock, SystemClock};
 pub use config::{ConfigError, PortalConfig, PortalSecrets};
 pub use model::{
     mask_destination, AccountSummary, AddressValidationError, AddressValidator, Asset,
-    ChainNetwork, PayoutSettingSummary, PoolDataSource, PoolOverview, ReceiverKind,
-    UnavailablePoolData, ValidatedDestination, WorkerSummary,
+    ChainNetwork, MinerBlockSummary, MinerPayoutSummary, Page, PageRequest, PayoutSettingSummary,
+    PoolDataSource, PoolOverview, ReceiverKind, RewardSummary, UnavailablePoolData,
+    ValidatedDestination, WorkerSummary,
 };
 pub use signer::{
     BroadcastReceipt, DisabledPayoutSigner, IsolatedPayoutSigner, PayoutBatchRequest, PayoutOutput,

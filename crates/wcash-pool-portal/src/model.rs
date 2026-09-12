@@ -251,6 +251,84 @@ pub struct PayoutSettingSummary {
     pub revision: u64,
 }
 
+/// Bounded keyset page requested from a private miner read model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageRequest {
+    /// Read records strictly before this monotonic cursor.
+    pub before: Option<u64>,
+    /// Maximum records returned, from one through 100.
+    pub limit: u16,
+}
+
+impl PageRequest {
+    /// Rejects zero and unbounded result sets.
+    pub const fn validate(self) -> bool {
+        self.limit > 0 && self.limit <= 100 && !matches!(self.before, Some(0))
+    }
+}
+
+/// One bounded private result page.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Page<T> {
+    /// Records in descending cursor order.
+    pub items: Vec<T>,
+    /// Cursor for the next older page.
+    pub next_before: Option<u64>,
+}
+
+/// One account allocation from an observed merged-mining reward.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RewardSummary {
+    /// Stable monotonic projection cursor.
+    pub cursor: u64,
+    /// Independently settled asset.
+    pub asset: Asset,
+    /// Public chain height of the winning block.
+    pub block_height: u64,
+    /// Conventional display-order block hash.
+    pub block_hash: String,
+    /// Account allocation in atomic units.
+    pub amount_zat: u64,
+    /// Current reversible lifecycle state.
+    pub state: String,
+}
+
+/// One block found directly by one of the account's workers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MinerBlockSummary {
+    /// Stable monotonic projection cursor.
+    pub cursor: u64,
+    /// Chain on which the block was found.
+    pub asset: Asset,
+    /// Public chain height.
+    pub height: u64,
+    /// Conventional display-order block hash.
+    pub block_hash: String,
+    /// Public coinbase value in atomic units.
+    pub reward_zat: u64,
+    /// Current reversible lifecycle state.
+    pub state: String,
+}
+
+/// One account output reserved in a durable payout batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MinerPayoutSummary {
+    /// Stable monotonic database cursor.
+    pub cursor: u64,
+    /// Public batch identity used for support and idempotency.
+    pub batch_id: Uuid,
+    /// Settled asset.
+    pub asset: Asset,
+    /// Exact account output in atomic units.
+    pub amount_zat: u64,
+    /// Durable payout lifecycle state.
+    pub state: String,
+    /// Public chain transaction identifier after signing.
+    pub transaction_id: Option<String>,
+    /// Confirming block height when final.
+    pub confirmation_height: Option<u64>,
+}
+
 /// Masks a destination while retaining enough characters to distinguish it.
 pub fn mask_destination(address: &str) -> String {
     let chars: Vec<char> = address.chars().collect();

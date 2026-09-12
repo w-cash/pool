@@ -8,7 +8,10 @@ use std::{fmt, future::Future, pin::Pin};
 
 use uuid::Uuid;
 
-use crate::{Asset, ChainNetwork, PayoutSettingSummary, ValidatedDestination, WorkerSummary};
+use crate::{
+    Asset, ChainNetwork, MinerBlockSummary, MinerPayoutSummary, Page, PageRequest,
+    PayoutSettingSummary, RewardSummary, ValidatedDestination, WorkerSummary,
+};
 
 /// Boxed repository operation used by object-safe asynchronous adapters.
 pub type RepositoryFuture<'a, T> =
@@ -258,4 +261,31 @@ pub trait PortalRepository: Send + Sync {
         network: ChainNetwork,
         now: u64,
     ) -> RepositoryFuture<'_, Option<ValidatedDestination>>;
+
+    /// Returns one account's reward allocations with bounded keyset pagination.
+    fn reward_history(
+        &self,
+        _account_id: Uuid,
+        _page: PageRequest,
+    ) -> RepositoryFuture<'_, Page<RewardSummary>> {
+        Box::pin(async { Err(RepositoryError::Unavailable) })
+    }
+
+    /// Returns blocks found by the account's workers.
+    fn found_blocks(
+        &self,
+        _account_id: Uuid,
+        _page: PageRequest,
+    ) -> RepositoryFuture<'_, Page<MinerBlockSummary>> {
+        Box::pin(async { Err(RepositoryError::Unavailable) })
+    }
+
+    /// Returns the account's payout outputs without exposing destinations.
+    fn payout_history(
+        &self,
+        _account_id: Uuid,
+        _page: PageRequest,
+    ) -> RepositoryFuture<'_, Page<MinerPayoutSummary>> {
+        Box::pin(async { Err(RepositoryError::Unavailable) })
+    }
 }

@@ -1,10 +1,10 @@
 //! Axum router for the authenticated miner portal.
 
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{
         header::{
             CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, ORIGIN, REFERRER_POLICY,
@@ -30,8 +30,8 @@ use crate::{
         SecurityError,
     },
     AccountSummary, AddressValidationError, AddressValidator, Asset, Clock, ConfigError,
-    NewSession, PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PortalConfig,
-    PortalRepository, PortalSecrets, RepositoryError, SignerError, SystemClock,
+    NewSession, PageRequest, PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource,
+    PortalConfig, PortalRepository, PortalSecrets, RepositoryError, SignerError, SystemClock,
     TestnetPayoutBoundary,
 };
 
@@ -42,6 +42,7 @@ const CSRF_DIGEST_DOMAIN: &[u8] = b"zecwec/portal/csrf/v1";
 const ADDRESS_DIGEST_DOMAIN: &[u8] = b"zecwec/payout/address/v1";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const TOTP_ENROLLMENT_TTL_SECS: u64 = 10 * 60;
+const READINESS_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Complete dependency set for the portal router.
 #[derive(Clone)]
@@ -121,9 +122,9 @@ impl PortalApp {
             .route("/assets/forms.css", get(form_styles))
             .route("/assets/app.js", get(script))
             .route("/api/v1/overview", get(overview))
-            .route("/api/v1/rewards", get(unavailable_dataset))
-            .route("/api/v1/blocks", get(unavailable_dataset))
-            .route("/api/v1/payouts", get(unavailable_dataset))
+            .route("/api/v1/rewards", get(reward_history))
+            .route("/api/v1/blocks", get(found_blocks))
+            .route("/api/v1/payouts", get(payout_history))
             .route("/api/v1/auth/register", post(register))
             .route("/api/v1/auth/login", post(login))
             .route("/api/v1/auth/logout", post(logout))
@@ -170,7 +171,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
     state.store.readiness().await?;
     address_validator_readiness(&state, Asset::Wec).await?;
     address_validator_readiness(&state, Asset::Zec).await?;
-    state.payout.readiness()?;
+    state.payout.readiness_bounded(READINESS_TIMEOUT).await?;
     Ok(Json(json!({
         "ready": true,
         "component": "miner-portal",
@@ -207,12 +208,64 @@ async fn overview(State(state): State<Arc<AppState>>) -> Json<crate::PoolOvervie
     Json(state.pool_data.overview())
 }
 
-async fn unavailable_dataset() -> Json<Value> {
-    Json(json!({
-        "available": false,
-        "items": [],
-        "reason": "durable accounting projection is not connected"
-    }))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    before: Option<u64>,
+    limit: Option<u16>,
+}
+
+impl HistoryQuery {
+    fn page(&self) -> Result<PageRequest, AppError> {
+        let page = PageRequest {
+            before: self.before,
+            limit: self.limit.unwrap_or(50),
+        };
+        if page.validate() {
+            Ok(page)
+        } else {
+            Err(AppError::Validation("invalid page"))
+        }
+    }
+}
+
+async fn reward_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let page = state
+        .store
+        .reward_history(auth.session.account_id, query.page()?)
+        .await?;
+    Ok(Json(json!(page)))
+}
+
+async fn found_blocks(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let page = state
+        .store
+        .found_blocks(auth.session.account_id, query.page()?)
+        .await?;
+    Ok(Json(json!(page)))
+}
+
+async fn payout_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let page = state
+        .store
+        .payout_history(auth.session.account_id, query.page()?)
+        .await?;
+    Ok(Json(json!(page)))
 }
 
 #[derive(Deserialize)]
