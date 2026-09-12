@@ -6,10 +6,10 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 use wcash_pool_portal::{
     mask_destination, AccountCredential, Asset, AuthenticatedSession, ChainNetwork,
-    MinerBlockSummary, MinerPayoutSummary, NewSession, Page, PageRequest, PayoutPreferenceChange,
-    PayoutSettingSummary, PoolDataSource, PoolOverview, PortalRepository, ProvisionedWorker,
-    ReceiverKind as PortalReceiverKind, RepositoryError, RepositoryFuture, RewardSummary,
-    ValidatedDestination, WorkerSummary,
+    MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, NewSession, Page, PageRequest,
+    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolOverview, PortalRepository,
+    ProvisionedWorker, ReceiverKind as PortalReceiverKind, RepositoryError, RepositoryFuture,
+    RewardSummary, ValidatedDestination, WorkerSummary,
 };
 use wcash_pool_protocol::JobDescriptor;
 
@@ -280,6 +280,10 @@ impl PortalRepository for PostgresStore {
         )
     }
 
+    fn balances(&self, account_id: Uuid) -> RepositoryFuture<'_, Vec<MinerBalanceSummary>> {
+        Box::pin(async move { miner_balances(self, account_id).await })
+    }
+
     fn reward_history(
         &self,
         account_id: Uuid,
@@ -316,8 +320,16 @@ async fn provision_worker_at(
     super::postgres::validate_component(worker_label, 63)?;
     let worker_id = Uuid::new_v4();
     let canonical_login = format!("{account_login}.{worker_label}");
-    let token = crate::generate_mining_token()?;
-    let verifier = crate::hash_mining_token(&token)?;
+    // Argon2 is intentionally kept off Tokio's async executor. The public
+    // portal additionally holds its shared non-queueing admission permit for
+    // the duration of this task.
+    let (token, verifier) = tokio::task::spawn_blocking(|| {
+        let token = crate::generate_mining_token()?;
+        let verifier = crate::hash_mining_token(&token)?;
+        Ok::<_, crate::MiningTokenError>((token, verifier))
+    })
+    .await
+    .map_err(|_| StoreError::MiningToken(crate::MiningTokenError::HashingFailed))??;
     let mut transaction = store.pool.begin().await?;
     let persisted_login = sqlx::query_scalar::<_, String>(
         "SELECT login FROM accounts WHERE deployment_id=$1 AND id=$2 AND enabled FOR UPDATE",
@@ -811,6 +823,71 @@ async fn reward_history(
     }))
 }
 
+async fn miner_balances(
+    store: &PostgresStore,
+    account_id: Uuid,
+) -> Result<Vec<MinerBalanceSummary>, RepositoryError> {
+    if account_id.is_nil() {
+        return Err(RepositoryError::NotFound);
+    }
+    let rows = sqlx::query(
+        "SELECT t.chain,e.ledger_account,(-SUM(e.amount_zat))::BIGINT AS amount_zat \
+         FROM ledger_entries e JOIN ledger_transactions t \
+           ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
+         WHERE e.deployment_id=$1 AND e.account_id=$2 AND t.sealed_at IS NOT NULL \
+           AND e.ledger_account IN ('miner_immature','miner_payable','payout_pending') \
+         GROUP BY t.chain,e.ledger_account ORDER BY t.chain,e.ledger_account",
+    )
+    .bind(store.identity.id)
+    .bind(account_id)
+    .fetch_all(&store.pool)
+    .await
+    .map_err(repository_error)?;
+
+    let mut balances = [
+        MinerBalanceSummary {
+            asset: Asset::Wec,
+            immature_zat: 0,
+            payable_zat: 0,
+            pending_zat: 0,
+            total_zat: 0,
+        },
+        MinerBalanceSummary {
+            asset: Asset::Zec,
+            immature_zat: 0,
+            payable_zat: 0,
+            pending_zat: 0,
+            total_zat: 0,
+        },
+    ];
+    for row in rows {
+        let asset = asset_from_row(&row)?;
+        let balance = balances
+            .iter_mut()
+            .find(|balance| balance.asset == asset)
+            .ok_or(RepositoryError::InvalidState)?;
+        let amount = nonnegative_u64(&row, "amount_zat")?;
+        match row
+            .try_get::<String, _>("ledger_account")
+            .map_err(|_| RepositoryError::InvalidState)?
+            .as_str()
+        {
+            "miner_immature" => balance.immature_zat = amount,
+            "miner_payable" => balance.payable_zat = amount,
+            "payout_pending" => balance.pending_zat = amount,
+            _ => return Err(RepositoryError::InvalidState),
+        }
+    }
+    for balance in &mut balances {
+        balance.total_zat = balance
+            .immature_zat
+            .checked_add(balance.payable_zat)
+            .and_then(|total| total.checked_add(balance.pending_zat))
+            .ok_or(RepositoryError::InvalidState)?;
+    }
+    Ok(balances.into())
+}
+
 async fn found_blocks(
     store: &PostgresStore,
     account_id: Uuid,
@@ -818,14 +895,12 @@ async fn found_blocks(
 ) -> Result<Page<MinerBlockSummary>, RepositoryError> {
     validate_page(account_id, page)?;
     let rows = sqlx::query(
-        "SELECT DISTINCT a.observation_event_seq,w.chain,w.height,w.block_hash_le,w.reward_zat,w.state \
-         FROM winner_allocations a \
-         JOIN winners w ON (w.deployment_id,w.chain,w.block_hash_le)= \
-                           (a.deployment_id,a.chain,a.block_hash_le) \
-         JOIN shares s ON (s.deployment_id,s.share_id)=(w.deployment_id,w.share_id) \
-         WHERE a.deployment_id=$1 AND s.account_id=$2 \
-           AND ($3::BIGINT IS NULL OR a.observation_event_seq < $3) \
-         ORDER BY a.observation_event_seq DESC LIMIT $4",
+        "SELECT w.portal_sequence,w.chain,w.height,w.block_hash_le,w.reward_zat,w.state \
+         FROM winners w JOIN shares s \
+           ON (s.deployment_id,s.share_id)=(w.deployment_id,w.share_id) \
+         WHERE w.deployment_id=$1 AND s.account_id=$2 \
+           AND ($3::BIGINT IS NULL OR w.portal_sequence < $3) \
+         ORDER BY w.portal_sequence DESC LIMIT $4",
     )
     .bind(store.identity.id)
     .bind(account_id)
@@ -838,7 +913,7 @@ async fn found_blocks(
         .into_iter()
         .map(|row| {
             Ok(MinerBlockSummary {
-                cursor: positive_u64(&row, "observation_event_seq")?,
+                cursor: positive_u64(&row, "portal_sequence")?,
                 asset: asset_from_row(&row)?,
                 height: positive_u64(&row, "height")?,
                 block_hash: display_hash(

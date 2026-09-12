@@ -10,6 +10,7 @@ mod bootstrap;
 mod config;
 mod edge;
 mod live_payout;
+mod miner_telemetry;
 mod payout;
 pub mod payout_runtime;
 mod service;

@@ -1,8 +1,13 @@
 # Threat model
 
-> **Status:** This document describes the security target for a non-deployable
-> foundation. It is not an audit, a proof of security, or permission to use the
-> current repository with miners or funds.
+> **Status:** This is the historical security target and adversarial checklist,
+> not the current component inventory. The Testnet implementation is now
+> composed, but public readiness remains RED until the exact artifacts pass
+> [the deployment runbook](zecwec-testnet-deployment.md). References below to
+> “future”, “missing”, or “does not exist” preserve the requirement's design
+> provenance; consult [the repository status](../README.md#implementation-status)
+> for current composition. This document is not an audit or permission to use
+> the service with public miners or funds.
 
 Implemented controls are limited to strict bounded wire codecs, redacted
 secret-bearing debug output, endian-distinct target types, exact job/proof

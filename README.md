@@ -5,14 +5,13 @@ account-based Equihash pool that will merge-mine Wcash and Zcash from one ASIC
 connection. Miners will configure one worker and receive independently
 accounted WEC and ZEC rewards at two chain-specific payout destinations.
 
-> **Current status:** non-deployable engineering foundation. The tested
-> PostgreSQL store now provides the shared account/token truth, authoritative
-> event projection, dual-chain monetary ledger, portal adapter, private read
-> models, and wallet-reconciliation fence. There is still no public mining
-> listener, authoritative address-decoder composition, collector-wallet
-> service, or crash-safe payout signer. The executable still reports
-> `ready: false`, has no `serve` command, and opens no listener. Do not point
-> miners or funds at this repository.
+> **Current status:** composed private-Testnet deployment candidate, not a
+> public launch. `wcash-poold serve` combines the bounded ZIP-301 edge,
+> shared PostgreSQL account/accounting truth, authoritative address adapters,
+> account-isolated portal, and independently fenced WEC/ZEC payout services.
+> Mainnet is rejected. Public miners and funds remain blocked until the exact
+> Wolf/pool release pair passes every private ASIC, payout, restart, reorg, and
+> HTTPS gate in the [Testnet deployment runbook](docs/zecwec-testnet-deployment.md).
 
 ## Product decision
 
@@ -59,12 +58,13 @@ The target collector policy is:
   coinbase receiver and value publicly recoverable. It must not be advertised
   as a private receipt.
 
-Wolf can construct private Wcash coinbases, but the current pool-backend path
-does not yet have the read-only trial-decryption attestation required to prove
-the encrypted collector recipient. It correctly refuses that mode today. The
-pool must add that verification and an isolated signer before private WEC
-settlement can be called ready; it must never fall back silently to a
-transparent collector.
+The deployment accepts private Wcash coinbases only from a Wolf backend that
+proves the encrypted collector recipient by read-only trial decryption and
+binds that evidence to the configured commitment. The spending seed remains
+inside the isolated signer path. Missing or crossed attestation fails closed;
+there is no transparent fallback. This is source-level capability, not public
+release evidence: the exact Wolf binary and pool binary still require the
+runbook's private launch proof.
 
 ## Responsibility boundary
 
@@ -82,17 +82,17 @@ is unavailable or its identity is inconsistent.
 
 ## Implementation status
 
-| Area | Current phase-0 state |
+| Area | Current private-Testnet candidate state |
 | --- | --- |
 | Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs; jobs bind the Wcash candidate hash and both chains' coinbase transaction IDs; canonical parent-header and stable share-ID derivations, exact dual-chain reward facts, and reversible winner-lifecycle events—including Wcash witness quarantine and requeue—have deterministic positive and negative tests |
 | Pool policy | In-memory session ordering with exact authorized-login reuse, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff that excludes idempotently replayed receipts |
 | Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetimes, submitted-header-time preservation, canonical proof/receipt/attribution binding, live response-watermark flush enforcement, bounded all-event sequence and share-identity evidence, and a fenced core-to-backend share path tested against local mock peers |
-| Miner edge | Listener-free bounded actors plus a loopback-only admitted-TCP stream driver for the standard 4+28 nonce profile, with strict framing, absolute deadlines, bounded backpressure, and deterministic synthetic transcripts; no public listener, TLS, credential implementation, durable nonce lease, or ASIC certification |
-| Miner portal | Responsive six-page UI; Argon2id login, encrypted TOTP, digest-only browser sessions, CSRF/origin controls, concrete PostgreSQL worker/payout adapter, masked dual payout settings, authenticated bounded reward/block/payout histories, replacement hold, loopback server composition, and fail-closed signer boundary; authoritative address and wallet adapters are not yet composed |
-| Service process | Readiness-only command; no composed miner or administrative listener |
-| Persistence and money | Deployment-fenced PostgreSQL projection, chain-specific PPLNS, immature/spendable collector assets, conserved sealed ledger, maturity/reorg/idempotency handling, bounded payout batches, restart recovery, and DB-issued wallet/ledger reconciliation roots; no collector-wallet integration or crash-safe signing/broadcast composition |
-| Wolf integration | Wolf now contains a pool-backend-v1 Unix listener, durable journal, native retained-job path, and matching protocol pin; service composition, end-to-end release evidence, and exact private Wcash recipient attestation remain incomplete |
-| Operations | No production container, deployment manifests, public endpoint, private soak, or release readiness |
+| Miner edge | Source-restricted public TCP listener behind nginx TLS, bounded ZIP-301 actors, PostgreSQL worker authentication, durable cross-process nonce leases, strict framing/deadlines/backpressure, and account-scoped process telemetry; real ASIC certification remains a launch gate |
+| Miner portal | Responsive six-page UI; bounded Argon2id work, encrypted TOTP, digest-only sessions, CSRF/origin controls, authoritative address adapters, account-isolated balances/rewards/blocks/payouts, one-time worker tokens, and separate WEC/ZEC settings |
+| Service process | `config-check`, listener-free `preflight`, migration/authority commands, and composed Testnet-only `serve`; readiness fails before wallet, backend, identity, or signer authority can be proven |
+| Persistence and money | Deployment-fenced PostgreSQL PPLNS/ledger projection, maturity/reorg/idempotency handling, durable payout artifacts and recovery, and exact wallet-to-ledger reconciliation for independent WEC and ZEC collectors |
+| Wolf integration | Backend-v1 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling are composed; exact artifact pairing and live recovery evidence remain launch gates |
+| Operations | Immutable release renderer, protected systemd credentials, private preflight/start/rollback paths, source-restricted Stratum, Cloudflare-AOP portal staging, and explicit publication gates; no public launch is claimed |
 
 The final miner, reward, privacy, account, UI, and deployment decisions are in
 the [product design](docs/product-design.md). The remaining backend integration
@@ -109,8 +109,9 @@ staged evidence required before any public endpoint is listed is in the
 - [Testnet roadmap](docs/testnet-roadmap.md)
 - [Security reporting policy](SECURITY.md)
 
-See [SECURITY.md](SECURITY.md) before reporting a vulnerability. Do not deploy
-this repository as a mining service.
+See [SECURITY.md](SECURITY.md) before reporting a vulnerability. Follow the
+runbook's private-Testnet gates; this repository does not authorize a public or
+Mainnet deployment.
 
 ## License
 

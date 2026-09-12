@@ -329,6 +329,81 @@ pub struct MinerPayoutSummary {
     pub confirmation_height: Option<u64>,
 }
 
+/// One authenticated account's current ledger balances for an asset.
+///
+/// Values are liabilities owed by the pool and are therefore exposed as
+/// non-negative atomic units. Collector, fee, and other accounts are never
+/// included in this browser projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MinerBalanceSummary {
+    /// Independently settled asset.
+    pub asset: Asset,
+    /// Reward allocations waiting for coinbase maturity.
+    pub immature_zat: u64,
+    /// Mature balance eligible for a payout batch.
+    pub payable_zat: u64,
+    /// Balance reserved by a not-yet-confirmed payout.
+    pub pending_zat: u64,
+    /// Sum of immature, payable, and pending balances.
+    pub total_zat: u64,
+}
+
+/// Live share counters for one worker owned by the authenticated account.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerTelemetrySummary {
+    /// Stable worker identifier used to join the private worker list.
+    pub worker_id: Uuid,
+    /// Number of currently authorized Stratum connections for this worker.
+    pub connections: u64,
+    /// Shares accepted during the current service process lifetime.
+    pub accepted: u64,
+    /// Shares rejected because their job was stale.
+    pub stale: u64,
+    /// Malformed, invalid-Equihash, or low-difficulty shares.
+    pub invalid: u64,
+    /// Idempotent replays or attribution-conflicting duplicate shares.
+    pub duplicate: u64,
+    /// Unix time of the latest recorded share outcome, if any.
+    pub last_share_at: Option<u64>,
+}
+
+/// Authenticated, account-scoped live mining telemetry.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct MinerTelemetrySummary {
+    /// Whether the live telemetry source is connected.
+    pub available: bool,
+    /// Unix time when this snapshot was produced.
+    pub updated_at: Option<u64>,
+    /// Number of this account's workers with an authorized connection.
+    pub active_workers: u64,
+    /// Aggregate share counters for only this account.
+    pub accepted: u64,
+    /// Aggregate stale shares for only this account.
+    pub stale: u64,
+    /// Aggregate invalid shares for only this account.
+    pub invalid: u64,
+    /// Aggregate duplicate shares for only this account.
+    pub duplicate: u64,
+    /// Per-worker counters, scoped to this account by the source.
+    pub workers: Vec<WorkerTelemetrySummary>,
+}
+
+/// Live telemetry source queried only after portal authentication.
+pub trait MinerTelemetrySource: Send + Sync {
+    /// Returns a snapshot containing no data outside `account_id`.
+    fn account_snapshot(&self, account_id: Uuid) -> MinerTelemetrySummary;
+}
+
+/// Fail-closed live telemetry source used outside a composed mining service.
+#[derive(Debug, Default)]
+pub struct UnavailableMinerTelemetry;
+
+impl MinerTelemetrySource for UnavailableMinerTelemetry {
+    fn account_snapshot(&self, _account_id: Uuid) -> MinerTelemetrySummary {
+        MinerTelemetrySummary::default()
+    }
+}
+
 /// Masks a destination while retaining enough characters to distinguish it.
 pub fn mask_destination(address: &str) -> String {
     let chars: Vec<char> = address.chars().collect();

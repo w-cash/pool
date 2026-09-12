@@ -22,7 +22,8 @@ use wcash_pool_protocol::{
 
 use crate::rate_limit::RequestRateLimiter;
 use crate::{
-    EdgeConfig, JobRouter, JobRouterError, JobUpdate, MinerError, MinerErrorCode, ShareRouterError,
+    EdgeConfig, JobRouter, JobRouterError, JobUpdate, MinerError, MinerErrorCode,
+    MinerTelemetrySink, NoopMinerTelemetry, ShareOutcome, ShareRouterError,
 };
 
 /// Vardiff policy installed independently on every authorized miner connection.
@@ -180,6 +181,8 @@ pub struct ConnectionActor {
     pending_shares: HashMap<u64, PendingShareState>,
     timing_order: VecDeque<u64>,
     next_ticket: u64,
+    telemetry: Arc<dyn MinerTelemetrySink>,
+    telemetry_connected: bool,
     closed: bool,
 }
 
@@ -214,6 +217,27 @@ impl ConnectionActor {
         router: JobRouter,
         now_ms: u64,
     ) -> Result<Self, ConnectionActorError> {
+        Self::new_with_telemetry(
+            session_id,
+            config,
+            policy,
+            nonce_allocator,
+            router,
+            now_ms,
+            Arc::new(NoopMinerTelemetry),
+        )
+    }
+
+    /// Creates one connection actor with account-scoped live telemetry.
+    pub fn new_with_telemetry(
+        session_id: Uuid,
+        config: EdgeConfig,
+        policy: MiningPolicy,
+        nonce_allocator: Arc<NoncePrefixAllocator>,
+        router: JobRouter,
+        now_ms: u64,
+        telemetry: Arc<dyn MinerTelemetrySink>,
+    ) -> Result<Self, ConnectionActorError> {
         let session = MiningSession::new(session_id, config.limits().maximum_announced_jobs())?;
         Ok(Self {
             config,
@@ -231,6 +255,8 @@ impl ConnectionActor {
             pending_shares: HashMap::new(),
             timing_order: VecDeque::new(),
             next_ticket: 1,
+            telemetry,
+            telemetry_connected: false,
             closed: false,
         })
     }
@@ -357,7 +383,9 @@ impl ConnectionActor {
                 // a different canonical login here would make authorization appear
                 // successful while every subsequent share fails `LoginMismatch`.
                 if worker.canonical_login() == ticket.worker {
-                    self.session.complete_authorization(worker)?;
+                    self.session.complete_authorization(worker.clone())?;
+                    self.telemetry.worker_connected(&worker);
+                    self.telemetry_connected = true;
                     self.queue(Zip301ServerMessage::Boolean {
                         id: response_id,
                         result: true,
@@ -432,6 +460,16 @@ impl ConnectionActor {
             ConnectionActorError::CompletionTicketMismatch
         })?;
         let response_id = self.take_response_id(response_index)?;
+        let outcome = match &result {
+            Ok(verified) if verified.replayed() => Some(ShareOutcome::Duplicate),
+            Ok(_) => Some(ShareOutcome::Accepted),
+            Err(ShareRouterError::Rejected(code)) => share_outcome_for_backend(*code),
+            Err(ShareRouterError::ReplayRequiresProjection { .. }) => Some(ShareOutcome::Duplicate),
+            Err(_) => None,
+        };
+        if let Some(outcome) = outcome {
+            self.record_share_outcome(outcome);
+        }
         match result {
             Ok(_verified) => {
                 self.queue(Zip301ServerMessage::Boolean {
@@ -590,6 +628,7 @@ impl ConnectionActor {
         let job_id = match JobId::new(*submitted.job_id.as_bytes()) {
             Ok(job_id) => job_id,
             Err(_) => {
+                self.record_share_outcome(ShareOutcome::Stale);
                 self.queue_error(
                     id,
                     MinerError::new(MinerErrorCode::StaleJob, "stale job", false),
@@ -608,6 +647,9 @@ impl ConnectionActor {
         ) {
             Ok(context) => context,
             Err(JobRouterError::Session(error)) => {
+                if let Some(outcome) = share_outcome_for_session(&error) {
+                    self.record_share_outcome(outcome);
+                }
                 self.queue_session_error(id, error)?;
                 return Ok(None);
             }
@@ -822,7 +864,19 @@ impl ConnectionActor {
         }
     }
 
+    fn record_share_outcome(&self, outcome: ShareOutcome) {
+        if let Some(worker) = self.session.authenticated_worker() {
+            self.telemetry.share_outcome(worker, outcome);
+        }
+    }
+
     fn close(&mut self) {
+        if self.telemetry_connected {
+            if let Some(worker) = self.session.authenticated_worker() {
+                self.telemetry.worker_disconnected(worker);
+            }
+            self.telemetry_connected = false;
+        }
         self.closed = true;
         self.session.close();
         self.assignments.clear();
@@ -836,6 +890,29 @@ impl ConnectionActor {
     #[cfg(test)]
     fn binding(&self) -> Option<TargetBinding> {
         self.vardiff.as_ref().map(VardiffController::binding)
+    }
+}
+
+fn share_outcome_for_backend(code: wcash_pool_protocol::BackendErrorCode) -> Option<ShareOutcome> {
+    use wcash_pool_protocol::BackendErrorCode;
+
+    match code {
+        BackendErrorCode::StaleJob => Some(ShareOutcome::Stale),
+        BackendErrorCode::AttributionConflict => Some(ShareOutcome::Duplicate),
+        BackendErrorCode::InvalidRequest
+        | BackendErrorCode::LowDifficulty
+        | BackendErrorCode::InvalidEquihash
+        | BackendErrorCode::TargetOutOfRange => Some(ShareOutcome::Invalid),
+        BackendErrorCode::Overloaded | BackendErrorCode::BackendUnhealthy => None,
+    }
+}
+
+fn share_outcome_for_session(error: &SessionError) -> Option<ShareOutcome> {
+    match MinerError::from_session(error).code() {
+        MinerErrorCode::StaleJob => Some(ShareOutcome::Stale),
+        MinerErrorCode::DuplicateShare => Some(ShareOutcome::Duplicate),
+        MinerErrorCode::LowDifficulty | MinerErrorCode::Other => Some(ShareOutcome::Invalid),
+        MinerErrorCode::Unauthorized | MinerErrorCode::NotSubscribed => None,
     }
 }
 
@@ -897,15 +974,49 @@ pub enum ConnectionActorError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Mutex, time::Duration};
 
     use super::*;
     use wcash_pool_core::{
         GenerationRegistryConfig, NonceNamespaceLease, NonceProfile, TargetBounds,
     };
     use wcash_pool_protocol::{
-        AcceptableJob, BackendEvent, Hex108, Hex32, JobDescriptor, TargetLe,
+        AcceptableJob, BackendErrorCode, BackendEvent, Hex108, Hex1344, Hex28, Hex32, Hex4,
+        JobDescriptor, NonceSuffix, TargetLe,
     };
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum TelemetryEvent {
+        Connected,
+        Disconnected,
+        Share(ShareOutcome),
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingTelemetry(Mutex<Vec<TelemetryEvent>>);
+
+    impl MinerTelemetrySink for RecordingTelemetry {
+        fn worker_connected(&self, _worker: &AuthenticatedWorker) {
+            self.0
+                .lock()
+                .expect("telemetry lock")
+                .push(TelemetryEvent::Connected);
+        }
+
+        fn worker_disconnected(&self, _worker: &AuthenticatedWorker) {
+            self.0
+                .lock()
+                .expect("telemetry lock")
+                .push(TelemetryEvent::Disconnected);
+        }
+
+        fn share_outcome(&self, _worker: &AuthenticatedWorker, outcome: ShareOutcome) {
+            self.0
+                .lock()
+                .expect("telemetry lock")
+                .push(TelemetryEvent::Share(outcome));
+        }
+    }
 
     fn descriptor(id: u8) -> JobDescriptor {
         let mut header = [id; 108];
@@ -975,6 +1086,14 @@ mod tests {
     }
 
     fn actor_with_router(outbound: usize, router: JobRouter) -> ConnectionActor {
+        actor_with_telemetry(outbound, router, Arc::new(NoopMinerTelemetry))
+    }
+
+    fn actor_with_telemetry(
+        outbound: usize,
+        router: JobRouter,
+        telemetry: Arc<dyn MinerTelemetrySink>,
+    ) -> ConnectionActor {
         let limits =
             crate::ConnectionLimits::new(10, outbound, 8, 4).expect("connection limits are valid");
         let rate = crate::RateLimit::new(100, Duration::from_secs(1)).expect("rate limit is valid");
@@ -1001,8 +1120,16 @@ mod tests {
         let policy = MiningPolicy::new(vardiff, bounds.hardest_allowed());
         let lease = NonceNamespaceLease::new(7).expect("lease is valid");
         let allocator = Arc::new(NoncePrefixAllocator::new(NonceProfile::FourByte, lease));
-        ConnectionActor::new(Uuid::from_u128(1), config, policy, allocator, router, 0)
-            .expect("actor is valid")
+        ConnectionActor::new_with_telemetry(
+            Uuid::from_u128(1),
+            config,
+            policy,
+            allocator,
+            router,
+            0,
+            telemetry,
+        )
+        .expect("actor is valid")
     }
 
     fn actor(outbound: usize) -> ConnectionActor {
@@ -1075,6 +1202,73 @@ mod tests {
             actor.pop_outbound(),
             Some(Zip301ServerMessage::Notify(_))
         ));
+    }
+
+    #[test]
+    fn telemetry_counts_each_terminal_path_once_and_disconnects_once() {
+        let telemetry = Arc::new(RecordingTelemetry::default());
+        let mut actor = actor_with_telemetry(16, router(), telemetry.clone());
+        authorize(&mut actor);
+        while actor.pop_outbound().is_some() {}
+
+        let action = actor
+            .handle_request(
+                Zip301Request::Submit {
+                    id: Zip301Id::Number(10),
+                    worker: "account.rig".to_owned(),
+                    job_id: Hex32::new([0; 32]),
+                    time: Hex4::new([0; 4]),
+                    nonce_2: NonceSuffix::TwentyEight(Hex28::new([0; 28])),
+                    solution: Box::new(Hex1344::new([0; 1344])),
+                },
+                2,
+            )
+            .expect("local stale share is handled");
+        assert!(
+            action.is_none(),
+            "locally rejected work has no backend ticket"
+        );
+
+        let response_id = actor
+            .store_response_id(Zip301Id::Number(11))
+            .expect("response slot");
+        let target = actor.binding().expect("authorized target");
+        actor.pending_shares.insert(
+            50,
+            PendingShareState {
+                response_id: Some(response_id),
+                target,
+                admitted_at_ms: 3,
+                vardiff_sample: None,
+                expected_job_id: [1; 32],
+                expected_share_id: [2; 32],
+                expected_attribution_id: [3; 32],
+            },
+        );
+        let ticket = ShareTicket {
+            session_id: actor.session.id(),
+            ticket: 50,
+        };
+        actor
+            .complete_submission(
+                ticket,
+                Err(ShareRouterError::Rejected(
+                    BackendErrorCode::InvalidEquihash,
+                )),
+            )
+            .expect("backend rejection is handled once");
+
+        actor.transport_failed();
+        actor.transport_failed();
+        assert_eq!(
+            *telemetry.0.lock().expect("telemetry lock"),
+            vec![
+                TelemetryEvent::Connected,
+                TelemetryEvent::Share(ShareOutcome::Stale),
+                TelemetryEvent::Share(ShareOutcome::Invalid),
+                TelemetryEvent::Disconnected,
+            ]
+        );
     }
 
     #[test]

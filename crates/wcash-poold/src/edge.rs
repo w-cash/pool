@@ -22,7 +22,8 @@ use wcash_pool_backend_client::MonotonicTimeline;
 use wcash_pool_core::{NoncePrefixAllocator, ShareTarget, VardiffConfig};
 use wcash_pool_edge::{
     AuthenticationProvider, ConnectionActor, ConnectionCapacity, ConnectionLimits, EdgeConfig,
-    JobRouter, MiningPolicy, PublicStreamDriver, RateLimit, ShareSubmissionProvider,
+    JobRouter, MinerTelemetrySink, MiningPolicy, PublicStreamDriver, RateLimit,
+    ShareSubmissionProvider,
 };
 use wcash_pool_protocol::TargetBe;
 
@@ -51,18 +52,23 @@ pub struct EdgeDependencies {
     nonces: Arc<NoncePrefixAllocator>,
     jobs: JobRouter,
     timeline: MonotonicTimeline,
+    telemetry: Arc<dyn MinerTelemetrySink>,
 }
 
 impl EdgeDependencies {
     /// Borrows no owned actor from the bootstrap, so the caller can explicitly
     /// drain `ShareRouter` only after every public session has stopped.
-    pub fn from_bootstrap(bootstrap: &MiningBootstrap) -> Self {
+    pub fn from_bootstrap(
+        bootstrap: &MiningBootstrap,
+        telemetry: Arc<dyn MinerTelemetrySink>,
+    ) -> Self {
         Self {
             authentication: bootstrap.authentication.clone(),
             submissions: Arc::new(bootstrap.shares.handle()),
             nonces: Arc::clone(&bootstrap.nonces),
             jobs: bootstrap.jobs.clone(),
             timeline: bootstrap.timeline,
+            telemetry,
         }
     }
 }
@@ -105,13 +111,14 @@ pub async fn run(
                     continue;
                 };
                 let now_ms = dependencies.timeline.now_ms()?;
-                let actor = match ConnectionActor::new(
+                let actor = match ConnectionActor::new_with_telemetry(
                     Uuid::new_v4(),
                     edge_config,
                     policy,
                     Arc::clone(&dependencies.nonces),
                     dependencies.jobs.clone(),
                     now_ms,
+                    Arc::clone(&dependencies.telemetry),
                 ) {
                     Ok(actor) => actor,
                     Err(_) => {

@@ -1,19 +1,18 @@
 # Testnet roadmap
 
-> **Current state: phase-0 libraries only, not deployable.** Strict protocol,
-> in-memory policy, Unix backend-client, and listener-free miner-edge actors
-> exist. Wolf contains a source-compatible backend-v1 server and durable
-> journal, but there is no public miner listener, service-composed
-> accepted-share path, exact private Wcash collector attestation, PostgreSQL
-> projection, payout engine, production image, or Wcash/Zcash endpoint. Passing
-> source CI does not make this pool Testnet- or production-ready.
+> **Current state:** the phases below are the historical implementation plan,
+> not a current component inventory. Their source components are now composed
+> in a private-Testnet deployment candidate. Public readiness remains RED until
+> the exact Wolf/pool artifacts pass every live gate in
+> [the deployment runbook](zecwec-testnet-deployment.md). Passing source CI or
+> rendering a release does not make the pool Testnet-public or production-ready.
 
 | Phase | Current status |
 | --- | --- |
-| 0 — Repository foundation | Implementation present; clean-clone CI evidence is still required on the release commit |
-| 1 — Wolf backend API | Partial: matching source implementations and a pinned protocol baseline exist; service composition, private Wcash recipient attestation, fixed cross-repository vectors, and release recovery evidence do not |
-| 2 — Miner protocol edge | Partial: strict ZIP-301 codec, policy state machines, and a bounded loopback-only accepted-stream driver with synthetic 4+28 transcripts exist; public listener, TLS, concrete auth provider, durable nonce leasing, service composition, and certified ASIC transcripts do not |
-| 3 and later | Not implemented |
+| 0 — Repository foundation | Implemented in source; exact-release clean-clone evidence is still required |
+| 1 — Wolf backend API | Composed in source with identity, journal, payout-recipient attestation, and recovery gates; exact paired-artifact live evidence remains required |
+| 2 — Miner protocol edge | Composed with source-restricted TCP/TLS, concrete authentication, durable nonce leasing, and backend projection; certified real-ASIC evidence remains required |
+| 3 and later | Portal, accounting, payout, deployment, and rollback paths are composed for Testnet; live launch gates remain incomplete |
 
 Each phase has an explicit exit gate. Work may be prototyped in parallel, but a
 later phase cannot be called complete until every earlier gate is evidenced on
@@ -33,9 +32,9 @@ Deliverables:
 Exit gate: all repository checks pass from a clean clone, and documentation
 contains no claim that a testnet service exists.
 
-Current note: the workspace contains these deliverables, including a
-readiness-only executable that opens no port. Phase 0 is not declared complete
-until the exact committed revision passes the clean-clone checks.
+Historical note: phase 0 originally required a readiness-only executable. The
+current executable also has Testnet-only preflight and serve modes; the exact
+committed revision must still pass clean-clone checks.
 
 ## Phase 1 — Freeze the wolf backend API
 

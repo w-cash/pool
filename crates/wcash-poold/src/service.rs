@@ -6,8 +6,8 @@ use tokio::{net::TcpListener, sync::watch, task::JoinSet, time};
 use wcash_pool_address::{TestnetAddressValidator, WcashCommandValidator};
 use wcash_pool_portal::{
     serve_until_shutdown, AddressValidator, Asset, ChainNetwork, DisabledPayoutSigner,
-    IsolatedPayoutSigner, PoolDataSource, PortalApp, PortalBuildError, PortalConfig,
-    PortalRepository, PortalSecrets, TestnetPayoutBoundary,
+    IsolatedPayoutSigner, MinerTelemetrySource, PoolDataSource, PortalApp, PortalBuildError,
+    PortalConfig, PortalRepository, PortalSecrets, TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
     Chain, NonceNamespaceClaim, PostgresPoolDataSource, PostgresStore, StoreError,
@@ -28,6 +28,7 @@ use crate::{
         LivePayoutConfigError, LoopbackJsonRpc, NodePayoutAuthority, RpcExactBroadcaster,
         ZalletObservationSource,
     },
+    miner_telemetry::LiveMinerTelemetry,
     payout::DualPayoutSigner,
     payout_runtime::{
         AutomaticPayoutRuntime, ObservationFailure, PayoutConfirmationAuthority, PayoutLoopPolicy,
@@ -150,6 +151,7 @@ impl PreflightProbe for LivePreflightProbe<'_> {
             Arc::clone(&self.started.store),
             validator,
             pool_data,
+            Arc::new(LiveMinerTelemetry::default()),
             payout,
         )?;
         drop(portal);
@@ -185,11 +187,13 @@ async fn run_started(
 
     let pool_data = PostgresPoolDataSource::new(started.store.as_ref().clone());
     pool_data.refresh().await?;
+    let miner_telemetry = Arc::new(LiveMinerTelemetry::default());
     let portal = build_portal(
         config,
         started,
         validator,
         pool_data.clone(),
+        Arc::clone(&miner_telemetry),
         Arc::clone(&payout_services.portal),
     )?;
 
@@ -211,7 +215,10 @@ async fn run_started(
     let portal_listener = TcpListener::bind(config.portal_listen).await?;
     let stratum_listener = TcpListener::bind(config.stratum_listen).await?;
 
-    let dependencies = EdgeDependencies::from_bootstrap(started);
+    let dependencies = EdgeDependencies::from_bootstrap(
+        started,
+        miner_telemetry as Arc<dyn wcash_pool_edge::MinerTelemetrySink>,
+    );
     let counters = Arc::new(EdgeCounters::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -834,6 +841,7 @@ fn build_portal(
     bootstrap: &MiningBootstrap,
     validator: Arc<dyn AddressValidator>,
     pool_data: PostgresPoolDataSource,
+    miner_telemetry: Arc<LiveMinerTelemetry>,
     payout: Arc<TestnetPayoutBoundary>,
 ) -> Result<PortalApp, ServiceError> {
     build_preflight_portal(
@@ -841,6 +849,7 @@ fn build_portal(
         Arc::clone(&bootstrap.store),
         validator,
         pool_data,
+        miner_telemetry,
         payout,
     )
 }
@@ -850,6 +859,7 @@ fn build_preflight_portal(
     store: Arc<PostgresStore>,
     validator: Arc<dyn AddressValidator>,
     pool_data: PostgresPoolDataSource,
+    miner_telemetry: Arc<dyn MinerTelemetrySource>,
     payout: Arc<TestnetPayoutBoundary>,
 ) -> Result<PortalApp, ServiceError> {
     let mut portal_config = PortalConfig::testnet();
@@ -861,8 +871,16 @@ fn build_preflight_portal(
     let secrets = PortalSecrets::new(*token, *totp);
     let repository: Arc<dyn PortalRepository> = store;
     let data: Arc<dyn PoolDataSource> = Arc::new(pool_data);
-    PortalApp::new(portal_config, secrets, repository, validator, data, payout)
-        .map_err(ServiceError::from)
+    PortalApp::new_with_telemetry(
+        portal_config,
+        secrets,
+        repository,
+        validator,
+        data,
+        miner_telemetry,
+        payout,
+    )
+    .map_err(ServiceError::from)
 }
 
 async fn refresh_portal(

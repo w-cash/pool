@@ -153,6 +153,14 @@ impl MiningSession {
         self.state
     }
 
+    /// Returns the identity bound to this authorized session, if any.
+    ///
+    /// Callers must not serialize this value or expose it outside a trusted,
+    /// account-scoped boundary.
+    pub fn authenticated_worker(&self) -> Option<&AuthenticatedWorker> {
+        self.worker.as_ref()
+    }
+
     /// Allocates the session's unique nonce prefix.
     pub fn subscribe(
         &mut self,

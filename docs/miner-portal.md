@@ -1,10 +1,10 @@
 # Miner portal and payout boundary
 
-> **Milestone status:** the portal HTTP/UI boundary is implemented and tested,
-> but it is not a public service. It becomes Testnet-deployable only after the
-> shared PostgreSQL adapter, authoritative Wcash/Zcash address adapters, pool
-> accounting projection, and isolated wallet signer are composed. Mainnet is
-> deliberately rejected by this release.
+> **Milestone status:** the portal, shared PostgreSQL adapter, authoritative
+> address adapters, account read models, and isolated Testnet payout services
+> are composed in `wcash-poold`. It is not a public service until the private
+> end-to-end launch and soak gates pass. Mainnet is deliberately rejected by
+> this release.
 
 ## Miner experience
 
@@ -13,6 +13,14 @@ independent payout preferences. The responsive portal has Overview, Workers,
 Rewards, Blocks, Payouts, and Settings pages. Aggregate service information is
 public; account names, worker names, shares, balances, destinations, and
 payouts require authentication.
+
+The authenticated overview shows independently conserved WEC and ZEC
+immature, payable, pending-payout, and total balances. Reward allocations,
+found blocks, and payout batches use bounded keyset pagination. Transaction
+identifiers appear only after a reconciled signer result. Live worker status
+and accepted, stale, invalid, and duplicate counters are scoped to one account
+and explicitly labelled as process-lifetime operational telemetry; they are
+not the durable monetary accounting record.
 
 The Workers page creates one canonical `account.worker` login and one
 `zw1.<selector>.<secret>` mining token. The token is displayed once. Only its
@@ -35,6 +43,10 @@ destination.
   two iterations, and one lane.
 - Unknown-account login still performs a dummy Argon2 verification, and known
   accounts receive a bounded temporary lock after repeated failures.
+- Registration, login, worker-token creation, and payout reauthentication
+  share a small non-queueing process-wide Argon2 semaphore. Saturation returns
+  HTTP 429 with a bounded retry hint instead of allocating another memory-hard
+  blocking task.
 - Browser sessions are random 256-bit values. PostgreSQL stores only a
   domain-separated keyed digest, an absolute expiry, an idle expiry, and the
   account security version.
@@ -66,13 +78,14 @@ process-local fake repository only to prove HTTP behavior.
 Address validation is an injected `AddressValidator`. If either chain's
 authority is missing, `/readyz` and destination changes fail closed.
 
-The current `/api/v1/rewards`, `/api/v1/blocks`, and `/api/v1/payouts`
-handlers deliberately return an unavailable dataset. They are typed
-integration seams for the append-only PostgreSQL accounting projection, not
-empty production datasets and not evidence of pool readiness. A deployment
-must replace them with account-scoped, projection-backed reads and prove their
-share, winner, maturity, reorganization, and payout-state behavior before
-miners are admitted.
+The `/api/v1/balances`, `/api/v1/rewards`, `/api/v1/blocks`, and
+`/api/v1/payouts` handlers are authenticated and query deployment-fenced,
+account-scoped PostgreSQL projections. The found-block view starts at the
+backend-validated submitted state rather than waiting for reward allocation;
+its immutable cursor also keeps dual-chain winners independently pageable.
+The `/api/v1/telemetry` route reads only the authenticated account's bounded
+in-process counters. Empty arrays mean a proven empty account dataset;
+repository failure remains an explicit unavailable response.
 
 The `TestnetPayoutBoundary` accepts only Testnet requests. Each request binds:
 
@@ -121,15 +134,14 @@ signer state.
 
 ## Evidence required before ASIC testing
 
-1. Implement `PortalRepository` over the deployment-fenced PostgreSQL store and
-   prove that a portal-created worker authenticates through the real Stratum
-   edge, then fails immediately after revocation.
-2. Connect authoritative Wcash Testnet and Zcash Testnet address validation;
+1. Re-run the deployment-fenced PostgreSQL migration and portal/Stratum
+   integration suite against the release artifact.
+2. Exercise authoritative Wcash Testnet and Zcash Testnet address validation;
    wrong-chain, wrong-network, malformed, unsupported, and unavailable cases
    must fail closed.
-3. Connect the real append-only account/reward projection. Empty UI states must
-   remain explicitly unavailable until then.
-4. Connect separate WEC and ZEC Testnet wallet observers plus an isolated,
+3. Verify non-empty and empty balance, reward, winner, and payout projections
+   through two independent accounts to prove isolation.
+4. Exercise separate WEC and ZEC Testnet wallet observers plus the isolated,
    durably idempotent signer. Exercise success, rejection, timeout, ambiguous
    broadcast, exact retry, conflicting retry, restart, and reorganization.
 5. Compose the portal on loopback behind HTTPS, inject secrets from protected

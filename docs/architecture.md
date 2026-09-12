@@ -1,9 +1,14 @@
 # Pool architecture
 
-> **Status:** This repository is a non-deployable phase-0 foundation. It has no
-> public miner listener, authentication provider, PostgreSQL projection, payout
-> engine, wallet integration, production image, or Wcash Testnet service.
-> Passing unit tests is not evidence of deployment or network readiness.
+> **Current status:** the architecture is composed as a private-Testnet
+> deployment candidate, but public readiness remains RED until the exact
+> Wolf/pool artifacts pass the live gates in
+> [the deployment runbook](zecwec-testnet-deployment.md). The detailed
+> “future”, “missing”, and phase-gap prose below is retained as the historical
+> design and threat checklist; it is not the current implementation inventory.
+> [The repository status](../README.md#implementation-status) and deployment
+> runbook are authoritative for what is now composed. Passing unit tests alone
+> is still not network-readiness evidence.
 
 ## Authority and ownership
 
@@ -48,7 +53,9 @@ the Wcash merged-mining design.
    later reward attribution, maturity, reorg reversal, and payout policy after
    those facts are projected.
 
-This is the target flow. No executable currently composes these steps.
+`wcash-poold serve` now composes this flow for Testnet. Public admission still
+requires exact-artifact, ASIC, payout, restart, reorganization, and HTTPS
+evidence; source composition alone is not that evidence.
 
 ## Implemented component status
 
