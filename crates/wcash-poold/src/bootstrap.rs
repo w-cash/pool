@@ -116,8 +116,11 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
 }
 
 /// Exercises database, replay, authenticated job snapshot, authentication,
-/// and nonce allocation without spawning a live actor. The backend connection
-/// and nonce claim are both closed before this function returns.
+/// and exclusive nonce-namespace ownership without spawning a live actor. The
+/// backend connection and nonce claim are both closed before this function
+/// returns. Preflight deliberately reserves no nonce range: no prefix is ever
+/// exposed to a miner, so advancing the finite counter would only consume
+/// availability on every service-manager restart.
 pub async fn preflight(config: &RuntimeConfig) -> Result<MiningPreflight, BootstrapError> {
     let PreparedBootstrap {
         store,
@@ -128,8 +131,7 @@ pub async fn preflight(config: &RuntimeConfig) -> Result<MiningPreflight, Bootst
     } = prepare(config).await?;
     client.shutdown().await?;
 
-    let (nonce_claim, nonces) = claim_nonce_allocator(&store, config).await?;
-    drop(nonces);
+    let nonce_claim = claim_nonce_namespace(&store, config).await?;
     store.release_nonce_namespace(&nonce_claim).await?;
 
     Ok(MiningPreflight {
@@ -192,15 +194,7 @@ async fn claim_nonce_allocator(
     store: &Arc<PostgresStore>,
     config: &RuntimeConfig,
 ) -> Result<(NonceNamespaceClaim, Arc<NoncePrefixAllocator>), BootstrapError> {
-    let namespace = NonceNamespaceLease::new(config.nonce_namespace)?;
-    let nonce_claim = store
-        .claim_nonce_namespace(
-            Uuid::new_v4(),
-            NonceProfile::FourByte,
-            namespace,
-            NONCE_NAMESPACE_LEASE_DURATION,
-        )
-        .await?;
+    let nonce_claim = claim_nonce_namespace(store, config).await?;
     let reservation = match reserve_nonce_tail(store, &nonce_claim, config.nonce_reservation).await
     {
         Ok(reservation) => reservation,
@@ -217,6 +211,22 @@ async fn claim_nonce_allocator(
         }
     };
     Ok((nonce_claim, nonces))
+}
+
+async fn claim_nonce_namespace(
+    store: &PostgresStore,
+    config: &RuntimeConfig,
+) -> Result<NonceNamespaceClaim, BootstrapError> {
+    let namespace = NonceNamespaceLease::new(config.nonce_namespace)?;
+    store
+        .claim_nonce_namespace(
+            Uuid::new_v4(),
+            NonceProfile::FourByte,
+            namespace,
+            NONCE_NAMESPACE_LEASE_DURATION,
+        )
+        .await
+        .map_err(BootstrapError::from)
 }
 
 async fn fail_after_nonce_claim<T>(
