@@ -23,6 +23,13 @@ with different facts is rejected. A timeout at broadcast is unresolved, never
 reported as paid; an explicit retry can only rebroadcast the already-persisted
 identical bytes.
 
+`LoopbackHttpTransport` is the concrete node boundary. It accepts only a
+nonzero loopback TCP address, reloads Basic-auth credentials from an
+owner-only cookie file for every request, applies the signer's per-call I/O
+deadline, requires an explicit HTTP content length, bounds both the envelope
+and JSON-RPC result, and rejects crossed response IDs. Cookie material and
+request bytes are cleared after transmission and are never formatted for logs.
+
 This crate implements the ZEC half of payout execution only. It does not
 authorize ledger entries, calculate rewards, operate the WEC signer, or expose
 an Internet-facing RPC endpoint.
