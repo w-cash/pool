@@ -1,6 +1,13 @@
-//! Loopback-only TCP composition for deterministic ZIP-301 integration tests.
+//! Bounded TCP composition for local tests and publicly accepted ZIP-301 peers.
 
-use std::{fmt, future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+};
 
 use thiserror::Error;
 use tokio::{
@@ -56,14 +63,8 @@ pub enum StreamTermination {
     ActorClosed,
 }
 
-/// A single admitted loopback TCP session around [`ConnectionActor`].
-///
-/// This type never binds or accepts a socket. Construction rejects any stream
-/// whose local or peer address is not loopback and rejects every nonce profile
-/// except the standard four-byte server prefix plus 28-byte miner suffix. Holding
-/// the supplied [`ConnectionPermit`] accounts for this session until `run` ends
-/// or its future is cancelled.
-pub struct LoopbackStreamDriver {
+/// Shared implementation for an already admitted TCP mining session.
+struct AcceptedStreamDriver {
     stream: TcpStream,
     actor: ConnectionActor,
     job_updates: JobSubscription,
@@ -78,10 +79,10 @@ pub struct LoopbackStreamDriver {
     idle_deadline: Instant,
 }
 
-impl fmt::Debug for LoopbackStreamDriver {
+impl fmt::Debug for AcceptedStreamDriver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("LoopbackStreamDriver")
+            .debug_struct("AcceptedStreamDriver")
             .field("actor", &self.actor)
             .field("buffered_bytes", &self.codec.buffered_bytes())
             .field("frame_in_progress", &self.frame_started_at.is_some())
@@ -89,7 +90,7 @@ impl fmt::Debug for LoopbackStreamDriver {
     }
 }
 
-impl Drop for LoopbackStreamDriver {
+impl Drop for AcceptedStreamDriver {
     fn drop(&mut self) {
         // `run` can be cancelled at any await point. Keep actor teardown tied to
         // ownership so cancellation cannot leave the logical session open.
@@ -99,13 +100,8 @@ impl Drop for LoopbackStreamDriver {
     }
 }
 
-impl LoopbackStreamDriver {
-    /// Composes one already accepted loopback stream with an edge actor.
-    ///
-    /// `clock_origin_ms` must be the same monotonic millisecond value used when
-    /// constructing `actor`. The driver adds elapsed Tokio monotonic time without
-    /// consulting wall-clock time.
-    pub fn new(
+impl AcceptedStreamDriver {
+    fn new(
         stream: TcpStream,
         actor: ConnectionActor,
         authentication: Arc<dyn AuthenticationProvider>,
@@ -113,15 +109,6 @@ impl LoopbackStreamDriver {
         connection_permit: ConnectionPermit,
         clock_origin_ms: u64,
     ) -> Result<Self, StreamDriverError> {
-        let local = stream
-            .local_addr()
-            .map_err(StreamDriverError::SocketIdentity)?;
-        let peer = stream
-            .peer_addr()
-            .map_err(StreamDriverError::SocketIdentity)?;
-        if !local.ip().is_loopback() || !peer.ip().is_loopback() {
-            return Err(StreamDriverError::LoopbackRequired { local, peer });
-        }
         if actor.nonce_profile() != NonceProfile::FourByte {
             return Err(StreamDriverError::UnsupportedNonceProfile);
         }
@@ -338,6 +325,127 @@ impl LoopbackStreamDriver {
     }
 }
 
+/// A single admitted loopback TCP session around [`ConnectionActor`].
+///
+/// This type is reserved for deterministic local integration tests. It never
+/// binds or accepts a socket, and construction rejects any stream whose local
+/// or peer address is not loopback.
+pub struct LoopbackStreamDriver(AcceptedStreamDriver);
+
+impl fmt::Debug for LoopbackStreamDriver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LoopbackStreamDriver")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl LoopbackStreamDriver {
+    /// Composes one already accepted loopback stream with an edge actor.
+    ///
+    /// `clock_origin_ms` must be the same monotonic millisecond value used when
+    /// constructing `actor`.
+    pub fn new(
+        stream: TcpStream,
+        actor: ConnectionActor,
+        authentication: Arc<dyn AuthenticationProvider>,
+        submissions: Arc<dyn ShareSubmissionProvider>,
+        connection_permit: ConnectionPermit,
+        clock_origin_ms: u64,
+    ) -> Result<Self, StreamDriverError> {
+        let local = stream
+            .local_addr()
+            .map_err(StreamDriverError::SocketIdentity)?;
+        let peer = stream
+            .peer_addr()
+            .map_err(StreamDriverError::SocketIdentity)?;
+        if !local.ip().is_loopback() || !peer.ip().is_loopback() {
+            return Err(StreamDriverError::LoopbackRequired { local, peer });
+        }
+        AcceptedStreamDriver::new(
+            stream,
+            actor,
+            authentication,
+            submissions,
+            connection_permit,
+            clock_origin_ms,
+        )
+        .map(Self)
+    }
+
+    /// Drives the local session until the peer, actor, or owner stops it.
+    pub async fn run(
+        self,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<StreamTermination, StreamDriverError> {
+        self.0.run(shutdown).await
+    }
+}
+
+/// A single publicly accepted TCP mining session around [`ConnectionActor`].
+///
+/// The deployment must acquire the supplied process-wide permit before calling
+/// this constructor. The constructor then inspects the accepted socket identity
+/// and rejects non-unicast peer identities before any miner bytes are allocated
+/// or decoded. Firewall and per-source admission remain deployment responsibilities.
+pub struct PublicStreamDriver(AcceptedStreamDriver);
+
+impl fmt::Debug for PublicStreamDriver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PublicStreamDriver")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl PublicStreamDriver {
+    /// Composes one already accepted public stream with the bounded edge actor.
+    pub fn new(
+        stream: TcpStream,
+        actor: ConnectionActor,
+        authentication: Arc<dyn AuthenticationProvider>,
+        submissions: Arc<dyn ShareSubmissionProvider>,
+        connection_permit: ConnectionPermit,
+        clock_origin_ms: u64,
+    ) -> Result<Self, StreamDriverError> {
+        let peer = stream
+            .peer_addr()
+            .map_err(StreamDriverError::SocketIdentity)?;
+        if !public_peer_is_admissible(peer.ip()) {
+            return Err(StreamDriverError::InvalidPublicPeer { peer });
+        }
+        AcceptedStreamDriver::new(
+            stream,
+            actor,
+            authentication,
+            submissions,
+            connection_permit,
+            clock_origin_ms,
+        )
+        .map(Self)
+    }
+
+    /// Drives the public session until the peer, actor, or owner stops it.
+    pub async fn run(
+        self,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<StreamTermination, StreamDriverError> {
+        self.0.run(shutdown).await
+    }
+}
+
+fn public_peer_is_admissible(address: IpAddr) -> bool {
+    if address.is_unspecified() || address.is_multicast() {
+        return false;
+    }
+    match address {
+        IpAddr::V4(address) => !address.is_broadcast(),
+        IpAddr::V6(_) => true,
+    }
+}
+
 enum WaitEvent {
     Shutdown,
     IdleTimeout,
@@ -381,8 +489,14 @@ pub enum StreamDriverError {
         /// Connected peer address.
         peer: SocketAddr,
     },
+    /// The accepted public peer did not have a usable unicast address.
+    #[error("public ZIP-301 peer address is not admissible: {peer}")]
+    InvalidPublicPeer {
+        /// Rejected peer identity returned by the accepted socket.
+        peer: SocketAddr,
+    },
     /// Only the standard four-byte server nonce prefix is accepted by this driver.
-    #[error("loopback stream driver supports only the four-byte nonce profile")]
+    #[error("ZIP-301 stream driver supports only the four-byte nonce profile")]
     UnsupportedNonceProfile,
     /// No complete request arrived before the absolute idle deadline.
     #[error("ZIP-301 connection idle deadline elapsed")]
@@ -984,6 +1098,55 @@ mod tests {
             result,
             Err(StreamDriverError::UnsupportedNonceProfile)
         ));
+        assert_eq!(capacity.available_permits(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn public_peer_policy_accepts_unicast_and_rejects_unusable_identities() {
+        assert!(public_peer_is_admissible(IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST
+        )));
+        assert!(public_peer_is_admissible(IpAddr::V6(
+            std::net::Ipv6Addr::LOCALHOST
+        )));
+        assert!(!public_peer_is_admissible(IpAddr::V4(
+            std::net::Ipv4Addr::UNSPECIFIED
+        )));
+        assert!(!public_peer_is_admissible(IpAddr::V4(
+            std::net::Ipv4Addr::BROADCAST
+        )));
+        assert!(!public_peer_is_admissible(IpAddr::V6(
+            std::net::Ipv6Addr::UNSPECIFIED
+        )));
+        assert!(!public_peer_is_admissible(IpAddr::V6(
+            "ff02::1"
+                .parse()
+                .expect("multicast fixture is a valid IPv6 address")
+        )));
+    }
+
+    #[tokio::test]
+    async fn public_driver_uses_the_same_bounded_session_path() -> TestResult {
+        let (_client, server) = tcp_pair().await?;
+        let config = edge_config(
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let capacity = ConnectionCapacity::new(1)?;
+        let driver = PublicStreamDriver::new(
+            server,
+            actor(config, NonceProfile::FourByte),
+            Arc::new(AllowAuthentication),
+            Arc::new(RejectingSubmissions::default()),
+            capacity.try_acquire()?,
+            0,
+        )?;
+        assert_eq!(capacity.available_permits(), 0);
+        drop(driver);
         assert_eq!(capacity.available_permits(), 1);
         Ok(())
     }

@@ -28,7 +28,8 @@ pub use rate_limit::{ConnectionCapacity, ConnectionPermit, RateLimit, RateLimitE
 pub use router::{JobRouter, JobRouterError, JobSubscription, JobUpdate};
 #[cfg(unix)]
 pub use stream::{
-    LoopbackStreamDriver, ShareSubmissionProvider, StreamDriverError, StreamTermination,
+    LoopbackStreamDriver, PublicStreamDriver, ShareSubmissionProvider, StreamDriverError,
+    StreamTermination,
 };
 #[cfg(unix)]
 pub use submission::{
