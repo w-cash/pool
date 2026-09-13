@@ -166,12 +166,12 @@ both its binary and deployment-package manifests verify exactly.
 
 ### First security-epoch-2 bootstrap
 
-This bootstrap supports only a new host or a never-activated, zero-balance
-prototype whose old state has been independently recovered and archived. It is
-not an in-place upgrade for a finalized, funded, or running epoch-1 pool. Such a
-host requires a fresh or reprovisioned epoch-2 deployment and a separately
-reviewed ledger and wallet migration; this release intentionally provides no
-automatic state-continuity claim.
+This bootstrap supports only a pre-provisioned launch host or a never-activated,
+zero-balance prototype whose old state has been independently recovered and
+archived. It is not an in-place upgrade for a finalized, funded, or running
+epoch-1 pool. Such a host requires a fresh or reprovisioned epoch-2 deployment
+and a separately reviewed ledger and wallet migration; this release
+intentionally provides no automatic state-continuity claim.
 
 If a non-activated prototype has a `current` selector naming an epoch-1 release,
 do not switch that link by hand and do not let a preparation command resolve
@@ -319,6 +319,42 @@ arguments.
 
 ## 5. Discover, review, and freeze fresh wallet authorities
 
+Wallet key generation, export, and independent backup are an external reviewed
+custody procedure, not a service provided by this deployment. Before starting
+either wallet service, the launch host must already have:
+
+- a zero-account `/var/lib/zecwec-zallet` database and encryption identity;
+- an independently backed-up Zallet mnemonic, with only `mnemonic.txt` and
+  `mnemonic.age` staged as root-owned mode-`0400` files in the release-bound
+  root-owned mode-`0700` ceremony directory; and
+- root-owned mode-`0600` Wcash `init` and `payout-identity` JSON produced by a
+  fresh isolated recovery host from the independently retained seed.
+
+Abort rather than generating, exporting, or reconstructing any missing secret
+ad hoc on the pool host. Bind one exact release to the entire ceremony, create
+its empty staging directory, provision the two staged mnemonic files through a
+protected channel, and run the non-secret structural gate:
+
+```bash
+ZECWEC_CEREMONY_RELEASE="$ZECWEC_BOOTSTRAP_RELEASE"
+ZECWEC_CEREMONY_SUFFIX=${ZECWEC_CEREMONY_RELEASE##*/pool-}
+ZECWEC_CEREMONY_STAGING=/var/lib/zecwec-custody/zec-$ZECWEC_CEREMONY_SUFFIX
+sudo install -d -o root -g root -m 0700 -- /var/lib/zecwec-custody
+sudo install -d -o root -g root -m 0700 -- "$ZECWEC_CEREMONY_STAGING"
+# Provision only mnemonic.txt and mnemonic.age before running this gate.
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/verify-prelaunch-custody-inputs.sh" \
+  "$ZECWEC_CEREMONY_RELEASE" "$ZECWEC_CEREMONY_STAGING" \
+  /protected/recovery-init.json /protected/recovery-identity.json \
+  --ack-external-custody-reviewed
+```
+
+The gate validates paths, owners, modes, link counts, exact staging contents,
+and the secret-free Wcash recovery schemas without printing secret material.
+It cannot prove that an off-host backup exists; the acknowledgement records the
+operator's independently reviewed custody prerequisite. The authenticated
+Zallet capture below remains the authority for the zero-account check.
+
 ```bash
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
   "$ZECWEC_BOOTSTRAP_DEPLOY/render-deployment.sh" \
@@ -336,10 +372,9 @@ RPC port and a funded datadir. The deployment deliberately does not stop, copy,
 or migrate it. Back it up, prove the intended Testnet identity, and perform a
 reviewed handover before disabling it. Restore the backed-up wallet only when
 needed to derive a new dedicated account; never reuse its funded collector as
-the pool collector. Under `/var/lib/zecwec-zallet`, initialize only the fresh
-mnemonic/encryption state and leave the wallet at exactly zero accounts. Back
-up the mnemonic and encryption identity offline and confirm the mnemonic
-backup before continuing. The later `capture-original` step performs the sole
+the pool collector. The pre-provisioned `/var/lib/zecwec-zallet` state must have
+exactly zero accounts and the externally reviewed mnemonic/encryption backup
+described above. The later `capture-original` step performs the sole
 `z_getnewaccount`, captures its canonical Ironwood address and account index,
 and proves its spendable Ironwood balance is exactly zero. Preflight fails if
 another process still owns the RPC port.
@@ -383,9 +418,10 @@ wallet response. Before the first mining job, restore the protected seed into
 a fresh isolated wallet and prove it reproduces the frozen seed-derived payout
 commitment; an IVK proves receipt capability but not spendability.
 
-Keep the fresh isolated wallet's `init` and `payout-identity` JSON outputs in
-temporary root-owned mode-`0600` files. After comparing them independently,
-seal the live-host copy of the seed:
+The fresh isolated recovery host must sync before producing the `init` and
+`payout-identity` JSON inputs validated above. Keep only those secret-free
+outputs in temporary root-owned mode-`0600` files on the launch host. After
+comparing them independently, seal the live-host copy of the seed:
 
 ```bash
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
@@ -420,15 +456,9 @@ configuration and unit. The recovery instance has a distinct Unix identity,
 `127.0.0.1:28242`. It cannot read the original Zallet datadir or Wcash custody,
 cannot broadcast, and is never wanted by the pool target.
 
-Pin one reviewed immutable release and its matching lowercase hexadecimal
-source suffix for the entire ceremony. The concrete values below are examples;
-replace both assignments together before running any command and do not change
-them midway through the ceremony:
-
-```bash
-ZECWEC_CEREMONY_RELEASE=/opt/wcash/releases/pool-0eb9c43
-ZECWEC_CEREMONY_STAGING=/var/lib/zecwec-custody/zec-0eb9c43
-```
+Continue using the exact `ZECWEC_CEREMONY_RELEASE` and
+`ZECWEC_CEREMONY_STAGING` values bound by the prelaunch gate. Do not change
+either value midway through the ceremony.
 
 Start only the original Zallet wallet and verify its authenticated Testnet
 status:
@@ -456,11 +486,10 @@ forbidden after the recovery proof. Mainnet must use
 offline custody from key creation and must never copy plaintext to this host.
 Restart the original service and wait for its readiness gate.
 
-Create the root-owned `0700` ceremony directory, snapshot the active cookie as
-root `0400`, and let the immutable verifier capture account creation itself:
+Snapshot the active cookie as root `0400`, and let the immutable verifier
+capture account creation itself:
 
 ```bash
-sudo install -d -o root -g root -m 0700 /var/lib/zecwec-custody
 sudo install -o root -g root -m 0400 \
   /var/lib/zecwec-zallet/.cookie /var/lib/zecwec-custody/original.cookie
 sudo "$ZECWEC_CEREMONY_RELEASE/deployment/scripts/deploy/verify-zec-wallet-recovery.py" \
@@ -739,7 +768,10 @@ sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
 ```
 
 Do not open the allowlist manually for launch. The readiness-gated start command
-does that only after the payout worker proves a fresh lease.
+does that only after the payout worker proves a fresh lease. On the first start,
+that command validates the installed nginx configuration and starts nginx while
+mining ingress is still closed. A missing stream-capable nginx installation or
+failed start aborts before preflight and leaves the pool inaccessible.
 
 Install the publicly trusted mining certificate and matching private key before
 starting the pool, but do not publish mining DNS yet. The edge gate proves the

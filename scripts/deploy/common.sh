@@ -77,6 +77,16 @@ require_paths_absent() {
     done
 }
 
+start_nginx_for_closed_ingress() {
+    require_command nginx
+    require_command systemctl
+    nginx -t >/dev/null 2>&1 || die "nginx configuration validation failed"
+    systemctl start nginx.service \
+        || die "nginx could not start while mining ingress was closed"
+    systemctl is-active --quiet nginx.service \
+        || die "nginx is not active while mining ingress is closed"
+}
+
 require_supported_postgres_server() {
     local version_num
     require_command runuser

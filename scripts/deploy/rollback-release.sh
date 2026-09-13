@@ -61,6 +61,7 @@ transition_failed() {
     exit "$status"
 }
 trap transition_failed ERR
+start_nginx_for_closed_ingress
 
 for unit in \
     zecwec-testnet-pool-start.service \

@@ -234,6 +234,81 @@ if require_absence_test "${absence_paths[@]}" >/dev/null 2>&1; then
     exit 1
 fi
 rm -f -- "$absence_test/wcash-wallet.sqlite"
+nginx_start_test="$temporary/nginx-start-test"
+mkdir -p "$nginx_start_test/bin"
+cat >"$nginx_start_test/bin/nginx" <<'SH'
+#!/bin/sh
+[ "$*" = -t ] || exit 2
+printf 'nginx-test\n' >>"$NGINX_START_TEST_LOG"
+exit "${NGINX_CONFIG_TEST_STATUS:-0}"
+SH
+cat >"$nginx_start_test/bin/systemctl" <<'SH'
+#!/bin/sh
+case "$*" in
+    "start nginx.service")
+        printf 'systemctl-start\n' >>"$NGINX_START_TEST_LOG"
+        exit "${NGINX_START_STATUS:-0}"
+        ;;
+    "is-active --quiet nginx.service")
+        printf 'systemctl-active\n' >>"$NGINX_START_TEST_LOG"
+        exit "${NGINX_ACTIVE_STATUS:-0}"
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0555 "$nginx_start_test/bin/nginx" "$nginx_start_test/bin/systemctl"
+nginx_start_log="$nginx_start_test/calls.log"
+PATH="$nginx_start_test/bin:$PATH" NGINX_START_TEST_LOG=$nginx_start_log \
+    bash -c 'source "$1"; start_nginx_for_closed_ingress' \
+    bash "$repo_root/scripts/deploy/common.sh"
+[[ $(cat "$nginx_start_log") == $'nginx-test\nsystemctl-start\nsystemctl-active' ]] \
+    || {
+        printf 'deployment-package-test: first-start nginx order is invalid\n' >&2
+        exit 1
+    }
+for rejected_nginx_start in invalid-config start-failed inactive; do
+    : >"$nginx_start_log"
+    config_status=0
+    start_status=0
+    active_status=0
+    case $rejected_nginx_start in
+        invalid-config) config_status=1 ;;
+        start-failed) start_status=1 ;;
+        inactive) active_status=3 ;;
+    esac
+    if PATH="$nginx_start_test/bin:$PATH" \
+        NGINX_START_TEST_LOG=$nginx_start_log \
+        NGINX_CONFIG_TEST_STATUS=$config_status \
+        NGINX_START_STATUS=$start_status \
+        NGINX_ACTIVE_STATUS=$active_status \
+        bash -c 'source "$1"; start_nginx_for_closed_ingress' \
+        bash "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        printf 'deployment-package-test: nginx start gate accepted %s\n' \
+            "$rejected_nginx_start" >&2
+        exit 1
+    fi
+done
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/start-testnet-pool.sh" \
+    "$repo_root/scripts/deploy/rollback-release.sh" <<'PY'
+import pathlib
+import sys
+
+start = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+close = start.index('restrict-mining-firewall.sh" close')
+nginx = start.index("start_nginx_for_closed_ingress")
+preflight = start.index('preflight.sh"')
+target = start.index("systemctl start zecwec-testnet-pool.target")
+assert close < nginx < preflight < target
+
+transition = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+close = transition.index('restrict-mining-firewall.sh" close')
+trap = transition.index("trap transition_failed ERR")
+nginx = transition.index("start_nginx_for_closed_ingress")
+stop = transition.index("stop_loaded_unit_strict", nginx)
+target = transition.index("systemctl start zecwec-testnet-pool.target")
+assert close < trap < nginx < stop < target
+PY
 cat >"$temporary/fake-bin/ss" <<'SH'
 #!/bin/sh
 if [ "${SS_TEST_STATUS:-0}" -ne 0 ]; then exit "$SS_TEST_STATUS"; fi
@@ -1461,6 +1536,13 @@ assert (
 assert "no automatic state-continuity claim" in normalized_runbook
 assert "move every legacy wallet database" in normalized_runbook
 assert "Do not delete it." in normalized_runbook
+assert 'ZECWEC_CEREMONY_RELEASE="$ZECWEC_BOOTSTRAP_RELEASE"' in runbook
+assert 'install -d -o root -g root -m 0700 -- "$ZECWEC_CEREMONY_STAGING"' in runbook
+prelaunch_gate = runbook.index("verify-prelaunch-custody-inputs.sh")
+wallet_initializer = runbook.index("systemctl restart wcash-pool-wallet-init.service")
+zallet_start = runbook.index("systemctl start zecwec-zallet.service")
+assert prelaunch_gate < wallet_initializer
+assert prelaunch_gate < zallet_start
 PY
 
 # shellcheck disable=SC2016
