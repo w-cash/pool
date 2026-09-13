@@ -385,8 +385,18 @@ fn build_outputs_pczt(
         .ironwood_meta
         .spend_action_index(0)
         .expect("source spend action exists");
-    let output_index = build.ironwood_meta.output_action_index(0);
-    let extra_index = build.ironwood_meta.output_action_index(1);
+    let output_index = if transparent.is_none() {
+        build.ironwood_meta.output_action_index(0)
+    } else {
+        None
+    };
+    let extra_index = if extra_output {
+        build
+            .ironwood_meta
+            .output_action_index(usize::from(transparent.is_none()))
+    } else {
+        None
+    };
     let pczt = Creator::build_from_parts(build.pczt_parts).expect("V6 PCZT parts");
     let pczt = IoFinalizer::new(pczt)
         .finalize_io()
@@ -583,6 +593,35 @@ fn multiple_recipient_pczt() -> TestPczt {
                 signed,
                 raw_transaction,
                 transaction_id,
+                extra_recipient: identity.extra_recipient,
+                fee_zat: 15_000,
+                ..test_pczt()
+            }
+        })
+        .clone()
+}
+
+fn mixed_recipient_pczt() -> TestPczt {
+    static FIXTURE: OnceLock<TestPczt> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let (created, identity) = build_outputs_pczt(
+                EXPIRY_HEIGHT,
+                &RECIPIENT_SEED,
+                PAYOUT_ZAT,
+                Some(TransparentAddress::PublicKeyHash([0x77; 20])),
+                true,
+            );
+            let (proved, signed) = prove_and_sign(&created, identity.spend_action_index);
+            let (raw_transaction, transaction_id) = extract_transaction(&signed);
+            TestPczt {
+                created,
+                proved,
+                signed,
+                raw_transaction,
+                transaction_id,
+                recipient_unified_address: identity.recipient_unified_address,
+                recipient_kind: ReceiverKind::Transparent,
                 extra_recipient: identity.extra_recipient,
                 fee_zat: 15_000,
                 ..test_pczt()
@@ -799,6 +838,14 @@ impl HappyZallet {
             ]);
             inspection["ironwood"]["actions"] = json!(3);
             inspection["ironwood"]["signed_actions"] = json!(if ordinal > 1 { 3 } else { 2 });
+            if transparent {
+                inspection["ironwood"]["outputs"] = json!([
+                    {"value_zat": PAYOUT_ZAT, "user_address": extra},
+                    {"value_zat": 0, "user_address": null}
+                ]);
+                inspection["ironwood"]["actions"] = json!(2);
+                inspection["ironwood"]["signed_actions"] = json!(if ordinal > 1 { 2 } else { 1 });
+            }
         }
         inspection
     }
@@ -1240,6 +1287,29 @@ fn multiple_shielded_recipients_allow_shuffled_actions_but_reject_duplicate_reci
             assert!(zebra.calls().is_empty());
         }
     }
+}
+
+#[test]
+fn mixed_transparent_and_shielded_batch_preserves_every_recipient() {
+    let root = TestDirectory::new();
+    let (config, request, pczt) = fixture_for(&root, mixed_recipient_pczt());
+    let zallet = Arc::new(HappyZallet::new(pczt));
+    let zebra = Arc::new(ScriptedZebra::new([ZebraStep::Accepted]));
+    let signer = ZecPcztSigner::new(config, zallet.clone(), zebra).unwrap();
+    let receipt = signer
+        .execute(&request)
+        .expect("both recipient types are paid from shielded funds");
+    assert_eq!(receipt.output_total_zat, 2 * PAYOUT_ZAT);
+    assert_eq!(receipt.network_fee_zat, 15_000);
+    assert_eq!(
+        zallet
+            .calls()
+            .iter()
+            .find(|call| call.method == "pczt_create")
+            .unwrap()
+            .params[3],
+        "AllowRevealedRecipients"
+    );
 }
 
 #[cfg(feature = "regtest")]
