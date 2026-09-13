@@ -14,6 +14,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import time
 import tomllib
@@ -46,6 +47,7 @@ class Harness:
         self.processes = []
         self.cookies = {}
         self.csrf = None
+        self.portal_started = False
         self.origin = 'https://localhost:18443'
 
     def command(self, label, command, *, env=None, stdin=None, timeout=300):
@@ -163,6 +165,18 @@ filter = "info"
 
     def run(self):
         args = self.args
+        backend_socket = self.root / 'backend.sock'
+        if backend_socket.exists():
+            metadata = backend_socket.lstat()
+            if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise RuntimeError('existing backend socket is not owned by this harness user')
+            with socket.socket(socket.AF_UNIX) as connection:
+                try:
+                    connection.connect(str(backend_socket))
+                except ConnectionRefusedError:
+                    backend_socket.unlink()
+                else:
+                    raise RuntimeError('a backend is already running in this runtime')
         pg_env = os.environ.copy()
         database = urlsplit(args.database_url_file.read_text().strip())
         pg_env.update({'PGHOST': database.hostname or '', 'PGPORT': str(database.port or 5432),
@@ -221,6 +235,7 @@ filter = "info"
         self.command('pool-preflight', [args.poold, 'preflight', '--config', config])
         self.spawn('poold', [args.poold, 'serve', '--config', config])
         self.until('portal', lambda: self.portal('/healthz'))
+        self.portal_started = True
         session_path = self.root / 'portal-session.json'
         saved = json.loads(session_path.read_text()) if session_path.exists() else {}
         primary = self.miner_account('regtest_team', 'asic-1', saved)
@@ -230,18 +245,12 @@ filter = "info"
         self.cookies, self.csrf = primary['cookies'], primary['csrf']
         private(session_path, json.dumps({**primary, 'secondary': secondary}))
         worker, secondary_worker = primary['worker'], secondary['worker']
-        miner_env = os.environ.copy()
         first_height = self.rpc('wec', 'getblockcount') + 1
         self.until('equal resumed chain tips', lambda: self.rpc('zec', 'getblockcount') == first_height - 1)
         for height in range(first_height, args.blocks + 1):
             started = time.monotonic()
             selected_worker = secondary_worker if height == 2 else worker
-            miner_env['WCASH_STRATUM_PASSWORD'] = selected_worker['token']
-            proof = self.command(f'zip301-mine-{height:04}', [args.miner, 'zip301-mine',
-                                '127.0.0.1:18237', selected_worker['mining_username'], '256', '0'],
-                                env=miner_env, timeout=900)
-            if json.loads(proof).get('result') != 'accepted':
-                raise RuntimeError('real ZIP-301 submission was not accepted')
+            self.mine_winner(f'zip301-mine-{height:04}', args.miner, selected_worker)
             self.until('Wcash chain win', lambda: self.rpc('wec', 'getblockcount') >= height)
             self.until('Zcash chain win', lambda: self.rpc('zec', 'getblockcount') >= height)
             if height == 1 or height % 10 == 0 or height == args.blocks:
@@ -272,6 +281,30 @@ filter = "info"
         worker = saved.get('worker') or self.portal('/api/v1/workers', {'label': label})['worker']
         return {'account': account, 'password': password, 'worker': worker,
                 'cookies': self.cookies.copy(), 'csrf': self.csrf}
+
+    def mine_winner(self, label, miner, worker):
+        env = os.environ.copy()
+        env['WCASH_STRATUM_PASSWORD'] = worker['token']
+        for attempt in range(1, 6):
+            attempt_label = f'{label}-attempt-{attempt}'
+            try:
+                proof = self.command(attempt_label, [miner, 'zip301-mine',
+                    '127.0.0.1:18237', worker['mining_username'], '256', '0'], env=env, timeout=900)
+            except RuntimeError:
+                # A client can solve the previous generation during rollover.
+                # Retain every diagnostic and retry only this submission error,
+                # with a fresh authorized connection and a bounded attempt count.
+                expected = 'wcash-merge-miner: invalid local protocol request: mining.submit returned an error'
+                diagnostic = (self.root / (attempt_label + '.stderr')).read_text().strip()
+                if diagnostic != expected or attempt == 5:
+                    raise
+                self.alive()
+                time.sleep(1)
+                continue
+            if json.loads(proof).get('result') != 'accepted':
+                raise RuntimeError('real ZIP-301 submission was not accepted')
+            private(self.root / (label + '.stdout'), proof)
+            return
 
     def two_chain_blocks(self):
         result = self.portal('/api/v1/blocks')
@@ -359,6 +392,14 @@ def main():
     harness = Harness(args)
     try:
         harness.run()
+    except RuntimeError as error:
+        if not args.keep_running or not harness.portal_started:
+            raise
+        private(harness.root / 'mining-failure.json', json.dumps({'error': str(error)}))
+        print('Mining stage failed; healthy services retained for diagnosis, not a passing result.', flush=True)
+        while True:
+            harness.alive()
+            time.sleep(1)
     finally:
         harness.close()
 
