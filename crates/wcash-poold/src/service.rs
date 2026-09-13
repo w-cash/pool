@@ -1041,6 +1041,15 @@ async fn build_probe_only_payout_boundary(
     );
     let wcash_authority = NodePayoutAuthority::new(Chain::Wcash, wcash_rpc, config.wcash_genesis)?;
     let zcash_authority = NodePayoutAuthority::new(Chain::Zcash, zcash_rpc, config.zcash_genesis)?;
+    #[cfg(feature = "regtest")]
+    let (wcash_authority, zcash_authority) = if config.network == ChainNetwork::Regtest {
+        (
+            wcash_authority.with_regtest_network()?,
+            zcash_authority.with_regtest_network()?,
+        )
+    } else {
+        (wcash_authority, zcash_authority)
+    };
     let (wcash_tip, zcash_tip) = tokio::join!(
         wcash_authority.preflight_probe(),
         zcash_authority.preflight_probe()
@@ -1298,23 +1307,41 @@ async fn build_payout_services(
         )
         .map_err(|_| ServiceError::PayoutAuthorityConfiguration)?,
     );
-    let zcash_wallet = Arc::new(ZalletObservationSource::new(
+    let zcash_wallet = ZalletObservationSource::new(
         zallet_rpc,
         payout.zcash_signer_account,
         payout.zcash_signer_account_index,
         config.zcash_policy.required_confirmations,
         config.zcash_payout_commitment,
-    )?);
-    let wcash_authority = Arc::new(NodePayoutAuthority::new(
+    )?;
+    #[cfg(feature = "regtest")]
+    let zcash_wallet = if config.network == ChainNetwork::Regtest {
+        zcash_wallet.with_regtest_network()
+    } else {
+        zcash_wallet
+    };
+    let zcash_wallet = Arc::new(zcash_wallet);
+    let wcash_authority = NodePayoutAuthority::new(
         Chain::Wcash,
         wcash_rpc,
         config.wcash_genesis,
-    )?);
-    let zcash_authority = Arc::new(NodePayoutAuthority::new(
+    )?;
+    let zcash_authority = NodePayoutAuthority::new(
         Chain::Zcash,
         zcash_rpc,
         config.zcash_genesis,
-    )?);
+    )?;
+    #[cfg(feature = "regtest")]
+    let (wcash_authority, zcash_authority) = if config.network == ChainNetwork::Regtest {
+        (
+            wcash_authority.with_regtest_network()?,
+            zcash_authority.with_regtest_network()?,
+        )
+    } else {
+        (wcash_authority, zcash_authority)
+    };
+    let wcash_authority = Arc::new(wcash_authority);
+    let zcash_authority = Arc::new(zcash_authority);
 
     let (wcash_capabilities, zcash_capabilities) = tokio::join!(
         wcash_authority.startup_probe(),
