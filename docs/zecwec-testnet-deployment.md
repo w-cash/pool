@@ -166,19 +166,27 @@ both its binary and deployment-package manifests verify exactly.
 
 ### First security-epoch-2 bootstrap
 
-When upgrading a host whose `current` selector still names an epoch-1 release,
+This bootstrap supports only a new host or a never-activated, zero-balance
+prototype whose old state has been independently recovered and archived. It is
+not an in-place upgrade for a finalized, funded, or running epoch-1 pool. Such a
+host requires a fresh or reprovisioned epoch-2 deployment and a separately
+reviewed ledger and wallet migration; this release intentionally provides no
+automatic state-continuity claim.
+
+If a non-activated prototype has a `current` selector naming an epoch-1 release,
 do not switch that link by hand and do not let a preparation command resolve
-the selector implicitly. The epoch-2 authority does not exist yet, so normal
-forward activation cannot run. Pin the newly installed immutable release for
-every wallet, credential, custody, render, database, preflight, firewall, and
-edge-preparation command until the final activation:
+the selector implicitly. Stop its services, prove independent wallet recovery
+and zero balances, and move every legacy wallet database, wallet authority,
+signer journal, share journal, and old rendered runtime policy into a root-only
+audit backup. Do not delete it. The renderer fails before invoking Python,
+installing a file, or reloading systemd while any legacy durable path remains.
+
+Pin the newly installed immutable release for every wallet, credential,
+custody, render, database, preflight, firewall, and edge-preparation command:
 
 ```bash
 ZECWEC_BOOTSTRAP_RELEASE=/opt/wcash/releases/<epoch-2-release-id>
 ZECWEC_BOOTSTRAP_DEPLOY="$ZECWEC_BOOTSTRAP_RELEASE/deployment/scripts/deploy"
-sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
-  "$ZECWEC_BOOTSTRAP_DEPLOY/render-deployment.sh" \
-  wallet-bootstrap /etc/wcash-pool/deployment.env
 ```
 
 Use the same `sudo env ZECWEC_RELEASE_PATH=...` prefix and the same release's
@@ -187,10 +195,11 @@ literal path is one installed, root-owned, immutable release; never substitute
 `/opt/wcash/current`. Creating `backend-authority-protocol-v2.json` alone is not
 an activation signal. First finish the final render and preflight, install the
 exact miner CIDRs and publicly trusted mining certificate, and close the
-firewall as described through section 8. Then use `activate-release.sh` once in
-section 9 to perform the fail-closed selector transition, migration, preflight,
-start, edge enablement, and health gate. This is the only supported first
-epoch-1-to-epoch-2 transition.
+firewall as described through section 8. A clean host whose selector already
+names the epoch-2 release uses `start-testnet-pool.sh` in section 9. A scoped,
+never-activated prototype selector uses `activate-release.sh` once to perform
+the fail-closed selector change, database migration, preflight, start, edge
+enablement, and health gate.
 
 For every later forward rollout, first install and independently review schema
 compatibility, then activate the staged version explicitly:
@@ -760,9 +769,9 @@ preflight refuses any process that already owns the plaintext port.
 ## 9. Private start and ASIC gate
 
 Only after source review, deterministic tests, final policy, miner CIDRs, and
-the mining certificate gate are complete may the runtime start. For the first
-epoch-1-to-epoch-2 rollout, activate the pinned release; this is the operation
-that atomically changes the selector and starts it:
+the mining certificate gate are complete may the runtime start. On the scoped
+never-activated prototype described in section 1, activate the pinned release;
+this is the operation that atomically changes its stale selector and starts it:
 
 ```bash
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
