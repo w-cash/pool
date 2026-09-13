@@ -14,8 +14,12 @@ mod pipeline;
 mod rpc;
 mod transport;
 
+#[cfg(feature = "regtest")]
+pub use config::validate_zallet_regtest_configuration;
 pub use config::{validate_zallet_configuration, RpcLimits, ZecSignerConfig, ZALLET_API_VERSION};
 pub use error::{PipelineStage, ZecPayoutError};
+#[cfg(feature = "regtest")]
+pub use pipeline::validated_regtest_parent_payout_address_commitment;
 pub use pipeline::{
     parent_payout_address_commitment, validated_parent_payout_address_commitment, Checkpoint,
     CheckpointHook, ZecFundSource, ZecPayoutExecution, ZecPayoutRequest, ZecPcztSigner,

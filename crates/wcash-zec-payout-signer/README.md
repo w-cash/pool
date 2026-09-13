@@ -26,6 +26,13 @@ isolated wallet and carry the standard account derivation. Every positive
 external output must contain the exact requested Testnet receiver bytes and
 amount plus the canonical empty memo; at most one unlabeled positive output
 may be account-owned change.
+ZEC miner destinations support Testnet transparent P2PKH/P2SH addresses and
+Unified Addresses containing a supported shielded receiver. The collector
+remains shielded. PCZT creation requests `FullPrivacy` for shielded-only batches
+or `AllowRevealedRecipients` when a batch includes transparent recipients;
+transparent destinations and amounts are public on-chain. Existing mixed
+batches retain independent exact-output verification for both receiver types.
+
 Transparent outputs, when requested, must contain the exact independently
 decoded P2PKH or P2SH script and amount. The fee is derived from these parsed
 effects and bounded independently.

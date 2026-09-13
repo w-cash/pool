@@ -38,6 +38,7 @@ const MAX_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct TestnetAddressValidator {
     wcash: Arc<WcashCommandValidator>,
+    network: ChainNetwork,
 }
 
 impl TestnetAddressValidator {
@@ -45,16 +46,40 @@ impl TestnetAddressValidator {
     pub fn new(wcash: WcashCommandValidator) -> Self {
         Self {
             wcash: Arc::new(wcash),
+            network: ChainNetwork::Testnet,
         }
+    }
+
+    /// Selects isolated Regtest validation in an explicitly enabled test build.
+    #[cfg(feature = "regtest")]
+    pub fn with_regtest_network(mut self) -> Self {
+        self.network = ChainNetwork::Regtest;
+        self
+    }
+
+    fn wcash_network(&self) -> WcashNetwork {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return WcashNetwork::Regtest;
+        }
+        WcashNetwork::Testnet
+    }
+
+    fn zcash_network(&self) -> NetworkType {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return NetworkType::Regtest;
+        }
+        NetworkType::Test
     }
 
     fn validate_wcash(
         &self,
         candidate: &str,
     ) -> Result<ValidatedDestination, AddressValidationError> {
-        match self.wcash.validate_for(WcashNetwork::Testnet, candidate) {
+        match self.wcash.validate_for(self.wcash_network(), candidate) {
             Ok(validated) => {
-                let destination = validated.into_portal(candidate)?;
+                let destination = validated.into_portal(candidate, self.network)?;
                 // Launch payouts are Ironwood-only. Accepting a transparent
                 // WEC destination would let one account poison a whole batch.
                 if destination.receiver_kind() != ReceiverKind::Ironwood {
@@ -63,12 +88,18 @@ impl TestnetAddressValidator {
                 Ok(destination)
             }
             Err(CommandValidationError::Rejected) => {
-                if parse_supported_zcash(candidate, NetworkType::Test).is_ok() {
+                if parse_supported_zcash(candidate, self.zcash_network()).is_ok() {
                     return Err(AddressValidationError::WrongAsset);
                 }
                 if self
                     .wcash
-                    .validate_for(WcashNetwork::Regtest, candidate)
+                    .validate_for(
+                        match self.wcash_network() {
+                            WcashNetwork::Testnet => WcashNetwork::Regtest,
+                            WcashNetwork::Regtest => WcashNetwork::Testnet,
+                        },
+                        candidate,
+                    )
                     .is_ok()
                 {
                     return Err(AddressValidationError::WrongNetwork);
@@ -85,21 +116,15 @@ impl TestnetAddressValidator {
         &self,
         candidate: &str,
     ) -> Result<ValidatedDestination, AddressValidationError> {
-        match parse_supported_zcash(candidate, NetworkType::Test) {
-            Ok(ReceiverKind::Ironwood) => ValidatedDestination::from_authoritative_validation(
+        match parse_supported_zcash(candidate, self.zcash_network()) {
+            Ok(receiver_kind) => ValidatedDestination::from_authoritative_validation(
                 Asset::Zec,
-                ChainNetwork::Testnet,
+                self.network,
                 canonical_zcash(candidate)?,
-                ReceiverKind::Ironwood,
+                receiver_kind,
             ),
-            // The chain continues to support transparent receivers, but the
-            // initial custodial pool deliberately exposes only one payout
-            // privacy policy on both assets. Keeping this gate in the
-            // authoritative validator prevents a single account from adding
-            // a transparent output to an otherwise shielded payout batch.
-            Ok(ReceiverKind::Transparent) => Err(AddressValidationError::UnsupportedReceiver),
             Err(AddressValidationError::Malformed) => {
-                match self.wcash.validate_for(WcashNetwork::Testnet, candidate) {
+                match self.wcash.validate_for(self.wcash_network(), candidate) {
                     Ok(_) => Err(AddressValidationError::WrongAsset),
                     Err(CommandValidationError::Rejected) => Err(AddressValidationError::Malformed),
                     Err(CommandValidationError::Unavailable) => {
@@ -118,7 +143,7 @@ impl AddressValidator for TestnetAddressValidator {
         _asset: Asset,
         network: ChainNetwork,
     ) -> Result<(), AddressValidationError> {
-        if network != ChainNetwork::Testnet {
+        if network != self.network {
             return Err(AddressValidationError::AuthorityUnavailable);
         }
         self.wcash
@@ -133,7 +158,7 @@ impl AddressValidator for TestnetAddressValidator {
         candidate: &str,
     ) -> Result<ValidatedDestination, AddressValidationError> {
         validate_candidate_shape(candidate)?;
-        if network != ChainNetwork::Testnet {
+        if network != self.network {
             return Err(AddressValidationError::AuthorityUnavailable);
         }
         match asset {
@@ -317,8 +342,12 @@ struct WcashCommandResponse {
 }
 
 impl WcashCommandResponse {
-    fn into_portal(self, submitted: &str) -> Result<ValidatedDestination, AddressValidationError> {
-        if self.network != "testnet" || self.canonical != submitted {
+    fn into_portal(
+        self,
+        submitted: &str,
+        network: ChainNetwork,
+    ) -> Result<ValidatedDestination, AddressValidationError> {
+        if self.network != network.as_str() || self.canonical != submitted {
             return Err(AddressValidationError::AuthorityUnavailable);
         }
         let receiver_kind = match self.receiver_kind.as_str() {
@@ -329,7 +358,7 @@ impl WcashCommandResponse {
         };
         ValidatedDestination::from_authoritative_validation(
             Asset::Wec,
-            ChainNetwork::Testnet,
+            network,
             self.canonical,
             receiver_kind,
         )
@@ -358,7 +387,10 @@ impl TryFromAddress for ZcashReceiverClass {
                 false
             }
         });
-        if address.has_receiver_of_type(PoolType::ORCHARD) && orchard_is_valid {
+        let has_unknown = items
+            .iter()
+            .any(|receiver| matches!(receiver, unified::Receiver::Unknown { .. }));
+        if address.has_receiver_of_type(PoolType::ORCHARD) && orchard_is_valid && !has_unknown {
             Ok(Self::Ironwood)
         } else {
             Err(UnsupportedZcashReceiver.into())
@@ -414,6 +446,19 @@ impl TryFromAddress for OrchardOnly {
 /// consensus Orchard implementation. The offline collector recovery ceremony
 /// uses this authority before it seals an address commitment.
 pub fn validate_zcash_testnet_orchard_only(candidate: &str) -> Result<(), AddressValidationError> {
+    validate_zcash_orchard_only(candidate, NetworkType::Test)
+}
+
+/// Validates a collector on the isolated, explicitly enabled Regtest network.
+#[cfg(feature = "regtest")]
+pub fn validate_zcash_regtest_orchard_only(candidate: &str) -> Result<(), AddressValidationError> {
+    validate_zcash_orchard_only(candidate, NetworkType::Regtest)
+}
+
+fn validate_zcash_orchard_only(
+    candidate: &str,
+    network: NetworkType,
+) -> Result<(), AddressValidationError> {
     validate_candidate_shape(candidate)?;
     let parsed =
         ZcashAddress::try_from_encoded(candidate).map_err(|_| AddressValidationError::Malformed)?;
@@ -421,7 +466,7 @@ pub fn validate_zcash_testnet_orchard_only(candidate: &str) -> Result<(), Addres
         return Err(AddressValidationError::Malformed);
     }
     parsed
-        .convert_if_network::<OrchardOnly>(NetworkType::Test)
+        .convert_if_network::<OrchardOnly>(network)
         .map(|_| ())
         .map_err(|error| match error {
             ConversionError::IncorrectNetwork { .. } => AddressValidationError::WrongNetwork,
@@ -618,6 +663,18 @@ mod tests {
             parse_supported_zcash(&tex, NetworkType::Test),
             Err(AddressValidationError::UnsupportedReceiver)
         );
+        let (_, address) = unified::Address::decode(&testnet_ironwood()).unwrap();
+        let mut items = address.items();
+        items.push(unified::Receiver::Unknown {
+            typecode: 0xff,
+            data: vec![1; 32],
+        });
+        let unknown = unified::Address::try_from_items(items).unwrap();
+        assert_eq!(
+            parse_supported_zcash(&unknown.encode(&NetworkType::Test), NetworkType::Test),
+            Err(AddressValidationError::UnsupportedReceiver),
+            "the portal must not accept a receiver the signer rejects"
+        );
     }
 
     #[test]
@@ -718,13 +775,61 @@ mod tests {
         assert!(validator
             .validate(Asset::Zec, ChainNetwork::Testnet, &testnet_ironwood())
             .is_ok());
+        for address in [
+            testnet_transparent(),
+            ZcashAddress::from_transparent_p2sh(NetworkType::Test, [8; 20]).encode(),
+        ] {
+            let destination = validator
+                .validate(Asset::Zec, ChainNetwork::Testnet, &address)
+                .expect("Zcash supports transparent P2PKH and P2SH payouts");
+            assert_eq!(destination.asset(), Asset::Zec);
+            assert_eq!(destination.receiver_kind(), ReceiverKind::Transparent);
+            assert_eq!(destination.canonical_address(), address);
+        }
         assert_eq!(
-            validator.validate(Asset::Zec, ChainNetwork::Testnet, &testnet_transparent()),
-            Err(AddressValidationError::UnsupportedReceiver)
+            validator.validate(Asset::Zec, ChainNetwork::Testnet, &mainnet_transparent()),
+            Err(AddressValidationError::WrongNetwork)
         );
         assert_eq!(
             validator.validate(Asset::Zec, ChainNetwork::Mainnet, &mainnet_transparent()),
             Err(AddressValidationError::AuthorityUnavailable)
+        );
+    }
+
+    #[cfg(all(unix, feature = "regtest"))]
+    #[test]
+    fn regtest_authority_requires_explicit_selection_and_matching_addresses() {
+        let (_directory, command) = command_fixture();
+        let validator = TestnetAddressValidator::new(command);
+        assert_eq!(
+            validator.validate(Asset::Wec, ChainNetwork::Regtest, "WRtestfixture"),
+            Err(AddressValidationError::AuthorityUnavailable)
+        );
+        let validator = validator.with_regtest_network();
+        assert_eq!(
+            validator.validate(Asset::Wec, ChainNetwork::Testnet, "WItestfixture"),
+            Err(AddressValidationError::AuthorityUnavailable)
+        );
+        assert!(validator
+            .validate(Asset::Wec, ChainNetwork::Regtest, "WRtestfixture")
+            .is_ok());
+        assert_eq!(
+            validator.validate(Asset::Wec, ChainNetwork::Regtest, "WItestfixture"),
+            Err(AddressValidationError::WrongNetwork)
+        );
+        let (_, address) = unified::Address::decode(&testnet_ironwood()).unwrap();
+        let address = address.encode(&NetworkType::Regtest);
+        assert!(validator
+            .validate(Asset::Zec, ChainNetwork::Regtest, &address)
+            .is_ok());
+        assert_eq!(
+            validator.validate(Asset::Zec, ChainNetwork::Regtest, &testnet_ironwood()),
+            Err(AddressValidationError::WrongNetwork)
+        );
+        assert!(validate_zcash_regtest_orchard_only(&address).is_ok());
+        assert_eq!(
+            validate_zcash_testnet_orchard_only(&address),
+            Err(AddressValidationError::WrongNetwork)
         );
     }
 

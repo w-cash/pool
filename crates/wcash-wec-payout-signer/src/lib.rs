@@ -27,3 +27,5 @@ pub use transport::{
     WalletInspectionCall, WalletNetwork, WalletOutput, WalletRecoveryCall, WalletSignCall,
     WalletSignedTransaction, WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
 };
+#[cfg(feature = "regtest")]
+pub use transport::{WCASH_REGTEST_BRANCH_ID, WCASH_REGTEST_GENESIS_HASH};

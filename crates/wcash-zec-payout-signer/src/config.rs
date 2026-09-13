@@ -12,6 +12,8 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use uuid::Uuid;
+use wcash_pool_portal::ChainNetwork;
+use zcash_protocol::consensus::NetworkType;
 
 use crate::ZecPayoutError;
 
@@ -100,6 +102,7 @@ impl Default for RpcLimits {
 /// Immutable signer policy and local wallet fencing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZecSignerConfig {
+    network: ChainNetwork,
     journal_directory: PathBuf,
     zallet_configuration: PathBuf,
     account_id: Uuid,
@@ -119,6 +122,7 @@ impl ZecSignerConfig {
         expected_parent_payout_commitment: [u8; 32],
     ) -> Result<Self, ZecPayoutError> {
         let config = Self {
+            network: ChainNetwork::Testnet,
             journal_directory: journal_directory.into(),
             zallet_configuration: zallet_configuration.into(),
             account_id,
@@ -130,6 +134,35 @@ impl ZecSignerConfig {
         };
         config.validate_policy()?;
         Ok(config)
+    }
+
+    /// Selects isolated Regtest in a build that explicitly enables it.
+    /// Wallet configuration and every payout must match this network.
+    #[cfg(feature = "regtest")]
+    pub fn with_regtest_network(mut self) -> Result<Self, ZecPayoutError> {
+        self.network = ChainNetwork::Regtest;
+        self.validate_policy()?;
+        Ok(self)
+    }
+
+    pub(crate) const fn network(&self) -> ChainNetwork {
+        self.network
+    }
+
+    pub(crate) fn address_network(&self) -> NetworkType {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return NetworkType::Regtest;
+        }
+        NetworkType::Test
+    }
+
+    pub(crate) fn validate_wallet_configuration(&self) -> Result<(), ZecPayoutError> {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return validate_zallet_regtest_configuration(self.zallet_configuration());
+        }
+        validate_zallet_configuration(self.zallet_configuration())
     }
 
     /// Replaces the RPC bounds.
@@ -217,6 +250,19 @@ impl ZecSignerConfig {
 /// selects public Testnet, pins the expected beta API, and binds RPC to
 /// loopback addresses only.
 pub fn validate_zallet_configuration(path: &Path) -> Result<(), ZecPayoutError> {
+    validate_zallet_configuration_for_network(path, "test")
+}
+
+/// Verifies an explicitly isolated Regtest wallet with broadcasts disabled.
+#[cfg(feature = "regtest")]
+pub fn validate_zallet_regtest_configuration(path: &Path) -> Result<(), ZecPayoutError> {
+    validate_zallet_configuration_for_network(path, "regtest")
+}
+
+fn validate_zallet_configuration_for_network(
+    path: &Path,
+    network: &str,
+) -> Result<(), ZecPayoutError> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|_| ZecPayoutError::UnsafeWalletConfiguration)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -245,7 +291,7 @@ pub fn validate_zallet_configuration(path: &Path) -> Result<(), ZecPayoutError> 
         .get("consensus")
         .and_then(|value| value.get("network"))
         .and_then(toml::Value::as_str)
-        != Some("test")
+        != Some(network)
         || config
             .get("external")
             .and_then(|value| value.get("broadcast"))

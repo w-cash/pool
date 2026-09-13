@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+regtest = ["wcash-pool-portal/regtest"]
+
 [dependencies]
 base64.workspace = true
 hex.workspace = true
@@ -38,6 +42,7 @@ incrementalmerkletree = "=0.8.2"
 pczt = { version = "=0.9.3", features = ["prover"] }
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 tempfile = "3.23.0"
+zcash_transparent = "=0.10.0"
 
 [lints]
 workspace = true

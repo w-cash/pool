@@ -7,8 +7,11 @@ use std::{
 };
 
 use uuid::Uuid;
+use wcash_pool_portal::ChainNetwork;
 
-use crate::{SeedSource, WecPayoutError};
+use crate::{
+    SeedSource, WalletNetwork, WecPayoutError, WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
+};
 
 const DEFAULT_MAX_OUTPUTS: usize = 50;
 const MAX_NATIVE_OUTPUTS: usize = 100;
@@ -108,6 +111,7 @@ impl Default for NativeCallLimits {
 
 /// Immutable policy for one Wcash Testnet collector signer.
 pub struct WecSignerConfig {
+    network: ChainNetwork,
     journal_directory: PathBuf,
     source_account: Uuid,
     expected_payout_commitment: [u8; 32],
@@ -127,6 +131,7 @@ impl WecSignerConfig {
         seed_source: SeedSource,
     ) -> Result<Self, WecPayoutError> {
         let config = Self {
+            network: ChainNetwork::Testnet,
             journal_directory: journal_directory.into(),
             source_account,
             expected_payout_commitment,
@@ -138,6 +143,42 @@ impl WecSignerConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Selects isolated Regtest in an explicitly enabled integration build.
+    #[cfg(feature = "regtest")]
+    pub fn with_regtest_network(mut self) -> Result<Self, WecPayoutError> {
+        self.network = ChainNetwork::Regtest;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) const fn network(&self) -> ChainNetwork {
+        self.network
+    }
+
+    pub(crate) fn wallet_network(&self) -> WalletNetwork {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return WalletNetwork::Regtest;
+        }
+        WalletNetwork::Testnet
+    }
+
+    pub(crate) fn genesis_hash(&self) -> &'static str {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return crate::WCASH_REGTEST_GENESIS_HASH;
+        }
+        WCASH_TESTNET_GENESIS_HASH
+    }
+
+    pub(crate) fn branch_id(&self) -> &'static str {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return crate::WCASH_REGTEST_BRANCH_ID;
+        }
+        WCASH_TESTNET_BRANCH_ID
     }
 
     /// Replaces the mature-note confirmation floor. Public Testnet never
@@ -225,6 +266,7 @@ impl fmt::Debug for WecSignerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WecSignerConfig")
+            .field("network", &self.network)
             .field("journal_directory", &self.journal_directory)
             .field("source_account", &self.source_account)
             .field("seed_source", &"[REDACTED]")

@@ -406,6 +406,36 @@ fn accepted() -> Result<BroadcastOutcome, BroadcastFailure> {
     })
 }
 
+#[cfg(feature = "regtest")]
+#[test]
+fn regtest_signer_requires_explicit_profile_and_exact_chain_identity() {
+    use wcash_wec_payout_signer::{WCASH_REGTEST_BRANCH_ID, WCASH_REGTEST_GENESIS_HASH};
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    wallet.mutate_identity(|identity| {
+        identity.network = WalletNetwork::Regtest;
+        identity.genesis_hash = WCASH_REGTEST_GENESIS_HASH.to_owned();
+        identity.branch_id = WCASH_REGTEST_BRANCH_ID.to_owned();
+    });
+    assert_eq!(
+        make_signer(&fixture, wallet.clone()).readiness(),
+        Err(WecPayoutError::WrongNetwork)
+    );
+    let signer = WecPayoutSigner::new(
+        fixture.config().with_regtest_network().unwrap(),
+        wallet.clone(),
+    )
+    .unwrap();
+    signer.readiness().unwrap();
+    assert_eq!(
+        signer.prepare(&request(fixture.account)),
+        Err(WecPayoutError::WrongNetwork)
+    );
+    wallet
+        .mutate_identity(|identity| identity.genesis_hash = WCASH_TESTNET_GENESIS_HASH.to_owned());
+    assert_eq!(signer.readiness(), Err(WecPayoutError::WrongNetwork));
+}
+
 #[test]
 fn exact_multi_output_success_is_store_compatible_and_redacted() {
     let fixture = Fixture::new();

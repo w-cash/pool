@@ -8,17 +8,15 @@ use std::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wcash_pool_portal::{
-    Asset, BroadcastReceipt, ChainNetwork, IsolatedPayoutSigner, PayoutBatchRequest, ReceiverKind,
-    SignerError,
+    Asset, BroadcastReceipt, IsolatedPayoutSigner, PayoutBatchRequest, ReceiverKind, SignerError,
 };
 
 use crate::{
     journal::{Journal, JournalRecord, StoredArtifact, StoredStage},
     BroadcastDisposition, BroadcastFailure, NativeWalletError, NativeWalletTransport,
     PersistedIntent, WalletBroadcastCall, WalletFundSource, WalletIdentity, WalletInspectionCall,
-    WalletNetwork, WalletOutput, WalletRecoveryCall, WalletSignCall, WalletSignedTransaction,
-    WecPayoutError, WecPipelineStage, WecSignerConfig, WCASH_TESTNET_BRANCH_ID,
-    WCASH_TESTNET_GENESIS_HASH,
+    WalletOutput, WalletRecoveryCall, WalletSignCall, WalletSignedTransaction, WecPayoutError,
+    WecPipelineStage, WecSignerConfig,
 };
 
 const PIPELINE_COMMITMENT_DOMAIN: &[u8] = b"zecwec/wec-payout-pipeline/v2";
@@ -535,7 +533,7 @@ impl WecPayoutSigner {
         if request.batch.asset != Asset::Wec {
             return Err(WecPayoutError::WrongAsset);
         }
-        if request.batch.network != ChainNetwork::Testnet {
+        if request.batch.network != self.config.network() {
             return Err(WecPayoutError::WrongNetwork);
         }
         if request.source_account != self.config.source_account() {
@@ -596,9 +594,9 @@ impl WecPayoutSigner {
     }
 
     fn verify_identity(&self, identity: &WalletIdentity) -> Result<(), WecPayoutError> {
-        if identity.network != WalletNetwork::Testnet
-            || identity.genesis_hash != WCASH_TESTNET_GENESIS_HASH
-            || identity.branch_id != WCASH_TESTNET_BRANCH_ID
+        if identity.network != self.config.wallet_network()
+            || identity.genesis_hash != self.config.genesis_hash()
+            || identity.branch_id != self.config.branch_id()
         {
             return Err(WecPayoutError::WrongNetwork);
         }
@@ -736,8 +734,8 @@ fn pipeline_commitment(
     hasher.update([fund_source_tag(request.fund_source)]);
     hasher.update(config.confirmations().to_be_bytes());
     hasher.update(config.max_fee_zat().to_be_bytes());
-    hasher.update(WCASH_TESTNET_GENESIS_HASH.as_bytes());
-    hasher.update(WCASH_TESTNET_BRANCH_ID.as_bytes());
+    hasher.update(config.genesis_hash().as_bytes());
+    hasher.update(config.branch_id().as_bytes());
     hasher.finalize().into()
 }
 

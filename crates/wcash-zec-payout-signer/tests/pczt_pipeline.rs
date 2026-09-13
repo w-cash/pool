@@ -57,6 +57,7 @@ use zcash_protocol::{
     memo::MemoBytes,
     value::Zatoshis,
 };
+use zcash_transparent::address::TransparentAddress;
 use zip32::{fingerprint::SeedFingerprint, AccountId, ChildIndex};
 
 const NU6_3_BRANCH_ID: u32 = 0x37a5_165b;
@@ -102,6 +103,8 @@ struct TestPczt {
     source_unified_address: String,
     source_ufvk: String,
     recipient_unified_address: String,
+    recipient_kind: ReceiverKind,
+    fee_zat: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -270,6 +273,15 @@ fn build_effects_pczt_for(
     recipient_seed: &[u8; 32],
     payout_zat: u64,
 ) -> (String, TestPcztIdentity) {
+    build_destination_pczt(expiry_height, recipient_seed, payout_zat, None)
+}
+
+fn build_destination_pczt(
+    expiry_height: u32,
+    recipient_seed: &[u8; 32],
+    payout_zat: u64,
+    transparent: Option<TransparentAddress>,
+) -> (String, TestPcztIdentity) {
     let account_index = AccountId::ZERO;
     let source_usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &SOURCE_SEED, account_index)
         .expect("source test key derives");
@@ -318,14 +330,20 @@ fn build_effects_pczt_for(
     builder
         .add_ironwood_spend::<zip317::FeeError>(source_orchard_fvk, source_note, merkle_path)
         .expect("valid Ironwood source note");
-    builder
-        .add_ironwood_output::<zip317::FeeError>(
-            None,
-            recipient,
-            Zatoshis::const_from_u64(payout_zat),
-            MemoBytes::empty(),
-        )
-        .expect("valid Ironwood payout");
+    if let Some(transparent) = transparent {
+        builder
+            .add_transparent_output(&transparent, Zatoshis::const_from_u64(payout_zat))
+            .expect("valid transparent payout");
+    } else {
+        builder
+            .add_ironwood_output::<zip317::FeeError>(
+                None,
+                recipient,
+                Zatoshis::const_from_u64(payout_zat),
+                MemoBytes::empty(),
+            )
+            .expect("valid Ironwood payout");
+    }
     let build = builder
         .build_for_pczt(DeterministicRng(0x5ec0_1a7e), &zip317::FeeRule::standard())
         .expect("balanced PCZT fixture");
@@ -333,10 +351,7 @@ fn build_effects_pczt_for(
         .ironwood_meta
         .spend_action_index(0)
         .expect("source spend action exists");
-    let output_index = build
-        .ironwood_meta
-        .output_action_index(0)
-        .expect("payout action exists");
+    let output_index = build.ironwood_meta.output_action_index(0);
     let pczt = Creator::build_from_parts(build.pczt_parts).expect("V6 PCZT parts");
     let pczt = IoFinalizer::new(pczt)
         .finalize_io()
@@ -351,7 +366,20 @@ fn build_effects_pczt_for(
         ],
     )
     .expect("standard Orchard ZIP 32 derivation");
-    let recipient_encoded = recipient_address.encode(&TEST_NETWORK);
+    let recipient_encoded = match transparent {
+        Some(TransparentAddress::PublicKeyHash(hash)) => {
+            ZcashAddress::from_transparent_p2pkh(NetworkType::Test, hash).encode()
+        }
+        Some(TransparentAddress::ScriptHash(hash)) => {
+            ZcashAddress::from_transparent_p2sh(NetworkType::Test, hash).encode()
+        }
+        None => recipient_address.encode(&TEST_NETWORK),
+    };
+    let privacy_policy = if transparent.is_some() {
+        "AllowRevealedRecipients"
+    } else {
+        "FullPrivacy"
+    };
     let pczt = Updater::new(pczt)
         .update_global_with(|mut global| {
             global.set_proprietary(
@@ -364,7 +392,7 @@ fn build_effects_pczt_for(
             );
             global.set_proprietary(
                 "zallet.v1.privacy_policy".to_owned(),
-                b"FullPrivacy".to_vec(),
+                privacy_policy.as_bytes().to_vec(),
             );
             global.set_proprietary("zcash_client_backend:proposal_info".to_owned(), vec![1]);
         })
@@ -373,14 +401,29 @@ fn build_effects_pczt_for(
                 action.set_spend_zip32_derivation(derivation);
                 Ok(())
             })?;
-            bundle.update_action_with(output_index, |mut action| {
-                action.set_output_user_address(recipient_encoded.clone());
-                Ok(())
-            })?;
+            if let Some(output_index) = output_index {
+                bundle.update_action_with(output_index, |mut action| {
+                    action.set_output_user_address(recipient_encoded.clone());
+                    Ok(())
+                })?;
+            }
             Ok(())
         })
         .expect("Ironwood metadata updates")
         .finish();
+    let pczt = if transparent.is_some() {
+        Updater::new(pczt)
+            .update_transparent_with(|mut bundle| {
+                bundle.update_output_with(0, |mut output| {
+                    output.set_user_address(recipient_encoded.clone());
+                    Ok(())
+                })
+            })
+            .expect("transparent metadata updates")
+            .finish()
+    } else {
+        pczt
+    };
     let encoded = BASE64_STANDARD.encode(pczt.serialize().expect("fixture PCZT serializes"));
     (
         encoded,
@@ -442,6 +485,41 @@ fn test_pczt() -> TestPczt {
                 source_unified_address: identity.source_unified_address,
                 source_ufvk: identity.source_ufvk,
                 recipient_unified_address: identity.recipient_unified_address,
+                recipient_kind: ReceiverKind::Ironwood,
+                fee_zat: FEE_ZAT,
+            }
+        })
+        .clone()
+}
+
+fn transparent_test_pczt(script_hash: bool) -> TestPczt {
+    static P2PKH: OnceLock<TestPczt> = OnceLock::new();
+    static P2SH: OnceLock<TestPczt> = OnceLock::new();
+    (if script_hash { &P2SH } else { &P2PKH })
+        .get_or_init(|| {
+            let destination = if script_hash {
+                TransparentAddress::ScriptHash([0x33; 20])
+            } else {
+                TransparentAddress::PublicKeyHash([0x44; 20])
+            };
+            let (created, identity) = build_destination_pczt(
+                EXPIRY_HEIGHT,
+                &RECIPIENT_SEED,
+                PAYOUT_ZAT,
+                Some(destination),
+            );
+            let (proved, signed) = prove_and_sign(&created, identity.spend_action_index);
+            let (raw_transaction, transaction_id) = extract_transaction(&signed);
+            TestPczt {
+                created,
+                proved,
+                signed,
+                raw_transaction,
+                transaction_id,
+                recipient_unified_address: identity.recipient_unified_address,
+                recipient_kind: ReceiverKind::Transparent,
+                fee_zat: FEE_ZAT,
+                ..test_pczt()
             }
         })
         .clone()
@@ -520,6 +598,7 @@ struct CapturedCall {
 #[derive(Clone, Copy)]
 enum Tamper {
     None,
+    WeakPrivacyPolicy,
     EmptyCreatedEffects,
     CreatedRecipientEffects,
     CreatedValueEffects,
@@ -540,6 +619,13 @@ struct HappyZallet {
 }
 
 impl HappyZallet {
+    fn privacy_policy(&self) -> &'static str {
+        match self.pczt.recipient_kind {
+            ReceiverKind::Transparent => "AllowRevealedRecipients",
+            ReceiverKind::Ironwood => "FullPrivacy",
+        }
+    }
+
     fn new(pczt: TestPczt) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
@@ -576,17 +662,18 @@ impl HappyZallet {
             } else {
                 self.pczt.recipient_unified_address.clone()
             };
-        json!({
+        let transparent = self.pczt.recipient_kind == ReceiverKind::Transparent;
+        let mut inspection = json!({
             "tx_version": 6,
             "consensus_branch_id": "37a5165b",
             "expiry_height": EXPIRY_HEIGHT,
-            "privacy_policy": "FullPrivacy",
+            "privacy_policy": self.privacy_policy(),
             "signing_hints": {
                 "seed_fingerprint": self.pczt.source_seed_fingerprint.to_string(),
                 "account_index": 0
             },
             "wallet_created": true,
-            "fee_zat": FEE_ZAT,
+            "fee_zat": self.pczt.fee_zat,
             "transparent": {
                 "inputs": [],
                 "outputs": []
@@ -614,10 +701,24 @@ impl HappyZallet {
                     "value_zat": 0,
                     "user_address": null
                 }],
-                "value_balance_zat": FEE_ZAT,
+                "value_balance_zat": self.pczt.fee_zat,
                 "proof_complete": proved
             }
-        })
+        });
+        if transparent {
+            inspection["transparent"]["outputs"] = json!([{
+                "value_zat": ironwood_amount,
+                "address": self.pczt.recipient_unified_address,
+                "user_address": ironwood_address
+            }]);
+            inspection["ironwood"]["outputs"] = json!([
+                {"value_zat": 0, "user_address": null}
+            ]);
+            inspection["ironwood"]["actions"] = json!(1);
+            inspection["ironwood"]["signed_actions"] = json!(usize::from(ordinal > 1));
+            inspection["ironwood"]["value_balance_zat"] = json!(PAYOUT_ZAT + self.pczt.fee_zat);
+        }
+        inspection
     }
 }
 
@@ -657,7 +758,7 @@ impl JsonRpcTransport for HappyZallet {
                     Tamper::MainnetCoinType => &self.pczt.wrong_coin_type,
                     _ => &self.pczt.created,
                 },
-                "privacy_policy": "FullPrivacy"
+                "privacy_policy": if matches!(self.tamper, Tamper::WeakPrivacyPolicy) { "NoPrivacy" } else { self.privacy_policy() }
             })),
             "pczt_inspect" => {
                 let pczt = call.params()[0].as_str().expect("PCZT string");
@@ -826,8 +927,14 @@ bind = ["127.0.0.1:28232", "[::1]:28232"]
 }
 
 fn fixture(root: &TestDirectory) -> (ZecSignerConfig, ZecPayoutRequest, TestPczt) {
+    fixture_for(root, test_pczt())
+}
+
+fn fixture_for(
+    root: &TestDirectory,
+    pczt: TestPczt,
+) -> (ZecSignerConfig, ZecPayoutRequest, TestPczt) {
     let account = Uuid::new_v4();
-    let pczt = test_pczt();
     let config_path = write_wallet_config(root.path(), None);
     let config = ZecSignerConfig::new(
         root.path().join("journal"),
@@ -847,7 +954,7 @@ fn fixture(root: &TestDirectory) -> (ZecSignerConfig, ZecPayoutRequest, TestPczt
             outputs: vec![PayoutOutput {
                 allocation_id: Uuid::new_v4(),
                 canonical_address: pczt.recipient_unified_address.clone(),
-                receiver_kind: ReceiverKind::Ironwood,
+                receiver_kind: pczt.recipient_kind,
                 amount_zat: PAYOUT_ZAT,
             }],
         },
@@ -925,12 +1032,136 @@ fn beta_three_rpc_pipeline_is_exact_and_replay_is_side_effect_free() {
     );
     assert_eq!(calls[4].params[1][0]["amount"].to_string(), "2.00000000");
     assert_eq!(calls[4].params[2], 100);
-    assert_eq!(calls[4].params[3], "NoPrivacy");
+    assert_eq!(calls[4].params[3], "FullPrivacy");
     assert_eq!(calls[4].params[4], "orchard");
     assert_eq!(calls[12].params, json!([pczt.proved, "FullPrivacy", true]));
     assert!(calls[10].timeout_millis > calls[4].timeout_millis);
     assert!(calls.iter().all(|call| call.max_response_bytes > 0));
     assert_eq!(zebra.calls()[0].params, json!([pczt.raw_transaction]));
+}
+
+#[test]
+fn transparent_p2pkh_and_p2sh_payouts_verify_real_effects_and_replay_exactly() {
+    for script_hash in [false, true] {
+        let root = TestDirectory::new();
+        let (config, request, pczt) = fixture_for(&root, transparent_test_pczt(script_hash));
+        let zallet = Arc::new(HappyZallet::new(pczt.clone()));
+        let zebra = Arc::new(ScriptedZebra::new([ZebraStep::Accepted]));
+        let signer = ZecPcztSigner::new(config, zallet.clone(), zebra.clone()).unwrap();
+        let receipt = signer
+            .execute(&request)
+            .expect("transparent payout succeeds");
+        assert_eq!(receipt.transaction_id, pczt.transaction_id);
+        assert_eq!(receipt.output_total_zat, PAYOUT_ZAT);
+        assert_eq!(receipt.network_fee_zat, pczt.fee_zat);
+        let calls = zallet.calls();
+        let create = calls
+            .iter()
+            .find(|call| call.method == "pczt_create")
+            .unwrap();
+        assert_eq!(create.params[3], "AllowRevealedRecipients");
+        let sign = calls
+            .iter()
+            .find(|call| call.method == "pczt_sign")
+            .unwrap();
+        assert_eq!(sign.params[1], "AllowRevealedRecipients");
+        let call_count = calls.len() + zebra.calls().len();
+        assert_eq!(signer.execute(&request).unwrap(), receipt);
+        assert_eq!(zallet.calls().len() + zebra.calls().len(), call_count);
+    }
+}
+
+#[test]
+fn transparent_script_substitution_is_rejected_even_when_wallet_echoes_requested_address() {
+    let root = TestDirectory::new();
+    let mut pczt = transparent_test_pczt(false);
+    let requested_address = pczt.recipient_unified_address.clone();
+    let (substituted, _) = build_destination_pczt(
+        EXPIRY_HEIGHT,
+        &RECIPIENT_SEED,
+        PAYOUT_ZAT,
+        Some(TransparentAddress::PublicKeyHash([0x55; 20])),
+    );
+    let parsed = Pczt::parse(&BASE64_STANDARD.decode(substituted).unwrap()).unwrap();
+    let substituted = Updater::new(parsed)
+        .update_transparent_with(|mut bundle| {
+            bundle.update_output_with(0, |mut output| {
+                output.set_user_address(requested_address);
+                Ok(())
+            })
+        })
+        .unwrap()
+        .finish();
+    pczt.created = BASE64_STANDARD.encode(substituted.serialize().unwrap());
+    let (config, request, pczt) = fixture_for(&root, pczt);
+    let zallet = Arc::new(HappyZallet::new(pczt));
+    let zebra = Arc::new(ScriptedZebra::new([]));
+    let signer = ZecPcztSigner::new(config, zallet.clone(), zebra.clone()).unwrap();
+    assert_eq!(
+        signer.execute(&request),
+        Err(ZecPayoutError::WalletProtocolViolation)
+    );
+    assert!(!zallet
+        .calls()
+        .iter()
+        .any(|call| matches!(call.method, "pczt_prove" | "pczt_sign")));
+    assert!(zebra.calls().is_empty());
+}
+
+#[test]
+fn weak_wallet_privacy_response_is_rejected_before_proving_or_signing() {
+    for pczt in [test_pczt(), transparent_test_pczt(false)] {
+        let root = TestDirectory::new();
+        let (config, request, pczt) = fixture_for(&root, pczt);
+        let zallet = Arc::new(HappyZallet::tampered(pczt, Tamper::WeakPrivacyPolicy));
+        let zebra = Arc::new(ScriptedZebra::new([]));
+        let signer = ZecPcztSigner::new(config, zallet.clone(), zebra.clone()).unwrap();
+        assert_eq!(
+            signer.execute(&request),
+            Err(ZecPayoutError::WalletProtocolViolation)
+        );
+        assert!(!zallet
+            .calls()
+            .iter()
+            .any(|call| matches!(call.method, "pczt_prove" | "pczt_sign")));
+        assert!(zebra.calls().is_empty());
+    }
+}
+
+#[cfg(feature = "regtest")]
+#[test]
+fn regtest_wallet_profile_cannot_cross_testnet_batch_or_address_boundaries() {
+    let root = TestDirectory::new();
+    let (config, mut request, pczt) = fixture(&root);
+    let config_path = root.path().join("zallet.toml");
+    let contents = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("network = \"test\"", "network = \"regtest\"");
+    fs::write(&config_path, contents).unwrap();
+    assert_eq!(
+        validate_zallet_configuration(&config_path),
+        Err(ZecPayoutError::UnsafeWalletConfiguration)
+    );
+    wcash_zec_payout_signer::validate_zallet_regtest_configuration(&config_path).unwrap();
+    let zallet = Arc::new(HappyZallet::new(pczt));
+    let zebra = Arc::new(ScriptedZebra::new([]));
+    assert!(matches!(
+        ZecPcztSigner::new(config.clone(), zallet.clone(), zebra.clone()),
+        Err(ZecPayoutError::UnsafeWalletConfiguration)
+    ));
+    let signer = ZecPcztSigner::new(
+        config.with_regtest_network().unwrap(),
+        zallet.clone(),
+        zebra,
+    )
+    .unwrap();
+    assert_eq!(signer.prepare(&request), Err(ZecPayoutError::WrongNetwork));
+    request.batch.network = ChainNetwork::Regtest;
+    assert_eq!(
+        signer.prepare(&request),
+        Err(ZecPayoutError::InvalidRequest)
+    );
+    assert!(zallet.calls().is_empty());
 }
 
 #[test]

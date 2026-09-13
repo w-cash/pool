@@ -64,6 +64,7 @@ impl TryFromAddress for SupportedReceiver {
 pub(crate) fn validate_destination(
     encoded: &str,
     expected_kind: ReceiverKind,
+    network: NetworkType,
 ) -> Result<(), ZecPayoutError> {
     let parsed =
         ZcashAddress::try_from_encoded(encoded).map_err(|_| ZecPayoutError::InvalidRequest)?;
@@ -71,7 +72,7 @@ pub(crate) fn validate_destination(
         return Err(ZecPayoutError::InvalidRequest);
     }
     let SupportedReceiver(destination) = parsed
-        .convert_if_network::<SupportedReceiver>(NetworkType::Test)
+        .convert_if_network::<SupportedReceiver>(network)
         .map_err(|_| ZecPayoutError::InvalidRequest)?;
     let actual_kind = match destination {
         Destination::Transparent { .. } => ReceiverKind::Transparent,
@@ -84,13 +85,20 @@ pub(crate) fn validate_destination(
 }
 
 pub(crate) fn decode_destination(encoded: &str) -> Result<Destination, ZecPayoutError> {
+    decode_destination_for_network(encoded, NetworkType::Test)
+}
+
+pub(crate) fn decode_destination_for_network(
+    encoded: &str,
+    network: NetworkType,
+) -> Result<Destination, ZecPayoutError> {
     let parsed =
         ZcashAddress::try_from_encoded(encoded).map_err(|_| ZecPayoutError::InvalidRequest)?;
     if parsed.encode() != encoded {
         return Err(ZecPayoutError::InvalidRequest);
     }
     parsed
-        .convert_if_network::<SupportedReceiver>(NetworkType::Test)
+        .convert_if_network::<SupportedReceiver>(network)
         .map(|receiver| receiver.0)
         .map_err(|_| ZecPayoutError::InvalidRequest)
 }

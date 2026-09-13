@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+regtest = ["wcash-pool-portal/regtest"]
+
 [dependencies]
 hex.workspace = true
 serde.workspace = true

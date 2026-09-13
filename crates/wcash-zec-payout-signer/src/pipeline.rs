@@ -27,14 +27,14 @@ use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wcash_pool_portal::{
-    Asset, BroadcastReceipt, ChainNetwork, IsolatedPayoutSigner, PayoutBatchRequest, ReceiverKind,
-    SignerError,
+    Asset, BroadcastReceipt, IsolatedPayoutSigner, PayoutBatchRequest, ReceiverKind, SignerError,
 };
+use zcash_address::unified::{Encoding, Ufvk};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_note_encryption::{try_output_recovery_with_pkd_esk, Domain};
 use zcash_primitives::transaction::{Transaction, TxVersion};
 use zcash_protocol::{
-    consensus::{BranchId, TEST_NETWORK},
+    consensus::{BranchId, NetworkType},
     constants::{
         testnet::COIN_TYPE as ZCASH_TESTNET_COIN_TYPE, V6_TX_VERSION, V6_VERSION_GROUP_ID,
     },
@@ -43,7 +43,9 @@ use zcash_protocol::{
 use zip32::{fingerprint::SeedFingerprint, AccountId, ChildIndex};
 
 use crate::{
-    address::{decode_destination, validate_destination, Destination},
+    address::{
+        decode_destination, decode_destination_for_network, validate_destination, Destination,
+    },
     journal::{Journal, JournalRecord, StoredStage},
     JsonRpcTransport, PipelineStage, RpcCall, ZecPayoutError, ZecSignerConfig, ZALLET_API_VERSION,
 };
@@ -222,7 +224,7 @@ impl ZecPcztSigner {
         zebra: Arc<dyn JsonRpcTransport>,
     ) -> Result<Self, ZecPayoutError> {
         config.validate_policy()?;
-        crate::validate_zallet_configuration(config.zallet_configuration())?;
+        config.validate_wallet_configuration()?;
         let journal = Journal::open(config.journal_directory())?;
         Ok(Self {
             config,
@@ -243,7 +245,7 @@ impl ZecPcztSigner {
     /// Verifies the static Testnet fence, exact configured account, sync-engine
     /// state, and availability of the account's exported viewing key.
     pub fn readiness(&self) -> Result<(), ZecPayoutError> {
-        crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        self.config.validate_wallet_configuration()?;
         self.wallet_context()?;
         Ok(())
     }
@@ -270,6 +272,7 @@ impl ZecPcztSigner {
         let identity = account.signing_identity(
             self.config.account_id(),
             self.config.expected_parent_payout_commitment(),
+            self.config.address_network(),
         )?;
 
         let value = self.wallet_call(
@@ -289,7 +292,12 @@ impl ZecPcztSigner {
         let encoded_ufvk = value
             .as_str()
             .ok_or(ZecPayoutError::WalletProtocolViolation)?;
-        let ufvk = UnifiedFullViewingKey::decode(&TEST_NETWORK, encoded_ufvk)
+        let (network, ufvk) =
+            Ufvk::decode(encoded_ufvk).map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
+        if network != self.config.address_network() {
+            return Err(ZecPayoutError::WalletProtocolViolation);
+        }
+        let ufvk = UnifiedFullViewingKey::parse(&ufvk)
             .map_err(|_| ZecPayoutError::WalletProtocolViolation)?;
         let orchard_fvk = ufvk
             .orchard()
@@ -318,7 +326,7 @@ impl ZecPcztSigner {
         &self,
         request: &ZecPayoutRequest,
     ) -> Result<ZecPayoutExecution, ZecPayoutError> {
-        crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        self.config.validate_wallet_configuration()?;
         let (portal_commitment, pipeline_commitment, output_total_zat) =
             self.validate_request(request)?;
         let _process_guard = lock_without_poison(&self.process_lock);
@@ -343,7 +351,7 @@ impl ZecPcztSigner {
         &self,
         request: &ZecPayoutRequest,
     ) -> Result<ZecPayoutExecution, ZecPayoutError> {
-        crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        self.config.validate_wallet_configuration()?;
         let (portal_commitment, pipeline_commitment, output_total_zat) =
             self.validate_request(request)?;
         let _process_guard = lock_without_poison(&self.process_lock);
@@ -368,7 +376,7 @@ impl ZecPcztSigner {
         &self,
         request: &ZecPayoutRequest,
     ) -> Result<Option<ZecPreparedRecovery>, ZecPayoutError> {
-        crate::validate_zallet_configuration(self.config.zallet_configuration())?;
+        self.config.validate_wallet_configuration()?;
         let (portal_commitment, pipeline_commitment, output_total_zat) =
             self.validate_request(request)?;
         let _process_guard = lock_without_poison(&self.process_lock);
@@ -690,7 +698,7 @@ impl ZecPcztSigner {
         if request.batch.asset != Asset::Zec {
             return Err(ZecPayoutError::WrongAsset);
         }
-        if request.batch.network != ChainNetwork::Testnet {
+        if request.batch.network != self.config.network() {
             return Err(ZecPayoutError::WrongNetwork);
         }
         if request.source_account != self.config.account_id() {
@@ -723,7 +731,11 @@ impl ZecPcztSigner {
             if !destinations.insert(output.canonical_address.as_str()) {
                 return Err(ZecPayoutError::InvalidRequest);
             }
-            validate_destination(&output.canonical_address, output.receiver_kind)?;
+            validate_destination(
+                &output.canonical_address,
+                output.receiver_kind,
+                self.config.address_network(),
+            )?;
         }
 
         let portal_commitment = request
@@ -769,7 +781,7 @@ impl ZecPcztSigner {
                 request.source_account.to_string(),
                 amounts?,
                 self.config.min_confirmations(),
-                "NoPrivacy",
+                requested_privacy_policy(request),
                 request.fund_source.rpc_value(),
             ]),
             self.config.rpc_limits().ordinary_timeout(),
@@ -910,7 +922,9 @@ impl ZecPcztSigner {
                     .then_some(index)
                 })
                 .ok_or(ZecPayoutError::WalletProtocolViolation)?;
-            let Destination::Transparent { script_pubkey } = decode_destination(address)? else {
+            let Destination::Transparent { script_pubkey } =
+                decode_destination_for_network(address, self.config.address_network())?
+            else {
                 return Err(ZecPayoutError::WalletProtocolViolation);
             };
             if output.script_pubkey() != &script_pubkey {
@@ -999,8 +1013,11 @@ impl ZecPcztSigner {
                                 .ok_or(pczt::roles::verifier::OrchardError::Custom(()))?;
                             let Destination::Ironwood {
                                 receiver: expected_receiver,
-                            } = decode_destination(address)
-                                .map_err(|_| pczt::roles::verifier::OrchardError::Custom(()))?
+                            } = decode_destination_for_network(
+                                address,
+                                self.config.address_network(),
+                            )
+                            .map_err(|_| pczt::roles::verifier::OrchardError::Custom(()))?
                             else {
                                 return Err(pczt::roles::verifier::OrchardError::Custom(()));
                             };
@@ -1472,6 +1489,19 @@ fn validate_privacy_policy(
     Ok(())
 }
 
+fn requested_privacy_policy(request: &ZecPayoutRequest) -> &'static str {
+    if request
+        .batch
+        .outputs
+        .iter()
+        .any(|output| output.receiver_kind == ReceiverKind::Transparent)
+    {
+        "AllowRevealedRecipients"
+    } else {
+        "FullPrivacy"
+    }
+}
+
 fn orchard_bundle_is_structural(bundle: &OrchardInfo) -> bool {
     bundle.outputs.len() == bundle.actions
         && bundle.signed_actions <= bundle.actions
@@ -1575,6 +1605,7 @@ impl WalletAccount {
         &self,
         expected_account: Uuid,
         expected_parent_payout_commitment: [u8; 32],
+        network: NetworkType,
     ) -> Result<WalletSigningIdentity, ZecPayoutError> {
         if self.account_uuid != expected_account {
             return Err(ZecPayoutError::WalletProtocolViolation);
@@ -1604,7 +1635,7 @@ impl WalletAccount {
         }
         let Destination::Ironwood {
             receiver: unified_receiver,
-        } = decode_destination(unified_address)?
+        } = decode_destination_for_network(unified_address, network)?
         else {
             return Err(ZecPayoutError::WalletProtocolViolation);
         };
@@ -1637,6 +1668,20 @@ pub fn validated_parent_payout_address_commitment(
 ) -> Result<[u8; 32], ZecPayoutError> {
     if !matches!(
         decode_destination(encoded_address)?,
+        Destination::Ironwood { .. }
+    ) {
+        return Err(ZecPayoutError::WalletProtocolViolation);
+    }
+    Ok(parent_payout_address_commitment(encoded_address))
+}
+
+/// Validates an isolated Regtest collector before committing its exact address.
+#[cfg(feature = "regtest")]
+pub fn validated_regtest_parent_payout_address_commitment(
+    encoded_address: &str,
+) -> Result<[u8; 32], ZecPayoutError> {
+    if !matches!(
+        decode_destination_for_network(encoded_address, NetworkType::Regtest)?,
         Destination::Ironwood { .. }
     ) {
         return Err(ZecPayoutError::WalletProtocolViolation);
