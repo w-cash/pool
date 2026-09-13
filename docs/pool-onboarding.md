@@ -19,7 +19,9 @@ target. Each chain has its own block acceptance, maturity, balance, and payout.
 3. Save the worker token immediately. It is shown only once and cannot be used
    to sign in to the portal.
 4. Configure one Wcash Testnet payout destination and one Zcash Testnet payout
-   destination. Never provide a seed phrase, spending key, or private key.
+   destination. Zcash accepts a transparent address or a supported shielded
+   address; Wcash requires a supported shielded address. Never provide a seed
+   phrase, spending key, or private key.
 5. Copy the generated mining username and token into the ASIC.
 
 Testnet connection settings:
@@ -64,8 +66,8 @@ The API origin is:
 https://testnet.zecwec.com
 ```
 
-The public deployment is API-only. A separately deployed frontend must use the
-same origin. Browser mutations require the exact
+The miner UI and API are served together at this origin. The UI is embedded in
+the Rust release and does not require a separate frontend service. Browser mutations require the exact
 `Origin: https://testnet.zecwec.com` header, a secure host-only session cookie,
 and the login response's CSRF token in `x-csrf-token`. Cross-origin browser
 requests are intentionally unsupported.
@@ -123,6 +125,15 @@ the API never returns the token again.
 Wcash and Zcash destinations are configured independently. The server parses
 each address using the authoritative Testnet rules and rejects wrong-chain,
 wrong-network, or unsupported receiver types.
+
+| Asset | Accepted destination |
+| --- | --- |
+| TWC | Wcash Testnet Unified Address with the supported Ironwood receiver |
+| ZEC | Zcash Testnet transparent P2PKH/P2SH address, or a Unified Address with the supported Ironwood receiver |
+
+The portal's transparent/shielded choice explains the Zcash address format;
+the server validates the actual address. It does not select a second mining
+implementation or require a second ASIC connection.
 
 ```sh
 curl --fail-with-body --silent --show-error \

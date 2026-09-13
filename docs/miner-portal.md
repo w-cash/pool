@@ -32,9 +32,11 @@ WEC and ZEC destinations are entered separately. Full values are accepted only
 by the mutation endpoint and handed to a chain-specific authoritative parser.
 The parser must verify the complete encoding, checksum, chain, network, and
 supported receiver set. A prefix or regular expression is not an acceptable
-validator. The launch pool accepts only Ironwood-capable destinations for both
-assets; chain-level transparent coinbase support remains outside this pool's
-payout policy. Browser responses contain masked destinations. Every new or
+validator. Wcash accepts an Ironwood-capable Unified Address. Zcash accepts
+transparent P2PKH/P2SH addresses or an Ironwood-capable Unified Address. These
+recipient choices share the same pool and accounting implementation; collector
+custody remains bound to its configured shielded wallet. Browser responses
+contain masked destinations. Every new or
 replacement destination remains pending for the configured 48-hour safety
 hold. Accounting continues during the hold, but no payout may use either the
 old or pending destination until the new revision becomes active.
@@ -93,7 +95,9 @@ The `/api/v1/telemetry` route reads only the authenticated account's bounded
 in-process counters. Empty arrays mean a proven empty account dataset;
 repository failure remains an explicit unavailable response.
 
-The `TestnetPayoutBoundary` accepts only Testnet requests. Each request binds:
+The production `TestnetPayoutBoundary` accepts only Testnet requests. A
+default-off `regtest` build feature permits the isolated local acceptance
+network and its exact genesis identity. Each request binds:
 
 - one stable batch UUID;
 - one asset and network;
@@ -106,6 +110,11 @@ durably store `(batch ID, request commitment, transaction ID)` before success.
 An exact retry returns the stored receipt; reuse of a batch ID with different
 content is an idempotency conflict and must never sign. The portal verifies the
 returned commitment, asset, batch ID, output total, and transaction identifier.
+The Zcash signer also verifies actual transaction outputs and amounts. It
+requests `FullPrivacy` for shielded recipients and
+`AllowRevealedRecipients` when a batch includes a transparent recipient;
+weaker returned policies are rejected. Shielded recipient inspection compares
+exact recipient/amount multisets because wallet action order can be shuffled.
 The built-in disabled signer always returns `NotConfigured`; there is no fake
 success or transparent-wallet fallback.
 

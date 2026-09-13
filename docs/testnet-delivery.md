@@ -54,7 +54,7 @@ service flow. Pending evidence must remain labeled pending.
 | Complete local regtest mining and accounting | Pending |
 | Real Zcash transparent and shielded payments | Pending |
 | Real Wcash payment and restart reconciliation | Pending |
-| Ubuntu package and origin routing | Pending |
+| Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
 | Remote preflight and public endpoint acceptance | Pending |
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
