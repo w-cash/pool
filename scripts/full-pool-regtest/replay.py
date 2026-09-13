@@ -30,11 +30,9 @@ class ReplayVerifier(Verifier):
     def query(self, select):
         timeout = 2 if self.query_deadline is None else min(2, self.query_deadline - time.monotonic())
         require(timeout > 0, 'projection query deadline reached before replay')
-        env = os.environ.copy()
-        env['PGDATABASE'] = Path(self.config['database_url_file']).read_text().strip()
         result = subprocess.run(['psql', '-X', '-At', '-v', 'ON_ERROR_STOP=1', '-c',
                                  "SELECT COALESCE(json_agg(r),'[]'::json) FROM (" + select + ') r'],
-                                env=env, capture_output=True, timeout=timeout)
+                                env=self.database_environment(connect_timeout=2), capture_output=True, timeout=timeout)
         require(result.returncode == 0, 'live PostgreSQL replay query failed')
         return json.loads(result.stdout)
 

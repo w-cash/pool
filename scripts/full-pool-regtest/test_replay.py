@@ -8,8 +8,10 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from replay import LedgerCheck, ReplayExchange, encode, private_file, proxy
+from replay import LedgerCheck, ReplayExchange, ReplayVerifier, encode, private_file, proxy
 
 
 SUBMIT = {'id': 4, 'method': 'mining.submit',
@@ -18,6 +20,22 @@ ACCEPTED = {'id': 4, 'result': True, 'error': None}
 
 
 class ReplayBoundaryTests(unittest.TestCase):
+    def test_postgres_uri_is_decoded_into_private_environment_not_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection_file = Path(directory) / 'database-url'
+            connection_file.write_text('postgresql://fixture_user:fixture%3Apassword@127.0.0.1:55432/fixture_db')
+            verifier = object.__new__(ReplayVerifier)
+            verifier.config = {'database_url_file': str(connection_file)}
+            with patch('replay.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=b'[]')) as run:
+                self.assertEqual(verifier.query('SELECT 1'), [])
+            args, options = run.call_args
+            self.assertNotIn('fixture:password', str(args))
+            self.assertEqual(options['env']['PGHOST'], '127.0.0.1')
+            self.assertEqual(options['env']['PGPORT'], '55432')
+            self.assertEqual(options['env']['PGUSER'], 'fixture_user')
+            self.assertEqual(options['env']['PGDATABASE'], 'fixture_db')
+            self.assertEqual(options['env']['PGPASSWORD'], 'fixture:password')
+
     def ready(self):
         exchange = ReplayExchange()
         exchange.request(SUBMIT)

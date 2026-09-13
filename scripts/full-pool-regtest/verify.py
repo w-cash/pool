@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tomllib
 import uuid
+from urllib.parse import unquote, urlsplit
 
 GENESIS = {
     'wcash': '70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c',
@@ -41,12 +42,25 @@ class Verifier:
         require(self.config.get('network') == 'regtest', 'requires explicit Regtest configuration')
         self.deployment = str(uuid.UUID(self.config['deployment_id']))
 
+    def database_environment(self, connect_timeout=10):
+        database = urlsplit(Path(self.config['database_url_file']).read_text().strip())
+        require(database.scheme in ('postgres', 'postgresql')
+                and database.hostname in ('127.0.0.1', 'localhost', '::1'),
+                'verification requires loopback PostgreSQL')
+        # libpq does not expand a URI supplied through PGDATABASE. Keep its
+        # credentials out of argv and exclude inherited PostgreSQL overrides.
+        env = {key: value for key, value in os.environ.items() if not key.startswith('PG')}
+        env.update({'PGHOST': database.hostname, 'PGPORT': str(database.port or 5432),
+                    'PGUSER': unquote(database.username or ''),
+                    'PGPASSWORD': unquote(database.password or ''),
+                    'PGDATABASE': unquote(database.path.lstrip('/')),
+                    'PGCONNECT_TIMEOUT': str(connect_timeout)})
+        return env
+
     def query(self, select):
-        env = os.environ.copy()
-        env['PGDATABASE'] = Path(self.config['database_url_file']).read_text().strip()
         result = subprocess.run(['psql', '-X', '-At', '-v', 'ON_ERROR_STOP=1', '-c',
                                  'SELECT COALESCE(json_agg(r),\'[]\'::json) FROM (' + select + ') r'],
-                                env=env, capture_output=True, timeout=30)
+                                env=self.database_environment(), capture_output=True, timeout=30)
         # Neither connection errors nor result rows are printed: they can carry
         # private connection details or account information.
         require(result.returncode == 0, 'live PostgreSQL query failed')
