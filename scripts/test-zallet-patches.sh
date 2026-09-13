@@ -28,7 +28,8 @@ git -C "$source_dir" -c advice.detachedHead=false checkout --quiet --detach FETC
 for patch in \
     "$patch_dir/0001-reserve-wallet-database-capacity.patch" \
     "$patch_dir/0002-signal-data-requests-after-chain-writes.patch" \
-    "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch"; do
+    "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch" \
+    "$patch_dir/0004-deflake-batch-decryptor-shutdown-test.patch"; do
     git -C "$source_dir" apply --check "$patch"
     git -C "$source_dir" apply "$patch"
 done
@@ -41,4 +42,8 @@ grep -Fq 'denied_build_constants.extend([CARGO_MANIFEST_DIR, CARGO_TREE]);' \
     "$source_dir/zallet-core/build.rs"
 grep -Fq '.deny_const(denied_build_constants)' \
     "$source_dir/zallet-core/build.rs"
+grep -Fq 'tokio::time::timeout(Duration::from_secs(30), async {' \
+    "$source_dir/zallet-core/src/components/sync.rs"
+grep -Fq 'A served reload' \
+    "$source_dir/zallet-core/src/components/sync.rs"
 printf 'zallet-patch-test: exact beta.3 patch set applies cleanly\n'

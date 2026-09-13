@@ -201,6 +201,10 @@ grep -Fq 'timeout --signal=TERM --kill-after=10s 300s' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'components::sync::tests -- --test-threads=1' \
     "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'for _stress_iteration in {1..100}; do' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'components::sync::tests::wallet_sync_error_shuts_down_the_spawned_batch_decryptor' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'const MIN_WALLET_POOL_SIZE: usize = 8;' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
 grep -Fq 'config.timeouts.wait = Some(WALLET_POOL_WAIT_TIMEOUT);' \
@@ -209,6 +213,8 @@ grep -Fq '.runtime(deadpool::Runtime::Tokio1)' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
 grep -Fq 'denied_build_constants.extend([CARGO_MANIFEST_DIR, CARGO_TREE]);' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0003-remove-nonreproducible-shadow-paths.patch"
+grep -Fq 'tokio::time::timeout(Duration::from_secs(30), async {' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0004-deflake-batch-decryptor-shutdown-test.patch"
 grep -Fq 'generated shadow metadata contains its build path' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 # shellcheck disable=SC2016
