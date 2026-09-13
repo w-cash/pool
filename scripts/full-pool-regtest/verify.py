@@ -81,8 +81,13 @@ class Verifier:
 
     def run(self):
         dep = "'" + self.deployment + "'::uuid"
-        identity = self.query(f"SELECT network FROM deployments WHERE id={dep}")
-        require(identity == [{'network': 'regtest'}], 'database deployment is not the exact Regtest identity')
+        identity = self.query(f"SELECT network,encode(wcash_genesis,'hex') AS wcash_genesis,"
+                              f"encode(zcash_genesis,'hex') AS zcash_genesis FROM deployments WHERE id={dep}")
+        require(len(identity) == 1 and identity[0]['network'] == 'regtest',
+                'database deployment is not the exact Regtest identity')
+        for chain, expected in GENESIS.items():
+            require(display_block(identity[0][chain + '_genesis']) == expected,
+                    'database genesis differs from frozen Regtest identity')
         version = self.query("SELECT current_setting('server_version_num')::int AS version")[0]['version']
         require(version >= 160000, 'requires PostgreSQL 16 or newer')
         tips = {}
