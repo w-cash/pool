@@ -31,6 +31,10 @@ ADDRESS = (
     "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x"
     "38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp"
 )
+DEFAULT_ADDRESS = (
+    "utest10c5kutapazdnf8ztl3pu43nkfsjx89fy3uuff8tsmxm6s86j37pe7uz94z5jhkl"
+    "49pqe8yz75rlsaygexk6jpaxwx0esjr8wm5ut7d5s"
+)
 COMMITMENT = hashlib.sha256(
     b"Wcash/Zcash parent payout address/v1\0" + ADDRESS.encode("ascii")
 ).hexdigest()
@@ -42,10 +46,12 @@ COOKIE = "__cookie__:unit-test-only"
 
 
 class RpcState:
-    def __init__(self, recovered: bool) -> None:
+    def __init__(self, recovered: bool, default_index: int = 1) -> None:
         self.recovered = recovered
         self.tip = RECOVERY_TIP if recovered else ORIGINAL_TIP
         self.created = False
+        self.collector_derived = False
+        self.default_index = default_index
         self.authenticated_calls = 0
 
     @property
@@ -106,23 +112,54 @@ class RpcState:
                 ]
             }
         if method == "z_getaddressforaccount" and self.created:
-            if params != [self.account_uuid, ["orchard"], 0]:
-                raise ValueError("invalid derivation")
-            return {
-                "account_uuid": self.account_uuid,
-                "diversifier_index": 0,
-                "receiver_types": ["orchard"],
-                "address": ADDRESS,
-            }
+            if params == [
+                self.account_uuid,
+                list(MODULE.DEFAULT_RECEIVER_TYPES),
+                self.default_index,
+            ]:
+                return {
+                    "account_uuid": self.account_uuid,
+                    "diversifier_index": self.default_index,
+                    "receiver_types": list(MODULE.DEFAULT_RECEIVER_TYPES),
+                    "address": DEFAULT_ADDRESS,
+                }
+            collector_index = MODULE.collector_diversifier_index(self.default_index)
+            if params == [self.account_uuid, ["orchard"], collector_index]:
+                self.collector_derived = True
+                return {
+                    "account_uuid": self.account_uuid,
+                    "diversifier_index": collector_index,
+                    "receiver_types": ["orchard"],
+                    "address": ADDRESS,
+                }
+            raise ValueError("invalid derivation")
         if method == "z_getaccount" and self.created:
             if params != [self.account_uuid]:
                 raise ValueError("wrong account")
+            addresses = [
+                {
+                    "diversifier_index": self.default_index,
+                    "ua": DEFAULT_ADDRESS,
+                }
+            ]
+            if self.collector_derived:
+                addresses.append(
+                    {
+                        "diversifier_index": MODULE.collector_diversifier_index(
+                            self.default_index
+                        ),
+                        "ua": ADDRESS,
+                    }
+                )
+                # The verifier must not rely on Zallet's current row ordering.
+                if self.recovered:
+                    addresses.reverse()
             return {
                 "account_uuid": self.account_uuid,
                 "name": MODULE.ACCOUNT_NAME,
                 "seedfp": SEEDFP,
                 "zip32_account_index": 0,
-                "addresses": [{"diversifier_index": 0, "ua": ADDRESS}],
+                "addresses": addresses,
             }
         raise ValueError(f"unexpected method {method}")
 
@@ -166,8 +203,8 @@ class RecoveryVerifierTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def server(self, recovered: bool):
-        state = RpcState(recovered)
+    def server(self, recovered: bool, default_index: int = 1):
+        state = RpcState(recovered, default_index)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(handler) -> None:
@@ -198,8 +235,10 @@ class RecoveryVerifierTest(unittest.TestCase):
         thread.start()
         return server, thread, state
 
-    def capture_pair(self) -> tuple[pathlib.Path, pathlib.Path]:
-        original_server, original_thread, original_state = self.server(False)
+    def capture_pair(self, default_index: int = 1) -> tuple[pathlib.Path, pathlib.Path]:
+        original_server, original_thread, original_state = self.server(
+            False, default_index
+        )
         original = self.root / "original.rpc.json"
         try:
             MODULE.capture_original(
@@ -213,9 +252,13 @@ class RecoveryVerifierTest(unittest.TestCase):
             original_server.shutdown()
             original_thread.join()
             original_server.server_close()
-        self.assertGreaterEqual(original_state.authenticated_calls, 7)
+        self.assertGreaterEqual(original_state.authenticated_calls, 9)
+        for suffix in ("mutation-intent", "mutation-receipt", "pending"):
+            self.assertFalse((self.root / f"{original.name}.{suffix}").exists())
 
-        recovered_server, recovered_thread, recovered_state = self.server(True)
+        recovered_server, recovered_thread, recovered_state = self.server(
+            True, default_index
+        )
         recovered = self.root / "recovered.rpc.json"
         try:
             MODULE.capture_recovered(
@@ -231,7 +274,9 @@ class RecoveryVerifierTest(unittest.TestCase):
             recovered_server.shutdown()
             recovered_thread.join()
             recovered_server.server_close()
-        self.assertGreaterEqual(recovered_state.authenticated_calls, 7)
+        self.assertGreaterEqual(recovered_state.authenticated_calls, 9)
+        for suffix in ("mutation-intent", "mutation-receipt", "pending"):
+            self.assertFalse((self.root / f"{recovered.name}.{suffix}").exists())
         return original, recovered
 
 
@@ -257,6 +302,63 @@ class RecoveryVerifierTest(unittest.TestCase):
         self.assertEqual(
             MODULE.read_object(os.fspath(attestation), "attestation"), expected
         )
+
+    def test_pinned_zallet_default_and_collector_address_set(self) -> None:
+        original, recovered = self.capture_pair()
+        for path in (original, recovered):
+            capture = MODULE.read_object(os.fspath(path), "capture")
+            transcript = capture["rpc_transcript"]
+            before = transcript["account_before_collector"]["response"]["result"]
+            after = transcript["account"]["response"]["result"]
+            default = transcript["default_address"]["response"]["result"]
+            collector = transcript["derived_address"]["response"]["result"]
+            self.assertEqual(len(before["addresses"]), 1)
+            self.assertEqual(len(after["addresses"]), 2)
+            self.assertEqual(
+                default["receiver_types"], list(MODULE.DEFAULT_RECEIVER_TYPES)
+            )
+            self.assertEqual(collector["receiver_types"], ["orchard"])
+            self.assertEqual(
+                {
+                    (entry["diversifier_index"], entry["ua"])
+                    for entry in after["addresses"]
+                },
+                {
+                    (default["diversifier_index"], default["address"]),
+                    (collector["diversifier_index"], collector["address"]),
+                },
+            )
+
+        value = json.loads(original.read_text(encoding="utf-8"))
+        value["rpc_transcript"]["account"]["response"]["result"]["addresses"].append(
+            {"diversifier_index": 2, "ua": DEFAULT_ADDRESS + "q"}
+        )
+        with self.assertRaises(SystemExit):
+            MODULE.validate_capture(
+                value,
+                "original_wallet_creation",
+                MODULE.read_settings(os.fspath(self.settings), False),
+                os.fspath(self.native),
+            )
+
+    def test_collector_uses_index_one_when_default_owns_zero(self) -> None:
+        original, recovered = self.capture_pair(default_index=0)
+        settings = MODULE.read_settings(os.fspath(self.settings), False)
+        original_identity = MODULE.validate_capture(
+            MODULE.read_object(os.fspath(original), "capture"),
+            "original_wallet_creation",
+            settings,
+            os.fspath(self.native),
+        )
+        recovered_identity = MODULE.validate_capture(
+            MODULE.read_object(os.fspath(recovered), "capture"),
+            "independent_mnemonic_recovery",
+            settings,
+            os.fspath(self.native),
+        )
+        self.assertEqual(original_identity["default_diversifier_index"], 0)
+        self.assertEqual(original_identity["diversifier_index"], 1)
+        self.assertEqual(recovered_identity["diversifier_index"], 1)
 
     def test_pre_account_lock_exception_is_exact_and_accountless(self) -> None:
         locked = {
@@ -419,6 +521,31 @@ class RecoveryVerifierTest(unittest.TestCase):
         self.assertFalse(output.exists())
         self.assertEqual(intent.read_text(encoding="utf-8"), "tainted\n")
 
+    def test_capture_refuses_stale_receipt_or_pending_before_any_rpc(self) -> None:
+        for suffix in ("mutation-receipt", "pending"):
+            with self.subTest(suffix=suffix):
+                output = self.root / f"stale-{suffix}.rpc.json"
+                artifact = self.root / f"{output.name}.{suffix}"
+                artifact.write_text("tainted\n", encoding="utf-8")
+                artifact.chmod(0o400)
+                server, thread, state = self.server(False)
+                try:
+                    with self.assertRaises(SystemExit):
+                        MODULE.capture_original(
+                            os.fspath(self.settings),
+                            f"127.0.0.1:{server.server_port}",
+                            os.fspath(self.cookie),
+                            os.fspath(output),
+                            os.fspath(self.native),
+                        )
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+                self.assertEqual(state.authenticated_calls, 0)
+                self.assertFalse(output.exists())
+                self.assertEqual(artifact.read_text(encoding="utf-8"), "tainted\n")
+
     def test_intent_is_durable_before_each_mutation_and_cleared_on_success(self) -> None:
         original_server, original_thread, _state = self.server(False)
         original = self.root / "timed-original.rpc.json"
@@ -536,6 +663,50 @@ class RecoveryVerifierTest(unittest.TestCase):
                 self.assertFalse(output.exists())
                 self.assertTrue(intent.exists())
                 self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o400)
+
+    def test_post_validation_failure_retains_complete_pending_transcript(self) -> None:
+        server, thread, state = self.server(False)
+        output = self.root / "failed-final-validation.rpc.json"
+        intent = self.root / f"{output.name}.mutation-intent"
+        receipt = pathlib.Path(MODULE.mutation_receipt_path(os.fspath(output)))
+        pending = pathlib.Path(MODULE.pending_capture_path(os.fspath(output)))
+        original_result = state.result
+
+        def add_unexpected_exposed_address(method: str, params: object) -> object:
+            result = original_result(method, params)
+            if method == "z_getaccount" and state.collector_derived:
+                assert isinstance(result, dict)
+                result["addresses"].append(
+                    {"diversifier_index": 2, "ua": DEFAULT_ADDRESS + "q"}
+                )
+            return result
+
+        state.result = add_unexpected_exposed_address  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(SystemExit):
+                MODULE.capture_original(
+                    os.fspath(self.settings),
+                    f"127.0.0.1:{server.server_port}",
+                    os.fspath(self.cookie),
+                    os.fspath(output),
+                    os.fspath(self.native),
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertFalse(output.exists())
+        for artifact in (intent, receipt, pending):
+            self.assertTrue(artifact.exists())
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o400)
+        receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(receipt_value["rpc_transcript"]),
+            {"pre_status", "pre_accounts", "account_operation"},
+        )
+        pending_value = json.loads(pending.read_text(encoding="utf-8"))
+        self.assertEqual(set(pending_value["rpc_transcript"]), MODULE.TRANSCRIPT_FIELDS)
 
     def test_bool_aliases_are_rejected_in_recovery_transcript(self) -> None:
         original, recovered = self.capture_pair()
