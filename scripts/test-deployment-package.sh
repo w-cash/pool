@@ -664,6 +664,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-zec-import-completion
 for helper in \
     finalize-zec-offline-custody.sh \
     import-zallet-mnemonic.py \
+    parse-mining-firewall-policy.py \
     seal-zec-initial-zero.sh \
     verify-zec-import-completion.py; do
     [[ -x $repo_root/scripts/deploy/$helper ]] || {
@@ -2132,12 +2133,13 @@ assert "mode == apply || $mode == close" in firewall
 assert "a mining allow rule remains after closing port" in firewall
 closed_guard = firewall.index("install_mining_guard 4 closed")
 ufw_mutation = firewall.index('ufw --force delete "$number"')
-open_guard = firewall.index("install_mining_guard 4 open")
-assert closed_guard < ufw_mutation < open_guard
+policy_guard = firewall.index('install_mining_guard 4 "$firewall_policy"')
+assert closed_guard < ufw_mutation < policy_guard
 assert firewall.count("install_mining_guard 4 closed") == 2
 assert firewall.count("install_mining_guard 6 closed") == 2
-assert firewall.count("install_mining_guard 4 open") == 1
-assert firewall.count("install_mining_guard 6 open") == 1
+assert firewall.count('install_mining_guard 4 "$firewall_policy"') == 1
+assert firewall.count('install_mining_guard 6 "$firewall_policy"') == 1
+assert "elif [[ $guard_mode == public ]]" in firewall
 assert '"$firewall" --wait 5 -t filter -I INPUT 1 -j "$staging"' in firewall
 assert 'readonly guard_chain=ZECWEC-MINING-GUARD' in firewall
 PY

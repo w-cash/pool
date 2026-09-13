@@ -99,7 +99,7 @@ is unavailable or its identity is inconsistent.
 | Service process | `config-check`, listener-free `preflight`, migration/authority commands, and composed Testnet-only `serve`; readiness fails before wallet, backend, identity, or signer authority can be proven |
 | Persistence and money | Deployment-fenced PostgreSQL PPLNS/ledger projection, maturity/reorg/idempotency handling, durable payout artifacts and recovery, and exact wallet-to-ledger reconciliation for independent WEC and ZEC collectors |
 | Wolf integration | Backend-v2 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling are composed; exact artifact pairing and live recovery evidence remain launch gates |
-| Operations | Immutable release renderer, protected systemd credentials, private preflight/start/rollback paths, source-restricted Stratum, Cloudflare-AOP portal staging, and explicit publication gates; no public launch is claimed |
+| Operations | Immutable release renderer, protected systemd credentials, private preflight/start/rollback paths, explicitly public or exact-host Testnet Stratum, Cloudflare-AOP portal staging, and explicit publication gates; no public launch is claimed |
 
 The PostgreSQL CI job runs an authenticated payout-lifecycle test through the
 production backend authority check, share and winner projector, PPLNS ledger,
