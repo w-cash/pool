@@ -35,6 +35,7 @@ wcash-wec-payout-signer = { path = "../wcash-wec-payout-signer" }
 wcash-zec-payout-signer = { path = "../wcash-zec-payout-signer" }
 
 [dev-dependencies]
+sqlx.workspace = true
 tempfile = "3.23.0"
 
 [lints]

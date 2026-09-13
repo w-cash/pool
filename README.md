@@ -101,6 +101,17 @@ is unavailable or its identity is inconsistent.
 | Wolf integration | Backend-v2 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling are composed; exact artifact pairing and live recovery evidence remain launch gates |
 | Operations | Immutable release renderer, protected systemd credentials, private preflight/start/rollback paths, source-restricted Stratum, Cloudflare-AOP portal staging, and explicit publication gates; no public launch is claimed |
 
+The PostgreSQL CI job runs an authenticated payout-lifecycle test through the
+production backend authority check, share and winner projector, PPLNS ledger,
+maturity, reconciliation, payout planner, WEC signer journal, settlement
+fences, restart retry, confirmation, and account read model. It replaces the
+backend-event source, address-validation result, native-wallet transport, and
+node broadcast/confirmation with deterministic test adapters. The ZEC PCZT
+signer has its own real-proof pipeline suite, but its PostgreSQL lifecycle is
+not duplicated by this WEC test. Live Equihash submission, Ironwood scanning,
+real transaction acceptance, and an ASIC remain separate private-Testnet
+release gates.
+
 The final miner, reward, privacy, account, UI, and deployment decisions are in
 the [product design](docs/product-design.md). The remaining backend integration
 contract is described in [the architecture](docs/architecture.md), and the
