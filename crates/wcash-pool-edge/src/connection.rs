@@ -75,6 +75,50 @@ impl AuthenticationTicket {
     }
 }
 
+/// Successful authorization bound to the exact non-secret credential selector
+/// that must remain live for the lifetime of the Stratum connection.
+#[derive(Clone)]
+pub struct AuthenticationGrant {
+    worker: AuthenticatedWorker,
+    credential_id: Uuid,
+}
+
+impl fmt::Debug for AuthenticationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticationGrant")
+            .field("worker", &self.worker)
+            .field("credential_id", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl AuthenticationGrant {
+    /// Binds an authenticated worker to the exact token selector used at login.
+    pub fn new(
+        worker: AuthenticatedWorker,
+        credential_id: Uuid,
+    ) -> Result<Self, AuthenticationError> {
+        if credential_id.is_nil() {
+            return Err(AuthenticationError::Unavailable);
+        }
+        Ok(Self {
+            worker,
+            credential_id,
+        })
+    }
+
+    /// Returns the stable worker identity authorized by this grant.
+    pub const fn worker(&self) -> &AuthenticatedWorker {
+        &self.worker
+    }
+
+    /// Returns the non-secret mining-token selector bound to this connection.
+    pub const fn credential_id(&self) -> Uuid {
+        self.credential_id
+    }
+}
+
 /// Asynchronous credential boundary implemented by the deployment.
 ///
 /// The future must be driven under [`EdgeConfig::authorization_timeout`] by the
@@ -86,7 +130,15 @@ pub trait AuthenticationProvider: Send + Sync {
     fn authenticate<'a>(
         &'a self,
         ticket: &'a AuthenticationTicket,
-    ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedWorker, AuthenticationError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<AuthenticationGrant, AuthenticationError>> + Send + 'a>>;
+
+    /// Rechecks that an already authenticated worker still has live mining
+    /// authority. Implementations must consult their authoritative store; a
+    /// process-local success cached at login is not sufficient.
+    fn revalidate<'a>(
+        &'a self,
+        grant: &'a AuthenticationGrant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthenticationError>> + Send + 'a>>;
 }
 
 /// One core-validated share ready for the bounded Wolf submission actor.
@@ -178,6 +230,7 @@ pub struct ConnectionActor {
     outbound: VecDeque<Zip301ServerMessage>,
     response_ids: Vec<Option<Zip301Id>>,
     pending_authorization: Option<(u64, Zip301IdIndex)>,
+    authentication_grant: Option<AuthenticationGrant>,
     pending_shares: HashMap<u64, PendingShareState>,
     timing_order: VecDeque<u64>,
     next_ticket: u64,
@@ -252,6 +305,7 @@ impl ConnectionActor {
             outbound: VecDeque::with_capacity(config.limits().outbound_queue_capacity()),
             response_ids: Vec::with_capacity(config.limits().outbound_queue_capacity()),
             pending_authorization: None,
+            authentication_grant: None,
             pending_shares: HashMap::new(),
             timing_order: VecDeque::new(),
             next_ticket: 1,
@@ -276,6 +330,14 @@ impl ConnectionActor {
 
     pub(crate) fn subscribe_job_updates(&self) -> crate::JobSubscription {
         self.router.subscribe()
+    }
+
+    pub(crate) fn authentication_grant(&self) -> Option<&AuthenticationGrant> {
+        self.authentication_grant.as_ref()
+    }
+
+    pub(crate) fn invalidate_authorization(&mut self) {
+        self.close();
     }
 
     /// Applies one strictly decoded request and returns any external operation.
@@ -364,7 +426,7 @@ impl ConnectionActor {
     pub fn complete_authorization(
         &mut self,
         ticket: AuthenticationTicket,
-        result: Result<AuthenticatedWorker, AuthenticationError>,
+        result: Result<AuthenticationGrant, AuthenticationError>,
     ) -> Result<(), ConnectionActorError> {
         self.require_open()?;
         let expected = self
@@ -377,13 +439,15 @@ impl ConnectionActor {
         }
         let response_id = self.take_response_id(expected.1)?;
         match result {
-            Ok(worker) => {
+            Ok(grant) => {
                 // ZIP-301 repeats the authorized login on every share. Until the
                 // authentication interface carries an explicit alias set, accepting
                 // a different canonical login here would make authorization appear
                 // successful while every subsequent share fails `LoginMismatch`.
-                if worker.canonical_login() == ticket.worker {
+                if grant.worker().canonical_login() == ticket.worker {
+                    let worker = grant.worker().clone();
                     self.session.complete_authorization(worker.clone())?;
+                    self.authentication_grant = Some(grant);
                     self.telemetry.worker_connected(&worker);
                     self.telemetry_connected = true;
                     self.queue(Zip301ServerMessage::Boolean {
@@ -882,6 +946,7 @@ impl ConnectionActor {
         self.assignments.clear();
         self.advertised_lineage.clear();
         self.pending_authorization = None;
+        self.authentication_grant = None;
         self.pending_shares.clear();
         self.timing_order.clear();
         self.response_ids.clear();
@@ -1136,6 +1201,15 @@ mod tests {
         actor_with_router(outbound, router())
     }
 
+    fn grant(login: &str) -> AuthenticationGrant {
+        AuthenticationGrant::new(
+            AuthenticatedWorker::new(Uuid::from_u128(2), Uuid::from_u128(3), login)
+                .expect("worker identity is valid"),
+            Uuid::from_u128(4),
+        )
+        .expect("credential identity is valid")
+    }
+
     fn authorize(actor: &mut ConnectionActor) {
         actor
             .handle_request(
@@ -1161,13 +1235,7 @@ mod tests {
             unreachable!("fixture must request authorization")
         };
         actor
-            .complete_authorization(
-                ticket,
-                Ok(
-                    AuthenticatedWorker::new(Uuid::from_u128(2), Uuid::from_u128(3), "account.rig")
-                        .expect("worker identity is valid"),
-                ),
-            )
+            .complete_authorization(ticket, Ok(grant("account.rig")))
             .expect("authorization completes");
     }
 
@@ -1299,15 +1367,7 @@ mod tests {
         };
 
         actor
-            .complete_authorization(
-                ticket,
-                Ok(AuthenticatedWorker::new(
-                    Uuid::from_u128(2),
-                    Uuid::from_u128(3),
-                    "different.rig",
-                )
-                .expect("worker identity is valid")),
-            )
+            .complete_authorization(ticket, Ok(grant("different.rig")))
             .expect("mismatch is returned as a uniform denial");
 
         assert!(actor.is_closed());
@@ -1477,13 +1537,7 @@ mod tests {
         let ConnectionAction::Authenticate(ticket) = action else {
             unreachable!("fixture must request authorization")
         };
-        let result = actor.complete_authorization(
-            ticket,
-            Ok(
-                AuthenticatedWorker::new(Uuid::from_u128(2), Uuid::from_u128(3), "account.rig")
-                    .expect("worker identity is valid"),
-            ),
-        );
+        let result = actor.complete_authorization(ticket, Ok(grant("account.rig")));
         assert!(matches!(
             result,
             Err(ConnectionActorError::OutboundQueueFull { maximum: 2 })

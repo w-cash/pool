@@ -10,5 +10,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID
 AmbientCapabilities=

@@ -14,6 +14,9 @@ readonly ZECWEC_RELEASE_ROOT=/opt/wcash/releases
 readonly ZECWEC_CURRENT_RELEASE=/opt/wcash/current
 # shellcheck disable=SC2034
 readonly ZECWEC_LIBEXEC=/usr/local/libexec/zecwec
+# PostgreSQL 14 reaches upstream end-of-life during this Testnet launch window.
+# Keep the supported server floor explicit and compare PostgreSQL's numeric value.
+readonly ZECWEC_MINIMUM_POSTGRES_VERSION_NUM=160000
 
 log() {
     printf 'zecwec-deploy: %s\n' "$*" >&2
@@ -30,6 +33,38 @@ require_root() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+require_supported_postgres_server() {
+    local version_num
+    require_command runuser
+    require_command psql
+    if ! version_num=$(runuser --user postgres -- \
+        psql --dbname=postgres --no-psqlrc --set=ON_ERROR_STOP=1 \
+        --tuples-only --no-align --command='SHOW server_version_num'); then
+        die "PostgreSQL server version could not be established"
+    fi
+    [[ $version_num =~ ^[0-9]+$ ]] \
+        || die "PostgreSQL returned an invalid server_version_num"
+    ((10#$version_num >= ZECWEC_MINIMUM_POSTGRES_VERSION_NUM)) \
+        || die "PostgreSQL 16 or newer is required (server_version_num=$version_num)"
+}
+
+stop_testnet_runtime_after_failure() {
+    local settings=${1:-/etc/wcash-pool/deployment.env}
+    local cidrs=${2:-/etc/wcash-pool/miner-cidrs}
+    local deploy_dir
+    systemctl stop zecwec-testnet-pool.target wcash-pool-health.timer \
+        wcash-payout-worker.service zecwec-zallet-payout.service \
+        wcash-pool.service wcash-pool-projector.service >/dev/null 2>&1 || true
+    deploy_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    if [[ -x $deploy_dir/restrict-mining-firewall.sh \
+        && -f $settings && ! -L $settings \
+        && -f $cidrs && ! -L $cidrs ]]; then
+        "$deploy_dir/restrict-mining-firewall.sh" close "$settings" "$cidrs" \
+            >/dev/null 2>&1 \
+            || log "WARNING: could not close the mining firewall after runtime failure"
+    fi
 }
 
 require_unreadable_by_user() {
@@ -64,6 +99,9 @@ require_distinct_service_identities() {
     local identity uid gid seen_uids=, seen_gids=,
     for identity in \
         wcash-pool \
+        wcash-pool-migrate \
+        wcash-pool-projector \
+        wcash-payout \
         wcash-pool-backend \
         zecwec-zallet \
         zecwec-zallet-recovery; do
@@ -107,6 +145,18 @@ systemctl_value_strict() {
     printf '%s\n' "$value"
 }
 
+require_unit_without_dropins() {
+    local unit=${1:?systemd unit is required}
+    local paths
+    require_command systemctl
+    paths=$(systemctl show --property=DropInPaths --value "$unit") \
+        || die "could not inspect systemd drop-ins for $unit"
+    [[ $paths != *$'\n'* ]] \
+        || die "systemd returned ambiguous drop-ins for $unit"
+    [[ -z $paths ]] \
+        || die "$unit has unmanaged systemd drop-ins; archive them before deployment"
+}
+
 require_loaded_unit_fully_inactive() {
     local unit=${1:?unit is required}
     [[ $(systemctl_value_strict "$unit" LoadState) == loaded \
@@ -115,6 +165,25 @@ require_loaded_unit_fully_inactive() {
         && $(systemctl_value_strict "$unit" MainPID) == 0 \
         && $(systemctl_value_strict "$unit" ControlPID) == 0 ]] \
         || die "$unit is not loaded and fully inactive"
+}
+
+# Stop a unit when it exists, but allow an older release not to have introduced
+# it yet. A masked, generated, or otherwise ambiguous unit is never treated as
+# absent, and a real stop failure is fatal.
+stop_loaded_unit_strict() {
+    local unit=${1:?unit is required}
+    local load_state
+    load_state=$(systemctl_value_strict "$unit" LoadState)
+    case $load_state in
+        loaded)
+            systemctl stop "$unit" || die "could not stop loaded unit: $unit"
+            systemctl reset-failed "$unit" \
+                || die "could not clear the stopped unit's failure state: $unit"
+            require_loaded_unit_fully_inactive "$unit"
+            ;;
+        not-found) ;;
+        *) die "$unit has unexpected systemd load state: $load_state" ;;
+    esac
 }
 
 require_tcp_listener_absent() {
@@ -129,6 +198,64 @@ require_tcp_listener_absent() {
     fi
     [[ -z $listeners ]] || die "$label listener must be absent"
 }
+
+require_direct_origin_mtls_rejection() (
+    local host=${1:?origin hostname is required}
+    local address=${2:-127.0.0.1}
+    [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ \
+        && $host != *..* ]] || die "origin hostname is invalid"
+    [[ $address =~ ^[0-9a-fA-F:.]+$ ]] || die "origin probe address is invalid"
+    require_command curl
+    require_command mktemp
+
+    local scratch='' body='' errors='' metadata='' curl_status=0
+    local http_status='' verify_result='' remaining=''
+    scratch=$(mktemp -d)
+    # Expand the mktemp-owned path now because an EXIT trap runs after local
+    # function variables have left scope on the deployment host's Bash version.
+    # shellcheck disable=SC2064
+    trap "rm -rf -- $(printf '%q' "$scratch")" EXIT
+    body=$scratch/body
+    errors=$scratch/errors
+
+    # Do not use --fail here: nginx can report a missing client certificate as
+    # an explicit HTTP 400 on some TLS stacks. curl still verifies the server
+    # certificate and records that result even when TLS 1.3 rejects the client
+    # with a certificate_required alert.
+    if metadata=$(curl --silent --show-error --max-time 10 --noproxy '*' \
+        --header 'CF-Connecting-IP: 192.0.2.1' \
+        --resolve "$host:443:$address" \
+        --output "$body" \
+        --write-out $'%{http_code}\n%{ssl_verify_result}\n' \
+        "https://$host/healthz" 2>"$errors"); then
+        curl_status=0
+    else
+        curl_status=$?
+    fi
+    [[ $metadata == *$'\n'* ]] \
+        || die "direct origin probe returned invalid TLS metadata"
+    http_status=${metadata%%$'\n'*}
+    remaining=${metadata#*$'\n'}
+    [[ $remaining != *$'\n'* ]] \
+        || die "direct origin probe returned invalid TLS metadata"
+    verify_result=$remaining
+    [[ $http_status =~ ^[0-9]{3}$ && $verify_result =~ ^[0-9]+$ ]] \
+        || die "direct origin probe returned invalid TLS metadata"
+    [[ $verify_result == 0 ]] \
+        || die "direct origin probe could not verify the server certificate"
+
+    if ((curl_status != 0)); then
+        grep -Eiq '(^|[^[:alpha:]])(tlsv[0-9.]+ alert )?certificate required([^[:alpha:]]|$)' \
+            "$errors" \
+            || die "direct origin probe failed without proving client-certificate rejection"
+        return 0
+    fi
+    if [[ $http_status == 400 ]] \
+        && grep -Fqi 'No required SSL certificate was sent' "$body"; then
+        return 0
+    fi
+    die "direct origin did not explicitly reject the missing client certificate"
+)
 
 require_cleanup_trees_safe() {
     (($# > 0)) || die "cleanup tree is required"
@@ -203,7 +330,16 @@ stop_backend_units_for_zec_sealing() {
     local unit field expected actual
     require_command systemctl
     for unit in \
+        zecwec-testnet-pool-start.service \
+        wcash-pool-health.timer \
+        wcash-pool-health.service \
+        zecwec-cookie-refresh.path \
+        zecwec-cookie-refresh.service \
+        zecwec-testnet-pool.target \
         wcash-pool.service \
+        wcash-pool-projector.service \
+        wcash-payout-worker.service \
+        zecwec-zallet-payout.service \
         wcash-pool-backend.service \
         wcash-pool-backend-init.service \
         wcash-pool-migrate.service \
@@ -251,50 +387,80 @@ require_sealed_wcash_custody() {
         verify "$authority" "$attestation"
 }
 
-require_offline_collector_custody() {
+require_hot_testnet_payout_custody() {
     local settings=${1:?settings path is required}
     local release_root=${2:-${ZECWEC_RELEASE_PATH:-}}
     local wcash_seed wcash_authority wcash_recovery_attestation
-    local zallet_state zallet_config zallet_identity zallet_recovery_state
+    local payout_state zallet_state zallet_config zallet_payout_config
+    local zallet_identity zallet_identity_credential zallet_recovery_state
     local zallet_recovery_config zec_custody zec_original zec_recovered
     local zec_recovery_attestation zec_initial_zero zec_initial_zero_attestation
     local zec_recovery_verifier native_validator
     [[ $release_root == /opt/wcash/releases/* \
         && -d $release_root && ! -L $release_root \
         && $(realpath -e -- "$release_root") == "$release_root" ]] \
-        || die "offline custody gate requires one immutable release root"
+        || die "payout custody gate requires one immutable release root"
     require_exact_user_groups wcash-pool wcash-pool,wcash-pool-socket
-    require_exact_user_groups wcash-pool-backend wcash-pool-socket
+    require_exact_user_groups wcash-pool-migrate wcash-pool-migrate
+    require_exact_user_groups wcash-pool-projector wcash-pool-projector,wcash-pool-socket
+    require_exact_user_groups wcash-payout wcash-payout,wcash-pool-socket
+    require_exact_user_groups wcash-pool-backend wcash-pool-backend,wcash-pool-socket
     require_exact_user_groups zecwec-zallet zecwec-zallet
     require_exact_user_groups zecwec-zallet-recovery zecwec-zallet-recovery
     require_distinct_service_identities
     wcash_seed=$(read_setting "$settings" WEC_SEED_FILE)
-    wcash_authority=/var/lib/wcash-pool/wcash-wallet-authority.json
+    wcash_authority=/var/lib/wcash-payout/wcash-wallet-authority.json
     wcash_recovery_attestation=/var/lib/wcash-pool-secrets/wcash-wallet-recovery.attestation
     require_sealed_wcash_custody \
         "$wcash_seed" "$wcash_authority" "$wcash_recovery_attestation"
+    payout_state=$(read_setting "$settings" PAYOUT_STATE_DIR)
+    [[ $payout_state == /var/lib/wcash-payout && -d $payout_state && ! -L $payout_state \
+        && $(stat -c '%U:%G:%a' -- "$payout_state") == wcash-payout:wcash-payout:700 ]] \
+        || die "payout worker state directory is unsafe"
+    require_unreadable_by_user "$payout_state" wcash-pool "payout worker state"
     zallet_state=$(read_setting "$settings" ZALLET_STATE_DIR)
     zallet_config=$(read_setting "$settings" ZALLET_CONFIG_FILE)
+    zallet_payout_config=/etc/wcash-pool/zallet-payout.toml
     zallet_identity=$zallet_state/encryption-identity.txt
+    zallet_identity_credential=$(read_setting "$settings" ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL)
     zallet_recovery_state=/var/lib/zecwec-zallet-recovery
     zallet_recovery_config=/etc/wcash-pool/zallet-recovery.toml
     [[ $zallet_state == /var/lib/zecwec-zallet && -d $zallet_state && ! -L $zallet_state \
         && $(stat -c '%U:%G:%a' -- "$zallet_state") == zecwec-zallet:zecwec-zallet:700 ]] \
-        || die "offline Zallet state directory is unsafe"
+        || die "Zallet state directory is unsafe"
     [[ $zallet_config == /etc/wcash-pool/zallet.toml \
         && -f $zallet_config && ! -L $zallet_config \
-        && $(stat -c '%U:%G:%a:%h' -- "$zallet_config") == zecwec-zallet:zecwec-zallet:600:1 ]] \
-        || die "offline Zallet configuration is unsafe"
-    require_unreadable_by_user "$zallet_state" wcash-pool "offline Zallet state"
-    require_unreadable_by_user "$zallet_config" wcash-pool "offline Zallet configuration"
+        && $(stat -c '%U:%G:%a:%h' -- "$zallet_config") == root:zecwec-zallet:640:1 ]] \
+        || die "bootstrap Zallet configuration is unsafe"
+    [[ -f $zallet_payout_config && ! -L $zallet_payout_config \
+        && $(stat -c '%U:%G:%a:%h' -- "$zallet_payout_config") == \
+            root:zecwec-zallet:640:1 ]] \
+        || die "payout Zallet configuration is unsafe"
+    require_command runuser
+    runuser --user zecwec-zallet -- /usr/bin/test -r "$zallet_config" \
+        || die "bootstrap Zallet configuration is unreadable by its service identity"
+    runuser --user zecwec-zallet -- /usr/bin/test -r "$zallet_payout_config" \
+        || die "payout Zallet configuration is unreadable by its service identity"
+    require_unreadable_by_user "$zallet_state" wcash-pool "Zallet state"
+    require_unreadable_by_user "$zallet_config" wcash-pool "bootstrap Zallet configuration"
+    require_unreadable_by_user "$zallet_payout_config" wcash-pool \
+        "payout Zallet configuration"
     [[ ! -e $zallet_identity && ! -L $zallet_identity ]] \
-        || die "online Zallet decryption identity must be removed before mining"
+        || die "Zallet state contains an unsealed decryption identity"
+    [[ $zallet_identity_credential == /etc/wcash-pool/credentials/zallet-encryption-identity \
+        && -f $zallet_identity_credential && ! -L $zallet_identity_credential \
+        && $(stat -c '%U:%G:%a:%h' -- "$zallet_identity_credential") == root:root:400:1 ]] \
+        || die "sealed Zallet payout identity credential is unavailable or unsafe"
+    require_unreadable_by_user "$zallet_identity_credential" wcash-pool \
+        "sealed Zallet payout identity"
+    require_unreadable_by_user "$zallet_identity_credential" zecwec-zallet \
+        "sealed Zallet payout identity source"
     [[ ! -e $zallet_recovery_state && ! -L $zallet_recovery_state ]] \
         || die "isolated Zallet recovery state must be removed before mining"
     [[ -f $zallet_recovery_config && ! -L $zallet_recovery_config \
         && $(stat -c '%U:%G:%a:%h' -- "$zallet_recovery_config") == \
             root:zecwec-zallet-recovery:640:1 ]] \
-        || die "offline Zallet recovery configuration is unsafe"
+        || die "Zallet recovery configuration is unsafe"
     require_unreadable_by_user "$zallet_state" zecwec-zallet-recovery \
         "original Zallet state"
 
@@ -351,6 +517,12 @@ require_offline_collector_custody() {
     ZEC_AUTHORITY_ATTESTATION=$zec_initial_zero_attestation \
         "$release_root/deployment/scripts/deploy/zec-authority-bootstrap.sh" \
         verify-sealed
+}
+
+# Kept as a compatibility name for older operator scripts. The gate now proves
+# isolated hot Testnet payout custody, not an offline/deferred runtime.
+require_offline_collector_custody() {
+    require_hot_testnet_payout_custody "$@"
 }
 
 require_absolute_path() {

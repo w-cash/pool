@@ -19,8 +19,9 @@ use thiserror::Error;
 use tokio::{sync::watch, time};
 use uuid::Uuid;
 use wcash_pool_store::{
-    Chain, PayoutBatch, PayoutBatchState, PayoutConfirmation, PayoutReorg, PayoutWatch,
-    PostgresStore, StoreError, WalletObservation, WalletReconciliation,
+    Chain, ConfirmedPayoutWatchCursor, PayoutBatch, PayoutBatchState, PayoutConfirmation,
+    PayoutReorg, PayoutWatch, PayoutWatchPage, PostgresStore, StoreError, WalletObservation,
+    WalletReconciliation,
 };
 use wcash_wec_payout_signer::NativeWalletError;
 
@@ -93,7 +94,14 @@ pub trait PayoutLifecycleStore: Send + Sync {
         &self,
         chain: Chain,
         maximum: u32,
-    ) -> LifecycleStoreFuture<'_, Vec<PayoutWatch>>;
+    ) -> LifecycleStoreFuture<'_, PayoutWatchPage>;
+
+    /// Acknowledges the confirmed page after a complete valid chain snapshot.
+    fn advance_confirmed_watch_cursor(
+        &self,
+        chain: Chain,
+        cursor: &ConfirmedPayoutWatchCursor,
+    ) -> LifecycleStoreFuture<'_, ()>;
 
     /// Confirms a broadcast transaction using exact best-chain evidence.
     fn confirm(
@@ -136,9 +144,22 @@ impl PayoutLifecycleStore for PostgresStore {
         &self,
         chain: Chain,
         maximum: u32,
-    ) -> LifecycleStoreFuture<'_, Vec<PayoutWatch>> {
+    ) -> LifecycleStoreFuture<'_, PayoutWatchPage> {
         Box::pin(async move {
             self.list_payout_watches(chain, maximum)
+                .await
+                .map_err(classify_store_error)
+        })
+    }
+
+    fn advance_confirmed_watch_cursor(
+        &self,
+        chain: Chain,
+        cursor: &ConfirmedPayoutWatchCursor,
+    ) -> LifecycleStoreFuture<'_, ()> {
+        let cursor = cursor.clone();
+        Box::pin(async move {
+            self.advance_confirmed_payout_watch_cursor(chain, &cursor)
                 .await
                 .map_err(classify_store_error)
         })
@@ -325,7 +346,7 @@ pub struct PayoutLoopPolicy {
     pub retry_maximum: Duration,
     /// Consecutive transient failures allowed before process shutdown.
     pub maximum_consecutive_failures: u32,
-    /// Maximum broadcast and recent-confirmed rows checked per pass.
+    /// Independent per-pass maximum for broadcasts and rotating confirmations.
     pub maximum_confirmation_watches: u32,
 }
 
@@ -411,17 +432,25 @@ impl AutomaticPayoutRuntime {
     /// An unresolved broadcast prevents another wallet snapshot or batch. Only
     /// an idle settlement path may reconcile, reserve, and sign fresh outputs.
     pub async fn tick(&self) -> Result<PayoutTick, PayoutRuntimeError> {
-        let watches = self
+        let page = self
             .store
             .payout_watches(self.chain, self.policy.maximum_confirmation_watches)
             .await
             .map_err(|failure| self.store_error("list_watches", failure))?;
+        validate_watch_page(self.chain, self.policy.maximum_confirmation_watches, &page)?;
+        let watches = &page.watches;
         let snapshot = self
             .authority
-            .snapshot(&watches)
+            .snapshot(watches)
             .await
             .map_err(|failure| self.observation_error("validator_snapshot", failure))?;
-        let confirmations_recorded = self.apply_snapshot(&watches, &snapshot).await?;
+        let confirmations_recorded = self.apply_snapshot(watches, &snapshot).await?;
+        if let Some(cursor) = &page.confirmed_cursor {
+            self.store
+                .advance_confirmed_watch_cursor(self.chain, cursor)
+                .await
+                .map_err(|failure| self.store_error("advance_watch_cursor", failure))?;
+        }
 
         let settlement = self.resume_settlement().await?;
         validate_resume_outcome(self.chain, &settlement)?;
@@ -492,6 +521,15 @@ impl AutomaticPayoutRuntime {
             }
             Err(failure) => return Err(self.store_error("create_batch", failure)),
         };
+        let derived_payout_total = batch
+            .outputs
+            .iter()
+            .try_fold(0u64, |sum, output| sum.checked_add(output.amount_zat));
+        let derived_liability_total = batch.outputs.iter().try_fold(0u64, |sum, output| {
+            (output.liability_amount_zat >= output.amount_zat)
+                .then(|| sum.checked_add(output.liability_amount_zat))
+                .flatten()
+        });
         if batch.chain != self.chain
             || batch.reconciliation_id != reconciliation.id
             || batch.id.is_nil()
@@ -500,6 +538,14 @@ impl AutomaticPayoutRuntime {
             || batch.ledger_root == [0; 32]
             || batch.ledger_sequence_cutoff == 0
             || batch.miner_total_zat == 0
+            || batch.payout_total_zat == 0
+            || batch.maximum_network_fee_zat == 0
+            || batch
+                .payout_total_zat
+                .checked_add(batch.maximum_network_fee_zat)
+                != Some(batch.miner_total_zat)
+            || derived_payout_total != Some(batch.payout_total_zat)
+            || derived_liability_total != Some(batch.miner_total_zat)
             || batch.outputs.is_empty()
         {
             return Err(PayoutRuntimeError::Invariant {
@@ -799,6 +845,54 @@ fn validate_authority_snapshot<'a>(
     Ok(responses)
 }
 
+fn validate_watch_page(
+    chain: Chain,
+    maximum: u32,
+    page: &PayoutWatchPage,
+) -> Result<(), PayoutRuntimeError> {
+    let invalid = || PayoutRuntimeError::Invariant {
+        chain,
+        operation: "payout_watch_page",
+    };
+    let maximum = usize::try_from(maximum).map_err(|_| invalid())?;
+    let mut broadcast_count = 0_usize;
+    let mut confirmed_count = 0_usize;
+    let mut last_confirmed = None;
+    let mut reached_confirmed = false;
+    for watch in &page.watches {
+        if watch.chain != chain {
+            return Err(invalid());
+        }
+        match watch.state {
+            PayoutBatchState::Broadcast if !reached_confirmed => {
+                broadcast_count = broadcast_count.saturating_add(1);
+            }
+            PayoutBatchState::Confirmed => {
+                reached_confirmed = true;
+                confirmed_count = confirmed_count.saturating_add(1);
+                last_confirmed = Some(watch.batch_id);
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    if broadcast_count > maximum || confirmed_count > maximum {
+        return Err(invalid());
+    }
+    match (&page.confirmed_cursor, last_confirmed) {
+        (None, None) => Ok(()),
+        (Some(cursor), Some(last))
+            if !cursor.checked_through_batch_id.is_nil()
+                && cursor.checked_through_batch_id == last
+                && !cursor
+                    .previous_batch_id
+                    .is_some_and(|batch_id| batch_id.is_nil()) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
 fn validate_confirmation(
     chain: Chain,
     snapshot: &AuthoritySnapshot,
@@ -947,6 +1041,10 @@ mod tests {
         created_keys: Vec<(Chain, Uuid, Uuid)>,
         confirmations: Vec<(Uuid, PayoutConfirmation)>,
         reorgs: Vec<(Uuid, PayoutReorg)>,
+        cursor_advances: Vec<(Chain, ConfirmedPayoutWatchCursor)>,
+        cursor_failure: Option<LifecycleStoreFailure>,
+        confirmation_failure: Option<LifecycleStoreFailure>,
+        reorg_failure: Option<LifecycleStoreFailure>,
         create_failure: Option<LifecycleStoreFailure>,
     }
 
@@ -993,14 +1091,44 @@ mod tests {
             &self,
             _chain: Chain,
             _maximum: u32,
-        ) -> LifecycleStoreFuture<'_, Vec<PayoutWatch>> {
+        ) -> LifecycleStoreFuture<'_, PayoutWatchPage> {
             Box::pin(async move {
                 let state = self.state.lock().unwrap();
                 if let Some(failure) = state.watch_failure {
                     Err(failure)
                 } else {
-                    Ok(state.watches.clone())
+                    let confirmed = state
+                        .watches
+                        .iter()
+                        .rfind(|watch| watch.state == PayoutBatchState::Confirmed);
+                    Ok(PayoutWatchPage {
+                        watches: state.watches.clone(),
+                        confirmed_cursor: confirmed.map(|watch| ConfirmedPayoutWatchCursor {
+                            generation: u64::try_from(state.cursor_advances.len()).unwrap(),
+                            previous_batch_id: state
+                                .cursor_advances
+                                .last()
+                                .map(|(_, cursor)| cursor.checked_through_batch_id),
+                            checked_through_batch_id: watch.batch_id,
+                        }),
+                    })
                 }
+            })
+        }
+
+        fn advance_confirmed_watch_cursor(
+            &self,
+            chain: Chain,
+            cursor: &ConfirmedPayoutWatchCursor,
+        ) -> LifecycleStoreFuture<'_, ()> {
+            let cursor = cursor.clone();
+            Box::pin(async move {
+                let mut state = self.state.lock().unwrap();
+                if let Some(failure) = state.cursor_failure {
+                    return Err(failure);
+                }
+                state.cursor_advances.push((chain, cursor));
+                Ok(())
             })
         }
 
@@ -1011,11 +1139,11 @@ mod tests {
         ) -> LifecycleStoreFuture<'_, ()> {
             let confirmation = confirmation.clone();
             Box::pin(async move {
-                self.state
-                    .lock()
-                    .unwrap()
-                    .confirmations
-                    .push((batch_id, confirmation));
+                let mut state = self.state.lock().unwrap();
+                if let Some(failure) = state.confirmation_failure {
+                    return Err(failure);
+                }
+                state.confirmations.push((batch_id, confirmation));
                 Ok(())
             })
         }
@@ -1027,7 +1155,11 @@ mod tests {
         ) -> LifecycleStoreFuture<'_, ()> {
             let evidence = evidence.clone();
             Box::pin(async move {
-                self.state.lock().unwrap().reorgs.push((batch_id, evidence));
+                let mut state = self.state.lock().unwrap();
+                if let Some(failure) = state.reorg_failure {
+                    return Err(failure);
+                }
+                state.reorgs.push((batch_id, evidence));
                 Ok(())
             })
         }
@@ -1132,13 +1264,16 @@ mod tests {
             reconciliation_id,
             ledger_root: [0x62; 32],
             ledger_sequence_cutoff: 8,
-            miner_total_zat: 10_000,
+            miner_total_zat: 10_001,
+            payout_total_zat: 10_000,
+            maximum_network_fee_zat: 1,
             outputs: vec![PayoutInstruction {
                 allocation_id: Uuid::from_u128(0x2001),
                 account_id: Uuid::from_u128(0x2002),
                 destination_id: Uuid::from_u128(0x2003),
                 receiver_kind: ReceiverKind::Ironwood,
                 address: "test-only-recipient".to_owned(),
+                liability_amount_zat: 10_001,
                 amount_zat: 10_000,
             }],
         }
@@ -1376,8 +1511,128 @@ mod tests {
             })
         ));
         assert_eq!(store.state.lock().unwrap().reorgs, [(BATCH_ID, evidence)]);
+        assert!(store.state.lock().unwrap().cursor_advances.is_empty());
         assert_eq!(wallet.calls.load(Ordering::SeqCst), 0);
         assert!(settlement.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmed_cursor_advances_only_after_a_complete_valid_snapshot() {
+        let chain = Chain::Wcash;
+        let prior = PayoutConfirmation {
+            block_hash: [0x93; 32],
+            block_height: 101,
+            confirmations: 100,
+        };
+        let watch = PayoutWatch {
+            batch_id: BATCH_ID,
+            chain,
+            state: PayoutBatchState::Confirmed,
+            transaction_id: [0x94; 32],
+            prior_confirmation: Some(prior.clone()),
+        };
+        let store = Arc::new(FakeStore::default());
+        {
+            let mut state = store.state.lock().unwrap();
+            state.watches.push(watch.clone());
+            state.create_failure = Some(LifecycleStoreFailure::NoPayableBalances);
+        }
+        let wallet = Arc::new(FakeWallet {
+            chain,
+            observation: Ok(observation(chain)),
+            calls: AtomicUsize::new(0),
+        });
+        let authority = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Ok(snapshot(
+                chain,
+                vec![AuthorityPayoutObservation {
+                    batch_id: BATCH_ID,
+                    transaction_id: watch.transaction_id,
+                    state: AuthorityPayoutState::Mined(prior),
+                }],
+            )),
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, _) = runtime(
+            chain,
+            store.clone(),
+            wallet,
+            authority,
+            [Ok(ResumeOutcome::Idle)],
+        )
+        .unwrap();
+
+        runtime.tick().await.unwrap();
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.cursor_advances.len(), 1);
+        assert_eq!(state.cursor_advances[0].0, chain);
+        assert_eq!(
+            state.cursor_advances[0].1.checked_through_batch_id,
+            BATCH_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_confirmed_snapshot_and_failed_reorg_never_advance_cursor() {
+        let chain = Chain::Zcash;
+        let prior = PayoutConfirmation {
+            block_hash: [0x95; 32],
+            block_height: 100,
+            confirmations: 101,
+        };
+        let watch = PayoutWatch {
+            batch_id: BATCH_ID,
+            chain,
+            state: PayoutBatchState::Confirmed,
+            transaction_id: [0x96; 32],
+            prior_confirmation: Some(prior.clone()),
+        };
+        let store = Arc::new(FakeStore::default());
+        store.state.lock().unwrap().watches.push(watch.clone());
+        let wallet = Arc::new(FakeWallet {
+            chain,
+            observation: Ok(observation(chain)),
+            calls: AtomicUsize::new(0),
+        });
+        let incomplete = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Ok(snapshot(chain, Vec::new())),
+            calls: AtomicUsize::new(0),
+        });
+        let (invalid_runtime, _) =
+            runtime(chain, store.clone(), wallet.clone(), incomplete, []).unwrap();
+        assert!(invalid_runtime.tick().await.is_err());
+        assert!(store.state.lock().unwrap().cursor_advances.is_empty());
+
+        store.state.lock().unwrap().reorg_failure = Some(LifecycleStoreFailure::Unavailable);
+        let failed_reorg = PayoutReorg {
+            prior_confirmation: prior,
+            replacement_tip_hash: [0x51; 32],
+            replacement_tip_height: 200,
+            observed_at: 1_001,
+        };
+        let authority = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Ok(snapshot(
+                chain,
+                vec![AuthorityPayoutObservation {
+                    batch_id: BATCH_ID,
+                    transaction_id: watch.transaction_id,
+                    state: AuthorityPayoutState::Reorged(failed_reorg),
+                }],
+            )),
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, _) = runtime(chain, store.clone(), wallet, authority, []).unwrap();
+        assert!(matches!(
+            runtime.tick().await,
+            Err(PayoutRuntimeError::StoreUnavailable {
+                operation: "mark_reorged",
+                ..
+            })
+        ));
+        assert!(store.state.lock().unwrap().cursor_advances.is_empty());
     }
 
     #[tokio::test]

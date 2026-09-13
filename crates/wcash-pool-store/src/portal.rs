@@ -19,8 +19,7 @@ use crate::{
     Chain, DeploymentNetwork, NewPortalSessionRecord, PostgresStore, StoreError,
 };
 
-const MINIMUM_REPLACEMENT_HOLD_SECS: u64 = 24 * 60 * 60;
-const MAXIMUM_REPLACEMENT_HOLD_SECS: u64 = 72 * 60 * 60;
+const PAYOUT_CONFIGURATION_HOLD_SECS: u64 = 48 * 60 * 60;
 const MAXIMUM_MONEY_ZAT: u64 = 2_100_000_000_000_000;
 const MAXIMUM_WORKERS_PER_ACCOUNT: i64 = 100;
 
@@ -55,6 +54,14 @@ impl PortalRepository for PostgresStore {
             } else {
                 Err(RepositoryError::InvalidState)
             }
+        })
+    }
+
+    fn payout_worker_is_live(&self) -> RepositoryFuture<'_, bool> {
+        Box::pin(async move {
+            PostgresStore::payout_worker_is_live(self)
+                .await
+                .map_err(repository_error)
         })
     }
 
@@ -260,7 +267,6 @@ impl PortalRepository for PostgresStore {
             receiver_kind: change.destination.receiver_kind(),
             threshold_zat: change.threshold_zat,
             automatic: change.automatic,
-            changed_at: change.changed_at,
             replacement_hold_secs: change.replacement_hold_secs,
             address_digest: *change.address_digest,
         };
@@ -501,7 +507,6 @@ struct OwnedPayoutPreference {
     receiver_kind: PortalReceiverKind,
     threshold_zat: u64,
     automatic: bool,
-    changed_at: u64,
     replacement_hold_secs: u64,
     address_digest: [u8; 32],
 }
@@ -511,9 +516,9 @@ async fn configure_payout(
     change: OwnedPayoutPreference,
 ) -> Result<PayoutSettingSummary, RepositoryError> {
     if change.account_id.is_nil()
-        || change.changed_at == 0
         || change.threshold_zat == 0
         || change.threshold_zat > MAXIMUM_MONEY_ZAT
+        || change.replacement_hold_secs != PAYOUT_CONFIGURATION_HOLD_SECS
         || change.address_digest.iter().all(|byte| *byte == 0)
     {
         return Err(RepositoryError::InvalidState);
@@ -521,106 +526,20 @@ async fn configure_payout(
     require_network(store, change.network)?;
     let chain = chain_for_asset(change.asset);
     let mut transaction = store.pool.begin().await.map_err(repository_error)?;
-    sqlx::query(
-        "SELECT id FROM accounts \
-         WHERE deployment_id=$1 AND id=$2 AND enabled FOR UPDATE",
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT public.configure_payout_destination_v1( \
+             $1,$2,$3,$4,$5,$6,$7,$8,$9)",
     )
     .bind(store.identity.id)
-    .bind(change.account_id)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(repository_error)?
-    .ok_or(RepositoryError::NotFound)?;
-    let next_revision = sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(MAX(revision),0)+1 FROM payout_change_events \
-         WHERE deployment_id=$1 AND account_id=$2 AND chain=$3",
-    )
-    .bind(store.identity.id)
-    .bind(change.account_id)
-    .bind(chain.as_str())
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(repository_error)?;
-    let has_active = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM payout_destinations \
-         WHERE deployment_id=$1 AND account_id=$2 AND chain=$3 AND state='active')",
-    )
-    .bind(store.identity.id)
-    .bind(change.account_id)
-    .bind(chain.as_str())
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(repository_error)?;
-    let (state, active_after) = if has_active {
-        if !(MINIMUM_REPLACEMENT_HOLD_SECS..=MAXIMUM_REPLACEMENT_HOLD_SECS)
-            .contains(&change.replacement_hold_secs)
-        {
-            return Err(RepositoryError::InvalidState);
-        }
-        (
-            "pending",
-            change
-                .changed_at
-                .checked_add(change.replacement_hold_secs)
-                .ok_or(RepositoryError::InvalidState)?,
-        )
-    } else {
-        ("active", change.changed_at)
-    };
-    sqlx::query(
-        "UPDATE payout_destinations SET state='disabled',disabled_at=to_timestamp($4) \
-         WHERE deployment_id=$1 AND account_id=$2 AND chain=$3 AND state='pending'",
-    )
-    .bind(store.identity.id)
-    .bind(change.account_id)
-    .bind(chain.as_str())
-    .bind(unix_i64(change.changed_at).map_err(repository_error)?)
-    .execute(&mut *transaction)
-    .await
-    .map_err(repository_error)?;
-    let destination_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO payout_destinations \
-         (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by, \
-          validated_at,active_after,address_digest,payout_threshold_zat,automatic,state, \
-          created_at,revision) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'portal-authoritative-address-v1', \
-                 to_timestamp($8),to_timestamp($9),$10,$11,$12,$13,to_timestamp($8),$14)",
-    )
-    .bind(store.identity.id)
-    .bind(destination_id)
     .bind(change.account_id)
     .bind(chain.as_str())
     .bind(change.network.as_str())
     .bind(&change.canonical_address)
     .bind(portal_receiver_name(change.receiver_kind))
-    .bind(unix_i64(change.changed_at).map_err(repository_error)?)
-    .bind(unix_i64(active_after).map_err(repository_error)?)
     .bind(change.address_digest.as_slice())
     .bind(i64::try_from(change.threshold_zat).map_err(|_| RepositoryError::InvalidState)?)
     .bind(change.automatic)
-    .bind(state)
-    .bind(next_revision)
-    .execute(&mut *transaction)
-    .await
-    .map_err(repository_error)?;
-    sqlx::query(
-        "INSERT INTO payout_change_events \
-         (deployment_id,id,account_id,chain,address_digest,payout_threshold_zat,automatic, \
-          requested_at,active_after,revision) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,to_timestamp($8),to_timestamp($9),$10)",
-    )
-    .bind(store.identity.id)
-    .bind(Uuid::new_v4())
-    .bind(change.account_id)
-    .bind(chain.as_str())
-    .bind(change.address_digest.as_slice())
-    .bind(i64::try_from(change.threshold_zat).map_err(|_| RepositoryError::InvalidState)?)
-    .bind(change.automatic)
-    .bind(unix_i64(change.changed_at).map_err(repository_error)?)
-    .bind(unix_i64(active_after).map_err(repository_error)?)
-    .bind(next_revision)
-    .execute(&mut *transaction)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(repository_error)?;
     let setting = payout_setting_in_transaction(
@@ -639,17 +558,11 @@ async fn payout_settings(
     store: &PostgresStore,
     account_id: Uuid,
     network: ChainNetwork,
-    now: u64,
+    _now: u64,
 ) -> Result<Vec<PayoutSettingSummary>, RepositoryError> {
     require_network(store, network)?;
     if account_id.is_nil() {
         return Err(RepositoryError::NotFound);
-    }
-    for chain in [Chain::Wcash, Chain::Zcash] {
-        store
-            .activate_due_payout_destinations(chain, now)
-            .await
-            .map_err(repository_error)?;
     }
     let mut transaction = store.pool.begin().await.map_err(repository_error)?;
     let mut settings = Vec::with_capacity(2);
@@ -675,17 +588,16 @@ async fn active_payout_destination(
     account_id: Uuid,
     asset: Asset,
     network: ChainNetwork,
-    now: u64,
+    _now: u64,
 ) -> Result<Option<ValidatedDestination>, RepositoryError> {
     require_network(store, network)?;
     let chain = chain_for_asset(asset);
-    store
-        .activate_due_payout_destinations(chain, now)
-        .await
-        .map_err(repository_error)?;
     let row = sqlx::query(
         "SELECT address,receiver_kind,network FROM payout_destinations \
-         WHERE deployment_id=$1 AND account_id=$2 AND chain=$3 AND state='active'",
+         WHERE deployment_id=$1 AND account_id=$2 AND chain=$3 AND state='active' \
+           AND NOT EXISTS (SELECT 1 FROM payout_destinations pending \
+               WHERE pending.deployment_id=$1 AND pending.account_id=$2 \
+                 AND pending.chain=$3 AND pending.state='pending')",
     )
     .bind(store.identity.id)
     .bind(account_id)
@@ -725,7 +637,7 @@ async fn payout_setting_in_transaction(
 ) -> Result<Option<PayoutSettingSummary>, RepositoryError> {
     let rows = sqlx::query(
         "SELECT address,receiver_kind,state, \
-                EXTRACT(EPOCH FROM active_after)::BIGINT AS active_after, \
+                FLOOR(EXTRACT(EPOCH FROM active_after))::BIGINT AS active_after, \
                 payout_threshold_zat,automatic,revision \
          FROM payout_destinations \
          WHERE deployment_id=$1 AND account_id=$2 AND chain=$3 \
@@ -747,6 +659,9 @@ async fn payout_setting_in_transaction(
     let mut threshold_zat = 0;
     let mut automatic = false;
     let mut revision = 0;
+    let mut pending_threshold_zat = None;
+    let mut pending_automatic = None;
+    let mut pending_revision = None;
     for row in rows {
         let state = row
             .try_get::<String, _>("state")
@@ -763,23 +678,29 @@ async fn payout_setting_in_transaction(
                 .map_err(|_| RepositoryError::InvalidState)?,
         )
         .map_err(|_| RepositoryError::InvalidState)?;
-        if row_revision >= revision {
-            revision = row_revision;
-            threshold_zat = u64::try_from(
-                row.try_get::<i64, _>("payout_threshold_zat")
-                    .map_err(|_| RepositoryError::InvalidState)?,
-            )
+        let row_threshold = u64::try_from(
+            row.try_get::<i64, _>("payout_threshold_zat")
+                .map_err(|_| RepositoryError::InvalidState)?,
+        )
+        .map_err(|_| RepositoryError::InvalidState)?;
+        let row_automatic = row
+            .try_get::<bool, _>("automatic")
             .map_err(|_| RepositoryError::InvalidState)?;
-            automatic = row
-                .try_get("automatic")
-                .map_err(|_| RepositoryError::InvalidState)?;
-        }
         match state.as_str() {
             "active" => {
+                if active_destination.is_some() {
+                    return Err(RepositoryError::InvalidState);
+                }
                 active_destination = Some(mask_destination(&address));
                 active_receiver = Some(receiver);
+                threshold_zat = row_threshold;
+                automatic = row_automatic;
+                revision = row_revision;
             }
             "pending" => {
+                if pending_destination.is_some() {
+                    return Err(RepositoryError::InvalidState);
+                }
                 pending_destination = Some(mask_destination(&address));
                 pending_effective_at = Some(
                     unix_u64(
@@ -788,6 +709,9 @@ async fn payout_setting_in_transaction(
                     )
                     .map_err(repository_error)?,
                 );
+                pending_threshold_zat = Some(row_threshold);
+                pending_automatic = Some(row_automatic);
+                pending_revision = Some(row_revision);
             }
             _ => return Err(RepositoryError::InvalidState),
         }
@@ -802,6 +726,9 @@ async fn payout_setting_in_transaction(
         threshold_zat,
         automatic,
         revision,
+        pending_threshold_zat,
+        pending_automatic,
+        pending_revision,
     }))
 }
 
@@ -962,10 +889,30 @@ async fn payout_history(
 ) -> Result<Page<MinerPayoutSummary>, RepositoryError> {
     validate_page(account_id, page)?;
     let rows = sqlx::query(
-        "SELECT b.portal_sequence,b.id,b.chain,i.amount_zat,b.state,b.transaction_id, \
-                b.confirmation_height \
+        "SELECT b.portal_sequence,b.id,b.chain,i.amount_zat, \
+                COALESCE(i.liability_amount_zat,i.amount_zat) AS gross_amount_zat, \
+                CASE WHEN i.liability_amount_zat IS NULL THEN NULL \
+                     ELSE i.liability_amount_zat-i.amount_zat END AS reserved_network_fee_zat, \
+                CASE WHEN b.state IN ('confirmed','reorged') \
+                           AND i.liability_amount_zat IS NOT NULL \
+                     THEN (i.liability_amount_zat-i.amount_zat)-fee_refund.amount_zat \
+                     ELSE NULL END AS actual_network_fee_zat, \
+                CASE WHEN b.state IN ('confirmed','reorged') \
+                           AND i.liability_amount_zat IS NOT NULL \
+                     THEN fee_refund.amount_zat \
+                     ELSE NULL END AS refunded_network_fee_zat, \
+                b.state,b.transaction_id,b.confirmation_height \
          FROM payout_items i JOIN payout_batches b \
            ON (b.deployment_id,b.id)=(i.deployment_id,i.batch_id) \
+         LEFT JOIN LATERAL ( \
+             SELECT (-COALESCE(SUM(e.amount_zat),0))::BIGINT AS amount_zat \
+               FROM ledger_transactions t JOIN ledger_entries e \
+                 ON (e.deployment_id,e.transaction_id)=(t.deployment_id,t.id) \
+              WHERE t.deployment_id=i.deployment_id \
+                AND t.kind='payout_confirmed' AND t.reference=b.id::TEXT \
+                AND e.account_id=i.account_id \
+                AND e.ledger_account='miner_payable' AND e.amount_zat < 0 \
+         ) fee_refund ON TRUE \
          WHERE i.deployment_id=$1 AND i.account_id=$2 \
            AND ($3::BIGINT IS NULL OR b.portal_sequence < $3) \
          ORDER BY b.portal_sequence DESC LIMIT $4",
@@ -992,6 +939,16 @@ async fn payout_history(
                     .try_get("id")
                     .map_err(|_| RepositoryError::InvalidState)?,
                 asset: asset_from_row(&row)?,
+                gross_amount_zat: positive_u64(&row, "gross_amount_zat")?,
+                reserved_network_fee_zat: optional_nonnegative_u64(
+                    &row,
+                    "reserved_network_fee_zat",
+                )?,
+                actual_network_fee_zat: optional_nonnegative_u64(&row, "actual_network_fee_zat")?,
+                refunded_network_fee_zat: optional_nonnegative_u64(
+                    &row,
+                    "refunded_network_fee_zat",
+                )?,
                 amount_zat: positive_u64(&row, "amount_zat")?,
                 state: safe_state(&row)?,
                 transaction_id,
@@ -1053,6 +1010,16 @@ fn nonnegative_u64(row: &sqlx::postgres::PgRow, column: &str) -> Result<u64, Rep
     .map_err(|_| RepositoryError::InvalidState)
 }
 
+fn optional_nonnegative_u64(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<Option<u64>, RepositoryError> {
+    row.try_get::<Option<i64>, _>(column)
+        .map_err(|_| RepositoryError::InvalidState)?
+        .map(|value| u64::try_from(value).map_err(|_| RepositoryError::InvalidState))
+        .transpose()
+}
+
 fn asset_from_row(row: &sqlx::postgres::PgRow) -> Result<Asset, RepositoryError> {
     Chain::parse(
         &row.try_get::<String, _>("chain")
@@ -1107,7 +1074,8 @@ impl PostgresPoolDataSource {
     /// Refreshes public chain, worker, and immutable fee-policy state.
     pub async fn refresh(&self) -> Result<(), StoreError> {
         let policies = sqlx::query(
-            "SELECT chain,fee_bps,policy_version FROM chain_policies \
+            "SELECT chain,fee_bps,maximum_network_fee_zat,maximum_network_fee_bps,policy_version \
+             FROM chain_policies \
              WHERE deployment_id=$1 ORDER BY chain",
         )
         .bind(self.store.identity.id)
@@ -1118,15 +1086,34 @@ impl PostgresPoolDataSource {
         }
         let mut wec_fee_bps = None;
         let mut zec_fee_bps = None;
+        let mut wec_maximum_network_fee_zat = None;
+        let mut wec_maximum_network_fee_bps = None;
+        let mut zec_maximum_network_fee_zat = None;
+        let mut zec_maximum_network_fee_bps = None;
         let mut fee_policy_revision = None;
         for row in policies {
             let fee = u16::try_from(row.try_get::<i32, _>("fee_bps")?)
                 .map_err(|_| StoreError::CorruptDatabaseState("portal pool fee"))?;
+            let maximum_network_fee_zat =
+                u64::try_from(row.try_get::<i64, _>("maximum_network_fee_zat")?)
+                    .map_err(|_| StoreError::CorruptDatabaseState("portal maximum network fee"))?;
+            let maximum_network_fee_bps =
+                u16::try_from(row.try_get::<i32, _>("maximum_network_fee_bps")?).map_err(|_| {
+                    StoreError::CorruptDatabaseState("portal maximum network fee rate")
+                })?;
             let revision = u64::try_from(row.try_get::<i64, _>("policy_version")?)
                 .map_err(|_| StoreError::CorruptDatabaseState("portal fee revision"))?;
             match Chain::parse(&row.try_get::<String, _>("chain")?)? {
-                Chain::Wcash => wec_fee_bps = Some(fee),
-                Chain::Zcash => zec_fee_bps = Some(fee),
+                Chain::Wcash => {
+                    wec_fee_bps = Some(fee);
+                    wec_maximum_network_fee_zat = Some(maximum_network_fee_zat);
+                    wec_maximum_network_fee_bps = Some(maximum_network_fee_bps);
+                }
+                Chain::Zcash => {
+                    zec_fee_bps = Some(fee);
+                    zec_maximum_network_fee_zat = Some(maximum_network_fee_zat);
+                    zec_maximum_network_fee_bps = Some(maximum_network_fee_bps);
+                }
             }
             fee_policy_revision = match fee_policy_revision {
                 None => Some(revision),
@@ -1175,6 +1162,10 @@ impl PostgresPoolDataSource {
                 .map(|job| u64::from(job.zcash_height.saturating_sub(1))),
             wec_fee_bps,
             zec_fee_bps,
+            wec_maximum_network_fee_zat,
+            wec_maximum_network_fee_bps,
+            zec_maximum_network_fee_zat,
+            zec_maximum_network_fee_bps,
             fee_policy_revision,
         };
         *self

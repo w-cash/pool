@@ -1,0 +1,57 @@
+[Unit]
+Description=Isolated ZecWec Testnet Zcash payout wallet
+Documentation=https://github.com/zcash/zallet
+PartOf=zecwec-testnet-pool.target
+Requires=wcash-pool-custody-gate.service @ZCASH_VALIDATOR_UNIT@
+BindsTo=@ZCASH_VALIDATOR_UNIT@
+After=network-online.target wcash-pool-custody-gate.service @ZCASH_VALIDATOR_UNIT@
+Wants=network-online.target
+Conflicts=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-zec-authority-bootstrap.service
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/zallet
+ConditionPathExists=@ZALLET_PAYOUT_CONFIG_FILE@
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=zecwec-zallet
+Group=zecwec-zallet
+SupplementaryGroups=
+UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
+LoadCredential=validator-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
+LoadCredential=encryption-identity:@ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL@
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh zallet
+ExecStart=@WCASH_RELEASE_ROOT@/zallet --datadir @ZALLET_STATE_DIR@ --config @ZALLET_PAYOUT_CONFIG_FILE@ start
+ExecStartPost=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/wait-zallet-ready.sh @ZALLET_RPC@
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=1200s
+TimeoutStopSec=60s
+LimitCORE=0
+StateDirectory=zecwec-zallet
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+InaccessiblePaths=-@POOL_STATE_DIR@ -@PAYOUT_STATE_DIR@ -@ZALLET_RECOVERY_STATE_DIR@ -/var/lib/zecwec-custody -/var/lib/wcash-pool-secrets
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=zecwec-testnet-pool.target

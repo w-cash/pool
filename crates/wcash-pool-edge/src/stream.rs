@@ -7,6 +7,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -27,6 +28,7 @@ use crate::{
 };
 
 const READ_BUFFER_BYTES: usize = 4 * 1024;
+const AUTHORIZATION_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Asynchronous boundary used by the stream driver for already prepared shares.
 ///
@@ -77,6 +79,7 @@ struct AcceptedStreamDriver {
     clock_origin_ms: u64,
     frame_started_at: Option<Instant>,
     idle_deadline: Instant,
+    authorization_revalidation_deadline: Option<Instant>,
 }
 
 impl fmt::Debug for AcceptedStreamDriver {
@@ -129,6 +132,7 @@ impl AcceptedStreamDriver {
             clock_origin_ms,
             frame_started_at: None,
             idle_deadline,
+            authorization_revalidation_deadline: None,
         })
     }
 
@@ -170,12 +174,22 @@ impl AcceptedStreamDriver {
                 .unwrap_or(self.idle_deadline);
             let frame_sleep = time::sleep_until(frame_deadline);
             tokio::pin!(frame_sleep);
+            let authorization_revalidation_deadline = self
+                .authorization_revalidation_deadline
+                .unwrap_or(self.idle_deadline);
+            let authorization_revalidation_sleep =
+                time::sleep_until(authorization_revalidation_deadline);
+            tokio::pin!(authorization_revalidation_sleep);
 
             let event = tokio::select! {
                 biased;
                 _ = &mut *shutdown => WaitEvent::Shutdown,
                 _ = &mut frame_sleep, if self.frame_started_at.is_some() => {
                     WaitEvent::FrameTimeout
+                }
+                _ = &mut authorization_revalidation_sleep,
+                    if self.authorization_revalidation_deadline.is_some() => {
+                    WaitEvent::AuthorizationRevalidation
                 }
                 _ = &mut idle_sleep => WaitEvent::IdleTimeout,
                 update = self.job_updates.receive() => WaitEvent::JobUpdate(update),
@@ -186,6 +200,11 @@ impl AcceptedStreamDriver {
                 WaitEvent::Shutdown => return Ok(StreamTermination::LocalShutdown),
                 WaitEvent::IdleTimeout => return Err(StreamDriverError::IdleTimeout),
                 WaitEvent::FrameTimeout => return Err(StreamDriverError::FrameReadTimeout),
+                WaitEvent::AuthorizationRevalidation => {
+                    if let Some(termination) = self.revalidate_authorization(shutdown).await? {
+                        return Ok(termination);
+                    }
+                }
                 WaitEvent::JobUpdate(update) => {
                     self.actor.apply_job_update(update?)?;
                     self.flush_outbound().await?;
@@ -268,6 +287,10 @@ impl AcceptedStreamDriver {
                 };
                 self.actor.complete_authorization(ticket, result)?;
                 self.flush_outbound().await?;
+                if self.actor.authentication_grant().is_some() {
+                    self.authorization_revalidation_deadline =
+                        Some(Instant::now() + AUTHORIZATION_REVALIDATION_INTERVAL);
+                }
                 if timed_out {
                     return Err(StreamDriverError::AuthorizationTimeout);
                 }
@@ -300,6 +323,48 @@ impl AcceptedStreamDriver {
             Ok(Some(StreamTermination::ActorClosed))
         } else {
             Ok(None)
+        }
+    }
+
+    async fn revalidate_authorization(
+        &mut self,
+        shutdown: &mut oneshot::Receiver<()>,
+    ) -> Result<Option<StreamTermination>, StreamDriverError> {
+        let Some(grant) = self.actor.authentication_grant().cloned() else {
+            self.authorization_revalidation_deadline = None;
+            return Ok(None);
+        };
+        let deadline = Instant::now() + self.config.authorization_timeout();
+        let (result, timed_out) = {
+            let revalidation = self.authentication.revalidate(&grant);
+            tokio::pin!(revalidation);
+            tokio::select! {
+                biased;
+                _ = &mut *shutdown => return Ok(Some(StreamTermination::LocalShutdown)),
+                result = time::timeout_at(deadline, &mut revalidation) => match result {
+                    Ok(result) => (result, false),
+                    Err(_) => (Err(AuthenticationError::Unavailable), true),
+                },
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.authorization_revalidation_deadline =
+                    Some(Instant::now() + AUTHORIZATION_REVALIDATION_INTERVAL);
+                Ok(None)
+            }
+            Err(AuthenticationError::Denied) => {
+                self.actor.invalidate_authorization();
+                Ok(Some(StreamTermination::ActorClosed))
+            }
+            Err(AuthenticationError::Unavailable) => {
+                self.actor.invalidate_authorization();
+                if timed_out {
+                    Err(StreamDriverError::AuthorizationRevalidationTimeout)
+                } else {
+                    Err(StreamDriverError::AuthorizationRevalidationUnavailable)
+                }
+            }
         }
     }
 
@@ -450,6 +515,7 @@ enum WaitEvent {
     Shutdown,
     IdleTimeout,
     FrameTimeout,
+    AuthorizationRevalidation,
     JobUpdate(Result<crate::JobUpdate, JobRouterError>),
     Read(io::Result<usize>),
 }
@@ -510,6 +576,12 @@ pub enum StreamDriverError {
     /// Credential verification exceeded its absolute deadline.
     #[error("ZIP-301 authorization deadline elapsed")]
     AuthorizationTimeout,
+    /// An authenticated worker could not be revalidated before the deadline.
+    #[error("ZIP-301 authorization revalidation deadline elapsed")]
+    AuthorizationRevalidationTimeout,
+    /// The authoritative store could not revalidate an authenticated worker.
+    #[error("ZIP-301 authorization revalidation service is unavailable")]
+    AuthorizationRevalidationUnavailable,
     /// One admitted share did not receive a backend result before its deadline.
     #[error("ZIP-301 share submission deadline elapsed")]
     SubmissionTimeout,
@@ -541,7 +613,7 @@ pub enum StreamDriverError {
 mod tests {
     use std::{
         future::pending,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::Duration,
     };
 
@@ -556,7 +628,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ConnectionCapacity, ConnectionLimits, MiningPolicy, RateLimit};
+    use crate::{
+        AuthenticationGrant, ConnectionCapacity, ConnectionLimits, MiningPolicy, RateLimit,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -568,12 +642,24 @@ mod tests {
             &'a self,
             ticket: &'a crate::AuthenticationTicket,
         ) -> Pin<
-            Box<dyn Future<Output = Result<AuthenticatedWorker, AuthenticationError>> + Send + 'a>,
+            Box<dyn Future<Output = Result<AuthenticationGrant, AuthenticationError>> + Send + 'a>,
         > {
             Box::pin(async move {
-                AuthenticatedWorker::new(Uuid::from_u128(2), Uuid::from_u128(3), ticket.worker())
-                    .map_err(|_| AuthenticationError::Denied)
+                let worker = AuthenticatedWorker::new(
+                    Uuid::from_u128(2),
+                    Uuid::from_u128(3),
+                    ticket.worker(),
+                )
+                .map_err(|_| AuthenticationError::Denied)?;
+                AuthenticationGrant::new(worker, Uuid::from_u128(4))
             })
+        }
+
+        fn revalidate<'a>(
+            &'a self,
+            _grant: &'a AuthenticationGrant,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuthenticationError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -585,9 +671,65 @@ mod tests {
             &'a self,
             _ticket: &'a crate::AuthenticationTicket,
         ) -> Pin<
-            Box<dyn Future<Output = Result<AuthenticatedWorker, AuthenticationError>> + Send + 'a>,
+            Box<dyn Future<Output = Result<AuthenticationGrant, AuthenticationError>> + Send + 'a>,
         > {
             Box::pin(pending())
+        }
+
+        fn revalidate<'a>(
+            &'a self,
+            _grant: &'a AuthenticationGrant,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuthenticationError>> + Send + 'a>> {
+            Box::pin(pending())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RevocableAuthentication {
+        live: AtomicBool,
+        revalidations: AtomicUsize,
+    }
+
+    impl RevocableAuthentication {
+        fn new() -> Self {
+            Self {
+                live: AtomicBool::new(true),
+                revalidations: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AuthenticationProvider for RevocableAuthentication {
+        fn authenticate<'a>(
+            &'a self,
+            ticket: &'a crate::AuthenticationTicket,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AuthenticationGrant, AuthenticationError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let worker = AuthenticatedWorker::new(
+                    Uuid::from_u128(2),
+                    Uuid::from_u128(3),
+                    ticket.worker(),
+                )
+                .map_err(|_| AuthenticationError::Denied)?;
+                AuthenticationGrant::new(worker, Uuid::from_u128(4))
+            })
+        }
+
+        fn revalidate<'a>(
+            &'a self,
+            _grant: &'a AuthenticationGrant,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuthenticationError>> + Send + 'a>> {
+            self.revalidations.fetch_add(1, Ordering::SeqCst);
+            let live = self.live.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if live {
+                    Ok(())
+                } else {
+                    Err(AuthenticationError::Denied)
+                }
+            })
         }
     }
 
@@ -1073,6 +1215,57 @@ mod tests {
         assert_eq!(capacity.available_permits(), 1);
         let mut byte = [0u8; 1];
         assert_eq!(client.read(&mut byte).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revoked_authorization_closes_an_existing_session_promptly() -> TestResult {
+        let (mut client, server) = tcp_pair().await?;
+        let config = edge_config(
+            Duration::from_secs(120),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let capacity = ConnectionCapacity::new(1)?;
+        let authentication = Arc::new(RevocableAuthentication::new());
+        let driver = standard_driver(
+            server,
+            actor(config, NonceProfile::FourByte),
+            authentication.clone(),
+            Arc::new(RejectingSubmissions::default()),
+            &capacity,
+        )?;
+        let (_stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(driver.run(stopped));
+        client
+            .write_all(
+                concat!(
+                    "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n",
+                    "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"account.rig\",\"x\"]}\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        for _ in 0..4 {
+            let _ = read_line(&mut client).await?;
+        }
+
+        authentication.live.store(false, Ordering::SeqCst);
+        time::advance(AUTHORIZATION_REVALIDATION_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(task.await??, StreamTermination::ActorClosed);
+        assert_eq!(authentication.revalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(capacity.available_permits(), 1);
+        let mut byte = [0u8; 1];
+        let peer_closed = match client.read(&mut byte).await {
+            Ok(0) => true,
+            Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+            Ok(_) => false,
+        };
+        assert!(peer_closed, "revoked connection must close without data");
         Ok(())
     }
 

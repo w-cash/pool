@@ -14,6 +14,10 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # Used by the audited Zcash transaction stack (including secp256k1).
+  "CC0-1.0",
+  # Used for Mozilla's public TLS root-certificate data.
+  "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "Unicode-3.0",

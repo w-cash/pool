@@ -10,32 +10,42 @@ This runbook deploys one account-based WEC/ZEC merged-mining **Testnet** pool:
   payout observations; calibrated hashrate projection remains unavailable;
 - one ZIP-301 work stream with independent Wcash and Zcash winner handling;
 - PPLNS accounting with zero launch fee and chain-separated liabilities;
-- deferred payout execution: collector spending keys stay offline while
-  mining runs, and the portal reports that state explicitly.
+- automatic threshold payouts from isolated hot Testnet collectors, with a
+  listener-free worker and chain-separated crash-safe signer journals.
 
 It does not enable Mainnet. Installing these files is not evidence that the
 pool is ASIC-ready. The private mining signal requires all source gates,
 independent collector-recovery proofs, initial-zero attestations, deployment
-preflight, restart/reorganization tests, and one real accepted ASIC share.
-Testnet payout transactions are a later, separately authorized ceremony and
-are not allowed to hold the mining work stream online.
+preflight, restart/reorganization tests, automatic payout evidence, and one
+real accepted ASIC share.
 
 ## Security boundaries
 
 The services run under separate Unix identities. `wcash-pool-backend` owns the
 AuxPoW authority, identity, append-only winner journal, and node credentials.
-`wcash-pool` owns miner sessions, the ledger, and the portal. It can reach the
-backend only through a
-`0660` Unix socket in a `0750` non-writable directory. `zecwec-zallet` owns its
-persistent wallet database and encryption identity, but it is stopped and
-disabled after the one-time collector authority is sealed.
+`wcash-pool` owns miner sessions and the public ledger/portal role, and has no
+payout or accounting-projection authority. It can reach the backend only
+through a `0660` Unix socket in a `0750` non-writable directory.
+`wcash-pool-projector` is a separate no-listener user with the sole runtime
+PostgreSQL capability to advance the exact Wolf event cursor and derived
+share, winner, and ledger rows. The public process waits for and verifies the
+same authority, sequence, and payload digest before acknowledging journal
+progress; projector delay therefore backpressures or stops mining instead of
+losing durable credits. `wcash-pool-migrate` is a separate no-listener user
+that receives only the schema-owner database credential while migrations run;
+the public UID can never inherit that credential through a shared process
+identity. `wcash-payout` is a distinct no-listener user that
+alone receives the Wcash seed credential, wallet database, payout journals,
+and payout PostgreSQL role. `zecwec-zallet` owns the Zcash collector database
+and receives its encryption identity through a private systemd credential;
+its RPC binds only to literal loopback.
 
-The live mining unit mounts neither collector seed, wallet database, signer
-journal, Zallet configuration, nor Zallet cookie; systemd also makes those
-paths inaccessible. Node cookies, payout addresses, the read-only Wcash IVK,
-database URLs, portal pepper, and TOTP key use systemd credential mounts. No
-spending seed appears in an argument, environment variable, unit, repository,
-log, or mining-process filesystem view.
+The public unit mounts neither collector seed, wallet database, signer journal,
+Zallet configuration, Zallet cookie, nor encryption identity; systemd also
+makes those paths inaccessible. The payout unit does not receive portal pepper,
+TOTP state, mining-token authority, or a public listener. No spending seed or
+wallet identity appears in an argument, environment variable, unit,
+repository, log, or public-process filesystem view.
 
 Zallet uses public Testnet, beta.3 RPC semantics, loopback RPC, and:
 
@@ -46,15 +56,28 @@ broadcast = false
 
 The payout pipeline persists exact transaction bytes before the independent
 Zebra RPC broadcasts them. Enabling Zallet broadcasting would violate the
-crash-recovery boundary and is rejected by the signer.
+crash-recovery boundary and is rejected by the signer. A deployment-scoped
+PostgreSQL lease is acquired before signer construction or journal recovery.
+Only an exact ready owner can heartbeat or clear readiness. The public portal
+reports payout execution as enabled only while that external heartbeat is
+fresh; configuration alone is never readiness evidence.
+
+An uncleanly killed payout worker can leave its 35-minute database-clock fence
+intact. Its replacement stays in a listener-free, heartbeat-free standby and
+retries acquisition for up to 36 minutes; it constructs no signer or wallet
+until PostgreSQL grants the lease. Start and rollback wait up to 70 minutes for
+that takeover plus the bounded startup path. This keeps the service process
+alive past systemd's restart burst without allowing overlapping signers.
 
 Release directories are root-owned and non-writable. Every service is rendered
 with one canonical `/opt/wcash/releases/<release-id>` path and never executes
 through the mutable `current` symlink. It verifies the selected binary against
-an exact four-entry `SHA256SUMS` manifest before execution. Installation also
-snapshots the matching templates, runbook, and scripts into that release and
-binds them with `DEPLOYMENT-SHA256SUMS`. Rollback renders from that exact
-snapshot, so old binaries can never be paired silently with new templates.
+an exact six-entry `SHA256SUMS` manifest before execution. The manifest covers
+all four executables plus Zallet's `PROVENANCE.json` and
+`ZALLET_SHA256SUM`. Installation also snapshots the matching templates,
+runbook, scripts, and exact Zallet patch set into that release and binds them
+with `DEPLOYMENT-SHA256SUMS`. Rollback renders from that exact snapshot, so old
+binaries can never be paired silently with new templates or provenance.
 The pool additionally pins the Wcash wallet digest in its policy.
 
 The launch accepts only direct Ironwood collector coinbase on both chains. A
@@ -74,8 +97,9 @@ this runbook and requires a separately reviewed ledger migration.
 | ZIP-301 plaintext | approved source CIDRs only | Legacy ASIC compatibility |
 | ZIP-301 TLS | approved source CIDRs only, nginx TLS | Preferred ASIC endpoint |
 | Wcash/Zcash/PostgreSQL RPC | loopback only | Live mining authorities |
-| Zallet RPC | offline during mining | Manual collector bootstrap and payout ceremony only |
+| Zallet payout RPC | loopback only | Isolated hot Testnet ZEC collector; no public listener |
 | Backend Unix socket | pool/backend group only | Immutable job and share authority |
+| Journal projector | no TCP listener | Exact Wolf-to-PostgreSQL monetary projection |
 
 The portal hostname must use Cloudflare Full (strict) mode with Authenticated
 Origin Pulls enabled. nginx requires Cloudflare's client certificate and
@@ -107,16 +131,24 @@ the plaintext port remains protected by source-restricted firewall rules.
 ## 1. Build and stage a release
 
 Build on a reviewed x86-64 Linux builder. Do not compile on the production
-host. The release directory must contain exactly these executable files and an
-exact manifest:
+host. Build pinned Zallet beta.3 with `scripts/build-zallet-testnet.sh`; retain
+its generated provenance and checksum beside the binary. The release directory
+must contain these exact artifacts and an exact six-entry manifest:
 
 ```text
 wcash-poold
 wcash-merge-miner
 wcash-wallet
 zallet
+PROVENANCE.json
+ZALLET_SHA256SUM
 SHA256SUMS
 ```
+
+Required CI performs two sequential clean Zallet builds from the pinned source
+and compares their exact `ZALLET_SHA256SUM` files. Before public deployment,
+repeat the build on two independent reviewed hosts and require the binary
+SHA-256 values to match; CI does not replace that cross-host release gate.
 
 Generate the manifest from inside the release directory, then transfer it over
 an authenticated channel. Run:
@@ -131,6 +163,25 @@ selects the release only when no `/opt/wcash/current` link exists. That link is
 only an operator selection marker: rendered services and policies contain the
 resolved immutable version directory. An existing release is accepted only if
 both its binary and deployment-package manifests verify exactly.
+
+For every later forward rollout, first install and independently review schema
+compatibility, then activate the staged version explicitly:
+
+```bash
+sudo scripts/deploy/activate-release.sh \
+  <release-id> \
+  /etc/wcash-pool/deployment.env \
+  /var/lib/wcash-pool-backend/backend-authority-protocol-v2.json \
+  /etc/wcash-pool/miner-cidrs \
+  --ack-forward-schema-compatible
+```
+
+Activation uses the same fail-closed transition as rollback: it verifies the
+target with the currently trusted tooling before stopping the live target,
+then renders the immutable target snapshot, switches the selector, migrates,
+runs preflight, snapshots credentials, and reopens listeners only after payout
+readiness and the complete health contract pass. It never rewinds the database.
+Any failed step after shutdown leaves public and payout services stopped.
 
 If an older deployment owns `wcash-pool.service`, archive and disable it before
 rendering any new unit:
@@ -191,15 +242,39 @@ proved that they belong to the intended account.
 
 ## 4. Provision PostgreSQL
 
+PostgreSQL 16 or newer is a launch prerequisite. PostgreSQL 14 is outside this
+deployment's tested support window and is rejected before provisioning mutates
+credentials or roles, and before preflight stops any running service. Upgrade
+and validate the host database first; do not bypass the numeric
+`server_version_num` gate.
+
 ```bash
 sudo scripts/deploy/provision-postgres.sh /etc/wcash-pool/deployment.env
 ```
 
-This creates or reconciles a schema-owning migrator and a separate runtime
-role. The runtime role cannot create databases, roles, or schema objects. It
-receives only connect, schema usage, table DML, and sequence permissions. The
-script generates strong local passwords and protected connection URL files; it
-never prints them or places them in process arguments.
+This creates or reconciles a schema-owning migrator plus distinct public,
+projector, and payout roles. No service role can create databases, roles, or
+schema objects. The migration unit uses its own Unix UID, receives no portal or
+custody credential, and cannot bind a socket. Provisioning also revokes legacy
+migrator default table and sequence grants plus default public function
+execution before installing the explicit least-authority matrix, so upgrades
+cannot silently restore broad public authority. It also removes every prior
+PostgreSQL role membership held by the migrator, public, projector, or payout
+login; `NOINHERIT` alone would still permit an explicit `SET ROLE` escalation.
+The public role has no DML on Wolf events, shares, winners,
+ledger, reconciliation, payout batch, payout item, reorg, or payout-worker
+lease tables. The projector alone inserts projection/accounting rows, but
+cannot mutate portal credentials, payout destinations, payout batches, or
+wallet state. The payout role has no mining-token, session, share, job, winner,
+or backend-event mutation authority. Payout-destination creation and activation
+and chain freezes cross narrow migrator-owned `SECURITY DEFINER` routines;
+direct service-role table updates are revoked. Every new or replacement
+destination receives an exact database-clock 48-hour pending hold and audit
+entry. Only the migrator binds deployment identity and chain policy; all
+runtimes verify those rows. Sequence access is granted only for each role's
+actual identity inserts. The script generates strong local passwords and
+protected connection URL files; it never prints them or places them in process
+arguments.
 
 ## 5. Discover, review, and freeze fresh wallet authorities
 
@@ -236,14 +311,15 @@ blocks):
 sudo systemctl restart wcash-pool-wallet-init.service
 ```
 
-This one-shot runs as `wcash-pool`, reads the seed only from its protected file
-on standard input, rejects an active public pool, and refuses a symlinked or
-foreign wallet database. It then performs one timeout-bounded serialized sync,
+This one-shot runs as the isolated `wcash-payout` identity, reads the seed only
+from its private systemd credential mount, rejects an active public pool or
+projector/payout worker, and refuses a symlinked or foreign wallet database. It
+then performs one timeout-bounded serialized sync,
 requires every Ironwood, legacy, transparent, pending, and spendable balance to
 be exactly zero, and writes only public authority data to:
 
 ```text
-/var/lib/wcash-pool/wcash-wallet-authority.json
+/var/lib/wcash-payout/wcash-wallet-authority.json
 ```
 
 Review its canonical `account_id`, `collector_payout_commitment`, genesis,
@@ -274,7 +350,7 @@ sudo scripts/deploy/seal-wcash-custody.sh \
   /etc/wcash-pool/deployment.env \
   /protected/recovery-init.json \
   /protected/recovery-identity.json \
-  /var/lib/wcash-pool/wcash-wallet-authority.json \
+  /var/lib/wcash-payout/wcash-wallet-authority.json \
   --ack-independent-offline-backup-recovery
 ```
 
@@ -287,8 +363,9 @@ restore. The verifier writes only a deterministic root-only attestation,
 changes the seed and its parent to `root:root` mode `0400`/`0700`, and proves
 with a dropped-privilege access check that `wcash-pool` cannot read it. Securely
 erase the temporary recovery output files after review. Re-running host
-provisioning preserves this sealed state. Reopening custody later is a
-separate, explicit payout ceremony; it must never overlap the mining service.
+provisioning preserves this sealed state. The payout worker receives a private
+systemd snapshot of the sealed seed; the public pool and backend identities
+remain unable to traverse or read its source directory.
 
 The wallet-bootstrap render also installs a disabled, manual-only recovery
 configuration and unit. The recovery instance has a distinct Unix identity,
@@ -453,7 +530,7 @@ backend-UID processes, revalidates it, and installs root `0400` evidence at:
 ```
 
 After the off-host ciphertext and identity restore is independently confirmed,
-close online Testnet custody:
+complete bootstrap and seal the hot Testnet payout credential:
 
 ```bash
 sudo "$ZECWEC_CEREMONY_RELEASE/deployment/scripts/deploy/finalize-zec-offline-custody.sh" \
@@ -464,12 +541,14 @@ sudo "$ZECWEC_CEREMONY_RELEASE/deployment/scripts/deploy/finalize-zec-offline-cu
 
 The finalizer requires the two captures, sealed recovery attestation,
 root-sealed initial-zero pair, exact recovery-completion binding, no mutation
-intent, and no unexpected custody entry. Only then does it remove the original
-on-host decryption identity, plaintext/ciphertext staging, completion marker,
-and isolated recovery datadir. The final gate proves both wallet identities
-have no process or listener and neither mining identity can traverse the
-remaining root-only five-file evidence set. These proofs and two payout
-commitments are the only collector facts the mining runtime needs.
+intent, and no unexpected custody entry. It copies the exact original Zallet
+encryption identity into the configured root-owned mode-`0400` systemd
+credential source, verifies any existing copy byte-for-byte, and only then
+removes the original identity, plaintext/ciphertext staging, completion marker,
+and isolated recovery datadir. The final gate proves the bootstrap and recovery
+processes/listeners are gone, neither public mining identity can traverse the
+remaining five-file evidence set or identity credential, and the Zallet user
+cannot read the credential source outside its service mount.
 
 ## 6. Initialize the immutable Wolf authority
 
@@ -521,38 +600,59 @@ instance, wallet collector commitments, and journal stream during startup.
 sudo scripts/deploy/preflight.sh /etc/wcash-pool/deployment.env
 ```
 
-This explicitly stops and disables the bootstrap wallets, proves the Wcash
-seed is sealed behind host DAC with a matching recovery attestation, proves
-the Zallet state and configuration are unreadable by the mining identity,
-starts the private backend, validates both frozen collector authorities and the
-immutable ZEC initial-zero evidence, runs migrations, grants the runtime role only its
-required DML, and runs a
-probe-only pool dependency graph without binding either the miner or portal
-listener. The preflight policy uses
+This explicitly stops the full target and every key-bearing runtime, disables
+the bootstrap/recovery wallets, proves the Wcash seed and Zallet encryption
+identity are root-sealed with matching off-host recovery evidence, and proves
+the public mining identity cannot read either custody store. It starts the
+private backend and projector only long enough to replay and validate the
+frozen authorities, runs migrations, grants the public, projector, and payout
+roles only their reviewed privileges, and runs a probe-only public dependency
+graph without binding either the miner or portal listener. After the credential
+snapshot, it stops and proves both the projector and backend fully inactive; an
+error or signal also stops them. The non-key-bearing credential path watcher
+remains enabled after success. Its reconciliation observes the inactive target
+and runtime roles, so a dormant cookie rotation only updates the protected
+digest snapshot and cannot start the backend, projector, pool, Zallet, or payout
+worker. The preflight policy uses
 `/run/credentials/wcash-pool-preflight.service`, never the runtime service's
 credential mount. The probe binds the current read-only Wcash/Zcash chain tips
 to the backend generation. It deliberately has no signer policy or wallet RPC
 path and does not construct a signer journal, invoke wallet commands, call
-transaction-submission RPCs, or change payout state.
+transaction-submission RPCs, or change settlement state. The surrounding
+orchestration can apply reviewed migrations and advance canonical derived
+accounting while replaying the journal; those are explicit durable operations,
+not capabilities of the probe-only payout composition path.
 
-The mining unit also declares a systemd conflict with Zallet and both bootstrap
-units. Starting any custody service therefore stops mining rather than allowing
-the offline-key invariant to drift silently. After `ExecStartPre` returns,
-`wcash-poold serve` validates the two node tips
-against Wolf's exact generation and binds the source-restricted listener. It
-spawns no payout task and cannot read either spending key. Payout settings and
-liabilities remain durable, while execution returns a stable unavailable
-response until an audited payout ceremony is deliberately activated.
+During live pool startup, the no-listener projector first replays Wolf's
+journal, projects any snapshot gap, then retains its own live identity-bound
+stream. It receives only its database credential and backend-socket group
+membership; `SocketBindDeny=any` prevents it from opening a TCP listener. The
+public mining unit requires and binds to that projector, conflicts with
+bootstrap and recovery wallets, and has inaccessible-path fences over all
+payout custody. After `ExecStartPre` returns,
+`wcash-poold serve` validates the two node tips against Wolf's exact generation
+and binds the source-restricted listener. It cannot compose automatic payout
+mode or read either spending key. The separate `wcash-payout-worker.service`
+has no listener and cannot read portal authentication credentials. It obtains
+the payout database role, acquires its DB-clock lease, begins heartbeating,
+then performs signer recovery and reconciliation. Readiness remains disabled
+until both chain runtimes exist and the exact lease owner marks itself ready.
 
 After success, a root-only path watcher fingerprints the three node cookies
-without logging their contents. A rotation stops the public pool, refreshes
-only the affected node/backend authorities, proves
-the sources stable, and then restarts the pool only if the Testnet target was
-already active. A failed or racing refresh leaves the pool stopped. Check logs
+without logging their contents. A rotation closes mining ingress before reading
+a possibly mid-rename cookie, then stops the full target before its
+`Upholds=` relationship can restart a dependent unit, refreshes only affected
+node/backend authorities, proves the sources stable, restores the earlier
+service state, waits for a fresh payout-owner heartbeat, restores the approved
+source rules and persisted edge mode, reruns the full health contract, and only
+then restarts the health timer. Any error or explicit early exit stops the target,
+health timer, projector, public pool, payout worker, and payout Zallet and leaves
+ingress closed after a failed or racing refresh. Check logs
 without copying credential-bearing environment or configuration files:
 
 ```bash
 sudo journalctl -u zecwec-zallet -u wcash-pool-backend \
+  -u wcash-pool-projector \
   -u wcash-pool-migrate -u wcash-pool-preflight \
   -u zecwec-cookie-refresh --since today
 ```
@@ -563,11 +663,29 @@ Create `/etc/wcash-pool/miner-cidrs`, root-owned mode `0600`, with one approved
 ASIC public CIDR per line. World-open CIDRs are rejected. The script removes
 generic rules for the current and legacy mining ports, preserves unrelated
 firewall rules, and requires UFW to already be active with default-deny input.
+It also owns a `ZECWEC-MINING-GUARD` chain in each filter ruleset and requires
+one unconditional jump to that chain as the first `INPUT` rule. The guard
+returns only exact approved IPv4 `/32` and IPv6 `/128` sources on ports 3333
+and 3443 plus the exact loopback interface/source used by nginx to reach the
+plaintext backend. It drops every other source plus every legacy-port attempt,
+then returns unrelated traffic to the host policy. This first-position guard
+makes an earlier direct `ACCEPT` or jump to another accepting chain a
+verification failure instead of an allowlist bypass.
+
+`apply` and `close` stage a closed replacement guard before changing UFW. The
+open replacement is activated only after the exact persistent UFW allowlist is
+installed. Guard replacement uses a new populated chain and a rule-one hook,
+so it never flushes the active chain in place. `check` is read-only and proves
+the exact guard order and contents in both address families as well as the UFW
+rule set.
 
 ```bash
 sudo scripts/deploy/restrict-mining-firewall.sh \
-  apply /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
+  close /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
 ```
+
+Do not open the allowlist manually for launch. The readiness-gated start command
+does that only after the payout worker proves a fresh lease.
 
 Install the reviewed certificates, but do not publish the web origin or mining
 DNS before this firewall gate. Install Cloudflare's current official
@@ -575,17 +693,8 @@ Authenticated Origin Pull CA at the exact configured root-owned path, enable
 Authenticated Origin Pulls for the `zecwec.com` zone, set SSL/TLS mode to Full
 (strict), and configure the edge to redirect HTTP to HTTPS. Do not substitute
 an arbitrary client CA. nginx snippets are staged in `sites-available` and
-`streams-available`. Enable only the source-restricted TLS mining edge for the
-private ASIC test; activation is atomic with `nginx -t`:
-
-```bash
-sudo scripts/deploy/enable-nginx-edge.sh \
-  stratum-only \
-  /etc/wcash-pool/deployment.env \
-  /etc/wcash-pool/miner-cidrs
-```
-
-This deliberately leaves the portal nginx site disabled. An SSH tunnel may be
+`streams-available`. The start command enables only the source-restricted TLS
+mining edge and deliberately leaves the portal site disabled. An SSH tunnel may be
 used for service diagnostics, but it is not browser E2E evidence: it does not
 exercise the canonical HTTPS origin, `Secure`/`__Host-` cookies, or Cloudflare
 Authenticated Origin Pulls.
@@ -603,11 +712,28 @@ sudo scripts/deploy/start-testnet-pool.sh \
   /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
 ```
 
-The command applies the source allowlist first, repeats probe-only listener-free
-preflight, enables only the source-restricted TLS Stratum listener, starts the
-pool, and stops `wcash-pool.service` if post-start health fails. Runtime payout
-execution is deferred; health requires that exact state and requires Zallet to
-be inactive with no wallet RPC listener.
+The command first removes all current and legacy mining allow rules, repeats
+probe-only listener-free preflight, starts the full Testnet target behind the
+closed firewall, and waits a bounded interval for signer recovery and a fresh
+payout-worker heartbeat. Only then does it restore the exact source allowlist,
+reconcile nginx to the durable portal launch mode, and run health. Health requires the public pool, backend,
+payout worker, and payout Zallet to be active; Zallet must listen only on
+literal loopback, `/readyz` must report `payout_execution=enabled`, and a
+failure stops every public/key-bearing pool component and closes mining ingress.
+
+The command enables `zecwec-testnet-pool-start.service` as the sole boot entry
+point. The raw target and health timer are deliberately not enabled: on every
+boot the one-shot entry point closes persisted UFW rules, repeats preflight,
+starts the target, waits for payout readiness, restores only the previously
+acknowledged edge mode, proves full health, and only then starts the minute
+health timer. The root-owned portal mode is persisted before its nginx link;
+missing, stale, or invalid state removes the managed link and fails closed. A
+failed scheduled health check closes the target, its listeners, and the mining
+firewall. The health unit retains only the additional `CAP_NET_ADMIN` capability
+needed to inspect and close the raw guard, and its otherwise read-only
+filesystem namespace exposes only UFW's configuration and the two existing
+firewall lock files as writable. There is no boot-time window where the timer
+can race a recovering payout lease.
 
 Before the browser gate, create a Cloudflare Access application covering
 `testnet.zecwec.com/*`, allow only the named Testnet operator identity, and
@@ -637,8 +763,11 @@ Before telling an operator to point an ASIC, prove all of the following:
   account, address, and payout commitment;
 - the Wcash recovery attestation matches the frozen authority and the mining
   identity cannot read or traverse either wallet custody store;
-- Zallet is stopped and no wallet RPC listener is present;
+- payout Zallet is active only on its configured loopback RPC; the bootstrap
+  and recovery Zallet units are inactive and the recovery port is absent;
 - backend identity, journal stream, payout commitments, and chain ID match;
+- the projector is active under its dedicated UID, has no TCP listener, and a
+  forced projector stop also closes public miner intake;
 - registration, login, TOTP, worker creation/revocation, and both payout
   destination flows work through HTTPS;
 - accepted/rejected/duplicate/stale shares update the correct worker metrics;
@@ -646,7 +775,10 @@ Before telling an operator to point an ASIC, prove all of the following:
 - restart/reorganization handling neither loses nor duplicates mining
   liabilities;
 - one actual ASIC share is accepted through the source-restricted endpoint;
-- payout execution reports `deferred` and cannot sign or broadcast.
+- payout execution reports `enabled` only from a fresh exact-owner DB heartbeat;
+- a matured Testnet payout can be constructed, journaled, broadcast through
+  the independent node path, confirmed, and recovered idempotently after a
+  forced restart.
 
 After every gate above has evidence recorded, remove the Cloudflare Access
 application, confirm the zone still uses Full (strict) and Authenticated Origin
@@ -675,10 +807,11 @@ sudo scripts/deploy/health-check.sh \
   --cidrs /etc/wcash-pool/miner-cidrs
 ```
 
-## Rollback and recovery
+## Release activation, rollback, and recovery
 
 Application rollback never rewinds the database. Use only a release explicitly
-reviewed as schema-compatible, and acknowledge that fact:
+reviewed as schema-compatible, from deployment security epoch 2 or newer, and
+acknowledge that fact:
 
 ```bash
 sudo scripts/deploy/rollback-release.sh \
@@ -693,10 +826,18 @@ The script verifies the mining artifact digests and the release-paired deploymen
 snapshot, stops the pool authorities and credential watcher, renders from that
 exact target release, atomically changes the selection link, verifies the
 immutable ZEC initial-zero evidence, reruns migration, probe-only preflight,
-and credential snapshotting, and then starts the pool. It keeps both wallet
-services stopped. A failed start or health check
-leaves the public pool service stopped. Database rollback is never automatic;
-the explicit schema-compatible acknowledgement is mandatory.
+and credential snapshotting, and then starts the full public+payout target. A
+failed start, payout-readiness wait, or health check leaves the target, health
+timer, public pool, payout worker, and payout Zallet stopped. Database rollback
+is never automatic; the explicit schema-compatible acknowledgement is
+mandatory.
+
+Epoch 1 is intentionally not rollback-compatible. Those packages predate the
+separate projector and migrator identities and can reinstall broad public
+database grants. The rollback script reads the immutable epoch marker and uses
+the current trusted verifier before stopping any service or executing target
+deployment code; an epoch-1 target therefore fails closed with the running
+epoch-2 service untouched.
 
 Back up PostgreSQL, the two payout journals, Wcash wallet database, Wcash seed,
 Zallet datadir and encryption identity, the ZEC initial-zero evidence, and the

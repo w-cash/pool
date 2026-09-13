@@ -102,7 +102,7 @@ pub struct RuntimeConfig {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PayoutMode {
-    /// Record exact liabilities while both collector spending keys stay offline.
+    /// Record exact liabilities without collector spending authority in this process.
     Deferred,
     /// Run the separately fenced automatic payout workers.
     Automatic,

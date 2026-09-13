@@ -2,7 +2,7 @@
 //!
 //! The Unix socket path provides a local routing and operating-system access-control
 //! boundary, but connecting to a path does not prove which process is listening. An
-//! operator must protect the containing directory and socket permissions. Protocol-v1
+//! operator must protect the containing directory and socket permissions. Protocol-v2
 //! network, payout-recipient commitment, backend-instance, and journal identity
 //! comparisons reject accidental misrouting, reward redirection, or replacement
 //! when the peer reports different identifiers. A process controlling the socket can

@@ -14,7 +14,10 @@ base64.workspace = true
 hex.workspace = true
 orchard = "=0.15.5"
 pczt = { version = "=0.9.3", features = ["io-finalizer", "signer", "tx-extractor", "zcp-builder"] }
-postcard = "=1.1.3"
+# PCZT already uses Postcard's allocation-backed wire format. Disable
+# Postcard's unrelated embedded `heapless-cas` default so the payout signer
+# does not ship the unmaintained `atomic-polyfill` dependency.
+postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

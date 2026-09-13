@@ -11,7 +11,7 @@ let authGeneration = 0;
 const history = {
   rewards: { cursor: null, columns: 5 },
   blocks: { cursor: null, columns: 5 },
-  payouts: { cursor: null, columns: 6 },
+  payouts: { cursor: null, columns: 10 },
 };
 
 function csrfToken() {
@@ -49,6 +49,26 @@ function formatCoin(value, asset) {
   const whole = Math.floor(value / ATOMIC_UNITS).toLocaleString();
   const fraction = String(value % ATOMIC_UNITS).padStart(8, "0");
   return `${whole}.${fraction} ${String(asset).toUpperCase()}`;
+}
+
+function formatOptionalCoin(value, asset) {
+  return value == null ? "—" : formatCoin(value, asset);
+}
+
+function formatBasisPoints(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? `${(value / 100).toFixed(2)}%` : "—";
+}
+
+function formatFeePolicy(data, asset) {
+  const prefix = asset === "wec" ? "wec" : "zec";
+  const poolFee = data[`${prefix}_fee_bps`];
+  const maximumFee = data[`${prefix}_maximum_network_fee_zat`];
+  const maximumRate = data[`${prefix}_maximum_network_fee_bps`];
+  if (![poolFee, maximumFee, maximumRate].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    return "Fee policy unavailable";
+  }
+  const revision = data.fee_policy_revision ? ` · policy v${data.fee_policy_revision}` : "";
+  return `Service fee ${formatBasisPoints(poolFee)} · payout transaction fee paid by miners; reserve capped at the lower of ${formatCoin(maximumFee, asset)}, ${formatBasisPoints(maximumRate)} of the gross batch, and the nonzero-output bound; unused reserve is returned${revision}`;
 }
 
 function formatTime(value) {
@@ -167,9 +187,8 @@ async function refreshOverview(generation = authGeneration) {
     setText("#pool-active-workers", formatCount(data.active_workers));
     setText("#wcash-height", formatCount(data.wcash_height));
     setText("#zcash-height", formatCount(data.zcash_height));
-    const revision = data.fee_policy_revision ? ` · policy v${data.fee_policy_revision}` : "";
-    setText("#wec-fee", `Pool fee ${data.wec_fee_bps == null ? "—" : `${(data.wec_fee_bps / 100).toFixed(2)}%`}${revision}`);
-    setText("#zec-fee", `Pool fee ${data.zec_fee_bps == null ? "—" : `${(data.zec_fee_bps / 100).toFixed(2)}%`}${revision}`);
+    setText("#wec-fee", formatFeePolicy(data, "wec"));
+    setText("#zec-fee", formatFeePolicy(data, "zec"));
     setText("#data-state", data.available ? "Pool projection live" : "Pool projection offline");
     $("#data-state").className = `status ${data.available ? "ok" : "warning"}`;
   } catch (reason) {
@@ -292,8 +311,14 @@ async function refreshPayoutSettings(generation = authGeneration) {
       if (!form) return;
       const result = $(".setting-result", form);
       const parts = [];
-      if (setting.active_destination) parts.push(`Active: ${setting.active_destination} · revision ${setting.revision}`);
-      if (setting.pending_destination) parts.push(`Pending: ${setting.pending_destination}`);
+      if (setting.active_destination) {
+        const mode = setting.automatic ? "automatic" : "paused";
+        parts.push(`Active: ${setting.active_destination} · threshold ${formatCoin(setting.threshold_zat, setting.asset)} · ${mode} · revision ${setting.revision}`);
+      }
+      if (setting.pending_destination) {
+        const pendingMode = setting.pending_automatic ? "automatic" : "paused";
+        parts.push(`Pending until ${formatTime(setting.pending_effective_at)}: ${setting.pending_destination} · threshold ${formatCoin(setting.pending_threshold_zat, setting.asset)} · ${pendingMode} · revision ${setting.pending_revision}`);
+      }
       result.textContent = parts.length ? parts.join(" · ") : "No payout destination configured.";
       if (setting.threshold_zat) form.elements.threshold_zat.value = setting.threshold_zat;
       form.elements.automatic.checked = setting.automatic;
@@ -322,6 +347,10 @@ function renderBlock(row, item) {
 
 function renderPayout(row, item) {
   appendCell(row, String(item.asset || "").toUpperCase());
+  appendCell(row, formatCoin(item.gross_amount_zat, item.asset || ""));
+  appendCell(row, formatOptionalCoin(item.reserved_network_fee_zat, item.asset || ""));
+  appendCell(row, formatOptionalCoin(item.actual_network_fee_zat, item.asset || ""));
+  appendCell(row, formatOptionalCoin(item.refunded_network_fee_zat, item.asset || ""));
   appendCell(row, formatCoin(item.amount_zat, item.asset || ""));
   appendStateCell(row, item.state);
   appendCell(row, item.batch_id || "—", "mono hash");
@@ -448,8 +477,8 @@ $$('.payout-form').forEach((form) => form.addEventListener("submit", async (even
     const setting = await api(`/api/v1/settings/payouts/${form.dataset.asset}`, { method: "PUT", body: JSON.stringify(payload) });
     if (!currentGeneration(generation)) return;
     result.textContent = setting.pending_destination
-      ? `Change held until ${formatTime(setting.pending_effective_at)}.`
-      : `Active destination: ${setting.active_destination}`;
+      ? `Pending until ${formatTime(setting.pending_effective_at)}: ${setting.pending_destination} · threshold ${formatCoin(setting.pending_threshold_zat, setting.asset)} · ${setting.pending_automatic ? "automatic" : "paused"} · revision ${setting.pending_revision}. No payout is created during the hold.`
+      : `Active: ${setting.active_destination} · threshold ${formatCoin(setting.threshold_zat, setting.asset)} · ${setting.automatic ? "automatic" : "paused"} · revision ${setting.revision}.`;
     form.elements.destination.value = "";
     form.elements.password.value = "";
     form.elements.totp_code.value = "";

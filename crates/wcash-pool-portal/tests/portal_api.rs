@@ -5,7 +5,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -58,8 +58,8 @@ struct SavedSession {
 
 #[derive(Clone)]
 struct PayoutState {
-    destination: ValidatedDestination,
-    pending: Option<(ValidatedDestination, u64)>,
+    destination: Option<ValidatedDestination>,
+    pending: Option<(ValidatedDestination, u64, u64, bool, u64)>,
     threshold_zat: u64,
     automatic: bool,
     revision: u64,
@@ -79,8 +79,13 @@ struct MemoryState {
     payout_history: HashMap<Uuid, Vec<MinerPayoutSummary>>,
 }
 
-#[derive(Default)]
-struct MemoryRepository(Mutex<MemoryState>);
+struct MemoryRepository(Mutex<MemoryState>, AtomicBool);
+
+impl Default for MemoryRepository {
+    fn default() -> Self {
+        Self(Mutex::new(MemoryState::default()), AtomicBool::new(true))
+    }
+}
 
 fn future<T: Send + 'static>(value: Result<T, RepositoryError>) -> RepositoryFuture<'static, T> {
     Box::pin(async move { value })
@@ -89,6 +94,10 @@ fn future<T: Send + 'static>(value: Result<T, RepositoryError>) -> RepositoryFut
 impl PortalRepository for MemoryRepository {
     fn readiness(&self) -> RepositoryFuture<'_, ()> {
         future(Ok(()))
+    }
+
+    fn payout_worker_is_live(&self) -> RepositoryFuture<'_, bool> {
+        future(Ok(self.1.load(Ordering::SeqCst)))
     }
 
     fn create_account<'a>(
@@ -398,31 +407,47 @@ impl PortalRepository for MemoryRepository {
         &self,
         change: PayoutPreferenceChange<'_>,
     ) -> RepositoryFuture<'_, PayoutSettingSummary> {
+        if change.replacement_hold_secs != 48 * 60 * 60 {
+            return future(Err(RepositoryError::InvalidState));
+        }
         let key = (change.account_id, change.destination.asset());
         let result = self
             .0
             .lock()
             .map_err(|_| RepositoryError::Unavailable)
-            .map(|mut state| {
-                let entry = state.payouts.entry(key).or_insert_with(|| PayoutState {
-                    destination: change.destination.clone(),
-                    pending: None,
-                    threshold_zat: change.threshold_zat,
-                    automatic: change.automatic,
-                    revision: 0,
-                });
-                if entry.destination.canonical_address() != change.destination.canonical_address() {
-                    entry.pending = Some((
+            .map(|mut state| match state.payouts.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    payout_summary(entry.insert(PayoutState {
+                        destination: None,
+                        pending: Some((
+                            change.destination.clone(),
+                            change.changed_at.saturating_add(48 * 60 * 60),
+                            change.threshold_zat,
+                            change.automatic,
+                            1,
+                        )),
+                        threshold_zat: 0,
+                        automatic: false,
+                        revision: 0,
+                    }))
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let payout = entry.get_mut();
+                    let pending_revision = payout
+                        .pending
+                        .as_ref()
+                        .map_or(payout.revision + 1, |pending| pending.4 + 1);
+                    payout.pending = Some((
                         change.destination.clone(),
                         change
                             .changed_at
                             .saturating_add(change.replacement_hold_secs),
+                        change.threshold_zat,
+                        change.automatic,
+                        pending_revision,
                     ));
+                    payout_summary(payout)
                 }
-                entry.threshold_zat = change.threshold_zat;
-                entry.automatic = change.automatic;
-                entry.revision += 1;
-                payout_summary(entry)
             });
         Box::pin(async move { result })
     }
@@ -431,29 +456,18 @@ impl PortalRepository for MemoryRepository {
         &self,
         account_id: Uuid,
         _network: ChainNetwork,
-        now: u64,
+        _now: u64,
     ) -> RepositoryFuture<'_, Vec<PayoutSettingSummary>> {
         let result = self
             .0
             .lock()
             .map_err(|_| RepositoryError::Unavailable)
-            .map(|mut state| {
+            .map(|state| {
                 state
                     .payouts
-                    .iter_mut()
+                    .iter()
                     .filter(|((owner, _), _)| *owner == account_id)
-                    .map(|(_, payout)| {
-                        if payout
-                            .pending
-                            .as_ref()
-                            .is_some_and(|(_, effective)| *effective <= now)
-                        {
-                            if let Some((destination, _)) = payout.pending.take() {
-                                payout.destination = destination;
-                            }
-                        }
-                        payout_summary(payout)
-                    })
+                    .map(|(_, payout)| payout_summary(payout))
                     .collect()
             });
         Box::pin(async move { result })
@@ -470,10 +484,13 @@ impl PortalRepository for MemoryRepository {
             .0
             .lock()
             .map(|state| {
-                state
-                    .payouts
-                    .get(&(account_id, asset))
-                    .map(|value| value.destination.clone())
+                state.payouts.get(&(account_id, asset)).and_then(|value| {
+                    value
+                        .pending
+                        .is_none()
+                        .then(|| value.destination.clone())
+                        .flatten()
+                })
             })
             .map_err(|_| RepositoryError::Unavailable);
         Box::pin(async move { result })
@@ -587,19 +604,36 @@ impl MinerTelemetrySource for MemoryTelemetry {
 }
 
 fn payout_summary(state: &PayoutState) -> PayoutSettingSummary {
+    let reference = state
+        .destination
+        .as_ref()
+        .or_else(|| state.pending.as_ref().map(|pending| &pending.0))
+        .expect("payout fixture retains an active or pending destination");
     PayoutSettingSummary {
-        asset: state.destination.asset(),
-        network: state.destination.network(),
-        active_destination: Some(mask_destination(state.destination.canonical_address())),
-        active_receiver: Some(state.destination.receiver_kind()),
+        asset: reference.asset(),
+        network: reference.network(),
+        active_destination: state
+            .destination
+            .as_ref()
+            .map(|destination| mask_destination(destination.canonical_address())),
+        active_receiver: state
+            .destination
+            .as_ref()
+            .map(ValidatedDestination::receiver_kind),
         pending_destination: state
             .pending
             .as_ref()
-            .map(|(destination, _)| mask_destination(destination.canonical_address())),
-        pending_effective_at: state.pending.as_ref().map(|(_, effective)| *effective),
+            .map(|(destination, _, _, _, _)| mask_destination(destination.canonical_address())),
+        pending_effective_at: state
+            .pending
+            .as_ref()
+            .map(|(_, effective, _, _, _)| *effective),
         threshold_zat: state.threshold_zat,
         automatic: state.automatic,
         revision: state.revision,
+        pending_threshold_zat: state.pending.as_ref().map(|pending| pending.2),
+        pending_automatic: state.pending.as_ref().map(|pending| pending.3),
+        pending_revision: state.pending.as_ref().map(|pending| pending.4),
     }
 }
 
@@ -822,6 +856,15 @@ async fn static_ui_and_health_are_hardened() {
     ] {
         assert!(html.contains(page));
     }
+    for disclosure in [
+        "Service and network fee policy loading",
+        "Fee reserve",
+        "Actual fee",
+        "Refund",
+        "Net output",
+    ] {
+        assert!(html.contains(disclosure));
+    }
 
     let script_response = app
         .clone()
@@ -849,6 +892,15 @@ async fn static_ui_and_health_are_hardened() {
     assert!(script.contains("textContent"));
     assert!(!script.contains("innerHTML"));
     assert!(script.contains("authGeneration"));
+    assert!(script.contains("payout transaction fee paid by miners"));
+    for field in [
+        "gross_amount_zat",
+        "reserved_network_fee_zat",
+        "actual_network_fee_zat",
+        "refunded_network_fee_zat",
+    ] {
+        assert!(script.contains(field));
+    }
     assert!(script.contains("workerSecret.textContent = \"\""));
     assert!(script.contains("#totp-form"));
     let worker_table = script
@@ -1024,10 +1076,18 @@ async fn account_worker_and_payout_flow_enforces_security_boundaries() {
     let payout = app.clone().oneshot(payout).await.expect("payout response");
     assert_eq!(payout.status(), StatusCode::OK);
     let payout_body = json_response(payout).await;
+    assert_eq!(payout_body["active_destination"], serde_json::Value::Null);
     assert_eq!(
-        payout_body["active_destination"],
+        payout_body["pending_destination"],
         mask_destination(FIRST_WEC_DESTINATION)
     );
+    assert!(payout_body["pending_effective_at"].as_u64().is_some());
+    assert_eq!(payout_body["threshold_zat"], 0);
+    assert_eq!(payout_body["automatic"], false);
+    assert_eq!(payout_body["revision"], 0);
+    assert_eq!(payout_body["pending_threshold_zat"], 100_000);
+    assert_eq!(payout_body["pending_automatic"], true);
+    assert_eq!(payout_body["pending_revision"], 1);
     assert!(!payout_body.to_string().contains(FIRST_WEC_DESTINATION));
 
     let replacement = Request::builder()
@@ -1039,9 +1099,9 @@ async fn account_worker_and_payout_flow_enforces_security_boundaries() {
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
-                "destination": SECOND_WEC_DESTINATION,
+                "destination": FIRST_WEC_DESTINATION,
                 "threshold_zat": 200_000,
-                "automatic": true,
+                "automatic": false,
                 "password": "test-only credential 0001"
             })
             .to_string(),
@@ -1054,9 +1114,19 @@ async fn account_worker_and_payout_flow_enforces_security_boundaries() {
     let replacement_body = json_response(replacement).await;
     assert_eq!(
         replacement_body["pending_destination"],
-        mask_destination(SECOND_WEC_DESTINATION)
+        mask_destination(FIRST_WEC_DESTINATION)
     );
     assert!(replacement_body["pending_effective_at"].as_u64().is_some());
+    assert_eq!(
+        replacement_body["active_destination"],
+        serde_json::Value::Null
+    );
+    assert_eq!(replacement_body["threshold_zat"], 0);
+    assert_eq!(replacement_body["automatic"], false);
+    assert_eq!(replacement_body["revision"], 0);
+    assert_eq!(replacement_body["pending_threshold_zat"], 200_000);
+    assert_eq!(replacement_body["pending_automatic"], false);
+    assert_eq!(replacement_body["pending_revision"], 2);
 }
 
 #[test]
@@ -1076,11 +1146,89 @@ fn mainnet_router_is_disabled() {
     assert!(result.is_err());
 }
 
+#[tokio::test]
+async fn repository_reads_cannot_promote_a_same_address_policy_hold() {
+    let repository = MemoryRepository::default();
+    let account_id = Uuid::new_v4();
+    let destination = ValidatedDestination::from_authoritative_validation(
+        Asset::Wec,
+        ChainNetwork::Testnet,
+        FIRST_WEC_DESTINATION.to_owned(),
+        ReceiverKind::Ironwood,
+    )
+    .expect("fixture destination is authoritative");
+    PortalRepository::configure_payout(
+        &repository,
+        PayoutPreferenceChange {
+            account_id,
+            destination: &destination,
+            threshold_zat: 100_000,
+            automatic: true,
+            changed_at: 100,
+            replacement_hold_secs: 48 * 60 * 60,
+            address_digest: &[0x41; 32],
+        },
+    )
+    .await
+    .expect("initial setting is held");
+    let pending = PortalRepository::configure_payout(
+        &repository,
+        PayoutPreferenceChange {
+            account_id,
+            destination: &destination,
+            threshold_zat: 200_000,
+            automatic: false,
+            changed_at: 200,
+            replacement_hold_secs: 48 * 60 * 60,
+            address_digest: &[0x41; 32],
+        },
+    )
+    .await
+    .expect("same-address policy revision is held");
+    assert_eq!(pending.revision, 0);
+    assert_eq!(pending.pending_revision, Some(2));
+    assert_eq!(pending.pending_effective_at, Some(200 + 48 * 60 * 60));
+    assert_eq!(pending.pending_threshold_zat, Some(200_000));
+    assert_eq!(pending.pending_automatic, Some(false));
+    let after_untrusted_future =
+        PortalRepository::payout_settings(&repository, account_id, ChainNetwork::Testnet, u64::MAX)
+            .await
+            .expect("settings read succeeds");
+    assert_eq!(after_untrusted_future[0].revision, 0);
+    assert_eq!(after_untrusted_future[0].pending_revision, Some(2));
+    assert!(PortalRepository::active_payout_destination(
+        &repository,
+        account_id,
+        Asset::Wec,
+        ChainNetwork::Testnet,
+        u64::MAX,
+    )
+    .await
+    .expect("active lookup succeeds")
+    .is_none());
+}
+
 #[test]
 fn unavailable_overview_is_explicit() {
     let overview = UnavailablePoolData.overview();
     assert!(!overview.available);
     assert_eq!(overview.hashrate_sol_s, None);
+}
+
+#[tokio::test]
+async fn readiness_fails_closed_without_a_live_payout_lease() {
+    let repository = Arc::new(MemoryRepository::default());
+    repository.1.store(false, Ordering::SeqCst);
+    let app = portal_with_repository(Arc::new(FixedClock::default()), repository);
+    let response = app
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -1274,6 +1422,10 @@ async fn private_read_models_are_successful_empty_and_account_isolated() {
                 cursor: 7,
                 batch_id,
                 asset: Asset::Wec,
+                gross_amount_zat: 333,
+                reserved_network_fee_zat: Some(12),
+                actual_network_fee_zat: Some(5),
+                refunded_network_fee_zat: Some(7),
                 amount_zat: 321,
                 state: "confirmed".to_owned(),
                 transaction_id: Some("22".repeat(32)),
@@ -1351,6 +1503,11 @@ async fn private_read_models_are_successful_empty_and_account_isolated() {
     .await;
     assert_eq!(owner_payouts["items"][0]["batch_id"], batch_id.to_string());
     assert_eq!(owner_payouts["items"][0]["transaction_id"], "22".repeat(32));
+    assert_eq!(owner_payouts["items"][0]["gross_amount_zat"], 333);
+    assert_eq!(owner_payouts["items"][0]["reserved_network_fee_zat"], 12);
+    assert_eq!(owner_payouts["items"][0]["actual_network_fee_zat"], 5);
+    assert_eq!(owner_payouts["items"][0]["refunded_network_fee_zat"], 7);
+    assert_eq!(owner_payouts["items"][0]["amount_zat"], 321);
 
     let owner_telemetry = json_response(
         app.clone()
@@ -1560,6 +1717,27 @@ async fn login_lock_and_payout_reauthentication_fail_closed() {
         .await
         .expect("response");
     assert_eq!(payout.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn malformed_and_unknown_logins_have_one_uniform_denial() {
+    let app = portal(Arc::new(FixedClock::default()));
+    let mut bodies = Vec::new();
+    for username in ["@", "not valid", "unknown_account"] {
+        let response = app
+            .clone()
+            .oneshot(mutation(
+                "/api/v1/auth/login",
+                "POST",
+                json!({"username":username,"password":"uniform dummy work credential"}),
+            ))
+            .await
+            .expect("login response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        bodies.push(json_response(response).await);
+    }
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(bodies[0]["error"], "invalid_credentials");
 }
 
 #[tokio::test]

@@ -1,0 +1,70 @@
+network = "testnet"
+deployment_id = "@DEPLOYMENT_ID@"
+pool_instance = "@POOL_INSTANCE@"
+backend_instance = "@BACKEND_INSTANCE@"
+journal_stream = "@JOURNAL_STREAM@"
+chain_id = @WCASH_CHAIN_ID@
+wcash_genesis = "@WCASH_GENESIS_WIRE@"
+zcash_genesis = "@ZCASH_GENESIS_WIRE@"
+wcash_payout_commitment = "@WCASH_PAYOUT_COMMITMENT_WIRE@"
+zcash_payout_commitment = "@ZCASH_PAYOUT_COMMITMENT_WIRE@"
+backend_socket = "@BACKEND_SOCKET@"
+database_url_file = "@DATABASE_URL_RUNTIME_PATH@"
+
+# Required by the common policy schema. The payout worker never opens either
+# socket and `wcash-poold payout-worker` has no listener implementation.
+stratum_listen = "@STRATUM_LISTEN@"
+portal_listen = "@PORTAL_LISTEN@"
+portal_origin = "@PORTAL_ORIGIN@"
+nonce_namespace = @NONCE_NAMESPACE@
+nonce_reservation = @NONCE_RESERVATION@
+database_connections = @DATABASE_CONNECTIONS@
+maximum_miners = @MAXIMUM_MINERS@
+maximum_miners_per_ip = @MAXIMUM_MINERS_PER_IP@
+authentication_parallelism = @AUTHENTICATION_PARALLELISM@
+
+wcash_wallet_program = "@WCASH_RELEASE_ROOT@/wcash-wallet"
+wcash_wallet_sha256 = "@WCASH_WALLET_SHA256@"
+wcash_wallet_uid = 0
+payout_mode = "automatic"
+wcash_wallet_database = "@WCASH_WALLET_DATABASE@"
+wcash_lightwalletd_endpoint = "@WCASH_LIGHTWALLETD_ENDPOINT@"
+wcash_wallet_sync_batch_size = @WCASH_WALLET_SYNC_BATCH_SIZE@
+wcash_wallet_sync_timeout_seconds = @WCASH_WALLET_SYNC_TIMEOUT_SECONDS@
+wcash_wallet_seed_file = "/run/credentials/wcash-payout-worker.service/wcash-seed"
+wcash_seed_uid = @PAYOUT_UID@
+wcash_signer_journal_directory = "@WEC_SIGNER_JOURNAL@"
+wcash_signer_account = "@WCASH_SIGNER_ACCOUNT@"
+zallet_configuration = "/run/credentials/wcash-payout-worker.service/zallet-config"
+zallet_rpc = "@ZALLET_RPC@"
+zallet_cookie_file = "/run/credentials/wcash-payout-worker.service/zallet-cookie"
+zcash_signer_journal_directory = "@ZEC_SIGNER_JOURNAL@"
+zcash_signer_account = "@ZCASH_SIGNER_ACCOUNT@"
+zcash_signer_account_index = @ZCASH_SIGNER_ACCOUNT_INDEX@
+
+wcash_node_rpc = "@WCASH_NODE_RPC@"
+wcash_node_cookie_file = "@WCASH_COOKIE_RUNTIME_PATH@"
+zcash_node_rpc = "@ZCASH_NODE_RPC@"
+zcash_node_cookie_file = "@ZCASH_COOKIE_RUNTIME_PATH@"
+portal_token_pepper_file = "@PORTAL_PEPPER_RUNTIME_PATH@"
+portal_totp_key_file = "@PORTAL_TOTP_RUNTIME_PATH@"
+initial_share_target_be = "@INITIAL_SHARE_TARGET_BE@"
+easiest_share_target_be = "@EASIEST_SHARE_TARGET_BE@"
+
+[wcash_policy]
+pplns_window_work = "@WEC_PPLNS_WINDOW_WORK@"
+payout_threshold_zat = @WEC_PAYOUT_THRESHOLD_ZAT@
+required_confirmations = @WEC_REQUIRED_CONFIRMATIONS@
+maximum_payout_outputs = @WEC_MAXIMUM_PAYOUT_OUTPUTS@
+maximum_network_fee_zat = @WEC_MAXIMUM_NETWORK_FEE_ZAT@
+maximum_network_fee_bps = @WEC_MAXIMUM_NETWORK_FEE_BPS@
+policy_version = @WEC_POLICY_VERSION@
+
+[zcash_policy]
+pplns_window_work = "@ZEC_PPLNS_WINDOW_WORK@"
+payout_threshold_zat = @ZEC_PAYOUT_THRESHOLD_ZAT@
+required_confirmations = @ZEC_REQUIRED_CONFIRMATIONS@
+maximum_payout_outputs = @ZEC_MAXIMUM_PAYOUT_OUTPUTS@
+maximum_network_fee_zat = @ZEC_MAXIMUM_NETWORK_FEE_ZAT@
+maximum_network_fee_bps = @ZEC_MAXIMUM_NETWORK_FEE_BPS@
+policy_version = @ZEC_POLICY_VERSION@

@@ -1133,7 +1133,7 @@ impl BackendClient {
 
     /// Removes the oldest unsolicited durable event without performing I/O.
     ///
-    /// Protocol v1 reads only inside bounded request exchanges. Once subscribed,
+    /// Protocol v2 reads only inside bounded request exchanges. Once subscribed,
     /// callers must issue periodic `health` requests as their heartbeat; events
     /// received before that correlated response are queued here. This avoids
     /// cancelling a partially read frame merely because a healthy chain is quiet.

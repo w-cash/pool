@@ -20,6 +20,20 @@ while (($#)); do
 done
 
 require_root
+
+# The scheduled probe is a safety authority, not only an alarm. Interactive
+# probes remain read-only so an operator can diagnose an intentionally stopped
+# deployment, but a failed timer probe closes every public and payout runtime.
+health_check_exit() {
+    local status=$?
+    trap - EXIT
+    if $quiet && ((status != 0)); then
+        stop_testnet_runtime_after_failure "$settings" "$cidrs"
+    fi
+    exit "$status"
+}
+trap health_check_exit EXIT
+
 require_command curl
 require_command grep
 require_command python3
@@ -32,7 +46,7 @@ release_policy=/etc/wcash-pool/release.env
     && $(stat -c '%u:%a:%h' -- "$release_policy") == 0:644:1 ]] \
     || die "rendered release policy is unavailable or unsafe"
 release_root=$(resolve_release_root "$(read_setting "$release_policy" ZECWEC_RELEASE_PATH)")
-[[ $(read_setting "$release_policy" ZECWEC_DEPLOYMENT_SCHEMA) == 1 ]] \
+[[ $(read_setting "$release_policy" ZECWEC_DEPLOYMENT_SCHEMA) == 2 ]] \
     || die "rendered deployment schema is unsupported"
 for binary in wcash-poold wcash-merge-miner wcash-wallet; do
     ZECWEC_RELEASE_PATH=$release_root \
@@ -40,21 +54,25 @@ for binary in wcash-poold wcash-merge-miner wcash-wallet; do
 done
 ZECWEC_RELEASE_PATH=$release_root \
     "$release_root/deployment/scripts/deploy/verify-release.sh" deployment-package
-for service in postgresql.service wcash-pool-backend.service \
-    wcash-pool.service zecwec-cookie-refresh.path; do
+for service in postgresql.service zecwec-testnet-pool.target wcash-pool-backend.service \
+    wcash-pool-projector.service wcash-pool.service \
+    zecwec-zallet-payout.service wcash-payout-worker.service \
+    zecwec-cookie-refresh.path; do
     systemctl is-active --quiet "$service" || die "service is not active: $service"
 done
 for unit in zecwec-zallet.service zecwec-zallet-recovery.service; do
     require_loaded_unit_fully_inactive "$unit"
 done
-require_no_processes_for_user zecwec-zallet "collector identity"
 require_no_processes_for_user zecwec-zallet-recovery "recovery identity"
 zallet_rpc=$(read_setting "$settings" ZALLET_RPC)
 zallet_port=${zallet_rpc##*:}
-for wallet_port in "$zallet_port" 28242; do
-    require_tcp_listener_absent "$wallet_port" "deferred-payout Zallet RPC"
-done
-require_offline_collector_custody "$settings" "$release_root"
+zallet_listeners=$(ss -H -ltn "sport = :$zallet_port") \
+    || die "Zallet payout RPC listener inspection failed"
+[[ -n $zallet_listeners && $zallet_listeners != *"0.0.0.0:$zallet_port"* \
+    && $zallet_listeners != *"[::]:$zallet_port"* ]] \
+    || die "Zallet payout RPC is absent or publicly reachable"
+require_tcp_listener_absent 28242 "recovery Zallet RPC"
+require_hot_testnet_payout_custody "$settings" "$release_root"
 
 socket=$(read_setting "$settings" BACKEND_SOCKET)
 [[ -S $socket && ! -L $socket ]] || die "backend socket is unavailable"
@@ -78,14 +96,15 @@ expected = {
     "ready": True,
     "component": "miner-portal",
     "network": "testnet",
-    "payout_execution": "deferred",
+    "payout_execution": "enabled",
 }
 raise SystemExit(0 if value == expected else 1)
-' <<<"$portal_readiness" || die "portal readiness policy is not deferred Testnet mining"
+' <<<"$portal_readiness" || die "portal does not confirm a fresh external payout worker"
 ss -H -ltn "sport = :$plain_port" | grep -q . || die "plaintext Stratum listener is unavailable"
 if systemctl is-active --quiet nginx.service; then
     ss -H -ltn "sport = :$tls_port" | grep -q . || die "TLS Stratum listener is unavailable"
 fi
 
 "$script_dir/restrict-mining-firewall.sh" check "$settings" "$cidrs" >/dev/null
+trap - EXIT
 $quiet || printf '{"healthy":true,"network":"testnet","pool":"zecwec"}\n'

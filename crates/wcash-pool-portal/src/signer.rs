@@ -15,7 +15,7 @@ use crate::{Asset, ChainNetwork, ReceiverKind};
 
 /// Maximum outputs permitted in one signer request.
 pub const MAX_PAYOUT_OUTPUTS: usize = 200;
-const PAYOUT_COMMITMENT_DOMAIN: &[u8] = b"zecwec/payout-batch/v1";
+const PAYOUT_COMMITMENT_DOMAIN: &[u8] = b"zecwec/payout-batch/v2";
 
 /// One exact payout output authorized by the accounting projector.
 #[derive(Clone, Eq, PartialEq)]
@@ -55,6 +55,10 @@ pub struct PayoutBatchRequest {
     pub ledger_root: [u8; 32],
     /// Reconciliation checkpoint proving collector funds were observed.
     pub reconciliation_id: Uuid,
+    /// Effective fee ceiling authorized by accounting for this exact batch.
+    /// It is the tightest of the policy's absolute limit, relative limit, and
+    /// the bound that keeps every miner output nonzero.
+    pub maximum_network_fee_zat: u64,
     /// Exact ordered outputs.
     pub outputs: Vec<PayoutOutput>,
 }
@@ -65,6 +69,7 @@ impl PayoutBatchRequest {
         if self.batch_id.is_nil()
             || self.reconciliation_id.is_nil()
             || self.ledger_root.iter().all(|byte| *byte == 0)
+            || self.maximum_network_fee_zat == 0
         {
             return Err(SignerError::InvalidRequest);
         }
@@ -106,6 +111,7 @@ impl PayoutBatchRequest {
         }]);
         hasher.update(self.ledger_root);
         hasher.update(self.reconciliation_id.as_bytes());
+        hasher.update(self.maximum_network_fee_zat.to_be_bytes());
         hasher.update(
             u16::try_from(self.outputs.len())
                 .map_err(|_| SignerError::InvalidRequest)?
@@ -372,6 +378,7 @@ mod tests {
             network,
             ledger_root: [1; 32],
             reconciliation_id: Uuid::from_u128(2),
+            maximum_network_fee_zat: 1,
             outputs: vec![PayoutOutput {
                 allocation_id: Uuid::from_u128(3),
                 canonical_address: "wcash-test-address-value".to_owned(),

@@ -1,9 +1,11 @@
 # ZecWec pool product design
 
-> **Status:** This is the product and security contract for the planned ZecWec
-> merged-mining pool. It is not a deployment claim. The current repository has
-> no public miner endpoint, monetary ledger, collector-wallet service, payout
-> signer, or miner portal. Do not send miners or funds to it.
+> **Status:** This is the product and security contract for the ZecWec
+> merged-mining pool. The repository now contains the Testnet miner edge,
+> conserved PostgreSQL ledger, portal, chain-separated collector observers,
+> crash-safe signers, and an isolated automatic payout-worker deployment. This
+> is still not a public-deployment claim: do not send miners or funds until the
+> host ceremony and end-to-end release gates below have recorded evidence.
 
 ## Decision summary
 
@@ -17,9 +19,9 @@ destinations in the private web portal.
 | Miner protocol | ZIP-301-compatible Stratum; TLS on port 3443 is preferred, with a restricted plaintext port 3333 for legacy ASIC firmware |
 | ASIC identity | `account.worker` plus a generated, revocable mining-only token |
 | Reward method | Chain-specific PPLNS based on accepted work, not raw share count |
-| WEC collector | Direct private Wcash Ironwood coinbase, after exact-recipient verification is implemented |
+| WEC collector | Direct private Wcash Ironwood coinbase, gated by exact read-only recipient verification |
 | ZEC collector | Direct Zcash Ironwood coinbase; receipt remains publicly recoverable under ZIP-213 |
-| Miner destinations | Separate Wcash and Zcash addresses; Ironwood-capable addresses recommended, transparent addresses allowed for compatibility |
+| Miner destinations | Separate Wcash and Zcash Ironwood-capable addresses; no transparent fallback in the launch pool |
 | Custody | Separate collectors, wallets, keys, ledgers, maturity rules, and payout batches for WEC and ZEC |
 | Testnet/Mainnet | Separate deployments and security domains; Mainnet stays unavailable until a later audited release |
 | Initial settlement | PPLNS and automatic threshold payouts; no PPS/PPS+ balance-sheet risk at launch |
@@ -93,6 +95,18 @@ auditable ledger entries. Wcash having no consensus developer tax does not
 mean that an independently operated mining pool has no service fee; any pool
 fee must be displayed before mining and versioned rather than changed silently.
 
+ZecWec launch policy has a 0% pool fee, but miners pay the actual network fee
+needed to deliver their payout. Batch creation deducts the tightest of the
+published absolute limit, relative limit, and nonzero-output safety bound from
+the selected gross balances, split by deterministic largest-remainder
+allocation. That maximum is committed
+into the immutable signer request. After confirmation, the same deterministic
+rule charges only the fee present in the signed transaction and returns every
+unused reserved atomic unit to the affected miners' payable balances. The
+collector therefore never requires hidden operator capital, and a full-balance
+payout conserves exactly: gross liabilities equal miner outputs plus network
+fee plus any returned reserve.
+
 ## Coinbase privacy: Wcash and Zcash are different
 
 “Ironwood” names a shielded protocol pool. It does not mean that a mining pool
@@ -116,11 +130,9 @@ key. Later Ironwood-to-Ironwood payouts redistribute private notes; they do not
 leave the global Ironwood pool except for fees or an explicit transparent
 output.
 
-Wolf can already construct and validate private Wcash coinbase transactions in
-its native coordinator and local tests. However, the current pool-backend path
-correctly refuses this mode: ciphertext alone does not prove to that boundary
-that the template paid the configured collector. Production support therefore
-requires an exact private-recipient attestation before any job reaches a miner:
+Wolf constructs and validates private Wcash coinbase transactions and the
+private pool backend now requires an exact private-recipient attestation before
+any job reaches a miner:
 
 1. A protected verifier receives only the Wcash collector's read-only incoming
    viewing capability, never its spending key.
@@ -135,15 +147,17 @@ requires an exact private-recipient attestation before any job reaches a miner:
 
 The spending key remains in a separate payout signer. A template-node claim or
 a signed assertion without independent trial decryption is not an equivalent
-control. Until this gap is implemented and tested, private WEC pool settlement
-is not production-ready; the service must fail closed rather than silently pay
-a transparent receiver.
+control. The source implementation and deterministic tests are present at Wolf
+commit `e457b08d8db261b226cf7fb3278493d033f458f8`; public readiness still requires
+the exact paired binaries to pass the private deployment, restart, reorg,
+payout, and ASIC gates. Any missing or crossed attestation fails closed rather
+than silently paying a transparent receiver.
 
 The relevant Wcash construction and privacy checks at the reviewed Wolf commit
 live in
-[`transaction.rs`](https://github.com/w-cash/wolf/blob/47c44cd2adab6e6aa911ac740450c62ab600b4f5/zebra-rpc/src/methods/types/transaction.rs)
+[`transaction.rs`](https://github.com/w-cash/wolf/blob/e457b08d8db261b226cf7fb3278493d033f458f8/zebra-rpc/src/methods/types/transaction.rs)
 and
-[`zcash_note_encryption.rs`](https://github.com/w-cash/wolf/blob/47c44cd2adab6e6aa911ac740450c62ab600b4f5/zebra-chain/src/primitives/zcash_note_encryption.rs).
+[`zcash_note_encryption.rs`](https://github.com/w-cash/wolf/blob/e457b08d8db261b226cf7fb3278493d033f458f8/zebra-chain/src/primitives/zcash_note_encryption.rs).
 
 ### ZEC collector
 
@@ -198,7 +212,7 @@ interaction patterns, not their current commercial numbers, as the reference.
 
 ZecWec onboarding should take three steps:
 
-1. Create an account and protect it with a passkey or TOTP plus recovery codes.
+1. Create an account with a strong password and optionally enable TOTP.
 2. Add one valid Wcash payout destination and one valid Zcash payout
    destination, or explicitly defer either destination and accept a payout hold.
 3. Create a worker, copy its three ASIC fields, and start mining.
@@ -255,9 +269,10 @@ chain reorganizations, and orphaned blocks.
   a promise of daily ZEC income.
 - Version 1 uses automatic payouts only. Manual instant withdrawals add an
   unnecessary hot-wallet and account-takeover surface.
-- Miner payout destinations may be Ironwood-capable or transparent where the
-  selected chain accepts them. The portal recommends Ironwood and states the
-  privacy consequence before accepting transparent output.
+- The launch pool accepts only Ironwood-capable miner payout destinations on
+  both chains. Wolf still permits a solo miner or a separately operated pool
+  to select transparent coinbase, but ZecWec never silently downgrades a
+  shielded payout batch to transparent output.
 
 Changing a Mainnet payout destination requires strong reauthentication, sends
 an immediate security notification, and places that asset's payouts on a
@@ -309,10 +324,11 @@ applicable. A Wcash row links its AuxPoW parent header/block identifier and the
 Zcash block only when that parent proof also became a canonical Zcash block.
 Using a Zcash-valid header as AuxPoW does not imply that Zcash accepted a block.
 
-The security/settings page manages passkeys, TOTP, recovery codes, active
-sessions, revocable worker tokens, watcher links, two payout destinations, and
-the payout-change hold. It never asks for a seed phrase, spending key, incoming
-viewing key, or full viewing key.
+The Testnet version-1 security/settings page manages TOTP, revocable worker
+tokens, two payout destinations, and the payout-change hold. Passkeys, recovery
+codes, an active-session management UI, and watcher links are later milestones
+and must not be advertised as available. The portal never asks for a seed
+phrase, spending key, incoming viewing key, or full viewing key.
 
 ## Services and data authority
 
@@ -333,6 +349,23 @@ or spend collector funds:
    the edge, portal, or database.
 6. **Portal API and UI:** account settings and read models only; no consensus
    validation and no direct signing capability.
+
+The concrete Testnet deployment gives the journal projector its own Unix user,
+PostgreSQL role, protected database URL, and persistent Wolf connection. It
+opens no TCP listener and is the only runtime allowed to insert backend events,
+shares, winners, allocations, or ledger entries. The Internet-facing service
+retains portal and nonce operations but has no monetary-table DML: before it
+acknowledges journal progress, it waits a fixed bound for the projector and
+verifies the exact backend authority, event sequence, and canonical payload
+digest already stored. Lag or contradiction therefore fails closed. Payout
+destination changes use a migrator-owned database routine that always imposes
+an audited 48-hour database-clock hold, including the first destination; the
+public role has no direct destination-table mutation grant.
+Schema migration likewise runs under a dedicated no-listener Unix identity;
+the Internet-facing UID never receives the migrator credential. Upgrade
+reconciliation clears legacy migrator table/sequence default ACLs and default
+public function execution before explicit grants are reapplied, so a later
+schema object fails closed until its role matrix is reviewed.
 
 PostgreSQL is the monetary source of truth. Redis may cache rate-limited
 sessions, live hashrate, and disposable UI projections, but losing Redis must
@@ -393,26 +426,27 @@ off-chain records private.
 
 ## Release gates
 
-The following are required before the endpoint can be called public Testnet:
+The following evidence is required before the endpoint can be called public
+Testnet. Source implementation or CI success alone does not satisfy it:
 
-1. Complete and cross-test the exact Wolf backend/journal contract.
-2. Add Wcash private-recipient trial decryption and immutable job attestation.
-3. Build the TCP/TLS edge, real worker authentication, durable nonce leases,
-   and certified transcripts from supported ASIC firmware.
-4. Implement the PostgreSQL projector, conserved ledgers, independent PPLNS,
-   maturity/reorg handling, and deterministic rounding.
-5. Implement separate collector observers and an isolated, idempotent Testnet
-   payout signer. Prove that the chosen NU6.3 Zcash parent/template and
-   proposal-validator stack constructs and accepts the Ironwood coinbase, and
-   that the Zcash collector can scan, reconcile, construct, sign, broadcast,
-   restart, rescan, and recover across a reorganization.
-6. Deliver the portal, alerts, aggregate status, reconciliation tools,
-   monitoring, backups, restore drill, and payout freeze.
-7. Prove ordinary shares, WEC-only, ZEC-only, and dual winners; maturity,
-   orphan/reorg reversal; successful payouts; ambiguous retry; restart; stale
-   work; dependency loss; and private-recipient rejection in the isolated local
-   topology.
-8. Complete a private Testnet soak and independent security/accounting review.
+1. Produce reproducible, digest-pinned Linux release artifacts and pass the
+   complete workspace, real-PostgreSQL, deployment-package, Zallet patch, and
+   Wolf/AuxPoW integration suites.
+2. Complete fresh zero-balance WEC and ZEC collector ceremonies, independent
+   off-host restores, root-sealed recovery/initial-zero attestations, and prove
+   the public UID cannot read any custody material.
+3. Deploy the distinct migrator, public, projector, and payout PostgreSQL roles; prove
+   denied-table mutations fail with PostgreSQL `42501`, and restore the database
+   plus both signer journals on an isolated host.
+4. Prove ordinary shares, WEC-only, ZEC-only, and dual winners; maturity,
+   orphan/reorg reversal; successful WEC and ZEC payouts; ambiguous retry;
+   restart; stale work; dependency loss; and private-recipient rejection in the
+   isolated Testnet topology.
+5. Complete the canonical HTTPS registration/login/TOTP/worker/token/address
+   flows and one real accepted ASIC share through the source-restricted edge.
+   Token/worker revocation must terminate an already-authenticated connection.
+6. Complete a private Testnet soak and independent security/accounting review,
+   then explicitly approve public DNS/portal publication.
 
 Public Testnet is a further evidence gate, not permission to launch Mainnet.
 Mainnet needs its own threat review, release revision, infrastructure, keys,

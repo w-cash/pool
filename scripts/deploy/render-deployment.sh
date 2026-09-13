@@ -35,17 +35,41 @@ for binary in wcash-poold wcash-merge-miner wcash-wallet zallet; do
 done
 source_root="$release_root/deployment"
 pool_uid=$(id -u wcash-pool)
+payout_uid=$(id -u wcash-payout)
+
+if systemctl is-active --quiet zecwec-testnet-pool.target; then
+    die "zecwec-testnet-pool.target must be stopped before rendering deployment state"
+fi
 
 if systemctl is-active --quiet wcash-pool.service; then
     die "wcash-pool.service must be stopped before rendering deployment state"
 fi
+if systemctl is-active --quiet wcash-pool-projector.service; then
+    die "wcash-pool-projector.service must be stopped before rendering deployment state"
+fi
 if systemctl is-active --quiet wcash-pool-backend.service; then
     die "wcash-pool-backend.service must be stopped before rendering deployment state"
 fi
-for wallet_unit in zecwec-zallet.service zecwec-zallet-recovery.service; do
+if systemctl is-active --quiet wcash-payout-worker.service; then
+    die "wcash-payout-worker.service must be stopped before rendering deployment state"
+fi
+for wallet_unit in zecwec-zallet.service zecwec-zallet-payout.service \
+    zecwec-zallet-recovery.service; do
     systemctl is-active --quiet "$wallet_unit" \
         && die "$wallet_unit must be stopped before rendering deployment state"
 done
+if [[ $phase == finalize ]]; then
+    # A failed or interrupted render must not leave an older boot link capable
+    # of starting a partially replaced policy. Successful start/activation
+    # re-enables only the readiness-gated boot entry point.
+    systemctl disable zecwec-testnet-pool-start.service \
+        zecwec-testnet-pool.target wcash-pool-health.timer \
+        >/dev/null 2>&1 || true
+    for supervisor in wcash-pool-health.timer zecwec-cookie-refresh.path \
+        zecwec-cookie-refresh.service; do
+        stop_loaded_unit_strict "$supervisor"
+    done
+fi
 # Cached backend/Wcash oneshots must be reconciled against every newly rendered
 # exact policy. The ZEC gate itself is deliberately transient: it repeats the
 # strict zero check only while no backend authority exists.
@@ -55,6 +79,7 @@ if [[ $phase == wallet-bootstrap ]]; then
     for stale in \
         /etc/wcash-pool/backend.env \
         /etc/wcash-pool/pool.runtime.toml \
+        /etc/wcash-pool/pool.projector.toml \
         /etc/wcash-pool/pool.preflight.toml \
         /etc/wcash-pool/pool.migrate.toml; do
         [[ ! -e $stale && ! -L $stale ]] \
@@ -78,17 +103,25 @@ arguments=(
     --release-root "$release_root"
     --output "$staging"
     --pool-uid "$pool_uid"
+    --payout-uid "$payout_uid"
 )
 if [[ $phase == finalize ]]; then
     arguments+=(--authority "$authority")
 fi
 python3 "$source_root/scripts/deploy/render_deployment.py" "${arguments[@]}"
 
+# A legacy drop-in survives replacement of the main fragment and can override
+# ExecStart, credentials, identity, or sandboxing. Refuse every such inherited
+# override before installing any managed unit.
+for unit in "$staging"/systemd/*; do
+    require_unit_without_dropins "$(basename -- "$unit")"
+done
+
 install -d -o root -g root -m 0755 "$ZECWEC_CONFIG_DIR"
-install -o zecwec-zallet -g zecwec-zallet -m 0600 "$staging/zallet.toml" "$ZECWEC_CONFIG_DIR/zallet.toml"
+install -o root -g zecwec-zallet -m 0640 "$staging/zallet.toml" "$ZECWEC_CONFIG_DIR/zallet.toml"
 install -o root -g zecwec-zallet-recovery -m 0640 \
     "$staging/zallet-recovery.toml" "$ZECWEC_CONFIG_DIR/zallet-recovery.toml"
-install -o root -g wcash-pool -m 0640 "$staging/wcash-wallet-bootstrap.env" \
+install -o root -g wcash-payout -m 0640 "$staging/wcash-wallet-bootstrap.env" \
     "$ZECWEC_CONFIG_DIR/wcash-wallet-bootstrap.env"
 if [[ $phase != wallet-bootstrap ]]; then
     install -o root -g wcash-pool-backend -m 0640 "$staging/backend.env" "$ZECWEC_CONFIG_DIR/backend.env"
@@ -99,7 +132,14 @@ fi
 if [[ $phase == finalize ]]; then
     install -o root -g wcash-pool -m 0640 "$staging/pool.runtime.toml" "$ZECWEC_CONFIG_DIR/pool.runtime.toml"
     install -o root -g wcash-pool -m 0640 "$staging/pool.preflight.toml" "$ZECWEC_CONFIG_DIR/pool.preflight.toml"
-    install -o root -g wcash-pool -m 0640 "$staging/pool.migrate.toml" "$ZECWEC_CONFIG_DIR/pool.migrate.toml"
+    install -o root -g wcash-pool-migrate -m 0640 "$staging/pool.migrate.toml" \
+        "$ZECWEC_CONFIG_DIR/pool.migrate.toml"
+    install -o root -g wcash-pool-projector -m 0640 "$staging/pool.projector.toml" \
+        "$ZECWEC_CONFIG_DIR/pool.projector.toml"
+    install -o root -g wcash-payout -m 0640 "$staging/pool.payout.toml" \
+        "$ZECWEC_CONFIG_DIR/pool.payout.toml"
+    install -o root -g zecwec-zallet -m 0640 "$staging/zallet-payout.toml" \
+        "$ZECWEC_CONFIG_DIR/zallet-payout.toml"
 fi
 install -o root -g root -m 0644 "$staging/release.env" "$ZECWEC_CONFIG_DIR/release.env"
 
@@ -115,4 +155,7 @@ if [[ $phase != wallet-bootstrap ]]; then
 fi
 
 systemctl daemon-reload
+for unit in "$staging"/systemd/*; do
+    require_unit_without_dropins "$(basename -- "$unit")"
+done
 log "rendered $phase Testnet configuration; no service or nginx endpoint was started or enabled"

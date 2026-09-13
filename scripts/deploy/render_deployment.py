@@ -54,12 +54,14 @@ REQUIRED = {
     "ZCASH_TEMPLATE_COOKIE_SOURCE",
     "ZCASH_VALIDATOR_COOKIE_SOURCE",
     "POOL_STATE_DIR",
+    "PAYOUT_STATE_DIR",
     "BACKEND_STATE_DIR",
     "BACKEND_RUNTIME_DIR",
     "BACKEND_SOCKET",
     "WEC_SEED_FILE",
     "ZALLET_STATE_DIR",
     "ZALLET_CONFIG_FILE",
+    "ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL",
     "WCASH_WALLET_DATABASE",
     "WCASH_WALLET_BIRTHDAY",
     "WCASH_WALLET_SYNC_BATCH_SIZE",
@@ -73,9 +75,13 @@ REQUIRED = {
     "PORTAL_TOTP_KEY_CREDENTIAL",
     "DATABASE_MIGRATOR_URL_CREDENTIAL",
     "DATABASE_RUNTIME_URL_CREDENTIAL",
+    "DATABASE_PROJECTOR_URL_CREDENTIAL",
+    "DATABASE_PAYOUT_URL_CREDENTIAL",
     "POSTGRES_DATABASE",
     "POSTGRES_MIGRATOR_ROLE",
     "POSTGRES_RUNTIME_ROLE",
+    "POSTGRES_PROJECTOR_ROLE",
+    "POSTGRES_PAYOUT_ROLE",
     "NONCE_NAMESPACE",
     "NONCE_RESERVATION",
     "DATABASE_CONNECTIONS",
@@ -200,14 +206,18 @@ DEPLOYMENT_TEMPLATES = {
     "deploy/systemd/wcash-pool-backend-init.service.in": "systemd/wcash-pool-backend-init.service",
     "deploy/systemd/wcash-pool-backend.service.in": "systemd/wcash-pool-backend.service",
     "deploy/systemd/wcash-pool-migrate.service.in": "systemd/wcash-pool-migrate.service",
+    "deploy/systemd/wcash-pool-projector.service.in": "systemd/wcash-pool-projector.service",
     "deploy/systemd/wcash-pool-custody-gate.service.in": "systemd/wcash-pool-custody-gate.service",
     "deploy/systemd/wcash-pool.service.in": "systemd/wcash-pool.service",
+    "deploy/systemd/wcash-payout-worker.service.in": "systemd/wcash-payout-worker.service",
+    "deploy/systemd/zecwec-zallet-payout.service.in": "systemd/zecwec-zallet-payout.service",
     "deploy/systemd/wcash-pool-preflight.service.in": "systemd/wcash-pool-preflight.service",
     "deploy/systemd/zecwec-cookie-refresh.path.in": "systemd/zecwec-cookie-refresh.path",
     "deploy/systemd/zecwec-cookie-refresh.service.in": "systemd/zecwec-cookie-refresh.service",
     "deploy/systemd/wcash-pool-health.service.in": "systemd/wcash-pool-health.service",
     "deploy/systemd/wcash-pool-health.timer.in": "systemd/wcash-pool-health.timer",
     "deploy/systemd/zecwec-testnet-pool.target.in": "systemd/zecwec-testnet-pool.target",
+    "deploy/systemd/zecwec-testnet-pool-start.service.in": "systemd/zecwec-testnet-pool-start.service",
     "deploy/nginx/zecwec-testnet-portal.conf.in": "nginx/zecwec-testnet-portal.conf",
     "deploy/nginx/zecwec-testnet-stratum.conf.in": "nginx/zecwec-testnet-stratum.conf",
 }
@@ -386,30 +396,49 @@ def validate(values: dict[str, str], phase: str) -> None:
     ):
         if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}\.service", values[key]):
             fail(f"{key} must be a concrete systemd service name")
-    for key in ("POSTGRES_DATABASE", "POSTGRES_MIGRATOR_ROLE", "POSTGRES_RUNTIME_ROLE"):
+    for key in (
+        "POSTGRES_DATABASE",
+        "POSTGRES_MIGRATOR_ROLE",
+        "POSTGRES_RUNTIME_ROLE",
+        "POSTGRES_PROJECTOR_ROLE",
+        "POSTGRES_PAYOUT_ROLE",
+    ):
         if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", values[key]):
             fail(f"{key} must be a safe lowercase PostgreSQL identifier")
-    if values["POSTGRES_MIGRATOR_ROLE"] == values["POSTGRES_RUNTIME_ROLE"]:
-        fail("PostgreSQL migration and runtime roles must be distinct")
+    if len(
+        {
+            values["POSTGRES_MIGRATOR_ROLE"],
+            values["POSTGRES_RUNTIME_ROLE"],
+            values["POSTGRES_PROJECTOR_ROLE"],
+            values["POSTGRES_PAYOUT_ROLE"],
+        }
+    ) != 4:
+        fail("PostgreSQL migration, public, projector, and payout roles must be distinct")
+    if int(values["BACKEND_LISTENERS"]) < 3:
+        fail("BACKEND_LISTENERS must reserve public, projector, and payout-startup capacity")
 
     exact_paths = {
         "POOL_STATE_DIR": "/var/lib/wcash-pool",
+        "PAYOUT_STATE_DIR": "/var/lib/wcash-payout",
         "BACKEND_STATE_DIR": "/var/lib/wcash-pool-backend",
         "BACKEND_RUNTIME_DIR": "/run/wcash-pool-backend",
         "BACKEND_SOCKET": "/run/wcash-pool-backend/backend.sock",
         "WEC_SEED_FILE": "/var/lib/wcash-pool-secrets/wcash-seed",
         "ZALLET_STATE_DIR": "/var/lib/zecwec-zallet",
         "ZALLET_CONFIG_FILE": "/etc/wcash-pool/zallet.toml",
-        "WCASH_WALLET_DATABASE": "/var/lib/wcash-pool/wcash-wallet.sqlite",
-        "WEC_SIGNER_JOURNAL": "/var/lib/wcash-pool/wec-payout-journal",
-        "ZEC_SIGNER_JOURNAL": "/var/lib/wcash-pool/zec-payout-journal",
+        "WCASH_WALLET_DATABASE": "/var/lib/wcash-payout/wcash-wallet.sqlite",
+        "WEC_SIGNER_JOURNAL": "/var/lib/wcash-payout/wec-payout-journal",
+        "ZEC_SIGNER_JOURNAL": "/var/lib/wcash-payout/zec-payout-journal",
         "WCASH_PAYOUT_ADDRESS_CREDENTIAL": "/etc/wcash-pool/credentials/wcash-payout-address",
         "WCASH_PAYOUT_IVK_CREDENTIAL": "/etc/wcash-pool/credentials/wcash-payout-ivk",
         "ZCASH_PAYOUT_ADDRESS_CREDENTIAL": "/etc/wcash-pool/credentials/zcash-payout-address",
+        "ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL": "/etc/wcash-pool/credentials/zallet-encryption-identity",
         "PORTAL_TOKEN_PEPPER_CREDENTIAL": "/etc/wcash-pool/credentials/portal-token-pepper",
         "PORTAL_TOTP_KEY_CREDENTIAL": "/etc/wcash-pool/credentials/portal-totp-key",
         "DATABASE_MIGRATOR_URL_CREDENTIAL": "/etc/wcash-pool/credentials/database-url-migrator",
         "DATABASE_RUNTIME_URL_CREDENTIAL": "/etc/wcash-pool/credentials/database-url-runtime",
+        "DATABASE_PROJECTOR_URL_CREDENTIAL": "/etc/wcash-pool/credentials/database-url-projector",
+        "DATABASE_PAYOUT_URL_CREDENTIAL": "/etc/wcash-pool/credentials/database-url-payout",
         "CLOUDFLARE_ORIGIN_PULL_CA": "/etc/wcash-pool/tls/cloudflare-origin-pull-ca.pem",
     }
     for key, expected in exact_paths.items():
@@ -527,6 +556,7 @@ def main() -> None:
     parser.add_argument("--release-root", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--pool-uid", required=True, type=int)
+    parser.add_argument("--payout-uid", required=True, type=int)
     args = parser.parse_args()
 
     values = read_settings(args.settings, args.phase)
@@ -538,8 +568,9 @@ def main() -> None:
     if release_root != args.release_root or not release_root.is_dir() or release_root.is_symlink():
         fail("release root must be one exact canonical directory, never a symlink")
     values["POOL_UID"] = str(args.pool_uid)
+    values["PAYOUT_UID"] = str(args.payout_uid)
     values["WCASH_RELEASE_ROOT"] = str(release_root)
-    values["WCASH_WALLET_AUTHORITY"] = "/var/lib/wcash-pool/wcash-wallet-authority.json"
+    values["WCASH_WALLET_AUTHORITY"] = "/var/lib/wcash-payout/wcash-wallet-authority.json"
     values["ZALLET_RECOVERY_RPC"] = "127.0.0.1:28242"
     values["ZALLET_RECOVERY_STATE_DIR"] = "/var/lib/zecwec-zallet-recovery"
     values["ZALLET_RECOVERY_CONFIG_FILE"] = "/etc/wcash-pool/zallet-recovery.toml"
@@ -563,10 +594,12 @@ def main() -> None:
     values["WCASH_IVK_LOAD_CREDENTIAL"] = (
         f'LoadCredential=wcash-payout-ivk:{values["WCASH_PAYOUT_IVK_CREDENTIAL"]}'
     )
+    values["ZALLET_PAYOUT_CONFIG_FILE"] = "/etc/wcash-pool/zallet-payout.toml"
 
     runtime_dir = "/run/credentials/wcash-pool.service"
     preflight_dir = "/run/credentials/wcash-pool-preflight.service"
     migrate_dir = "/run/credentials/wcash-pool-migrate.service"
+    projector_dir = "/run/credentials/wcash-pool-projector.service"
     values.update(
         {
             "DATABASE_URL_RUNTIME_PATH": f"{runtime_dir}/database-url",
@@ -633,9 +666,47 @@ def main() -> None:
         )
         render(pool_template, args.output / "pool.migrate.toml", migrate_values)
 
+        projector_values = dict(values)
+        projector_values.update(
+            {
+                "DATABASE_URL_RUNTIME_PATH": f"{projector_dir}/database-url",
+                "ZALLET_CONFIG_RUNTIME_PATH": f"{projector_dir}/zallet-config",
+                "ZALLET_COOKIE_RUNTIME_PATH": f"{projector_dir}/zallet-cookie",
+                "WCASH_COOKIE_RUNTIME_PATH": f"{projector_dir}/wcash-node-cookie",
+                "ZCASH_COOKIE_RUNTIME_PATH": f"{projector_dir}/zcash-node-cookie",
+                "PORTAL_PEPPER_RUNTIME_PATH": f"{projector_dir}/portal-token-pepper",
+                "PORTAL_TOTP_RUNTIME_PATH": f"{projector_dir}/portal-totp-key",
+            }
+        )
+        render(pool_template, args.output / "pool.projector.toml", projector_values)
+
+        payout_values = dict(values)
+        payout_dir = "/run/credentials/wcash-payout-worker.service"
+        payout_values.update(
+            {
+                "DATABASE_URL_RUNTIME_PATH": f"{payout_dir}/database-url",
+                "ZALLET_CONFIG_RUNTIME_PATH": f"{payout_dir}/zallet-config",
+                "ZALLET_COOKIE_RUNTIME_PATH": f"{payout_dir}/zallet-cookie",
+                "WCASH_COOKIE_RUNTIME_PATH": f"{payout_dir}/wcash-node-cookie",
+                "ZCASH_COOKIE_RUNTIME_PATH": f"{payout_dir}/zcash-node-cookie",
+                "PORTAL_PEPPER_RUNTIME_PATH": f"{payout_dir}/portal-token-pepper",
+                "PORTAL_TOTP_RUNTIME_PATH": f"{payout_dir}/portal-totp-key",
+            }
+        )
+        render(
+            args.source_root / "deploy/config/pool.payout.testnet.toml.in",
+            args.output / "pool.payout.toml",
+            payout_values,
+        )
+        render(
+            args.source_root / "deploy/config/zallet-payout.testnet.toml.in",
+            args.output / "zallet-payout.toml",
+            values,
+        )
+
     release_policy = args.output / "release.env"
     release_policy.write_text(
-        f"ZECWEC_RELEASE_PATH={release_root}\nZECWEC_DEPLOYMENT_SCHEMA=1\n",
+        f"ZECWEC_RELEASE_PATH={release_root}\nZECWEC_DEPLOYMENT_SCHEMA=2\n",
         encoding="utf-8",
     )
     os.chmod(release_policy, stat.S_IRUSR | stat.S_IWUSR)
@@ -647,7 +718,7 @@ def main() -> None:
         "pool_instance": values["POOL_INSTANCE"],
         "wcash_wallet_sha256": values["WCASH_WALLET_SHA256"],
         "release_root": str(release_root),
-        "deployment_schema": 1,
+        "deployment_schema": 2,
         "files": sorted(
             str(path.relative_to(args.output))
             for path in args.output.rglob("*")

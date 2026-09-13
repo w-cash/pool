@@ -1,16 +1,22 @@
 //! Testnet service composition and ordered process shutdown.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
+
+#[cfg(unix)]
+use std::{ffi::OsStr, os::unix::net::UnixDatagram, path::Path};
 
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time};
 use wcash_pool_address::{TestnetAddressValidator, WcashCommandValidator};
+use wcash_pool_backend_client::BackendClient;
+use wcash_pool_edge::BackendEventConsumer;
 use wcash_pool_portal::{
     serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
     MinerTelemetrySource, PoolDataSource, PortalApp, PortalBuildError, PortalConfig,
     PortalRepository, PortalSecrets, TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
-    Chain, NonceNamespaceClaim, PostgresPoolDataSource, PostgresStore, StoreError,
+    Chain, NonceNamespaceClaim, PostgresEventProjector, PostgresPoolDataSource, PostgresStore,
+    StoreError,
 };
 use wcash_wec_payout_signer::{
     SeedSource, WalletFundSource, WalletNetwork, WecPayoutSigner, WecSignerConfig,
@@ -63,6 +69,16 @@ const PAYOUT_MAXIMUM_CONSECUTIVE_FAILURES: u32 = 20;
 // eight watches keeps their worst case inside the non-cancellable drain bound;
 // any backlog advances deterministically on later ticks.
 const PAYOUT_MAXIMUM_CONFIRMATION_WATCHES: u32 = 8;
+const PAYOUT_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const PROJECTOR_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const PROJECTOR_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
+const PAYOUT_WORKER_LEASE_DURATION: Duration = Duration::from_secs(35 * 60);
+const PAYOUT_WORKER_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+// A successor remains alive without constructing either signer while a lease
+// left by SIGKILL reaches its database-clock expiry. The extra minute covers
+// the final poll and ordinary scheduling delay without weakening the fence.
+const PAYOUT_WORKER_LEASE_ACQUIRE_WAIT: Duration = Duration::from_secs(36 * 60);
+pub(crate) const REQUIRED_PAYOUT_READINESS_TIMEOUT: Duration = Duration::from_secs(70 * 60);
 const MAX_WEC_DEFAULT_SIGNER_PASS_SECS: u64 = 15 + 15 + 300 + 30 + 15;
 const MAX_EMPTY_AUTHORITY_SNAPSHOT_SECS: u64 = 2 * (15 + 10 + 10);
 const MAX_AUTHORITY_WATCH_SECS: u64 = 15 + 10;
@@ -77,10 +93,24 @@ const MAX_WEC_IN_FLIGHT_PASS_SECS: u64 = MAX_WCASH_WALLET_SYNC_TIMEOUT.as_secs()
 const _: () = assert!(SERVICE_DRAIN_TIMEOUT.as_secs() > MAX_WEC_IN_FLIGHT_PASS_SECS);
 const _: () =
     assert!(REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT.as_secs() > SERVICE_DRAIN_TIMEOUT.as_secs());
+const _: () = assert!(
+    PAYOUT_WORKER_LEASE_DURATION.as_secs() > REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT.as_secs() + 60
+);
+const _: () = assert!(
+    PAYOUT_WORKER_LEASE_ACQUIRE_WAIT.as_secs()
+        >= PAYOUT_WORKER_LEASE_DURATION.as_secs() + PAYOUT_WORKER_LEASE_RETRY_INTERVAL.as_secs()
+);
+const _: () = assert!(
+    REQUIRED_PAYOUT_READINESS_TIMEOUT.as_secs()
+        > PAYOUT_WORKER_LEASE_ACQUIRE_WAIT.as_secs() + SERVICE_DRAIN_TIMEOUT.as_secs()
+);
 
 /// Starts every Testnet dependency before opening either listener, then runs
 /// until a termination signal or any authority component exits.
 pub async fn run(config: RuntimeConfig) -> Result<(), ServiceError> {
+    if config.payout_mode != PayoutMode::Deferred || config.automatic_payout.is_some() {
+        return Err(ServiceError::PublicServiceHasPayoutAuthority);
+    }
     let mut bootstrap = Some(bootstrap::start(&config).await?);
     let service_result = run_started(&config, &mut bootstrap).await;
     let Some(owned) = bootstrap.take() else {
@@ -90,13 +120,585 @@ pub async fn run(config: RuntimeConfig) -> Result<(), ServiceError> {
     combine_service_and_cleanup(service_result, cleanup_result)
 }
 
+/// Runs the sole durable Wolf journal projector without opening a TCP listener.
+///
+/// This process receives only the projector database credential. It constructs
+/// no portal authentication, nonce, node-RPC, wallet, or payout authority.
+pub async fn run_projector(config: RuntimeConfig) -> Result<(), ServiceError> {
+    validate_projector_authority(config.payout_mode, config.automatic_payout.is_some())?;
+
+    let bootstrap::ProjectorBootstrap {
+        mut client,
+        projector,
+    } = bootstrap::projector(&config).await?;
+    let service_result = run_projector_loop(&mut client, &projector, shutdown_signal()).await;
+    let cleanup_result = client
+        .shutdown()
+        .await
+        .map_err(BootstrapError::from)
+        .map_err(ServiceError::from);
+    combine_service_and_cleanup(service_result, cleanup_result)
+}
+
+async fn run_projector_loop<S>(
+    client: &mut BackendClient,
+    projector: &PostgresEventProjector,
+    shutdown: S,
+) -> Result<(), ServiceError>
+where
+    S: Future<Output = io::Result<()>>,
+{
+    let mut heartbeat = time::interval(PROJECTOR_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
+
+    loop {
+        // Backend request futures are deliberately never cancelled because a
+        // partial framed response makes the connection correlation unusable.
+        if !wait_for_projector_heartbeat(&mut heartbeat, shutdown.as_mut()).await? {
+            return Ok(());
+        }
+
+        // Valid journal events received before a failing health response are
+        // still durable facts and must be projected before the process exits.
+        let health = client
+            .health()
+            .await
+            .map_err(BootstrapError::from)
+            .map_err(ServiceError::from);
+        drain_projector_events(client, projector).await?;
+        if !health?.healthy {
+            return Err(ServiceError::ProjectorBackendUnhealthy);
+        }
+    }
+}
+
+fn validate_projector_authority(
+    payout_mode: PayoutMode,
+    has_automatic_payout: bool,
+) -> Result<(), ServiceError> {
+    if payout_mode != PayoutMode::Deferred || has_automatic_payout {
+        Err(ServiceError::ProjectorHasPayoutAuthority)
+    } else {
+        Ok(())
+    }
+}
+
+async fn wait_for_projector_heartbeat<S>(
+    heartbeat: &mut time::Interval,
+    shutdown: Pin<&mut S>,
+) -> io::Result<bool>
+where
+    S: Future<Output = io::Result<()>>,
+{
+    tokio::select! {
+        biased;
+        signal = shutdown => {
+            signal?;
+            Ok(false)
+        }
+        _ = heartbeat.tick() => Ok(true),
+    }
+}
+
+async fn drain_projector_events(
+    client: &mut BackendClient,
+    projector: &PostgresEventProjector,
+) -> Result<(), ServiceError> {
+    let binding = client
+        .connection_binding()
+        .ok_or(ServiceError::ProjectorConnectionMismatch)?;
+    let mut events = Vec::with_capacity(client.queued_event_count());
+    while let Some(event) = client.pop_queued_event() {
+        if event.connection_binding() != &binding {
+            return Err(ServiceError::ProjectorConnectionMismatch);
+        }
+        events.push(event);
+    }
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    match time::timeout(
+        PROJECTOR_BATCH_TIMEOUT,
+        projector.consume(binding.authority(), &events),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(ServiceError::ProjectorUnavailable),
+    }
+}
+
+/// Runs the key-bearing payout lifecycle without opening any TCP listener.
+///
+/// A database-clock lease prevents two workers from signing concurrently. The
+/// public service can only advertise enabled payouts while this independently
+/// authenticated worker continues to refresh its durable heartbeat.
+pub async fn run_payout_worker(config: RuntimeConfig) -> Result<(), ServiceError> {
+    if config.payout_mode != PayoutMode::Automatic || config.automatic_payout.is_none() {
+        return Err(ServiceError::PayoutWorkerMissingAuthority);
+    }
+
+    let started = bootstrap::payout(&config).await?;
+    let worker_instance = uuid::Uuid::new_v4();
+    let acquire_store = Arc::clone(&started.store);
+    let acquired = wait_for_payout_worker_lease(
+        move || {
+            let store = Arc::clone(&acquire_store);
+            async move {
+                store
+                    .acquire_payout_worker(worker_instance, PAYOUT_WORKER_LEASE_DURATION)
+                    .await
+            }
+        },
+        PAYOUT_WORKER_LEASE_ACQUIRE_WAIT,
+        PAYOUT_WORKER_LEASE_RETRY_INTERVAL,
+        shutdown_signal(),
+        time::sleep,
+    )
+    .await?;
+    if !acquired {
+        return Ok(());
+    }
+
+    let release_store = Arc::clone(&started.store);
+    with_payout_worker_lease(
+        async { Ok(true) },
+        || run_acquired_payout_worker(&config, &started, worker_instance),
+        || async move { release_store.release_payout_worker(worker_instance).await },
+    )
+    .await
+}
+
+/// Waits inside one service process for an orphaned lease to expire.
+///
+/// Acquisition is always decided by PostgreSQL's clock. While waiting, this
+/// process has no signer, wallet, heartbeat, or payout authority, and a normal
+/// shutdown exits without attempting to release the predecessor's lease.
+async fn wait_for_payout_worker_lease<A, AF, S, W, WF>(
+    mut acquire: A,
+    maximum_wait: Duration,
+    retry_interval: Duration,
+    shutdown: S,
+    mut wait: W,
+) -> Result<bool, ServiceError>
+where
+    A: FnMut() -> AF,
+    AF: Future<Output = Result<bool, StoreError>>,
+    S: Future<Output = io::Result<()>>,
+    W: FnMut(Duration) -> WF,
+    WF: Future<Output = ()>,
+{
+    if maximum_wait.is_zero() || retry_interval.is_zero() {
+        return Err(ServiceError::Invariant);
+    }
+
+    let mut remaining = maximum_wait;
+    tokio::pin!(shutdown);
+    loop {
+        // Do not cancel this database request mid-flight. A successful insert
+        // or takeover must be observed before any shutdown path can exit.
+        if acquire().await? {
+            return Ok(true);
+        }
+        if remaining.is_zero() {
+            return Err(ServiceError::PayoutWorkerAlreadyActive);
+        }
+
+        let delay = retry_interval.min(remaining);
+        let delay_elapsed = wait(delay);
+        tokio::pin!(delay_elapsed);
+        tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                signal?;
+                return Ok(false);
+            }
+            () = &mut delay_elapsed => {}
+        }
+        remaining = remaining.saturating_sub(delay);
+    }
+}
+
+async fn with_payout_worker_lease<A, AF, R>(
+    acquire: A,
+    action: impl FnOnce() -> AF,
+    release: impl FnOnce() -> R,
+) -> Result<(), ServiceError>
+where
+    A: Future<Output = Result<bool, StoreError>>,
+    AF: Future<Output = Result<(), ServiceError>>,
+    R: Future<Output = Result<bool, StoreError>>,
+{
+    if !acquire.await? {
+        return Err(ServiceError::PayoutWorkerAlreadyActive);
+    }
+    let service_result = action().await;
+    if service_result
+        .as_ref()
+        .is_err_and(|error| !error.payout_worker_lease_can_release())
+    {
+        // A Tokio task that exceeded the drain deadline may still own a
+        // non-cancellable blocking wallet call. Preserve the 35-minute DB
+        // takeover fence and let systemd's shorter stop timeout kill the old
+        // process before any successor can acquire authority.
+        return service_result;
+    }
+    let release_result = release()
+        .await
+        .map_err(ServiceError::from)
+        .and_then(|released| {
+            if released {
+                Ok(())
+            } else {
+                Err(ServiceError::PayoutWorkerLeaseLost)
+            }
+        });
+    combine_service_and_cleanup(service_result, release_result)
+}
+
+async fn mark_payout_ready_or_shutdown<R, S>(
+    mark_ready: R,
+    shutdown: S,
+) -> Result<bool, ServiceError>
+where
+    R: Future<Output = Result<bool, StoreError>>,
+    S: Future<Output = io::Result<()>>,
+{
+    tokio::pin!(mark_ready);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        biased;
+        signal = &mut shutdown => {
+            signal?;
+            Ok(false)
+        }
+        result = &mut mark_ready => {
+            match result? {
+                true => Ok(true),
+                false => Err(ServiceError::PayoutWorkerLeaseLost),
+            }
+        }
+    }
+}
+
+async fn run_acquired_payout_worker(
+    config: &RuntimeConfig,
+    started: &crate::bootstrap::PayoutBootstrap,
+    worker_instance: uuid::Uuid,
+) -> Result<(), ServiceError> {
+    // Heartbeat begins before any signer is constructed or any journal,
+    // reconciliation, or external recovery transition can occur. Losing the
+    // lease cancels startup immediately.
+    let (heartbeat_shutdown_tx, heartbeat_shutdown_rx) = watch::channel(false);
+    let mut heartbeat_tasks = JoinSet::new();
+    let heartbeat_store = Arc::clone(&started.store);
+    let mut heartbeat_shutdown = heartbeat_shutdown_rx;
+    heartbeat_tasks.spawn(async move {
+        ServiceTask::PayoutHeartbeat(
+            maintain_payout_worker_heartbeat(
+                heartbeat_store,
+                worker_instance,
+                &mut heartbeat_shutdown,
+            )
+            .await,
+        )
+    });
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let startup_config = config.clone();
+    let startup_store = Arc::clone(&started.store);
+    let mut startup_tasks = JoinSet::new();
+    startup_tasks.spawn(async move { build_payout_services(&startup_config, startup_store).await });
+    let startup_result = tokio::select! {
+        biased;
+        signal = &mut shutdown => {
+            signal?;
+            Ok(None)
+        }
+        result = heartbeat_tasks.join_next() => {
+            Err(classify_task_exit(result).err().unwrap_or(ServiceError::Invariant))
+        }
+        result = startup_tasks.join_next() => {
+            classify_payout_startup_exit(result).map(Some)
+        }
+    };
+    let payout_services = match startup_result {
+        Ok(Some(services)) => services,
+        Ok(None) => {
+            let startup_cleanup = drain_payout_startup(&mut startup_tasks).await;
+            let _ = heartbeat_shutdown_tx.send(true);
+            let heartbeat_cleanup = drain_service_tasks(&mut heartbeat_tasks).await;
+            return combine_service_and_cleanup(startup_cleanup, heartbeat_cleanup);
+        }
+        Err(error) => {
+            let startup_cleanup = drain_payout_startup(&mut startup_tasks).await;
+            let _ = heartbeat_shutdown_tx.send(true);
+            let heartbeat_cleanup = drain_service_tasks(&mut heartbeat_tasks).await;
+            let cleanup = combine_service_and_cleanup(startup_cleanup, heartbeat_cleanup);
+            return combine_service_and_cleanup(Err(error), cleanup);
+        }
+    };
+
+    let (payout_shutdown_tx, payout_shutdown_rx) = watch::channel(false);
+    let mut payout_tasks = JoinSet::new();
+    let wec = Arc::clone(&payout_services.wec);
+    let wec_shutdown = payout_shutdown_rx.clone();
+    payout_tasks.spawn(async move { ServiceTask::WecPayout(wec.run(wec_shutdown).await) });
+    let zec = Arc::clone(&payout_services.zec);
+    let zec_shutdown = payout_shutdown_rx;
+    payout_tasks.spawn(async move { ServiceTask::ZecPayout(zec.run(zec_shutdown).await) });
+
+    // A worker becomes externally ready only after both runtimes exist and all
+    // signer recovery/reconciliation performed by construction has succeeded.
+    let ready_result = {
+        let ready_store = Arc::clone(&started.store);
+        let mark_ready = async {
+            let marked = mark_payout_ready_or_shutdown(
+                ready_store.mark_payout_worker_ready(worker_instance),
+                &mut shutdown,
+            )
+            .await?;
+            if !marked {
+                return Ok(false);
+            }
+            if let Err(notification_error) = notify_service_manager_ready() {
+                let withdrawal = ready_store
+                    .mark_payout_worker_not_ready(worker_instance)
+                    .await
+                    .map_err(ServiceError::from)
+                    .and_then(|updated| {
+                        if updated {
+                            Ok(())
+                        } else {
+                            Err(ServiceError::PayoutWorkerLeaseLost)
+                        }
+                    });
+                return match combine_service_and_cleanup(Err(notification_error), withdrawal) {
+                    Err(error) => Err(error),
+                    Ok(()) => Err(ServiceError::Invariant),
+                };
+            }
+            Ok(true)
+        };
+        tokio::pin!(mark_ready);
+        tokio::select! {
+            result = &mut mark_ready => result,
+            result = heartbeat_tasks.join_next() => {
+                classify_task_exit(result).map(|()| false)
+            }
+            result = payout_tasks.join_next() => {
+                classify_task_exit(result).map(|()| false)
+            }
+        }
+    };
+    match ready_result {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = payout_shutdown_tx.send(true);
+            let payout_cleanup = drain_service_tasks(&mut payout_tasks).await;
+            let _ = heartbeat_shutdown_tx.send(true);
+            let heartbeat_cleanup = drain_service_tasks(&mut heartbeat_tasks).await;
+            return combine_service_and_cleanup(payout_cleanup, heartbeat_cleanup);
+        }
+        Err(error) => {
+            let _ = payout_shutdown_tx.send(true);
+            let payout_cleanup = drain_service_tasks(&mut payout_tasks).await;
+            let _ = heartbeat_shutdown_tx.send(true);
+            let heartbeat_cleanup = drain_service_tasks(&mut heartbeat_tasks).await;
+            let cleanup = combine_service_and_cleanup(payout_cleanup, heartbeat_cleanup);
+            return combine_service_and_cleanup(Err(error), cleanup);
+        }
+    }
+
+    let first_exit = tokio::select! {
+        signal = &mut shutdown => {
+            signal?;
+            None
+        }
+        result = payout_tasks.join_next() => Some(classify_task_exit(result)),
+        result = heartbeat_tasks.join_next() => Some(classify_task_exit(result)),
+    };
+
+    // Stop advertising execution before asking either potentially
+    // non-cancellable signer pass to drain. The ownership heartbeat continues
+    // until those passes are gone, so no successor can race their external
+    // effects.
+    let not_ready = started
+        .store
+        .mark_payout_worker_not_ready(worker_instance)
+        .await
+        .map_err(ServiceError::from)
+        .and_then(|updated| {
+            if updated {
+                Ok(())
+            } else {
+                Err(ServiceError::PayoutWorkerLeaseLost)
+            }
+        });
+    let _ = payout_shutdown_tx.send(true);
+    let payout_drained = drain_service_tasks(&mut payout_tasks).await;
+    let _ = heartbeat_shutdown_tx.send(true);
+    let heartbeat_drained = drain_service_tasks(&mut heartbeat_tasks).await;
+
+    let mut result = None;
+    retain_first_error(&mut result, first_exit.transpose().map(|_| ()));
+    retain_first_error(&mut result, not_ready);
+    retain_first_error(&mut result, payout_drained);
+    retain_first_error(&mut result, heartbeat_drained);
+    result.map_or(Ok(()), Err)
+}
+
+/// Publishes readiness from the exact long-running payout process. Combined
+/// with `Type=notify`, this keeps the target's start job pending until signer
+/// construction and durable database readiness both belong to this process.
+fn notify_service_manager_ready() -> Result<(), ServiceError> {
+    let socket = std::env::var_os("NOTIFY_SOCKET").ok_or_else(|| {
+        ServiceError::ServiceManagerNotification(io::Error::new(
+            io::ErrorKind::NotFound,
+            "NOTIFY_SOCKET is unavailable",
+        ))
+    })?;
+    send_service_manager_ready(&socket).map_err(ServiceError::ServiceManagerNotification)
+}
+
+#[cfg(unix)]
+fn send_service_manager_ready(socket_name: &OsStr) -> io::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, net::SocketAddr};
+
+    const READY: &[u8] = b"READY=1";
+    let name = socket_name.as_bytes();
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NOTIFY_SOCKET is invalid",
+        ));
+    }
+
+    let address = if name[0] == b'@' {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            SocketAddr::from_abstract_name(&name[1..])?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "abstract service-manager sockets require Linux",
+            ));
+        }
+    } else {
+        let path = Path::new(socket_name);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NOTIFY_SOCKET path is not absolute",
+            ));
+        }
+        SocketAddr::from_pathname(path)?
+    };
+    let socket = UnixDatagram::unbound()?;
+    let sent = socket.send_to_addr(READY, &address)?;
+    if sent != READY.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "service-manager readiness datagram was truncated",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn send_service_manager_ready(_socket_name: &std::ffi::OsStr) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "service-manager readiness requires a Unix socket",
+    ))
+}
+
+async fn drain_service_tasks(tasks: &mut JoinSet<ServiceTask>) -> Result<(), ServiceError> {
+    let drain = async {
+        let mut first_error = None;
+        while let Some(result) = tasks.join_next().await {
+            retain_first_error(&mut first_error, classify_drained_task(result));
+        }
+        first_error.map_or(Ok(()), Err)
+    };
+    match time::timeout(SERVICE_DRAIN_TIMEOUT, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            Err(ServiceError::DrainTimeout)
+        }
+    }
+}
+
+fn classify_payout_startup_exit(
+    result: Option<Result<Result<PayoutServices, ServiceError>, tokio::task::JoinError>>,
+) -> Result<PayoutServices, ServiceError> {
+    match result {
+        Some(Ok(result)) => result,
+        Some(Err(_)) | None => Err(ServiceError::TaskFailed),
+    }
+}
+
+async fn drain_payout_startup(
+    tasks: &mut JoinSet<Result<PayoutServices, ServiceError>>,
+) -> Result<(), ServiceError> {
+    let drain = async {
+        let mut first_error = None;
+        while let Some(result) = tasks.join_next().await {
+            let result = classify_payout_startup_exit(Some(result)).map(drop);
+            retain_first_error(&mut first_error, result);
+        }
+        first_error.map_or(Ok(()), Err)
+    };
+    match time::timeout(SERVICE_DRAIN_TIMEOUT, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            Err(ServiceError::DrainTimeout)
+        }
+    }
+}
+
+async fn maintain_payout_worker_heartbeat(
+    store: Arc<PostgresStore>,
+    worker_instance: uuid::Uuid,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), StoreError> {
+    let mut interval = time::interval(PAYOUT_WORKER_HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = interval.tick() => {
+                if !store.heartbeat_payout_worker(worker_instance).await? {
+                    return Err(StoreError::PayoutWorkerLeaseLost);
+                }
+            }
+        }
+    }
+}
+
 /// Exercises the non-listening, probe-only service dependency graph once.
 ///
 /// Unlike [`run`], this path starts no share, payout, portal, refresh, nonce,
 /// or socket task. It never constructs signer journals or payout runtimes and
 /// never creates, recovers, signs, observes, synchronizes, or broadcasts a
-/// transaction. Durable payout recovery remains part of [`run`] after this
-/// service-manager probe succeeds. Every resource is dropped before return.
+/// transaction. Durable payout recovery remains exclusive to
+/// [`run_payout_worker`] after this service-manager probe succeeds. Every
+/// resource is dropped before return.
 pub async fn preflight(config: &RuntimeConfig) -> Result<(), ServiceError> {
     let started = bootstrap::preflight(config).await?;
     let mut probe = LivePreflightProbe {
@@ -185,16 +787,7 @@ async fn run_started(
 
     let validator = build_address_validator(config)?;
     verify_address_authority(Arc::clone(&validator)).await?;
-    let payout_services = match config.payout_mode {
-        PayoutMode::Deferred => None,
-        PayoutMode::Automatic => {
-            Some(build_payout_services(config, Arc::clone(&started.store), &started.jobs).await?)
-        }
-    };
-    let payout_boundary = match &payout_services {
-        Some(services) => Arc::clone(&services.portal),
-        None => build_probe_only_payout_boundary(config, &started.jobs).await?,
-    };
+    let payout_boundary = build_probe_only_payout_boundary(config, &started.jobs).await?;
 
     let pool_data = PostgresPoolDataSource::new(started.store.as_ref().clone());
     pool_data.refresh().await?;
@@ -277,20 +870,6 @@ async fn run_started(
             .await,
         )
     });
-
-    if let Some(payout_services) = payout_services {
-        let wec_payout_shutdown = shutdown_rx.clone();
-        let wec_payout = Arc::clone(&payout_services.wec);
-        tasks.spawn(
-            async move { ServiceTask::WecPayout(wec_payout.run(wec_payout_shutdown).await) },
-        );
-
-        let zec_payout_shutdown = shutdown_rx.clone();
-        let zec_payout = Arc::clone(&payout_services.zec);
-        tasks.spawn(
-            async move { ServiceTask::ZecPayout(zec_payout.run(zec_payout_shutdown).await) },
-        );
-    }
 
     let first_exit = {
         let shares = &bootstrap.as_ref().ok_or(ServiceError::Invariant)?.shares;
@@ -397,7 +976,6 @@ async fn verify_address_authority(
 }
 
 struct PayoutServices {
-    portal: Arc<TestnetPayoutBoundary>,
     wec: Arc<AutomaticPayoutRuntime>,
     zec: Arc<AutomaticPayoutRuntime>,
 }
@@ -529,7 +1107,6 @@ fn automatic_payout(config: &RuntimeConfig) -> Result<&AutomaticPayoutConfig, Se
 async fn build_payout_services(
     config: &RuntimeConfig,
     store: Arc<PostgresStore>,
-    jobs: &wcash_pool_edge::JobRouter,
 ) -> Result<PayoutServices, ServiceError> {
     let payout = automatic_payout(config)?;
     let pinned = PinnedWolfProgram::verify(
@@ -592,10 +1169,10 @@ async fn build_payout_services(
             .map_err(|_| ServiceError::SignerConfiguration)?,
     );
 
-    let portal = Arc::new(TestnetPayoutBoundary::new(Arc::new(DualPayoutSigner::new(
+    let signer: Arc<dyn IsolatedPayoutSigner> = Arc::new(DualPayoutSigner::new(
         Arc::clone(&wec) as Arc<dyn IsolatedPayoutSigner>,
         Arc::clone(&zec) as Arc<dyn IsolatedPayoutSigner>,
-    ))));
+    ));
 
     let wcash_rpc = Arc::new(
         LoopbackJsonRpc::new(config.wcash_node_rpc, config.wcash_node_cookie_file.clone())
@@ -654,27 +1231,32 @@ async fn build_payout_services(
     wcash_capabilities.map_err(map_authority_failure)?;
     zcash_capabilities.map_err(map_authority_failure)?;
 
-    let wcash_verified = verify_observer_authority(
-        wcash_wallet.as_ref(),
-        wcash_authority.as_ref(),
-        Chain::Wcash,
+    let snapshot_store = Arc::clone(&store);
+    let (wcash_verified, zcash_verified) = observe_then_verify_current_backend(
+        verify_observer_authority(
+            wcash_wallet.as_ref(),
+            wcash_authority.as_ref(),
+            Chain::Wcash,
+        ),
+        verify_observer_authority(
+            zcash_wallet.as_ref(),
+            zcash_authority.as_ref(),
+            Chain::Zcash,
+        ),
+        move |wcash_tip, zcash_tip| async move {
+            // Wcash wallet sync may consume its full 15-minute bound. Obtain a
+            // verifier-only, race-free Wolf snapshot at the last possible
+            // moment instead of retaining one from process bootstrap.
+            let jobs = bootstrap::payout_jobs(config, &snapshot_store).await?;
+            verify_backend_authority(&jobs, wcash_tip, zcash_tip)
+        },
     )
     .await?;
-    let zcash_verified = verify_observer_authority(
-        zcash_wallet.as_ref(),
-        zcash_authority.as_ref(),
-        Chain::Zcash,
-    )
-    .await?;
-    verify_backend_authority(jobs, wcash_verified.tip, zcash_verified.tip)?;
 
     // The Wcash observation above performs the required seedless sync under
     // the same transport lock. Check both spend-capable signer identities
     // before asking either journal to recover an unfinished payout.
-    portal
-        .readiness_bounded(SIGNER_READINESS_TIMEOUT)
-        .await
-        .map_err(|_| ServiceError::SignerUnavailable)?;
+    verify_startup_signer_readiness(signer, SIGNER_READINESS_TIMEOUT).await?;
 
     let settlement = Arc::new(SettlementOrchestrator::new(
         Arc::clone(&store) as Arc<dyn crate::settlement::SettlementStore>,
@@ -690,11 +1272,11 @@ async fn build_payout_services(
         Arc::new(RpcExactBroadcaster::new(Arc::clone(&zcash_authority))),
     )?);
 
-    // Signer journals are an earlier durable boundary than PostgreSQL. Recover
-    // them before comparing wallet balances: a crash can leave SQL Draft while
-    // the wallet already holds exact signed bytes (or an older release already
-    // broadcast them). Recovery first copies those bytes into SQL Signed and
-    // uses the authoritative node broadcaster; it never signs a replacement.
+    // SQL authorizes the signer boundary first. Recover durable Signing rows
+    // before comparing wallet balances: an exact journal artifact is copied to
+    // Signed, while an empty journal completes only that already-authorized
+    // idempotent request. Migration 0009 rejects ambiguous legacy Draft/Signed
+    // rows, so startup never guesses whether an older release crossed a fence.
     let wec_gate = settlement
         .recover_before_wallet_reconciliation(Chain::Wcash)
         .await?;
@@ -704,8 +1286,9 @@ async fn build_payout_services(
 
     // With no in-flight external effect, a collector can join this accounting
     // namespace only when its spendable balance is represented by the sealed
-    // ledger. Signed/Broadcast batches deliberately skip this snapshot: SQL
-    // already classifies their wallet balance as ambiguous until confirmation.
+    // ledger. Signing/Signed/Broadcasting/Broadcast batches deliberately skip
+    // this snapshot: SQL classifies their wallet balance as externally
+    // ambiguous until confirmation.
     if wec_gate == ReconciliationGate::Safe {
         record_startup_reconciliation(&store, &wcash_verified.observation).await?;
     }
@@ -713,9 +1296,9 @@ async fn build_payout_services(
         record_startup_reconciliation(&store, &zcash_verified.observation).await?;
     }
 
-    // Only after a safe wallet/ledger snapshot may an ordinary Draft create or
-    // sign new bytes. Ambiguous legacy and existing SQL states were already
-    // resolved above and remain under authoritative confirmation monitoring.
+    // Only after a safe wallet/ledger snapshot may Draft authorize signing.
+    // Existing effect-fenced states remain resumable without changing their
+    // exact request or transaction bytes.
     if wec_gate == ReconciliationGate::Safe {
         require_nonterminal_startup_outcome(settlement.resume_next(Chain::Wcash).await?)?;
     }
@@ -750,7 +1333,25 @@ async fn build_payout_services(
         zcash_authority,
         settlement_driver,
     )?);
-    Ok(PayoutServices { portal, wec, zec })
+    Ok(PayoutServices { wec, zec })
+}
+
+/// Runs the full, potentially multi-RPC signer startup probe outside Tokio's
+/// async workers. Portal HTTP readiness intentionally has a separate five
+/// second budget; startup recovery must not inherit that request-time cap.
+async fn verify_startup_signer_readiness(
+    signer: Arc<dyn IsolatedPayoutSigner>,
+    timeout: Duration,
+) -> Result<(), ServiceError> {
+    if timeout.is_zero() || timeout > SIGNER_READINESS_TIMEOUT {
+        return Err(ServiceError::SignerUnavailable);
+    }
+    let readiness = tokio::task::spawn_blocking(move || signer.readiness());
+    time::timeout(timeout, readiness)
+        .await
+        .map_err(|_| ServiceError::SignerUnavailable)?
+        .map_err(|_| ServiceError::SignerUnavailable)?
+        .map_err(|_| ServiceError::SignerUnavailable)
 }
 
 fn require_nonterminal_startup_outcome(outcome: ResumeOutcome) -> Result<(), ServiceError> {
@@ -799,6 +1400,23 @@ async fn verify_observer_authority(
 struct VerifiedWalletAuthority {
     tip: AuthorityTip,
     observation: wcash_pool_store::WalletObservation,
+}
+
+async fn observe_then_verify_current_backend<W, Z, V, VF>(
+    wcash_observation: W,
+    zcash_observation: Z,
+    verify_fresh_backend: V,
+) -> Result<(VerifiedWalletAuthority, VerifiedWalletAuthority), ServiceError>
+where
+    W: Future<Output = Result<VerifiedWalletAuthority, ServiceError>>,
+    Z: Future<Output = Result<VerifiedWalletAuthority, ServiceError>>,
+    V: FnOnce(AuthorityTip, AuthorityTip) -> VF,
+    VF: Future<Output = Result<(), ServiceError>>,
+{
+    let wcash = wcash_observation.await?;
+    let zcash = zcash_observation.await?;
+    verify_fresh_backend(wcash.tip, zcash.tip).await?;
+    Ok((wcash, zcash))
 }
 
 async fn record_startup_reconciliation(
@@ -1016,6 +1634,7 @@ enum ServiceTask {
     Nonce(Result<(), StoreError>),
     WecPayout(Result<(), PayoutRuntimeError>),
     ZecPayout(Result<(), PayoutRuntimeError>),
+    PayoutHeartbeat(Result<(), StoreError>),
 }
 
 fn classify_task_exit(
@@ -1044,6 +1663,10 @@ fn classify_task_exit(
             Err(ServiceError::UnexpectedComponentExit("zec_payout"))
         }
         Some(Ok(ServiceTask::ZecPayout(Err(error)))) => Err(ServiceError::PayoutRuntime(error)),
+        Some(Ok(ServiceTask::PayoutHeartbeat(Ok(())))) => {
+            Err(ServiceError::UnexpectedComponentExit("payout_heartbeat"))
+        }
+        Some(Ok(ServiceTask::PayoutHeartbeat(Err(error)))) => Err(ServiceError::Store(error)),
         Some(Err(_)) => Err(ServiceError::TaskFailed),
         None => Err(ServiceError::TaskFailed),
     }
@@ -1060,6 +1683,7 @@ fn classify_drained_task(
         Ok(ServiceTask::WecPayout(result) | ServiceTask::ZecPayout(result)) => {
             result.map_err(ServiceError::from)
         }
+        Ok(ServiceTask::PayoutHeartbeat(result)) => result.map_err(ServiceError::from),
         Err(_) => Err(ServiceError::TaskFailed),
     }
 }
@@ -1082,6 +1706,9 @@ pub enum ServiceError {
     /// An expected listener could not be opened or served.
     #[error("service listener is unavailable")]
     Listener(#[from] io::Error),
+    /// The exact payout worker could not publish readiness to its service manager.
+    #[error("service-manager payout readiness notification failed")]
+    ServiceManagerNotification(#[source] io::Error),
     /// Wolf's authoritative address command was not usable.
     #[error("Wcash address authority is unavailable")]
     AddressAuthorityUnavailable,
@@ -1100,6 +1727,30 @@ pub enum ServiceError {
     /// An automatic payout worker stopped on a durable or authority failure.
     #[error(transparent)]
     PayoutRuntime(#[from] PayoutRuntimeError),
+    /// The Internet-facing service was given spending-authority configuration.
+    #[error("public service refuses payout spending authority")]
+    PublicServiceHasPayoutAuthority,
+    /// The accounting projector was given spending-authority configuration.
+    #[error("accounting projector refuses payout spending authority")]
+    ProjectorHasPayoutAuthority,
+    /// The projector's backend stream was not the connection that produced its snapshot.
+    #[error("accounting projector backend connection binding changed")]
+    ProjectorConnectionMismatch,
+    /// PostgreSQL did not durably accept an exact journal batch in time.
+    #[error("accounting projector could not durably project the backend journal")]
+    ProjectorUnavailable,
+    /// Wolf reported that accepting or projecting current work is unsafe.
+    #[error("accounting projector stopped because the backend is unhealthy")]
+    ProjectorBackendUnhealthy,
+    /// The isolated worker was started without its complete spending authority.
+    #[error("payout worker requires automatic payout authority")]
+    PayoutWorkerMissingAuthority,
+    /// A fresh worker already owns this deployment's payout lease.
+    #[error("another payout worker is already active")]
+    PayoutWorkerAlreadyActive,
+    /// This process no longer owns the durable database-clock payout lease.
+    #[error("payout worker lease was lost")]
+    PayoutWorkerLeaseLost,
     /// Wallet and validator authorities could not be bound to one exact tip.
     #[error("payout authority configuration is invalid")]
     PayoutAuthorityConfiguration,
@@ -1137,18 +1788,32 @@ pub enum ServiceError {
     Invariant,
 }
 
+impl ServiceError {
+    fn payout_worker_lease_can_release(&self) -> bool {
+        match self {
+            Self::DrainTimeout | Self::TaskFailed => false,
+            Self::ServiceAndCleanupFailed { service, cleanup } => {
+                service.payout_worker_lease_can_release()
+                    && cleanup.payout_worker_lease_can_release()
+            }
+            _ => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::panic)]
+
+    use std::{io, sync::Arc, time::Duration};
 
     #[cfg(unix)]
     use std::{
         fs,
         net::SocketAddr,
-        os::unix::fs::PermissionsExt,
+        os::unix::{fs::PermissionsExt, net::UnixDatagram},
         path::{Path, PathBuf},
         str::FromStr,
-        time::Duration,
     };
 
     #[cfg(unix)]
@@ -1159,17 +1824,27 @@ mod tests {
     use tempfile::TempDir;
     #[cfg(unix)]
     use uuid::Uuid;
+    use wcash_pool_store::StoreError;
     #[cfg(unix)]
     use wcash_zec_payout_signer::ZALLET_API_VERSION;
 
-    use super::{
-        backend_tip_facts_match, combine_service_and_cleanup, exercise_preflight,
-        retain_first_error, validate_probe_only_payout_configuration, AuthorityTip, PreflightProbe,
-        ServiceError, MAX_WEC_IN_FLIGHT_PASS_SECS, PAYOUT_MAXIMUM_CONFIRMATION_WATCHES,
-        REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT, SERVICE_DRAIN_TIMEOUT,
-    };
     #[cfg(unix)]
-    use crate::config::{AutomaticPayoutConfig, ChainRuntimePolicy, PayoutMode, RuntimeConfig};
+    use super::send_service_manager_ready;
+    use super::{
+        backend_tip_facts_match, combine_service_and_cleanup, drain_payout_startup,
+        exercise_preflight, mark_payout_ready_or_shutdown, observe_then_verify_current_backend,
+        retain_first_error, validate_probe_only_payout_configuration, validate_projector_authority,
+        verify_startup_signer_readiness, wait_for_payout_worker_lease,
+        wait_for_projector_heartbeat, with_payout_worker_lease, AuthorityTip, PreflightProbe,
+        ServiceError, VerifiedWalletAuthority, MAX_WEC_IN_FLIGHT_PASS_SECS,
+        PAYOUT_MAXIMUM_CONFIRMATION_WATCHES, PAYOUT_WORKER_LEASE_ACQUIRE_WAIT,
+        PAYOUT_WORKER_LEASE_DURATION, PAYOUT_WORKER_LEASE_RETRY_INTERVAL,
+        REQUIRED_PAYOUT_READINESS_TIMEOUT, REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT,
+        SERVICE_DRAIN_TIMEOUT, SIGNER_READINESS_TIMEOUT,
+    };
+    use crate::config::PayoutMode;
+    #[cfg(unix)]
+    use crate::config::{AutomaticPayoutConfig, ChainRuntimePolicy, RuntimeConfig};
 
     #[derive(Clone, Copy)]
     enum BrokenPreflightGate {
@@ -1177,6 +1852,342 @@ mod tests {
         Program,
         Signer,
         Authority,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_manager_readiness_uses_one_exact_absolute_datagram() {
+        let temporary = TempDir::new().expect("notification fixture directory");
+        let socket_path = temporary.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&socket_path).expect("bind notification fixture");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound notification timeout");
+
+        send_service_manager_ready(socket_path.as_os_str()).expect("send exact readiness");
+        let mut payload = [0_u8; 32];
+        let received = receiver
+            .recv(&mut payload)
+            .expect("receive exact readiness");
+        assert_eq!(&payload[..received], b"READY=1");
+
+        let relative = std::ffi::OsStr::new("notify.sock");
+        assert_eq!(
+            send_service_manager_ready(relative)
+                .expect_err("relative notification socket is rejected")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn projector_configuration_cannot_contain_spending_authority() {
+        validate_projector_authority(PayoutMode::Deferred, false)
+            .expect("deferred projector is accepted");
+        for (mode, configured) in [
+            (PayoutMode::Automatic, true),
+            (PayoutMode::Automatic, false),
+            (PayoutMode::Deferred, true),
+        ] {
+            assert!(matches!(
+                validate_projector_authority(mode, configured),
+                Err(ServiceError::ProjectorHasPayoutAuthority)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn projector_shutdown_preempts_an_immediately_ready_heartbeat() {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+        let mut shutdown = Box::pin(async { Ok(()) });
+        assert!(
+            !wait_for_projector_heartbeat(&mut heartbeat, shutdown.as_mut())
+                .await
+                .expect("shutdown signal succeeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn projector_starts_with_an_immediate_health_cycle() {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+        let mut shutdown = Box::pin(std::future::pending::<io::Result<()>>());
+        assert!(
+            wait_for_projector_heartbeat(&mut heartbeat, shutdown.as_mut())
+                .await
+                .expect("initial heartbeat succeeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_lease_precedes_authority_and_releases_after_failure() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let acquire_events = std::sync::Arc::clone(&events);
+        let action_events = std::sync::Arc::clone(&events);
+        let release_events = std::sync::Arc::clone(&events);
+        let result = with_payout_worker_lease(
+            async move {
+                acquire_events.lock().expect("events").push("acquire");
+                Ok::<_, StoreError>(true)
+            },
+            || async move {
+                action_events.lock().expect("events").push("authority");
+                Err(ServiceError::SignerUnavailable)
+            },
+            || async move {
+                release_events.lock().expect("events").push("release");
+                Ok::<_, StoreError>(true)
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServiceError::SignerUnavailable)));
+        assert_eq!(
+            *events.lock().expect("events"),
+            ["acquire", "authority", "release"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_payout_lease_constructs_no_authority_and_does_not_release() {
+        let action_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let action_probe = std::sync::Arc::clone(&action_called);
+        let release_probe = std::sync::Arc::clone(&release_called);
+        let result = with_payout_worker_lease(
+            async { Ok::<_, StoreError>(false) },
+            || async move {
+                action_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || async move {
+                release_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, StoreError>(true)
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceError::PayoutWorkerAlreadyActive)
+        ));
+        assert!(!action_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!release_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn sigkill_takeover_waits_for_database_clock_expiry_without_overlap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let database_now = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let acquire_clock = Arc::clone(&database_now);
+        let acquire_attempts = Arc::clone(&attempts);
+        let wait_clock = Arc::clone(&database_now);
+        let previous_owner_expires_at = PAYOUT_WORKER_LEASE_DURATION.as_secs();
+
+        let acquired = wait_for_payout_worker_lease(
+            move || {
+                let now = acquire_clock.load(Ordering::SeqCst);
+                acquire_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<_, StoreError>(now >= previous_owner_expires_at) }
+            },
+            PAYOUT_WORKER_LEASE_ACQUIRE_WAIT,
+            PAYOUT_WORKER_LEASE_RETRY_INTERVAL,
+            std::future::pending::<io::Result<()>>(),
+            move |delay| {
+                wait_clock.fetch_add(delay.as_secs(), Ordering::SeqCst);
+                std::future::ready(())
+            },
+        )
+        .await
+        .expect("successor reaches the database-clock takeover boundary");
+
+        assert!(acquired);
+        assert_eq!(
+            database_now.load(Ordering::SeqCst),
+            previous_owner_expires_at
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            previous_owner_expires_at / PAYOUT_WORKER_LEASE_RETRY_INTERVAL.as_secs() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_lease_standby_is_interruptible_without_claim_or_release() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let acquire_attempts = Arc::clone(&attempts);
+        let acquired = wait_for_payout_worker_lease(
+            move || {
+                acquire_attempts.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, StoreError>(false) }
+            },
+            PAYOUT_WORKER_LEASE_ACQUIRE_WAIT,
+            PAYOUT_WORKER_LEASE_RETRY_INTERVAL,
+            async { Ok(()) },
+            |_| std::future::pending::<()>(),
+        )
+        .await
+        .expect("standby shutdown succeeds");
+
+        assert!(!acquired);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn payout_lease_standby_has_a_hard_retry_budget() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let waited = Arc::new(AtomicU64::new(0));
+        let wait_clock = Arc::clone(&waited);
+        let result = wait_for_payout_worker_lease(
+            || async { Ok::<_, StoreError>(false) },
+            PAYOUT_WORKER_LEASE_ACQUIRE_WAIT,
+            PAYOUT_WORKER_LEASE_RETRY_INTERVAL,
+            std::future::pending::<io::Result<()>>(),
+            move |delay| {
+                wait_clock.fetch_add(delay.as_secs(), Ordering::SeqCst);
+                std::future::ready(())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceError::PayoutWorkerAlreadyActive)
+        ));
+        assert_eq!(
+            waited.load(Ordering::SeqCst),
+            PAYOUT_WORKER_LEASE_ACQUIRE_WAIT.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_readiness_never_marks_worker_ready() {
+        use std::{
+            pin::Pin,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            task::{Context, Poll},
+        };
+
+        struct MarkReadyProbe(Arc<AtomicBool>);
+
+        impl std::future::Future for MarkReadyProbe {
+            type Output = Result<bool, StoreError>;
+
+            fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+                self.0.store(true, Ordering::SeqCst);
+                Poll::Pending
+            }
+        }
+
+        let readiness_polled = Arc::new(AtomicBool::new(false));
+        let outcome =
+            mark_payout_ready_or_shutdown(MarkReadyProbe(Arc::clone(&readiness_polled)), async {
+                Ok(())
+            })
+            .await
+            .expect("clean pre-ready shutdown succeeds");
+
+        assert!(!outcome);
+        assert!(!readiness_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn pre_ready_shutdown_drains_startup_before_lease_release() {
+        use std::sync::Mutex;
+
+        use tokio::{sync::Notify, task::JoinSet};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let startup_gate = Arc::new(Notify::new());
+        let acquire_events = Arc::clone(&events);
+        let action_events = Arc::clone(&events);
+        let action_gate = Arc::clone(&startup_gate);
+        let release_events = Arc::clone(&events);
+
+        let worker = tokio::spawn(async move {
+            with_payout_worker_lease(
+                async move {
+                    acquire_events.lock().expect("events").push("acquire");
+                    Ok::<_, StoreError>(true)
+                },
+                || async move {
+                    let mut startup_tasks = JoinSet::new();
+                    startup_tasks.spawn(async move {
+                        action_gate.notified().await;
+                        action_events
+                            .lock()
+                            .expect("events")
+                            .push("startup_finished");
+                        Err(ServiceError::SignerUnavailable)
+                    });
+                    // This is the production pre-ready signal path: it must
+                    // join the non-cancellable startup task before returning.
+                    drain_payout_startup(&mut startup_tasks).await
+                },
+                || async move {
+                    release_events.lock().expect("events").push("release");
+                    Ok::<_, StoreError>(true)
+                },
+            )
+            .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*events.lock().expect("events"), ["acquire"]);
+
+        startup_gate.notify_one();
+        let result = worker.await.expect("worker task joins");
+        assert!(matches!(result, Err(ServiceError::SignerUnavailable)));
+        assert_eq!(
+            *events.lock().expect("events"),
+            ["acquire", "startup_finished", "release"]
+        );
+    }
+
+    #[test]
+    fn unsafe_task_drain_never_releases_the_takeover_fence() {
+        assert!(!ServiceError::DrainTimeout.payout_worker_lease_can_release());
+        assert!(!ServiceError::TaskFailed.payout_worker_lease_can_release());
+    }
+
+    struct StartupReadySigner;
+
+    impl wcash_pool_portal::IsolatedPayoutSigner for StartupReadySigner {
+        fn readiness(&self) -> Result<(), wcash_pool_portal::SignerError> {
+            Ok(())
+        }
+
+        fn sign_and_broadcast(
+            &self,
+            _request: &wcash_pool_portal::PayoutBatchRequest,
+        ) -> Result<wcash_pool_portal::BroadcastReceipt, wcash_pool_portal::SignerError> {
+            Err(wcash_pool_portal::SignerError::NotConfigured)
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_signer_probe_uses_its_dedicated_long_budget() {
+        assert!(SIGNER_READINESS_TIMEOUT > Duration::from_secs(5));
+        verify_startup_signer_readiness(Arc::new(StartupReadySigner), SIGNER_READINESS_TIMEOUT)
+            .await
+            .expect("startup probe accepts the reviewed long timeout");
+
+        let error = verify_startup_signer_readiness(
+            Arc::new(StartupReadySigner),
+            SIGNER_READINESS_TIMEOUT + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("unreviewed startup timeouts fail closed");
+        assert!(matches!(error, ServiceError::SignerUnavailable));
     }
 
     struct FakePreflightProbe {
@@ -1406,6 +2417,18 @@ mod tests {
     fn shutdown_bounds_cover_the_longest_serialized_wcash_pass() {
         assert!(SERVICE_DRAIN_TIMEOUT.as_secs() > MAX_WEC_IN_FLIGHT_PASS_SECS);
         assert!(REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT > SERVICE_DRAIN_TIMEOUT);
+        assert!(
+            PAYOUT_WORKER_LEASE_DURATION
+                > REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT + Duration::from_secs(60)
+        );
+        assert!(
+            PAYOUT_WORKER_LEASE_ACQUIRE_WAIT
+                >= PAYOUT_WORKER_LEASE_DURATION + PAYOUT_WORKER_LEASE_RETRY_INTERVAL
+        );
+        assert!(
+            REQUIRED_PAYOUT_READINESS_TIMEOUT
+                > PAYOUT_WORKER_LEASE_ACQUIRE_WAIT + SERVICE_DRAIN_TIMEOUT
+        );
         assert_eq!(PAYOUT_MAXIMUM_CONFIRMATION_WATCHES, 8);
     }
 
@@ -1441,5 +2464,61 @@ mod tests {
         assert!(!backend_tip_facts_match(
             wcash_hash, 41, wcash, zcash_hash, 90, zcash,
         ));
+    }
+
+    #[tokio::test]
+    async fn payout_backend_snapshot_is_loaded_after_both_live_observations() {
+        use std::sync::Mutex;
+
+        fn verified(chain: wcash_pool_store::Chain, tip: AuthorityTip) -> VerifiedWalletAuthority {
+            VerifiedWalletAuthority {
+                tip,
+                observation: wcash_pool_store::WalletObservation {
+                    chain,
+                    wallet_state_digest: [9; 32],
+                    wallet_spendable_zat: 0,
+                    best_tip_hash: tip.hash,
+                    best_tip_height: tip.height,
+                    observed_at: 1,
+                    valid_until: 2,
+                },
+            }
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let wcash_order = Arc::clone(&order);
+        let zcash_order = Arc::clone(&order);
+        let backend_order = Arc::clone(&order);
+        let wcash_tip = AuthorityTip {
+            hash: [1; 32],
+            height: 10,
+        };
+        let zcash_tip = AuthorityTip {
+            hash: [2; 32],
+            height: 20,
+        };
+
+        let result = observe_then_verify_current_backend(
+            async move {
+                wcash_order.lock().expect("order").push("wcash");
+                Ok(verified(wcash_pool_store::Chain::Wcash, wcash_tip))
+            },
+            async move {
+                zcash_order.lock().expect("order").push("zcash");
+                Ok(verified(wcash_pool_store::Chain::Zcash, zcash_tip))
+            },
+            move |wcash, zcash| {
+                backend_order.lock().expect("order").push("backend");
+                async move {
+                    assert_eq!(wcash, wcash_tip);
+                    assert_eq!(zcash, zcash_tip);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*order.lock().expect("order"), ["wcash", "zcash", "backend"]);
     }
 }

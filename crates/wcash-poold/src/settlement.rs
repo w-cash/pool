@@ -151,6 +151,8 @@ impl RichPayoutExecution {
             || self.transaction_id_bytes == [0; 32]
             || self.signed_transaction.is_empty()
             || self.signed_transaction.len() > MAX_SIGNED_TRANSACTION_BYTES
+            || self.network_fee_zat == 0
+            || self.network_fee_zat > request.maximum_network_fee_zat
             || hex::encode(self.transaction_id_bytes) != self.transaction_id
         {
             return Err(SettlementError::Invariant("rich signer artifact"));
@@ -240,17 +242,23 @@ pub trait SettlementStore: Send + Sync {
     /// Loads the oldest incomplete batch for one chain.
     fn oldest_resumable(&self, chain: Chain) -> SettlementFuture<'_, Option<PayoutBatch>>;
 
-    /// Builds a signer request exclusively from immutable database facts.
-    fn build_signer_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest>;
+    /// Durably authorizes signing while unfrozen and returns the exact request.
+    fn authorize_signing(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest>;
 
-    /// Persists every rich signer artifact in the Draft-to-Signed transition.
+    /// Reconstructs a previously authorized request without granting authority.
+    fn signing_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest>;
+
+    /// Persists every rich signer artifact in the Signing-to-Signed transition.
     fn mark_signed(&self, artifact: &SignedPayoutArtifact) -> SettlementFuture<'_, ()>;
 
     /// Loads exact transaction bytes previously persisted by `mark_signed`.
     fn signed_artifact(&self, batch_id: Uuid)
         -> SettlementFuture<'_, Option<SignedPayoutArtifact>>;
 
-    /// Advances Signed to Broadcast after a resolved exact-byte submission.
+    /// Durably authorizes broadcast while unfrozen and returns the exact bytes.
+    fn authorize_broadcast(&self, batch_id: Uuid) -> SettlementFuture<'_, SignedPayoutArtifact>;
+
+    /// Advances Broadcasting to Broadcast after a resolved exact-byte submission.
     fn mark_broadcast(&self, batch_id: Uuid) -> SettlementFuture<'_, ()>;
 }
 
@@ -265,11 +273,19 @@ impl SettlementStore for PostgresStore {
         })
     }
 
-    fn build_signer_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest> {
+    fn authorize_signing(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest> {
         Box::pin(async move {
-            PostgresStore::build_signer_request(self, batch_id)
+            self.authorize_payout_signing(batch_id)
                 .await
-                .map_err(|error| SettlementError::persistence("build_signer_request", error))
+                .map_err(|error| SettlementError::persistence("authorize_signing", error))
+        })
+    }
+
+    fn signing_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest> {
+        Box::pin(async move {
+            self.signing_payout_request(batch_id)
+                .await
+                .map_err(|error| SettlementError::persistence("signing_request", error))
         })
     }
 
@@ -296,6 +312,14 @@ impl SettlementStore for PostgresStore {
             self.signed_payout_artifact(batch_id)
                 .await
                 .map_err(|error| SettlementError::persistence("signed_artifact", error))
+        })
+    }
+
+    fn authorize_broadcast(&self, batch_id: Uuid) -> SettlementFuture<'_, SignedPayoutArtifact> {
+        Box::pin(async move {
+            self.authorize_payout_broadcast(batch_id)
+                .await
+                .map_err(|error| SettlementError::persistence("authorize_broadcast", error))
         })
     }
 
@@ -344,7 +368,9 @@ pub trait ExactTransactionBroadcaster: Send + Sync {
     /// Chain exclusively served by this broadcaster.
     fn chain(&self) -> Chain;
 
-    /// Accepts or recognizes the exact transaction; ambiguity leaves Signed.
+    /// Accepts or recognizes the exact transaction authorized by a durable
+    /// `Broadcasting` or `Broadcast` fence. Ambiguity leaves SQL unchanged so
+    /// the same bytes can be retried without returning to the signer.
     fn rebroadcast_exact(&self, artifact: &SignedPayoutArtifact) -> BoundaryFuture<'_, ()>;
 }
 
@@ -597,14 +623,12 @@ impl SettlementOrchestrator {
         let boundary = self.boundary(chain);
         match batch.state {
             PayoutBatchState::Draft => self.resume_draft(batch, boundary).await,
+            PayoutBatchState::Signing => self.resume_signing(batch, boundary).await,
             PayoutBatchState::Signed => self.resume_signed(batch, boundary).await,
+            PayoutBatchState::Broadcasting => self.resume_broadcasting(batch, boundary).await,
             PayoutBatchState::Broadcast => {
                 let artifact = self.load_exact_artifact(&batch).await?;
-                Ok(ResumeOutcome::AwaitingConfirmation {
-                    batch_id: batch.id,
-                    chain,
-                    transaction_id: artifact.transaction_id,
-                })
+                self.rebroadcast_committed(batch, artifact, boundary).await
             }
             PayoutBatchState::Reorged => {
                 let artifact = self.load_exact_artifact(&batch).await?;
@@ -626,11 +650,13 @@ impl SettlementOrchestrator {
     /// Recovers only pre-existing external-effect ambiguity before startup
     /// wallet reconciliation.
     ///
-    /// A Draft with no signer artifact, or with a prepare-only artifact, is not
-    /// advanced here. This method never creates, proves, or signs. Legacy
-    /// artifacts are first copied into SQL Signed, then resolved through the
-    /// exact-byte broadcaster. Even prepare-only WEC signing can reserve wallet
-    /// value, so every complete artifact is wallet-effect ambiguity.
+    /// A Draft has not crossed a durable external-effect fence and is safe.
+    /// `Signing` is completed only with its already-authorized, idempotent
+    /// request: journaled bytes are recovered, while an empty journal executes
+    /// that same request to close the pre-signer crash window. SQL records the
+    /// exact result before startup can grant any broadcast authority. An
+    /// existing `Broadcasting` fence permits only exact-byte re-submission,
+    /// including after a later freeze.
     pub async fn recover_before_wallet_reconciliation(
         &self,
         chain: Chain,
@@ -643,8 +669,9 @@ impl SettlementOrchestrator {
         }
         let boundary = self.boundary(chain);
         match batch.state {
-            PayoutBatchState::Draft => {
-                let request = self.store.build_signer_request(batch.id).await?;
+            PayoutBatchState::Draft => Ok(ReconciliationGate::Safe),
+            PayoutBatchState::Signing => {
+                let request = self.store.signing_request(batch.id).await?;
                 if request.batch_id != batch.id || request.asset != asset_for_chain(batch.chain) {
                     return Err(SettlementError::Invariant("signer request batch binding"));
                 }
@@ -653,22 +680,27 @@ impl SettlementOrchestrator {
                     .recover_exact(&request)
                     .await
                     .map_err(|failure| SettlementError::Boundary { chain, failure })?;
-                let Some(recovered) = recovered else {
-                    return Ok(ReconciliationGate::Safe);
+                let payout = if let Some(recovered) = recovered {
+                    recovered.payout
+                } else {
+                    // The authorization itself predates the crash. Completing
+                    // that exact idempotent request closes the clean
+                    // post-authorization/pre-signer window without rewinding a
+                    // fence that another process could have crossed.
+                    boundary
+                        .signer
+                        .prepare_exact(&request)
+                        .await
+                        .map_err(|failure| SettlementError::Boundary { chain, failure })?
                 };
-                recovered.payout.validate_against(&request)?;
-                let artifact = recovered.payout.as_store_artifact(chain);
+                payout.validate_against(&request)?;
+                let artifact = payout.as_store_artifact(chain);
                 self.store.mark_signed(&artifact).await?;
-                boundary
-                    .broadcaster
-                    .rebroadcast_exact(&artifact)
-                    .await
-                    .map_err(|failure| SettlementError::Boundary { chain, failure })?;
-                self.store.mark_broadcast(batch.id).await?;
                 Ok(ReconciliationGate::ExternalEffectPending)
             }
-            PayoutBatchState::Signed => {
-                self.resume_signed(batch, boundary).await?;
+            PayoutBatchState::Signed => Ok(ReconciliationGate::ExternalEffectPending),
+            PayoutBatchState::Broadcasting => {
+                self.resume_broadcasting(batch, boundary).await?;
                 Ok(ReconciliationGate::ExternalEffectPending)
             }
             PayoutBatchState::Broadcast => Ok(ReconciliationGate::ExternalEffectPending),
@@ -692,7 +724,27 @@ impl SettlementOrchestrator {
         batch: PayoutBatch,
         boundary: &ChainBoundary,
     ) -> Result<ResumeOutcome, SettlementError> {
-        let request = self.store.build_signer_request(batch.id).await?;
+        let request = self.store.authorize_signing(batch.id).await?;
+        let mut signing = batch;
+        signing.state = PayoutBatchState::Signing;
+        self.sign_and_submit(signing, request, boundary).await
+    }
+
+    async fn resume_signing(
+        &self,
+        batch: PayoutBatch,
+        boundary: &ChainBoundary,
+    ) -> Result<ResumeOutcome, SettlementError> {
+        let request = self.store.signing_request(batch.id).await?;
+        self.sign_and_submit(batch, request, boundary).await
+    }
+
+    async fn sign_and_submit(
+        &self,
+        batch: PayoutBatch,
+        request: PayoutBatchRequest,
+        boundary: &ChainBoundary,
+    ) -> Result<ResumeOutcome, SettlementError> {
         if request.batch_id != batch.id || request.asset != asset_for_chain(batch.chain) {
             return Err(SettlementError::Invariant("signer request batch binding"));
         }
@@ -707,6 +759,51 @@ impl SettlementOrchestrator {
         execution.validate_against(&request)?;
         let artifact = execution.as_store_artifact(batch.chain);
         self.store.mark_signed(&artifact).await?;
+        let mut signed = batch;
+        signed.state = PayoutBatchState::Signed;
+        self.resume_signed(signed, boundary).await
+    }
+
+    async fn resume_signed(
+        &self,
+        batch: PayoutBatch,
+        boundary: &ChainBoundary,
+    ) -> Result<ResumeOutcome, SettlementError> {
+        let artifact = self.store.authorize_broadcast(batch.id).await?;
+        if artifact.batch_id != batch.id || artifact.chain != batch.chain {
+            return Err(SettlementError::Invariant("authorized broadcast artifact"));
+        }
+        match artifact.state {
+            PayoutBatchState::Broadcasting => {
+                self.submit_authorized(batch, artifact, boundary).await
+            }
+            PayoutBatchState::Broadcast => Ok(ResumeOutcome::AwaitingConfirmation {
+                batch_id: batch.id,
+                chain: batch.chain,
+                transaction_id: artifact.transaction_id,
+            }),
+            _ => Err(SettlementError::Invariant("authorized broadcast artifact")),
+        }
+    }
+
+    async fn resume_broadcasting(
+        &self,
+        batch: PayoutBatch,
+        boundary: &ChainBoundary,
+    ) -> Result<ResumeOutcome, SettlementError> {
+        let artifact = self.load_exact_artifact(&batch).await?;
+        self.submit_authorized(batch, artifact, boundary).await
+    }
+
+    async fn submit_authorized(
+        &self,
+        batch: PayoutBatch,
+        artifact: SignedPayoutArtifact,
+        boundary: &ChainBoundary,
+    ) -> Result<ResumeOutcome, SettlementError> {
+        if artifact.state != PayoutBatchState::Broadcasting {
+            return Err(SettlementError::Invariant("broadcast authorization fence"));
+        }
         boundary
             .broadcaster
             .rebroadcast_exact(&artifact)
@@ -723,12 +820,15 @@ impl SettlementOrchestrator {
         })
     }
 
-    async fn resume_signed(
+    async fn rebroadcast_committed(
         &self,
         batch: PayoutBatch,
+        artifact: SignedPayoutArtifact,
         boundary: &ChainBoundary,
     ) -> Result<ResumeOutcome, SettlementError> {
-        let artifact = self.load_exact_artifact(&batch).await?;
+        if artifact.state != PayoutBatchState::Broadcast {
+            return Err(SettlementError::Invariant("committed broadcast fence"));
+        }
         boundary
             .broadcaster
             .rebroadcast_exact(&artifact)
@@ -737,8 +837,7 @@ impl SettlementOrchestrator {
                 chain: batch.chain,
                 failure,
             })?;
-        self.store.mark_broadcast(batch.id).await?;
-        Ok(ResumeOutcome::Broadcast {
+        Ok(ResumeOutcome::AwaitingConfirmation {
             batch_id: batch.id,
             chain: batch.chain,
             transaction_id: artifact.transaction_id,
@@ -842,6 +941,7 @@ mod tests {
         fail_mark_signed_before_commit: bool,
         fail_mark_signed_after_commit: bool,
         fail_mark_broadcast_before_commit: bool,
+        frozen: HashMap<ChainKey, bool>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -888,11 +988,58 @@ mod tests {
             })
         }
 
-        fn build_signer_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest> {
+        fn authorize_signing(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest> {
             Box::pin(async move {
-                self.state
+                let mut state = self
+                    .state
                     .lock()
-                    .map_err(|_| SettlementError::Invariant("fake store lock"))?
+                    .map_err(|_| SettlementError::Invariant("fake store lock"))?;
+                let key = state
+                    .batches
+                    .iter()
+                    .find_map(|(key, batch)| (batch.id == batch_id).then_some(*key))
+                    .ok_or(SettlementError::Invariant("fake batch"))?;
+                let batch_state = state
+                    .batches
+                    .get(&key)
+                    .ok_or(SettlementError::Invariant("fake batch"))?
+                    .state;
+                if batch_state == PayoutBatchState::Draft {
+                    if state.frozen.get(&key).copied().unwrap_or(false) {
+                        return Err(injected("authorize_signing"));
+                    }
+                    state
+                        .batches
+                        .get_mut(&key)
+                        .ok_or(SettlementError::Invariant("fake batch"))?
+                        .state = PayoutBatchState::Signing;
+                    state.transitions.push("signing");
+                } else if batch_state != PayoutBatchState::Signing {
+                    return Err(SettlementError::Invariant("fake signing transition"));
+                }
+                state
+                    .requests
+                    .get(&batch_id)
+                    .cloned()
+                    .ok_or(SettlementError::Invariant("fake signer request"))
+            })
+        }
+
+        fn signing_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest> {
+            Box::pin(async move {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| SettlementError::Invariant("fake store lock"))?;
+                if state
+                    .batches
+                    .values()
+                    .find(|batch| batch.id == batch_id)
+                    .is_none_or(|batch| batch.state != PayoutBatchState::Signing)
+                {
+                    return Err(SettlementError::Invariant("fake signing request state"));
+                }
+                state
                     .requests
                     .get(&batch_id)
                     .cloned()
@@ -915,6 +1062,9 @@ mod tests {
                     .batches
                     .get_mut(&artifact.chain.into())
                     .ok_or(SettlementError::Invariant("fake batch"))?;
+                if batch.state != PayoutBatchState::Signing {
+                    return Err(SettlementError::Invariant("fake signed transition"));
+                }
                 batch.state = PayoutBatchState::Signed;
                 state.artifacts.insert(artifact.batch_id, artifact);
                 state.transitions.push("signed");
@@ -945,6 +1095,57 @@ mod tests {
             })
         }
 
+        fn authorize_broadcast(
+            &self,
+            batch_id: Uuid,
+        ) -> SettlementFuture<'_, SignedPayoutArtifact> {
+            Box::pin(async move {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| SettlementError::Invariant("fake store lock"))?;
+                let key = state
+                    .batches
+                    .iter()
+                    .find_map(|(key, batch)| (batch.id == batch_id).then_some(*key))
+                    .ok_or(SettlementError::Invariant("fake batch"))?;
+                let batch_state = state
+                    .batches
+                    .get(&key)
+                    .ok_or(SettlementError::Invariant("fake batch"))?
+                    .state;
+                if batch_state == PayoutBatchState::Signed {
+                    if state.frozen.get(&key).copied().unwrap_or(false) {
+                        return Err(injected("authorize_broadcast"));
+                    }
+                    state
+                        .batches
+                        .get_mut(&key)
+                        .ok_or(SettlementError::Invariant("fake batch"))?
+                        .state = PayoutBatchState::Broadcasting;
+                    state.transitions.push("broadcasting");
+                } else if !matches!(
+                    batch_state,
+                    PayoutBatchState::Broadcasting | PayoutBatchState::Broadcast
+                ) {
+                    return Err(SettlementError::Invariant(
+                        "fake broadcast authorization transition",
+                    ));
+                }
+                let mut artifact = state
+                    .artifacts
+                    .get(&batch_id)
+                    .cloned()
+                    .ok_or(SettlementError::Invariant("fake payout artifact"))?;
+                artifact.state = state
+                    .batches
+                    .get(&key)
+                    .ok_or(SettlementError::Invariant("fake batch"))?
+                    .state;
+                Ok(artifact)
+            })
+        }
+
         fn mark_broadcast(&self, batch_id: Uuid) -> SettlementFuture<'_, ()> {
             Box::pin(async move {
                 let mut state = self
@@ -960,11 +1161,14 @@ mod tests {
                     .iter()
                     .find_map(|(key, batch)| (batch.id == batch_id).then_some(*key))
                     .ok_or(SettlementError::Invariant("fake batch"))?;
-                state
+                let batch = state
                     .batches
                     .get_mut(&key)
-                    .ok_or(SettlementError::Invariant("fake batch"))?
-                    .state = PayoutBatchState::Broadcast;
+                    .ok_or(SettlementError::Invariant("fake batch"))?;
+                if batch.state != PayoutBatchState::Broadcasting {
+                    return Err(SettlementError::Invariant("fake broadcast transition"));
+                }
+                batch.state = PayoutBatchState::Broadcast;
                 state.transitions.push("broadcast");
                 Ok(())
             })
@@ -1171,6 +1375,7 @@ mod tests {
             network: ChainNetwork::Testnet,
             ledger_root: [0x31; 32],
             reconciliation_id: Uuid::new_v4(),
+            maximum_network_fee_zat: 1_000,
             outputs: vec![PayoutOutput {
                 allocation_id: Uuid::new_v4(),
                 canonical_address: match asset {
@@ -1196,13 +1401,17 @@ mod tests {
             reconciliation_id: request.reconciliation_id,
             ledger_root: request.ledger_root,
             ledger_sequence_cutoff: 7,
-            miner_total_zat: 12_500,
+            miner_total_zat: 12_500 + request.maximum_network_fee_zat,
+            payout_total_zat: 12_500,
+            maximum_network_fee_zat: request.maximum_network_fee_zat,
             outputs: vec![PayoutInstruction {
                 allocation_id: request.outputs[0].allocation_id,
                 account_id: Uuid::new_v4(),
                 destination_id: Uuid::new_v4(),
                 receiver_kind: StoreReceiverKind::Ironwood,
                 address: request.outputs[0].canonical_address.clone(),
+                liability_amount_zat: request.outputs[0].amount_zat
+                    + request.maximum_network_fee_zat,
                 amount_zat: request.outputs[0].amount_zat,
             }],
         }
@@ -1249,9 +1458,7 @@ mod tests {
                 .await?,
             ReconciliationGate::Safe
         );
-        let recovery_calls = fixture.wec_signer.recovery_calls();
-        assert_eq!(recovery_calls.len(), 1);
-        assert_eq!(recovery_calls[0], request);
+        assert!(fixture.wec_signer.recovery_calls().is_empty());
         assert!(fixture.wec_signer.calls().is_empty());
         assert!(fixture.wec_broadcaster.calls().is_empty());
         assert!(fixture
@@ -1279,7 +1486,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            state.batches.insert(ChainKey::Wec, batch(&request));
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Wec, payout);
             state.requests.insert(request.batch_id, request.clone());
         }
         fixture
@@ -1292,15 +1501,158 @@ mod tests {
                 .await?,
             ReconciliationGate::ExternalEffectPending
         );
+        {
+            let state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert_eq!(state.transitions, ["signed"]);
+        }
+        assert!(fixture.wec_signer.calls().is_empty());
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        fixture.orchestrator.resume_next(Chain::Wcash).await?;
+        assert_eq!(fixture.wec_broadcaster.calls().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_completes_empty_authorized_signing_without_broadcasting(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(vec![Ok(execution(&request, 0x15))])?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Wec, payout);
+            state.requests.insert(request.batch_id, request.clone());
+        }
+
+        assert_eq!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Wcash)
+                .await?,
+            ReconciliationGate::ExternalEffectPending
+        );
+        assert_eq!(
+            fixture.wec_signer.recovery_calls().as_slice(),
+            std::slice::from_ref(&request)
+        );
+        assert_eq!(fixture.wec_signer.calls(), [request]);
+        assert!(fixture.wec_broadcaster.calls().is_empty());
         let state = fixture
             .store
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(state.transitions, ["signed", "broadcast"]);
-        drop(state);
-        assert!(fixture.wec_signer.calls().is_empty());
+        assert_eq!(state.transitions, ["signed"]);
+        assert_eq!(
+            state.batches[&ChainKey::Wec].state,
+            PayoutBatchState::Signed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_freeze_cannot_revoke_signing_or_broadcast_completion(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(vec![Ok(execution(&request, 0x16))])?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Wec, payout);
+            state.requests.insert(request.batch_id, request.clone());
+            state.frozen.insert(ChainKey::Wec, true);
+        }
+        assert!(matches!(
+            fixture.orchestrator.resume_next(Chain::Wcash).await,
+            Err(SettlementError::Persistence {
+                operation: "authorize_broadcast",
+                ..
+            })
+        ));
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert_eq!(state.transitions, ["signed"]);
+            assert_eq!(
+                state.batches[&ChainKey::Wec].state,
+                PayoutBatchState::Signed
+            );
+            state
+                .batches
+                .get_mut(&ChainKey::Wec)
+                .ok_or(SettlementError::Invariant("fake WEC batch"))?
+                .state = PayoutBatchState::Broadcasting;
+            state
+                .artifacts
+                .get_mut(&request.batch_id)
+                .ok_or(SettlementError::Invariant("fake WEC payout artifact"))?
+                .state = PayoutBatchState::Broadcasting;
+        }
+        assert!(matches!(
+            fixture.orchestrator.resume_next(Chain::Wcash).await?,
+            ResumeOutcome::Broadcast { .. }
+        ));
         assert_eq!(fixture.wec_broadcaster.calls().len(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .batches[&ChainKey::Wec]
+                .state,
+            PayoutBatchState::Broadcast
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_signed_worker_observes_concurrent_broadcast_without_rebroadcast(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(Vec::new())?;
+        let mut stale = batch(&request);
+        stale.state = PayoutBatchState::Signed;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut completed = stale.clone();
+            completed.state = PayoutBatchState::Broadcast;
+            state.batches.insert(ChainKey::Wec, completed);
+            let mut artifact = execution(&request, 0x17).as_store_artifact(Chain::Wcash);
+            artifact.state = PayoutBatchState::Broadcast;
+            state.artifacts.insert(request.batch_id, artifact);
+        }
+        let outcome = fixture
+            .orchestrator
+            .resume_signed(stale, fixture.orchestrator.boundary(Chain::Wcash))
+            .await?;
+        assert!(matches!(
+            outcome,
+            ResumeOutcome::AwaitingConfirmation { .. }
+        ));
+        assert!(fixture.wec_broadcaster.calls().is_empty());
         Ok(())
     }
 
@@ -1315,7 +1667,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            state.batches.insert(ChainKey::Zec, batch(&request));
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Zec, payout);
             state.requests.insert(request.batch_id, request.clone());
         }
         fixture
@@ -1331,13 +1685,13 @@ mod tests {
         assert!(fixture.wec_signer.calls().is_empty());
         assert!(fixture.wec_broadcaster.calls().is_empty());
         assert!(fixture.zec_signer.calls().is_empty());
-        assert_eq!(fixture.zec_broadcaster.calls().len(), 1);
+        assert!(fixture.zec_broadcaster.calls().is_empty());
         let state = fixture
             .store
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(state.transitions, ["signed", "broadcast"]);
+        assert_eq!(state.transitions, ["signed"]);
         assert_eq!(
             state.artifacts[&request.batch_id].signed_transaction,
             vec![0x21; 96]
@@ -1356,7 +1710,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            state.batches.insert(ChainKey::Wec, batch(&request));
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Wec, payout);
             state.requests.insert(request.batch_id, request.clone());
             state.fail_mark_signed_before_commit = true;
         }
@@ -1395,7 +1751,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            state.batches.insert(ChainKey::Wec, batch(&request));
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Wec, payout);
             state.requests.insert(request.batch_id, request.clone());
         }
         fixture
@@ -1404,26 +1762,32 @@ mod tests {
         fixture
             .wec_broadcaster
             .replace_results([Err(BoundaryFailure::Ambiguous)]);
-        assert!(matches!(
+        assert_eq!(
             fixture
                 .orchestrator
                 .recover_before_wallet_reconciliation(Chain::Wcash)
-                .await,
+                .await?,
+            ReconciliationGate::ExternalEffectPending
+        );
+        {
+            let state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert_eq!(state.transitions, ["signed"]);
+            assert_eq!(
+                state.artifacts[&request.batch_id].signed_transaction,
+                vec![0x14; 96]
+            );
+        }
+        assert!(matches!(
+            fixture.orchestrator.resume_next(Chain::Wcash).await,
             Err(SettlementError::Boundary {
                 failure: BoundaryFailure::Ambiguous,
                 ..
             })
         ));
-        let state = fixture
-            .store
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(state.transitions, ["signed"]);
-        assert_eq!(
-            state.artifacts[&request.batch_id].signed_transaction,
-            vec![0x14; 96]
-        );
         Ok(())
     }
 
@@ -1447,7 +1811,10 @@ mod tests {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(state.transitions, ["signed", "broadcast"]);
+        assert_eq!(
+            state.transitions,
+            ["signing", "signed", "broadcasting", "broadcast"]
+        );
         assert_eq!(
             state
                 .artifacts
@@ -1507,13 +1874,15 @@ mod tests {
                 ..
             })
         ));
-        assert!(fixture
-            .store
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .transitions
-            .is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .transitions,
+            ["signing"]
+        );
         fixture.orchestrator.resume_next(Chain::Wcash).await?;
         let calls = fixture.wec_signer.calls();
         assert_eq!(calls, [seed_request.clone(), seed_request]);
@@ -1650,7 +2019,9 @@ mod tests {
             ResumeOutcome::AwaitingConfirmation { .. }
         ));
         assert!(fixture.wec_signer.calls().is_empty());
-        assert!(fixture.wec_broadcaster.calls().is_empty());
+        let broadcasts = fixture.wec_broadcaster.calls();
+        assert_eq!(broadcasts.len(), 1);
+        assert_eq!(broadcasts[0].state, PayoutBatchState::Broadcast);
         Ok(())
     }
 
@@ -1698,13 +2069,15 @@ mod tests {
             fixture.orchestrator.resume_next(Chain::Wcash).await,
             Err(SettlementError::Invariant("rich signer artifact"))
         ));
-        assert!(fixture
-            .store
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .transitions
-            .is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .transitions,
+            ["signing"]
+        );
         Ok(())
     }
 

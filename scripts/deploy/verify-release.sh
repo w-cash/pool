@@ -32,7 +32,7 @@ if [[ $binary == deployment-package ]]; then
     [[ $(stat -c '%u:%a:%h' -- "$manifest") == 0:444:1 ]] \
         || die "deployment package manifest ownership or mode is unsafe"
     [[ -f $package/DEPLOYMENT-SCHEMA \
-        && $(cat -- "$package/DEPLOYMENT-SCHEMA") == 1 ]] \
+        && $(cat -- "$package/DEPLOYMENT-SCHEMA") == 2 ]] \
         || die "deployment package schema is unsupported"
     audit=$(mktemp -d) || die "cannot create deployment verification workspace"
     chmod 0700 -- "$audit" || die "cannot protect deployment verification workspace"
@@ -84,6 +84,21 @@ manifest="$release_root/SHA256SUMS"
 [[ -f $manifest && ! -L $manifest ]] || die "release manifest is unavailable"
 [[ $(stat -c '%u:%a:%h' -- "$manifest") == 0:444:1 ]] \
     || die "release manifest ownership or mode is unsafe"
+release_artifacts=(
+    wcash-poold
+    wcash-merge-miner
+    wcash-wallet
+    zallet
+    PROVENANCE.json
+    ZALLET_SHA256SUM
+)
+[[ $(wc -l <"$manifest") -eq ${#release_artifacts[@]} ]] \
+    || die "release manifest inventory is incomplete"
+for artifact in "${release_artifacts[@]}"; do
+    match_count=$(awk -v name="$artifact" \
+        '$2 == name { count += 1 } END { print count + 0 }' "$manifest")
+    [[ $match_count == 1 ]] || die "manifest must contain one exact $artifact entry"
+done
 [[ -f $release_root/$binary && ! -L $release_root/$binary && -x $release_root/$binary ]] \
     || die "release binary is unavailable"
 
@@ -93,10 +108,25 @@ links=$(stat -Lc '%h' -- "$release_root/$binary")
 [[ $owner == 0 && $mode == 555 && $links == 1 ]] \
     || die "release binary ownership or mode is unsafe"
 
-match_count=$(awk -v name="$binary" '$2 == name { count += 1 } END { print count + 0 }' "$manifest")
-[[ $match_count == 1 ]] || die "manifest must contain one exact binary entry"
-
-(
-    cd -- "$release_root"
-    awk -v name="$binary" '$2 == name { print }' SHA256SUMS | sha256sum --strict --check --status
-) || die "release digest mismatch"
+verified_artifacts=("$binary")
+if [[ $binary == zallet ]]; then
+    verified_artifacts+=(PROVENANCE.json ZALLET_SHA256SUM)
+    for metadata in PROVENANCE.json ZALLET_SHA256SUM; do
+        [[ -f $release_root/$metadata && ! -L $release_root/$metadata \
+            && $(stat -c '%u:%a:%h' -- "$release_root/$metadata") == 0:444:1 ]] \
+            || die "Zallet provenance artifact is unavailable or unsafe"
+    done
+fi
+for artifact in "${verified_artifacts[@]}"; do
+    (
+        cd -- "$release_root"
+        awk -v name="$artifact" '$2 == name { print }' SHA256SUMS \
+            | sha256sum --strict --check --status
+    ) || die "release digest mismatch for $artifact"
+done
+if [[ $binary == zallet ]]; then
+    command -v python3 >/dev/null 2>&1 || die "python3 is unavailable"
+    python3 "$release_root/deployment/scripts/verify-zallet-build.py" \
+        "$release_root" "$release_root/deployment/patches/zallet-v0.1.0-beta.3" \
+        || die "Zallet provenance verification failed"
+fi

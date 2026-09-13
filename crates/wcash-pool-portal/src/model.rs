@@ -243,12 +243,19 @@ pub struct PayoutSettingSummary {
     pub pending_destination: Option<String>,
     /// When the pending destination becomes active.
     pub pending_effective_at: Option<u64>,
-    /// Automatic-payout threshold in the asset's smallest unit.
+    /// Automatic-payout threshold attached to the active destination.
+    /// Zero means no active destination is configured.
     pub threshold_zat: u64,
-    /// Whether eligible balances enter scheduled batches automatically.
+    /// Whether the active destination is eligible for automatic batches.
     pub automatic: bool,
-    /// Monotonic configuration revision.
+    /// Monotonic revision of the active destination, or zero when absent.
     pub revision: u64,
+    /// Threshold which will take effect with the pending destination.
+    pub pending_threshold_zat: Option<u64>,
+    /// Automatic-payout choice which will take effect after the hold.
+    pub pending_automatic: Option<bool>,
+    /// Monotonic revision of the pending destination.
+    pub pending_revision: Option<u64>,
 }
 
 /// Bounded keyset page requested from a private miner read model.
@@ -319,7 +326,21 @@ pub struct MinerPayoutSummary {
     pub batch_id: Uuid,
     /// Settled asset.
     pub asset: Asset,
-    /// Exact account output in atomic units.
+    /// Gross miner liability selected for this payout.
+    pub gross_amount_zat: u64,
+    /// Maximum miner-funded network fee reserved from this output.
+    ///
+    /// This is absent only for terminal payouts created by a pre-reserve
+    /// schema version.
+    pub reserved_network_fee_zat: Option<u64>,
+    /// Actual network fee charged to this miner after confirmation.
+    pub actual_network_fee_zat: Option<u64>,
+    /// Unused fee reserve returned to this miner after confirmation.
+    pub refunded_network_fee_zat: Option<u64>,
+    /// Exact account output after the deterministic network-fee reserve.
+    ///
+    /// The field name is retained for API-v1 compatibility; it is the net
+    /// transaction output rather than the gross liability.
     pub amount_zat: u64,
     /// Durable payout lifecycle state.
     pub state: String,
@@ -436,6 +457,14 @@ pub struct PoolOverview {
     pub wec_fee_bps: Option<u16>,
     /// Published ZEC pool fee in basis points; zero at Testnet launch.
     pub zec_fee_bps: Option<u16>,
+    /// Absolute WEC network-fee reserve ceiling in atomic units.
+    pub wec_maximum_network_fee_zat: Option<u64>,
+    /// Relative WEC network-fee reserve ceiling in basis points.
+    pub wec_maximum_network_fee_bps: Option<u16>,
+    /// Absolute ZEC network-fee reserve ceiling in atomic units.
+    pub zec_maximum_network_fee_zat: Option<u64>,
+    /// Relative ZEC network-fee reserve ceiling in basis points.
+    pub zec_maximum_network_fee_bps: Option<u16>,
     /// Monotonic fee-policy revision shared by the displayed rates.
     pub fee_policy_revision: Option<u64>,
 }

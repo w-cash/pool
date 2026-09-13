@@ -9,17 +9,15 @@
 > for current composition. This document is not an audit or permission to use
 > the service with public miners or funds.
 
-Implemented controls are limited to strict bounded wire codecs, redacted
-secret-bearing debug output, endian-distinct target types, exact job/proof
-receipt bindings, in-memory session/job/nonce/vardiff policy, global
-generation suspension, finite listener-free connection actors, a
-timeout-bounded Unix backend client, a bounded idle health/event pump with a
-mandatory acknowledged consumer seam, and a loopback-only test driver, all
-tested with local mock peers and synthetic transcripts. There is no durable
-event-consumer implementation, public listener, authentication implementation,
-pool database, payout code, wallet, deployment, or live-node test. Every
-operational control below remains a release requirement unless it is explicitly
-identified as implemented.
+The Testnet source now composes strict bounded wire codecs, redacted
+secret-bearing debug output, endian-distinct targets, exact job/proof receipt
+bindings, bounded session/job/vardiff policy, global generation suspension, a
+source-restricted listener, timeout-bounded Unix backend transport, durable
+PostgreSQL projection/authentication/nonce leasing, account-isolated portal,
+and chain-separated payout recovery. These controls have deterministic and
+real-PostgreSQL coverage. Exact release deployment, live-node recovery,
+private HTTPS, payout/reorg exercises, and a real-ASIC transcript remain
+mandatory gates; this document is not evidence that those gates passed.
 
 ## Assets
 
@@ -49,8 +47,8 @@ over a locally access-controlled transport. Backend session, instance, and
 journal IDs detect configuration changes; they are not cryptographic peer
 authentication. A separate Zcash validator is required to check parent
 proposals, because the template source is not trusted to attest its own output.
-The future pool database is trusted to persist and project bytes, not to invent
-valid wolf receipts.
+The pool database is trusted to persist and project bytes, not to invent valid
+Wolf receipts.
 
 ## Primary threats and required controls
 
@@ -61,15 +59,15 @@ Equihash solutions, event pages, and relevant strings; they reject trailing,
 unknown, and non-canonical backend encodings before policy use. The backend
 client enforces configured connection and request deadlines.
 
-The future public edge must additionally enforce accept, authentication,
+The Testnet edge enforces accept, authentication,
 request, write, and idle deadlines plus per-IP, per-account, and global
 concurrency and byte budgets before expensive hashing or backend calls. Its
 preferred listener requires TLS and certificate validation. A separate port may
 support legacy plaintext ASIC firmware only with an explicitly disclosed
 warning and a rate-limited, revocable credential that has mining-only authority.
 A LAN or ISP observer can read and replay that credential, so it must never be
-a portal password or authorize payout/account operations. Those listener
-controls do not exist yet.
+a portal password or authorize payout/account operations. Deployment and real
+ASIC evidence for those controls remain a launch gate.
 
 Required tests include truncation at every byte boundary, oversized lengths,
 invalid UTF-8 where applicable, trailing bytes, slow reads, request floods,
@@ -91,8 +89,8 @@ Per-session advertised lineage prevents a coalesced activation, local expiry,
 or hard retirement from incorrectly reusing `clean_jobs=false`; grace-eligible
 assignments remain available only for bounded late-share validation.
 Unknown, retired, cross-session, and wrong-network identifiers must fail
-closed. End-to-end enforcement still depends on the missing wolf backend-v1
-server and service integration.
+closed. End-to-end enforcement depends on the exact paired Wolf protocol-v2
+and pool release artifacts passing the deployment runbook.
 
 The authentication result is also session state, not a hint. Until an explicit
 alias set exists, its canonical login must byte-for-byte equal the login in the
@@ -198,7 +196,7 @@ Wolf retains consensus resources and pending winner outboxes independently of
 the pool connection. A same-ID, different-AuxPoW Wcash witness must enter an
 explicit durable quarantine, and exact-byte replay can resume only after a
 `WinnerRequeued` event records authoritative best-chain absence. Backend
-protocol v1 has
+protocol v2 has
 no pool-controlled retirement capability, so documentation and code must not
 invent one.
 

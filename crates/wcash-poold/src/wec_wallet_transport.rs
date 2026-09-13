@@ -1204,7 +1204,7 @@ mod tests {
             "http://127.0.0.1:0",
             "http://127.0.0.1:38234/path",
             "http://user@127.0.0.1:38234",
-            "http://76.13.10.156:38234",
+            "http://192.0.2.10:38234",
         ] {
             assert_eq!(
                 validate_loopback_endpoint(unsafe_endpoint),

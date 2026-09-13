@@ -146,7 +146,7 @@ pub struct PayoutPreferenceChange<'a> {
     pub automatic: bool,
     /// Request time.
     pub changed_at: u64,
-    /// Replacement-address safety hold; initial setup may activate directly.
+    /// Safety hold applied to every initial or replacement destination.
     pub replacement_hold_secs: u64,
     /// Keyed audit digest of the full destination.
     pub address_digest: &'a [u8; 32],
@@ -160,6 +160,12 @@ pub struct PayoutPreferenceChange<'a> {
 pub trait PortalRepository: Send + Sync {
     /// Confirms access to the correctly fenced PostgreSQL deployment.
     fn readiness(&self) -> RepositoryFuture<'_, ()>;
+
+    /// Reads the database-clock payout-worker lease without using cached
+    /// process configuration. A stale or absent heartbeat returns `false`.
+    fn payout_worker_is_live(&self) -> RepositoryFuture<'_, bool> {
+        Box::pin(async { Err(RepositoryError::Unavailable) })
+    }
 
     /// Creates one account with an Argon2id portal-password PHC verifier.
     fn create_account<'a>(
@@ -250,7 +256,8 @@ pub trait PortalRepository: Send + Sync {
         change: PayoutPreferenceChange<'_>,
     ) -> RepositoryFuture<'_, PayoutSettingSummary>;
 
-    /// Returns both chain settings after atomically activating elapsed holds.
+    /// Returns both chain settings from durable active and pending rows.
+    /// Implementations must not promote holds using the caller's clock.
     fn payout_settings(
         &self,
         account_id: Uuid,
@@ -258,7 +265,8 @@ pub trait PortalRepository: Send + Sync {
         now: u64,
     ) -> RepositoryFuture<'_, Vec<PayoutSettingSummary>>;
 
-    /// Resolves the unmasked active destination for the isolated payout engine.
+    /// Resolves the unmasked currently active destination. Batch creation must
+    /// independently exclude accounts with a pending replacement.
     /// This method must never be exposed through a browser handler.
     fn active_payout_destination(
         &self,

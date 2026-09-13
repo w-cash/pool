@@ -1,0 +1,35 @@
+[builder]
+
+[builder.limits]
+
+[consensus]
+network = "test"
+
+[database]
+wallet = "wallet.db"
+
+[external]
+# The pool journal owns broadcast recovery; Zallet only creates and signs PCZTs.
+broadcast = false
+
+[features]
+as_of_version = "0.1.0-beta.3"
+
+[features.deprecated]
+
+[features.experimental]
+
+[indexer]
+validator_address = "@ZCASH_VALIDATOR_RPC_SOCKET@"
+validator_cookie_path = "/run/credentials/zecwec-zallet-payout.service/validator-cookie"
+db_path = "zaino"
+
+[keystore]
+encryption_identity = "/run/credentials/zecwec-zallet-payout.service/encryption-identity"
+require_backup = true
+
+[note_management]
+
+[rpc]
+bind = ["@ZALLET_RPC@"]
+async_operation_limit = 32

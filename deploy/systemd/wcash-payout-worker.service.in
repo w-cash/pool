@@ -1,0 +1,63 @@
+# Managed by the ZecWec Testnet deployment package.
+[Unit]
+Description=Isolated ZecWec Testnet payout worker
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+PartOf=zecwec-testnet-pool.target
+Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-custody-gate.service wcash-pool.service zecwec-zallet-payout.service
+BindsTo=wcash-pool-backend.service wcash-pool.service zecwec-zallet-payout.service @WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@ @ZCASH_VALIDATOR_UNIT@
+After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-custody-gate.service wcash-pool.service zecwec-zallet-payout.service wcash-pool-wallet-init.service @WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@ @ZCASH_VALIDATOR_UNIT@
+Conflicts=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
+ConditionPathExists=/etc/wcash-pool/pool.payout.toml
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=wcash-payout
+Group=wcash-payout
+SupplementaryGroups=wcash-pool-socket
+UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
+LoadCredential=database-url:@DATABASE_PAYOUT_URL_CREDENTIAL@
+LoadCredential=wcash-seed:@WEC_SEED_FILE@
+LoadCredential=wcash-node-cookie:@WCASH_RPC_COOKIE_SOURCE@
+LoadCredential=zcash-node-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
+LoadCredential=zallet-config:@ZALLET_PAYOUT_CONFIG_FILE@
+LoadCredential=zallet-cookie:@ZALLET_STATE_DIR@/.cookie
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-wallet
+ExecStartPre=@WCASH_RELEASE_ROOT@/wcash-poold payout-config-check --config /etc/wcash-pool/pool.payout.toml
+ExecStart=@WCASH_RELEASE_ROOT@/wcash-poold payout-worker --config /etc/wcash-pool/pool.payout.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=4200s
+TimeoutStopSec=1920s
+KillMode=mixed
+StateDirectory=wcash-payout
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+InaccessiblePaths=-@POOL_STATE_DIR@ -@WEC_SEED_FILE@ -@ZALLET_CONFIG_FILE@ -@ZALLET_RECOVERY_CONFIG_FILE@ -@ZALLET_RECOVERY_STATE_DIR@ -@ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL@ -@PORTAL_TOKEN_PEPPER_CREDENTIAL@ -@PORTAL_TOTP_KEY_CREDENTIAL@ -/var/lib/zecwec-custody
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=zecwec-testnet-pool.target

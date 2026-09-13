@@ -44,8 +44,26 @@ require_inactive_custody_unit() {
 }
 
 stop_custody_units_for_sealing() {
+    # Stop every asynchronous supervisor before changing custody ownership.
+    # Otherwise a queued cookie refresh or boot/start oneshot can revive the
+    # payout identities after the ceremony has proved them inactive.
+    stop_loaded_custody_unit zecwec-testnet-pool-start.service true
+    stop_loaded_custody_unit wcash-pool-health.timer true
+    stop_loaded_custody_unit zecwec-cookie-refresh.path true
+    stop_loaded_custody_unit zecwec-cookie-refresh.service true
+    stop_loaded_custody_unit zecwec-testnet-pool.target true
     stop_loaded_custody_unit wcash-pool.service true
+    stop_loaded_custody_unit wcash-pool-projector.service true
+    stop_loaded_custody_unit wcash-payout-worker.service true
     stop_loaded_custody_unit wcash-pool-wallet-init.service false
+    for supervisor in zecwec-testnet-pool-start.service wcash-pool-health.timer \
+        zecwec-cookie-refresh.path zecwec-cookie-refresh.service; do
+        load_state=$(systemctl_value "$supervisor" LoadState)
+        [[ $load_state == not-found ]] || require_inactive_custody_unit "$supervisor"
+    done
+    require_inactive_custody_unit zecwec-testnet-pool.target
     require_inactive_custody_unit wcash-pool.service
+    require_inactive_custody_unit wcash-pool-projector.service
+    require_inactive_custody_unit wcash-payout-worker.service
     require_inactive_custody_unit wcash-pool-wallet-init.service
 }

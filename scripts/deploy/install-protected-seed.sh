@@ -34,16 +34,16 @@ PY
 if [[ -e $destination ]]; then
     [[ -f $destination && ! -L $destination ]] || die "existing seed destination is unsafe"
     cmp --silent -- "$source_seed" "$destination" || die "refusing to replace a different Wcash seed"
-    [[ $(stat -c '%U:%G:%a:%h' -- "$destination") == wcash-pool:wcash-pool:600:1 ]] \
+    [[ $(stat -c '%U:%G:%a:%h' -- "$destination") == wcash-payout:wcash-payout:600:1 ]] \
         || die "existing seed ownership or mode is unsafe"
     log "the existing protected Wcash seed matches the supplied source"
     exit 0
 fi
 
-install -d -o root -g wcash-pool -m 0710 -- "$(dirname -- "$destination")"
+install -d -o root -g wcash-payout -m 0710 -- "$(dirname -- "$destination")"
 temporary="${destination}.new.$$"
 trap 'rm -f -- "$temporary"' EXIT
-install -o wcash-pool -g wcash-pool -m 0600 -- "$source_seed" "$temporary"
+install -o wcash-payout -g wcash-payout -m 0600 -- "$source_seed" "$temporary"
 mv -fT -- "$temporary" "$destination"
 trap - EXIT
 log "installed the dedicated Wcash collector seed; prove its Ironwood balance is zero and back it up offline before continuing"

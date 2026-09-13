@@ -1,7 +1,7 @@
 [Unit]
-Description=Verify offline Wcash and Zcash collector custody before mining
+Description=Verify isolated hot Wcash and Zcash payout custody before mining
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
-Before=wcash-pool.service
+Before=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
 Conflicts=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
 After=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
 

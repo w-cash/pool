@@ -440,7 +440,7 @@ impl WecPayoutSigner {
                     identity,
                     outputs: validated.outputs.clone(),
                     confirmations: self.config.confirmations(),
-                    max_fee_zat: self.config.max_fee_zat(),
+                    max_fee_zat: request.batch.maximum_network_fee_zat,
                     timeout: limits.sign_timeout(),
                     max_response_bytes: limits.max_response_bytes(),
                 };
@@ -549,9 +549,10 @@ impl WecPayoutSigner {
             .validate()
             .map_err(|_| WecPayoutError::InvalidRequest)?;
         if request.batch.outputs.len() > self.config.max_outputs()
+            || request.batch.maximum_network_fee_zat > self.config.max_fee_zat()
             || output_total_zat > MAX_WEC_ZAT
             || output_total_zat
-                .checked_add(self.config.max_fee_zat())
+                .checked_add(request.batch.maximum_network_fee_zat)
                 .is_none_or(|total| total > MAX_WEC_ZAT)
             || request
                 .batch
@@ -632,7 +633,7 @@ impl WecPayoutSigner {
             || !valid_raw_transaction(&signed.raw_transaction_hex)
             || signed.unsigned_digest == [0; 32]
             || signed.fee_zat == 0
-            || signed.fee_zat > self.config.max_fee_zat()
+            || signed.fee_zat > request.batch.maximum_network_fee_zat
             || signed.target_height == 0
             || !valid_expiry
             || !signed.stored

@@ -1,0 +1,53 @@
+# Managed by the ZecWec Testnet deployment package.
+[Unit]
+Description=ZecWec Testnet authoritative accounting projector
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+PartOf=zecwec-testnet-pool.target
+Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-custody-gate.service
+BindsTo=wcash-pool-backend.service
+After=network-online.target postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-custody-gate.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
+Wants=network-online.target
+Conflicts=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
+ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
+ConditionPathExists=/etc/wcash-pool/pool.projector.toml
+
+[Service]
+Type=simple
+User=wcash-pool-projector
+Group=wcash-pool-projector
+SupplementaryGroups=wcash-pool-socket
+UMask=0077
+Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
+LoadCredential=database-url:@DATABASE_PROJECTOR_URL_CREDENTIAL@
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
+ExecStart=@WCASH_RELEASE_ROOT@/wcash-poold projector --config /etc/wcash-pool/pool.projector.toml
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=180s
+TimeoutStopSec=60s
+KillMode=mixed
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+InaccessiblePaths=-@WEC_SEED_FILE@ -@PAYOUT_STATE_DIR@ -@ZALLET_CONFIG_FILE@ -@ZALLET_PAYOUT_CONFIG_FILE@ -@ZALLET_STATE_DIR@ -@ZALLET_RECOVERY_CONFIG_FILE@ -@ZALLET_RECOVERY_STATE_DIR@ -@ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL@ -@PORTAL_TOKEN_PEPPER_CREDENTIAL@ -@PORTAL_TOTP_KEY_CREDENTIAL@
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SocketBindDeny=any
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=zecwec-testnet-pool.target

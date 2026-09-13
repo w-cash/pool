@@ -11,12 +11,18 @@ source "$script_dir/common.sh"
 require_root
 require_command ufw
 require_command python3
+require_command iptables
+require_command ip6tables
+require_command iptables-save
+require_command ip6tables-save
 
-[[ $# -eq 3 ]] || die "usage: restrict-mining-firewall.sh <apply|check> <settings> <cidr-file>"
+[[ $# -eq 3 ]] \
+    || die "usage: restrict-mining-firewall.sh <apply|close|check> <settings> <cidr-file>"
 mode=$1
 settings=$2
 cidr_file=$3
-[[ $mode == apply || $mode == check ]] || die "mode must be apply or check"
+[[ $mode == apply || $mode == close || $mode == check ]] \
+    || die "mode must be apply, close, or check"
 require_private_regular_file "$settings"
 require_private_regular_file "$cidr_file"
 
@@ -43,8 +49,8 @@ for raw in pathlib.Path(sys.argv[1]).read_text(encoding="ascii").splitlines():
     if not value or value.startswith("#"):
         continue
     network = ipaddress.ip_network(value, strict=False)
-    if network.prefixlen == 0 or network.is_unspecified:
-        raise SystemExit("world-open and unspecified mining CIDRs are forbidden")
+    if network.prefixlen != network.max_prefixlen or network.is_unspecified:
+        raise SystemExit("mining allowlist entries must be exact host addresses")
     canonical = str(network)
     if canonical not in values:
         values.append(canonical)
@@ -54,11 +60,125 @@ print("\n".join(values))
 PY
 ) || die "miner CIDR policy is invalid"
 
+readonly guard_chain=ZECWEC-MINING-GUARD
+
+chain_has_unsupported_references() {
+    local snapshot=${1:?ruleset snapshot is required}
+    local chain=${2:?chain name is required}
+    awk -v target="$chain" '
+        $1 == "-A" {
+            references = 0
+            for (field = 3; field < NF; field += 1) {
+                if (($field == "-j" || $field == "-g") && $(field + 1) == target) {
+                    references = 1
+                }
+            }
+            if (references && !(NF == 4 && $2 == "INPUT" && $3 == "-j" && $4 == target)) {
+                unsafe = 1
+            }
+        }
+        END { exit unsafe ? 0 : 1 }
+    ' <<<"$snapshot"
+}
+
+remove_owned_guard_chain() {
+    local firewall=${1:?firewall command is required}
+    local save=${2:?save command is required}
+    local chain=${3:?chain name is required}
+    local snapshot
+
+    snapshot=$($save -t filter) || die "$save could not inspect the filter ruleset"
+    if chain_has_unsupported_references "$snapshot" "$chain"; then
+        die "$chain has a reference outside its exact INPUT hook"
+    fi
+    while "$firewall" --wait 5 -t filter -C INPUT -j "$chain" >/dev/null 2>&1; do
+        "$firewall" --wait 5 -t filter -D INPUT -j "$chain"
+    done
+    if "$firewall" --wait 5 -t filter -S "$chain" >/dev/null 2>&1; then
+        "$firewall" --wait 5 -t filter -F "$chain"
+        "$firewall" --wait 5 -t filter -X "$chain"
+    fi
+}
+
+install_mining_guard() {
+    local family=${1:?address family is required}
+    local guard_mode=${2:?guard mode is required}
+    local firewall save staging source port snapshot stale
+    local -a stale_chains=()
+
+    [[ $guard_mode == open || $guard_mode == closed ]] \
+        || die "invalid mining guard mode"
+    case $family in
+        4) firewall=iptables; save=iptables-save ;;
+        6) firewall=ip6tables; save=ip6tables-save ;;
+        *) die "invalid mining guard address family" ;;
+    esac
+    staging="ZECWEC-MG${family}-${BASHPID}"
+    if "$firewall" --wait 5 -t filter -S "$staging" >/dev/null 2>&1; then
+        die "temporary mining guard chain already exists"
+    fi
+
+    # Build the replacement without a hook. Inserting its hook at rule one is
+    # the single activation step; the previous guard remains effective until
+    # that point, and the new guard protects the managed ports during cleanup.
+    "$firewall" --wait 5 -t filter -N "$staging"
+    if [[ $guard_mode == open ]]; then
+        if [[ $family == 4 ]]; then
+            "$firewall" --wait 5 -t filter -A "$staging" \
+                -i lo -s 127.0.0.1/32 -p tcp --dport "$plain_port" -j RETURN
+        else
+            "$firewall" --wait 5 -t filter -A "$staging" \
+                -i lo -s ::1/128 -p tcp --dport "$plain_port" -j RETURN
+        fi
+        while IFS= read -r source; do
+            [[ -n $source ]] || continue
+            if [[ $family == 4 && $source == *:* ]] \
+                || [[ $family == 6 && $source != *:* ]]; then
+                continue
+            fi
+            for port in "$plain_port" "$tls_port"; do
+                "$firewall" --wait 5 -t filter -A "$staging" \
+                    -s "$source" -p tcp --dport "$port" -j RETURN
+            done
+        done <<<"$cidrs"
+    fi
+    for port in "$plain_port" "$tls_port" "$legacy_port"; do
+        "$firewall" --wait 5 -t filter -A "$staging" \
+            -p tcp --dport "$port" -j DROP
+    done
+    "$firewall" --wait 5 -t filter -A "$staging" -j RETURN
+    "$firewall" --wait 5 -t filter -I INPUT 1 -j "$staging"
+
+    remove_owned_guard_chain "$firewall" "$save" "$guard_chain"
+    "$firewall" --wait 5 -t filter -E "$staging" "$guard_chain"
+
+    # An interrupted earlier invocation can leave one of our uniquely named
+    # staging chains behind. The stable guard is now rule one, so these owned
+    # remnants can be removed without opening a managed port.
+    snapshot=$($save -t filter) || die "$save could not inspect the filter ruleset"
+    readarray -t stale_chains < <(
+        awk -v prefix=":ZECWEC-MG${family}-" \
+            '$1 ~ ("^" prefix) { print substr($1, 2) }' <<<"$snapshot"
+    )
+    for stale in "${stale_chains[@]}"; do
+        [[ -n $stale ]] || continue
+        remove_owned_guard_chain "$firewall" "$save" "$stale"
+    done
+}
+
+# Mutating modes first put a closed guard at the first INPUT position in both
+# address families. UFW reconciliation therefore cannot expose a managed port,
+# and any later error leaves a closed guard in place.
+if [[ $mode == apply || $mode == close ]]; then
+    install_mining_guard 4 closed
+    install_mining_guard 6 closed
+fi
+
 status=$(ufw status verbose)
 grep -Fq 'Status: active' <<<"$status" || die "UFW must already be active"
 grep -Fq 'Default: deny (incoming)' <<<"$status" || die "UFW incoming policy must already be deny"
 
-if [[ $mode == apply ]]; then
+if [[ $mode == apply || $mode == close ]]; then
     for port in "$plain_port" "$tls_port" "$legacy_port"; do
         while IFS= read -r number; do
             [[ -n $number ]] || continue
@@ -78,10 +198,19 @@ if [[ $mode == apply ]]; then
             ' | sort -rn
         )
     done
-    while IFS= read -r cidr; do
-        ufw allow proto tcp from "$cidr" to any port "$plain_port" comment 'ZecWec Testnet plaintext'
-        ufw allow proto tcp from "$cidr" to any port "$tls_port" comment 'ZecWec Testnet TLS'
-    done <<<"$cidrs"
+    # UFW is permitted to reload its owned chains while deleting persisted
+    # rules. Reassert the closed rule-one guard before either returning closed
+    # or installing the new exact-host allows.
+    install_mining_guard 4 closed
+    install_mining_guard 6 closed
+    if [[ $mode == apply ]]; then
+        while IFS= read -r cidr; do
+            ufw allow proto tcp from "$cidr" to any port "$plain_port" comment 'ZecWec Testnet plaintext'
+            ufw allow proto tcp from "$cidr" to any port "$tls_port" comment 'ZecWec Testnet TLS'
+        done <<<"$cidrs"
+        install_mining_guard 4 open
+        install_mining_guard 6 open
+    fi
 fi
 
 rules=$(ufw status)
@@ -112,6 +241,38 @@ if awk -v old="$legacy_port/tcp" '
     END { exit found ? 0 : 1 }
 ' <<<"$rules"; then
     die "a legacy mining allow rule remains"
+fi
+if [[ $mode == close ]]; then
+    for port in "$plain_port" "$tls_port"; do
+        if awk -v target="$port/tcp" '
+            $1 == target {
+                for (field = 2; field <= NF; field += 1) {
+                    if ($field == "ALLOW") {
+                        found = 1
+                    }
+                }
+            }
+            END { exit found ? 0 : 1 }
+        ' <<<"$rules"; then
+            die "a mining allow rule remains after closing port $port"
+        fi
+    done
+    raw_mode=closed
+else
+    raw_mode=open
+fi
+readarray -t cidr_array <<<"$cidrs"
+iptables-save -t filter \
+    | python3 "$script_dir/verify-mining-firewall.py" \
+        ipv4 "$raw_mode" "$plain_port" "$tls_port" "$legacy_port" \
+        "${cidr_array[@]}"
+ip6tables-save -t filter \
+    | python3 "$script_dir/verify-mining-firewall.py" \
+        ipv6 "$raw_mode" "$plain_port" "$tls_port" "$legacy_port" \
+        "${cidr_array[@]}"
+if [[ $mode == close ]]; then
+    log "mining firewall is closed for every current and legacy Stratum port"
+    exit 0
 fi
 for port in "$plain_port" "$tls_port"; do
     grep -Eq "^${port}/tcp[[:space:]]+ALLOW" <<<"$rules" \

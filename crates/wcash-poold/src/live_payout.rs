@@ -863,7 +863,10 @@ impl RpcExactBroadcaster {
 
     async fn submit(&self, artifact: &SignedPayoutArtifact) -> Result<(), BoundaryFailure> {
         if artifact.chain != self.authority.chain
-            || artifact.state != PayoutBatchState::Signed
+            || !matches!(
+                artifact.state,
+                PayoutBatchState::Broadcasting | PayoutBatchState::Broadcast
+            )
             || artifact.batch_id.is_nil()
             || artifact.transaction_id == [0; 32]
             || artifact.unsigned_digest == [0; 32]
@@ -1615,7 +1618,7 @@ mod tests {
         SignedPayoutArtifact {
             batch_id: Uuid::from_u128(0xbbbbbbbb_bbbb_4bbb_8bbb_bbbbbbbbbbbb),
             chain: Chain::Wcash,
-            state: PayoutBatchState::Signed,
+            state: PayoutBatchState::Broadcasting,
             unsigned_digest: [0x55; 32],
             transaction_id: TRANSACTION,
             signed_transaction: vec![0x01, 0x02],
@@ -1912,8 +1915,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_succeeds_only_after_exact_authoritative_lookup() {
-        let artifact = signed_artifact();
+    async fn committed_broadcast_is_republished_only_after_exact_authoritative_lookup() {
+        let mut artifact = signed_artifact();
+        artifact.state = PayoutBatchState::Broadcast;
         let mut steps = Vec::new();
         push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
         steps.push(failure(
@@ -1944,8 +1948,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_known_succeeds_only_for_exact_bytes_at_a_stable_tip() {
-        let artifact = signed_artifact();
+    async fn committed_broadcast_recognizes_exact_bytes_at_a_stable_tip() {
+        let mut artifact = signed_artifact();
+        artifact.state = PayoutBatchState::Broadcast;
         let mut steps = Vec::new();
         push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
         steps.push(ok(

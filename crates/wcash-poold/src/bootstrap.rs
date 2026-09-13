@@ -16,7 +16,7 @@ use wcash_pool_edge::{
 use wcash_pool_protocol::{CanonicalUuid, Hex32, NonceProfile, TargetBe};
 use wcash_pool_store::{
     Chain, ChainPolicy, DeploymentIdentity, DeploymentNetwork, NonceNamespaceClaim, NonceRange,
-    PostgresAuthenticationProvider, PostgresStore, StoreError,
+    PostgresAuthenticationProvider, PostgresEventProjector, PostgresStore, StoreError,
 };
 
 use crate::config::{ChainRuntimePolicy, ConfigError, RuntimeConfig};
@@ -55,6 +55,27 @@ pub struct MiningPreflight {
     pub jobs: JobRouter,
     _authentication: Arc<PostgresAuthenticationProvider>,
     _timeline: MonotonicTimeline,
+}
+
+/// Database dependency retained by the non-listening payout worker.
+///
+/// The worker deliberately does not retain a job snapshot across wallet sync.
+/// It obtains a fresh, exact backend snapshot only after both chain authorities
+/// have been observed, immediately before binding those tips.
+pub struct PayoutBootstrap {
+    /// Durable accounting store opened with the payout-worker database role.
+    pub store: Arc<PostgresStore>,
+}
+
+/// Durable writer and live Wolf connection retained by the isolated projector.
+///
+/// This bootstrap deliberately contains no listener, authentication provider,
+/// nonce allocator, portal authority, or payout signer.
+pub struct ProjectorBootstrap {
+    /// Identity-bound live journal connection.
+    pub client: BackendClient,
+    /// Explicit database capability for projecting accounting events.
+    pub projector: PostgresEventProjector,
 }
 
 struct PreparedBootstrap {
@@ -142,10 +163,105 @@ pub async fn preflight(config: &RuntimeConfig) -> Result<MiningPreflight, Bootst
     })
 }
 
+/// Verifies the payout worker's database identity and policy without claiming
+/// a nonce namespace, opening a listener, or retaining a backend snapshot.
+pub async fn payout(config: &RuntimeConfig) -> Result<PayoutBootstrap, BootstrapError> {
+    let store = Arc::new(connect_store(config).await?);
+    store.verify_deployment().await?;
+    verify_policies(&store, config).await?;
+
+    Ok(PayoutBootstrap { store })
+}
+
+/// Obtains a race-free, verifier-only snapshot of the current Wolf job.
+///
+/// Callers must invoke this immediately before binding independently observed
+/// chain tips. The payout database role verifies the projector's exact rows;
+/// it never projects an event or writes mining accounting state itself.
+pub async fn payout_jobs(
+    config: &RuntimeConfig,
+    store: &PostgresStore,
+) -> Result<JobRouter, BootstrapError> {
+    store.verify_deployment().await?;
+    verify_policies(store, config).await?;
+
+    let last_event_seq = store.last_event_seq().await?;
+    let backend_config = backend_config(config)?;
+    let mut client = BackendClient::connect(
+        backend_config.clone(),
+        CanonicalUuid::new(config.pool_instance),
+        last_event_seq,
+    )
+    .await?;
+    replay_to_end(&mut client, store).await?;
+    let replayed_through = client.replay_cursor();
+    let timeline = MonotonicTimeline::new();
+    let snapshot = client.subscribe_jobs(replayed_through).await?;
+
+    if snapshot.event_seq() > snapshot.replayed_through_event_seq() {
+        let mut gap = BackendClient::connect(
+            backend_config,
+            CanonicalUuid::new(config.pool_instance),
+            snapshot.replayed_through_event_seq(),
+        )
+        .await?;
+        replay_through(&mut gap, store, snapshot.event_seq()).await?;
+        gap.shutdown().await?;
+    }
+    client.shutdown().await?;
+
+    let jobs = JobRouter::from_snapshot(
+        &snapshot,
+        GenerationRegistryConfig::new(MAXIMUM_RECENT_JOBS, MAXIMUM_GENERATIONS_PER_PROCESS)?,
+        timeline,
+        JOB_UPDATE_CAPACITY,
+    )?;
+    validate_initial_target_policy(&jobs, config)?;
+
+    Ok(jobs)
+}
+
+/// Reconciles the durable Wolf journal with PostgreSQL, closes the subscribe
+/// race, and returns one live, identity-bound projector connection.
+///
+/// Only the explicit [`PostgresEventProjector`] capability writes accounting
+/// state. The process does not construct any public or spending authority.
+pub async fn projector(config: &RuntimeConfig) -> Result<ProjectorBootstrap, BootstrapError> {
+    let store = connect_store(config).await?;
+    store.verify_deployment().await?;
+    verify_policies(&store, config).await?;
+
+    let last_event_seq = store.last_event_seq().await?;
+    let projector = store.event_projector();
+    let backend_config = backend_config(config)?;
+    let mut client = BackendClient::connect(
+        backend_config.clone(),
+        CanonicalUuid::new(config.pool_instance),
+        last_event_seq,
+    )
+    .await?;
+    projector_replay_to_end(&mut client, &projector).await?;
+    let replayed_through = client.replay_cursor();
+    let snapshot = client.subscribe_jobs(replayed_through).await?;
+
+    if snapshot.event_seq() > snapshot.replayed_through_event_seq() {
+        let mut gap = BackendClient::connect(
+            backend_config,
+            CanonicalUuid::new(config.pool_instance),
+            snapshot.replayed_through_event_seq(),
+        )
+        .await?;
+        projector_replay_through(&mut gap, &projector, snapshot.event_seq()).await?;
+        gap.shutdown().await?;
+    }
+
+    Ok(ProjectorBootstrap { client, projector })
+}
+
 async fn prepare(config: &RuntimeConfig) -> Result<PreparedBootstrap, BootstrapError> {
     let store = Arc::new(connect_store(config).await?);
-    store.bind_deployment().await?;
-    bind_policies(&store, config).await?;
+    store.verify_deployment().await?;
+    verify_policies(&store, config).await?;
 
     let last_event_seq = store.last_event_seq().await?;
     let backend_config = backend_config(config)?;
@@ -341,6 +457,18 @@ async fn bind_policies(
     Ok(())
 }
 
+async fn verify_policies(
+    store: &PostgresStore,
+    config: &RuntimeConfig,
+) -> Result<(), BootstrapError> {
+    let wcash = chain_policy(Chain::Wcash, &config.wcash_policy);
+    let zcash = chain_policy(Chain::Zcash, &config.zcash_policy);
+    store
+        .verify_zero_fee_launch_policies(&wcash, &zcash)
+        .await?;
+    Ok(())
+}
+
 fn chain_policy(chain: Chain, config: &ChainRuntimePolicy) -> ChainPolicy {
     ChainPolicy {
         chain,
@@ -383,6 +511,45 @@ async fn replay_through(
         let page = client.read_events(previous, REPLAY_PAGE_ITEMS).await?;
         let authority = client.authority();
         store.project_replay_page(&authority, &page.events).await?;
+        if page.next_event_seq <= previous {
+            return Err(BootstrapError::StalledReplay);
+        }
+    }
+    Ok(())
+}
+
+async fn projector_replay_to_end(
+    client: &mut BackendClient,
+    projector: &PostgresEventProjector,
+) -> Result<(), BootstrapError> {
+    loop {
+        let previous = client.replay_cursor();
+        let page = client.read_events(previous, REPLAY_PAGE_ITEMS).await?;
+        let authority = client.authority();
+        projector
+            .project_replay_page(&authority, &page.events)
+            .await?;
+        if page.complete {
+            return Ok(());
+        }
+        if page.next_event_seq <= previous {
+            return Err(BootstrapError::StalledReplay);
+        }
+    }
+}
+
+async fn projector_replay_through(
+    client: &mut BackendClient,
+    projector: &PostgresEventProjector,
+    required_event_seq: u64,
+) -> Result<(), BootstrapError> {
+    while client.replay_cursor() < required_event_seq {
+        let previous = client.replay_cursor();
+        let page = client.read_events(previous, REPLAY_PAGE_ITEMS).await?;
+        let authority = client.authority();
+        projector
+            .project_replay_page(&authority, &page.events)
+            .await?;
         if page.next_event_seq <= previous {
             return Err(BootstrapError::StalledReplay);
         }

@@ -17,10 +17,12 @@ The ordered patch set is deliberately small:
    `1d5a012931675caeed01c29aef30dcea829788ae`, which signals the data-request
    worker only after chain writes are stored. This closes upstream issue #817
    without taking unrelated unreleased changes.
-3. Exclude `shadow-rs`'s `CARGO_MANIFEST_DIR` and `CARGO_TREE` constants from
-   generated build metadata. Both can contain the ephemeral source path; they
-   are unused by Zallet at runtime and make otherwise identical binaries
-   non-reproducible.
+3. Remove two build-host path leaks. Exclude `shadow-rs`'s unused
+   `CARGO_MANIFEST_DIR` and `CARGO_TREE` constants, and patch the exact
+   `zewif-zcashd` 0.1.0-rc.5 crate so its vendored `db_dump` location is stored
+   relative to the release executable rather than as Cargo's absolute
+   `OUT_DIR`. Installed releases retain the existing system-`PATH` fallback
+   when the build-tree helper is not shipped.
 4. Replace the flaky request-based shutdown assertion tracked by upstream issue
    #766 with a narrow test observer. The observer captures the spawned batch
    task's `AbortHandle` only after the abort-on-drop guard owns it, then checks
@@ -44,5 +46,15 @@ fetches only the exact base commit, checks all patches before applying them,
 runs the low-core capacity regressions and sync tests, builds with both
 `rpc-cli` and `zcashd-import`, and writes a non-secret provenance record beside
 the output binary. One successful build is a private Testnet candidate only.
-Public deployment remains blocked until two clean builds from distinct roots
-produce the same binary digest under the pinned, remapped build environment.
+Public deployment remains blocked until two clean builds on independent
+reviewed hosts produce the same binary digest under the pinned, remapped build
+environment. Required CI also performs two sequential clean builds and compares
+their exact checksum records.
+The build downloads `zewif-zcashd` from its pinned crates.io archive, verifies
+the archive digest before safe extraction, resolves the unchanged Cargo lock,
+and byte-compares Cargo's private registry source with that archive. It applies
+the recorded dependency patch only inside the build-private registry, while
+retaining the crate's locked registry identity. Because Cargo hashes canonical
+workspace paths before rustc remapping, compilation is serialized in one fixed,
+ownership-checked build root on every host. The final gate rejects a binary that
+still embeds that build root.

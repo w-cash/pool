@@ -86,12 +86,18 @@ impl TestnetAddressValidator {
         candidate: &str,
     ) -> Result<ValidatedDestination, AddressValidationError> {
         match parse_supported_zcash(candidate, NetworkType::Test) {
-            Ok(kind) => ValidatedDestination::from_authoritative_validation(
+            Ok(ReceiverKind::Ironwood) => ValidatedDestination::from_authoritative_validation(
                 Asset::Zec,
                 ChainNetwork::Testnet,
                 canonical_zcash(candidate)?,
-                kind,
+                ReceiverKind::Ironwood,
             ),
+            // The chain continues to support transparent receivers, but the
+            // initial custodial pool deliberately exposes only one payout
+            // privacy policy on both assets. Keeping this gate in the
+            // authoritative validator prevents a single account from adding
+            // a transparent output to an otherwise shielded payout batch.
+            Ok(ReceiverKind::Transparent) => Err(AddressValidationError::UnsupportedReceiver),
             Err(AddressValidationError::Malformed) => {
                 match self.wcash.validate_for(WcashNetwork::Testnet, candidate) {
                     Ok(_) => Err(AddressValidationError::WrongAsset),
@@ -589,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn zcash_parser_accepts_only_testnet_transparent_or_ironwood() {
+    fn zcash_parser_classifies_only_testnet_transparent_or_ironwood() {
         assert_eq!(
             parse_supported_zcash(&testnet_transparent(), NetworkType::Test),
             Ok(ReceiverKind::Transparent)
@@ -712,6 +718,10 @@ mod tests {
         assert!(validator
             .validate(Asset::Zec, ChainNetwork::Testnet, &testnet_ironwood())
             .is_ok());
+        assert_eq!(
+            validator.validate(Asset::Zec, ChainNetwork::Testnet, &testnet_transparent()),
+            Err(AddressValidationError::UnsupportedReceiver)
+        );
         assert_eq!(
             validator.validate(Asset::Zec, ChainNetwork::Mainnet, &mainnet_transparent()),
             Err(AddressValidationError::AuthorityUnavailable)

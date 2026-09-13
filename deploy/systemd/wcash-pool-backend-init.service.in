@@ -10,6 +10,7 @@ ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-merge-miner
 Type=oneshot
 User=wcash-pool-backend
 Group=wcash-pool-socket
+SupplementaryGroups=wcash-pool-backend
 UMask=0077
 EnvironmentFile=/etc/wcash-pool/backend.env
 Environment=ZEC_AUTHORITY_CONFIG=/run/credentials/wcash-pool-backend-init.service/zec-authority-config

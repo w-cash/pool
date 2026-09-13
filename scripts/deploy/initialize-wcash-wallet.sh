@@ -39,17 +39,25 @@ pool_state=$(systemctl show --property=ActiveState --value wcash-pool.service) \
     || die "could not establish public pool service state"
 [[ $pool_state != active && $pool_state != reloading ]] \
     || die "public pool must be stopped before wallet initialization"
+projector_state=$(systemctl show --property=ActiveState --value wcash-pool-projector.service) \
+    || die "could not establish accounting projector service state"
+[[ $projector_state != active && $projector_state != reloading ]] \
+    || die "accounting projector must be stopped before wallet initialization"
+payout_state=$(systemctl show --property=ActiveState --value wcash-payout-worker.service) \
+    || die "could not establish payout worker service state"
+[[ $payout_state != active && $payout_state != reloading ]] \
+    || die "payout worker must be stopped before wallet initialization"
 
 [[ $WCASH_RELEASE_ROOT =~ ^/opt/wcash/releases/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ \
     && -d $WCASH_RELEASE_ROOT && ! -L $WCASH_RELEASE_ROOT \
     && $(realpath -e -- "$WCASH_RELEASE_ROOT") == "$WCASH_RELEASE_ROOT" ]] \
     || die "release root is not one immutable version directory"
-[[ $WCASH_WALLET_DATABASE == /var/lib/wcash-pool/wcash-wallet.sqlite ]] \
+[[ $WCASH_WALLET_DATABASE == /var/lib/wcash-payout/wcash-wallet.sqlite ]] \
     || die "wallet database path does not match the reviewed deployment"
-[[ $WCASH_WALLET_AUTHORITY == /var/lib/wcash-pool/wcash-wallet-authority.json ]] \
+[[ $WCASH_WALLET_AUTHORITY == /var/lib/wcash-payout/wcash-wallet-authority.json ]] \
     || die "wallet authority path does not match the reviewed deployment"
-[[ $WEC_SEED_FILE == /var/lib/wcash-pool-secrets/wcash-seed ]] \
-    || die "seed path does not match the reviewed deployment"
+[[ $WEC_SEED_FILE == /run/credentials/wcash-pool-wallet-init.service/wcash-seed ]] \
+    || die "seed path is not the private systemd credential mount"
 [[ $WCASH_LIGHTWALLETD_ENDPOINT =~ ^http://127\.0\.0\.1:[0-9]{1,5}$ ]] \
     || die "compact-block endpoint must be literal IPv4 loopback"
 [[ $WCASH_WALLET_BIRTHDAY =~ ^[1-9][0-9]{0,9}$ \
