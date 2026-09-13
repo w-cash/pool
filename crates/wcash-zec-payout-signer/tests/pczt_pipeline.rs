@@ -50,7 +50,7 @@ use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
     fees::zip317,
-    Authorized, TransactionData,
+    Authorized, Transaction, TransactionData,
 };
 use zcash_protocol::{
     consensus::{BlockHeight, NetworkType, TEST_NETWORK},
@@ -327,7 +327,7 @@ fn build_outputs_pczt(
         .to_unified_full_viewing_key()
         .default_address(UnifiedAddressRequest::ORCHARD)
         .unwrap();
-    let fee_zat = if extra_output { 15_000 } else { FEE_ZAT };
+    let fee_zat = FEE_ZAT;
     let source_note = valid_ironwood_note(
         source_address.orchard().copied().unwrap(),
         payout_zat * if extra_output { 2 } else { 1 } + fee_zat,
@@ -594,7 +594,7 @@ fn multiple_recipient_pczt() -> TestPczt {
                 raw_transaction,
                 transaction_id,
                 extra_recipient: identity.extra_recipient,
-                fee_zat: 15_000,
+                fee_zat: FEE_ZAT,
                 ..test_pczt()
             }
         })
@@ -623,7 +623,7 @@ fn mixed_recipient_pczt() -> TestPczt {
                 recipient_unified_address: identity.recipient_unified_address,
                 recipient_kind: ReceiverKind::Transparent,
                 extra_recipient: identity.extra_recipient,
-                fee_zat: 15_000,
+                fee_zat: FEE_ZAT,
                 ..test_pczt()
             }
         })
@@ -769,6 +769,23 @@ impl HappyZallet {
                 self.pczt.recipient_unified_address.clone()
             };
         let transparent = self.pczt.recipient_kind == ReceiverKind::Transparent;
+        let parsed = Pczt::parse(&BASE64_STANDARD.decode(&self.pczt.created).unwrap()).unwrap();
+        let action_count = parsed.ironwood().actions().len();
+        let mut ironwood_outputs = Vec::new();
+        if let Some(extra) = self.pczt.extra_recipient.as_ref() {
+            // Report the reverse of request order, as a shuffled action set may do.
+            let extra = if matches!(self.tamper, Tamper::DuplicateInspectionRecipient) {
+                &self.pczt.recipient_unified_address
+            } else {
+                extra
+            };
+            ironwood_outputs.push(json!({"value_zat": PAYOUT_ZAT, "user_address": extra}));
+        }
+        if !transparent {
+            ironwood_outputs
+                .push(json!({"value_zat": ironwood_amount, "user_address": ironwood_address}));
+        }
+        ironwood_outputs.resize(action_count, json!({"value_zat": 0, "user_address": null}));
         let mut inspection = json!({
             "tx_version": 6,
             "consensus_branch_id": "37a5165b",
@@ -798,15 +815,9 @@ impl HappyZallet {
                 "proof_complete": true
             },
             "ironwood": {
-                "actions": 2,
-                "signed_actions": if ordinal > 1 { 2 } else { 1 },
-                "outputs": [{
-                    "value_zat": ironwood_amount,
-                    "user_address": ironwood_address
-                }, {
-                    "value_zat": 0,
-                    "user_address": null
-                }],
+                "actions": action_count,
+                "signed_actions": action_count.saturating_sub(usize::from(ordinal <= 1)),
+                "outputs": ironwood_outputs,
                 "value_balance_zat": self.pczt.fee_zat,
                 "proof_complete": proved
             }
@@ -817,35 +828,7 @@ impl HappyZallet {
                 "address": self.pczt.recipient_unified_address,
                 "user_address": ironwood_address
             }]);
-            inspection["ironwood"]["outputs"] = json!([
-                {"value_zat": 0, "user_address": null}
-            ]);
-            inspection["ironwood"]["actions"] = json!(1);
-            inspection["ironwood"]["signed_actions"] = json!(usize::from(ordinal > 1));
             inspection["ironwood"]["value_balance_zat"] = json!(PAYOUT_ZAT + self.pczt.fee_zat);
-        }
-        if let Some(extra) = self.pczt.extra_recipient.as_ref() {
-            // The wallet's action order is deliberately opposite to request order.
-            let extra = if matches!(self.tamper, Tamper::DuplicateInspectionRecipient) {
-                &self.pczt.recipient_unified_address
-            } else {
-                extra
-            };
-            inspection["ironwood"]["outputs"] = json!([
-                {"value_zat": PAYOUT_ZAT, "user_address": extra},
-                {"value_zat": 0, "user_address": null},
-                {"value_zat": ironwood_amount, "user_address": ironwood_address}
-            ]);
-            inspection["ironwood"]["actions"] = json!(3);
-            inspection["ironwood"]["signed_actions"] = json!(if ordinal > 1 { 3 } else { 2 });
-            if transparent {
-                inspection["ironwood"]["outputs"] = json!([
-                    {"value_zat": PAYOUT_ZAT, "user_address": extra},
-                    {"value_zat": 0, "user_address": null}
-                ]);
-                inspection["ironwood"]["actions"] = json!(2);
-                inspection["ironwood"]["signed_actions"] = json!(if ordinal > 1 { 2 } else { 1 });
-            }
         }
         inspection
     }
@@ -1003,7 +986,13 @@ impl JsonRpcTransport for ScriptedZebra {
             .pop_front()
             .unwrap_or(ZebraStep::AlreadyKnown)
         {
-            ZebraStep::Accepted => Ok(Value::String(test_pczt().transaction_id)),
+            ZebraStep::Accepted => {
+                let raw = hex::decode(call.params()[0].as_str().unwrap()).unwrap();
+                let transaction =
+                    Transaction::read(raw.as_slice(), zcash_protocol::consensus::BranchId::Nu6_3)
+                        .expect("submitted fixture transaction parses");
+                Ok(Value::String(transaction.txid().to_string()))
+            }
             ZebraStep::AlreadyKnown => Err(RpcTransportError::server(
                 -27,
                 "transaction already in block chain",
@@ -1277,7 +1266,7 @@ fn multiple_shielded_recipients_allow_shuffled_actions_but_reject_duplicate_reci
         if matches!(tamper, Tamper::None) {
             let receipt = result.expect("valid shuffled multi-recipient payout");
             assert_eq!(receipt.output_total_zat, 2 * PAYOUT_ZAT);
-            assert_eq!(receipt.network_fee_zat, 15_000);
+            assert_eq!(receipt.network_fee_zat, FEE_ZAT);
         } else {
             assert_eq!(result, Err(ZecPayoutError::WalletProtocolViolation));
             assert!(!zallet
@@ -1300,7 +1289,7 @@ fn mixed_transparent_and_shielded_batch_preserves_every_recipient() {
         .execute(&request)
         .expect("both recipient types are paid from shielded funds");
     assert_eq!(receipt.output_total_zat, 2 * PAYOUT_ZAT);
-    assert_eq!(receipt.network_fee_zat, 15_000);
+    assert_eq!(receipt.network_fee_zat, FEE_ZAT);
     assert_eq!(
         zallet
             .calls()
