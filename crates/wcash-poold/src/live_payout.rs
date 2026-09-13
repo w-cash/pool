@@ -448,7 +448,12 @@ impl NodePayoutAuthority {
             .map_err(map_observation_rpc_failure)?;
         let direct: DirectTip =
             serde_json::from_value(direct).map_err(|_| ObservationFailure::Invariant)?;
-        if direct.height != info.blocks || direct.hash != info.best_block_hash {
+        let direct_tip_hash = direct
+            .hash
+            .into_wire()
+            .filter(|hash| *hash != [0; 32])
+            .ok_or(ObservationFailure::Invariant)?;
+        if direct.height != info.blocks || direct_tip_hash != best_tip_hash {
             return Err(ObservationFailure::Unavailable);
         }
         Ok(VerifiedTip {
@@ -730,7 +735,27 @@ struct ConsensusBranches {
 #[derive(Deserialize)]
 struct DirectTip {
     height: u32,
-    hash: String,
+    hash: DirectTipHash,
+}
+
+/// Zebra serializes `block::Hash([u8; 32])` as its raw wire-order byte array,
+/// while existing compatible/custom RPC fixtures can return the conventional
+/// display-order hex string. Normalize both strict representations before
+/// comparing independent tip observations.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DirectTipHash {
+    Display(String),
+    Wire([u8; 32]),
+}
+
+impl DirectTipHash {
+    fn into_wire(self) -> Option<[u8; 32]> {
+        match self {
+            Self::Display(display) => parse_display_hash_to_wire(&display),
+            Self::Wire(wire) => Some(wire),
+        }
+    }
 }
 
 enum ObservedTransaction {
@@ -1580,24 +1605,35 @@ mod tests {
         hex::encode(wire_hash)
     }
 
+    fn tip_steps_with_direct(
+        branch: &str,
+        tip: [u8; 32],
+        height: u32,
+        direct_hash: Value,
+    ) -> Vec<RpcStep> {
+        vec![
+            ok(
+                "getblockchaininfo",
+                json!([]),
+                json!({
+                    "chain": "test",
+                    "blocks": height,
+                    "headers": height,
+                    "bestblockhash": display_hash(tip),
+                    "consensus": { "chaintip": branch, "nextblock": branch },
+                }),
+            ),
+            ok("getblockhash", json!([0]), json!(display_hash(GENESIS))),
+            ok(
+                "getbestblockheightandhash",
+                json!([]),
+                json!({ "height": height, "hash": direct_hash }),
+            ),
+        ]
+    }
+
     fn push_tip(steps: &mut Vec<RpcStep>, branch: &str, tip: [u8; 32], height: u32) {
-        steps.push(ok(
-            "getblockchaininfo",
-            json!([]),
-            json!({
-                "chain": "test",
-                "blocks": height,
-                "headers": height,
-                "bestblockhash": display_hash(tip),
-                "consensus": { "chaintip": branch, "nextblock": branch },
-            }),
-        ));
-        steps.push(ok("getblockhash", json!([0]), json!(display_hash(GENESIS))));
-        steps.push(ok(
-            "getbestblockheightandhash",
-            json!([]),
-            json!({ "height": height, "hash": display_hash(tip) }),
-        ));
+        steps.extend(tip_steps_with_direct(branch, tip, height, json!(tip)));
     }
 
     fn authority(chain: Chain, rpc: Arc<ScriptedRpc>) -> NodePayoutAuthority {
@@ -1634,6 +1670,84 @@ mod tests {
             Some(TRANSACTION)
         );
         assert_ne!(hex::encode(TRANSACTION), display_hash(TRANSACTION));
+    }
+
+    #[test]
+    fn direct_tip_hash_accepts_zebra_wire_array_and_legacy_display_string() {
+        let zebra: DirectTip = serde_json::from_value(json!({
+            "height": 100,
+            "hash": TIP,
+        }))
+        .expect("Zebra wire-order hash array must deserialize");
+        assert_eq!(zebra.hash.into_wire(), Some(TIP));
+
+        let legacy: DirectTip = serde_json::from_value(json!({
+            "height": 100,
+            "hash": display_hash(TIP),
+        }))
+        .expect("legacy display-order hash must deserialize");
+        assert_eq!(legacy.hash.into_wire(), Some(TIP));
+    }
+
+    #[test]
+    fn direct_tip_hash_rejects_malformed_wire_arrays() {
+        for malformed in [
+            json!(vec![0_u8; 31]),
+            json!(vec![0_u8; 33]),
+            json!(vec![300_u16; 32]),
+        ] {
+            assert!(serde_json::from_value::<DirectTip>(json!({
+                "height": 100,
+                "hash": malformed,
+            }))
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_tip_hash_mismatch_is_temporarily_unavailable() {
+        let display_order_bytes =
+            parse_canonical_hex32(&display_hash(TIP)).expect("valid display hash");
+        assert_ne!(display_order_bytes, TIP);
+        let rpc = Arc::new(ScriptedRpc::new(tip_steps_with_direct(
+            WCASH_TESTNET_BRANCH_ID,
+            TIP,
+            100,
+            json!(display_order_bytes),
+        )));
+
+        assert_eq!(
+            authority(Chain::Wcash, Arc::clone(&rpc))
+                .verified_tip()
+                .await,
+            Err(ObservationFailure::Unavailable)
+        );
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn direct_tip_hash_rejects_zero_and_noncanonical_values() {
+        let mut uppercase = display_hash(TIP);
+        uppercase.make_ascii_uppercase();
+        for invalid in [
+            json!(vec![0_u8; 32]),
+            json!("0".repeat(64)),
+            json!(uppercase),
+        ] {
+            let rpc = Arc::new(ScriptedRpc::new(tip_steps_with_direct(
+                WCASH_TESTNET_BRANCH_ID,
+                TIP,
+                100,
+                invalid,
+            )));
+            assert_eq!(
+                authority(Chain::Wcash, Arc::clone(&rpc))
+                    .verified_tip()
+                    .await,
+                Err(ObservationFailure::Invariant)
+            );
+            rpc.assert_drained();
+        }
     }
 
     #[tokio::test]
