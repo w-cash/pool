@@ -38,6 +38,7 @@ MAX_INPUT_BYTES = 262_144
 MAX_RPC_BYTES = 131_072
 RPC_CALL_TIMEOUT = 30.0
 SYNC_DEADLINE_SECONDS = 1_080.0
+SYNC_POLL_SECONDS = 2.0
 
 CHAIN_SETTING_FIELDS = {"ZCASH_GENESIS_DISPLAY", "ZCASH_GENESIS_WIRE"}
 FINAL_SETTING_FIELDS = CHAIN_SETTING_FIELDS | {
@@ -834,23 +835,31 @@ def wait_for_status(
     nonce: str,
     sequence: int,
     accounts_exist: bool,
+    minimum_height: int | None = None,
 ) -> dict:
     deadline = time.monotonic() + SYNC_DEADLINE_SECONDS
     while True:
         pair = rpc_call(
             host, port, cookie, nonce, sequence, "getwalletstatus", []
         )
+        ready = False
         try:
-            validate_status(
+            height = validate_status(
                 pair["response"]["result"], "wallet status", accounts_exist
             )
-            return pair
+            ready = minimum_height is None or height >= minimum_height
         except SystemExit:
-            if time.monotonic() >= deadline:
+            pass
+        if ready:
+            return pair
+        if time.monotonic() >= deadline:
+            if minimum_height is not None:
                 fail(
-                    "wallet did not reach exact synchronized readiness before the deadline"
+                    "wallet did not synchronize through the frozen recovery birthday "
+                    "before the deadline"
                 )
-            time.sleep(2)
+            fail("wallet did not reach exact synchronized readiness before the deadline")
+        time.sleep(SYNC_POLL_SECONDS)
 
 
 def output_directory(path: pathlib.Path) -> int:
@@ -1228,13 +1237,26 @@ def capture_recovered(
     host, port = parse_socket(socket)
     cookie = read_cookie(cookie_path)
     nonce = secrets.token_hex(32)
-    pre_status = wait_for_status(host, port, cookie, nonce, 1, False)
+    birthday = original["birthday_height"]
+    # The chain snapshot used by z_recoveraccounts can be ahead of a fresh
+    # Zallet indexer's wallet tip. Importing an account whose birthday is above
+    # that tip can make the pinned scan-queue implementation construct a
+    # reversed range. Wait before the first mutating RPC so a lagging recovery
+    # wallet remains untouched and retryable.
+    pre_status = wait_for_status(
+        host,
+        port,
+        cookie,
+        nonce,
+        1,
+        False,
+        minimum_height=birthday,
+    )
     pre_accounts = rpc_call(
         host, port, cookie, nonce, 2, "z_listaccounts", [False]
     )
     if pre_accounts["response"]["result"] != []:
         fail("recovery wallet already contains an account")
-    birthday = original["birthday_height"]
     recovery_account = {
         "name": ACCOUNT_NAME,
         "seedfp": original["seedfp"],

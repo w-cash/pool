@@ -46,12 +46,19 @@ COOKIE = "__cookie__:unit-test-only"
 
 
 class RpcState:
-    def __init__(self, recovered: bool, default_index: int = 1) -> None:
+    def __init__(
+        self,
+        recovered: bool,
+        default_index: int = 1,
+        pre_account_tips: list[dict[str, object]] | None = None,
+    ) -> None:
         self.recovered = recovered
         self.tip = RECOVERY_TIP if recovered else ORIGINAL_TIP
         self.created = False
         self.collector_derived = False
         self.default_index = default_index
+        self.pre_account_tips = list(pre_account_tips or [])
+        self.pre_account_status_calls = 0
         self.authenticated_calls = 0
 
     @property
@@ -60,9 +67,16 @@ class RpcState:
 
     def result(self, method: str, params: object) -> object:
         if method == "getwalletstatus":
+            if not self.created:
+                self.pre_account_status_calls += 1
+            tip = (
+                self.pre_account_tips.pop(0)
+                if not self.created and self.pre_account_tips
+                else self.tip
+            )
             result = {
-                "node_tip": self.tip,
-                "wallet_tip": self.tip,
+                "node_tip": tip,
+                "wallet_tip": tip,
                 # Pinned Zallet beta.3 cannot derive a fully-scanned height
                 # before an account exists, so its synchronization lock stays
                 # set in this otherwise terminal bootstrap state.
@@ -171,6 +185,7 @@ class RecoveryVerifierTest(unittest.TestCase):
         self.root.chmod(0o700)
         MODULE.TRUSTED_UID = os.getuid()
         MODULE.SYNC_DEADLINE_SECONDS = 0.1
+        MODULE.SYNC_POLL_SECONDS = 0.01
         self.settings = self.root / "deployment.env"
         self.settings.write_text(
             "\n".join(
@@ -203,8 +218,13 @@ class RecoveryVerifierTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def server(self, recovered: bool, default_index: int = 1):
-        state = RpcState(recovered, default_index)
+    def server(
+        self,
+        recovered: bool,
+        default_index: int = 1,
+        pre_account_tips: list[dict[str, object]] | None = None,
+    ):
+        state = RpcState(recovered, default_index, pre_account_tips)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(handler) -> None:
@@ -476,6 +496,67 @@ class RecoveryVerifierTest(unittest.TestCase):
                 False,
             )
         self.assertFalse((self.root / "not-written.json").exists())
+
+    def test_recovery_waits_for_frozen_birthday_before_mutating_wallet(self) -> None:
+        original, _ = self.capture_pair()
+        lagging_tip = {
+            "height": ORIGINAL_TIP["height"] - 1,
+            "blockhash": "56" * 32,
+        }
+        server, thread, state = self.server(
+            True,
+            pre_account_tips=[lagging_tip, RECOVERY_TIP],
+        )
+        recovered = self.root / "caught-up-recovery.rpc.json"
+        try:
+            MODULE.capture_recovered(
+                os.fspath(self.settings),
+                os.fspath(original),
+                f"127.0.0.1:{server.server_port}",
+                os.fspath(self.cookie),
+                os.fspath(recovered),
+                os.fspath(self.native),
+                True,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+        self.assertTrue(recovered.exists())
+        self.assertGreaterEqual(state.pre_account_status_calls, 2)
+        self.assertTrue(state.created)
+
+    def test_recovery_tip_timeout_precedes_intent_and_mutating_rpc(self) -> None:
+        original, _ = self.capture_pair()
+        MODULE.SYNC_DEADLINE_SECONDS = 0.02
+        lagging_tip = {
+            "height": ORIGINAL_TIP["height"] - 1,
+            "blockhash": "78" * 32,
+        }
+        server, thread, state = self.server(
+            True,
+            pre_account_tips=[lagging_tip] * 20,
+        )
+        recovered = self.root / "timed-out-recovery.rpc.json"
+        try:
+            with self.assertRaises(SystemExit):
+                MODULE.capture_recovered(
+                    os.fspath(self.settings),
+                    os.fspath(original),
+                    f"127.0.0.1:{server.server_port}",
+                    os.fspath(self.cookie),
+                    os.fspath(recovered),
+                    os.fspath(self.native),
+                    True,
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+        self.assertFalse(state.created)
+        self.assertFalse(recovered.exists())
+        for suffix in ("mutation-intent", "mutation-receipt", "pending"):
+            self.assertFalse((self.root / f"{recovered.name}.{suffix}").exists())
 
     def test_capture_refuses_stale_output_before_mutating_rpc(self) -> None:
         stale = self.root / "stale.rpc.json"
