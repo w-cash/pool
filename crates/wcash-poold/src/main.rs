@@ -196,7 +196,10 @@ async fn main() -> ExitCode {
         Command::Migrate { config } => match config::RuntimeConfig::load(&config) {
             Ok(runtime) => match bootstrap::migrate(&runtime).await {
                 Ok(()) => {
-                    println!("{{\"migrated\":true,\"network\":\"testnet\",\"fees_bps\":0}}");
+                    println!(
+                        "{}",
+                        serde_json::json!({"migrated": true, "network": runtime.network, "fees_bps": 0})
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
@@ -212,7 +215,10 @@ async fn main() -> ExitCode {
         Command::Preflight { config } => match config::RuntimeConfig::load(&config) {
             Ok(runtime) => match service::preflight(&runtime).await {
                 Ok(()) => {
-                    println!("{{\"preflight\":true,\"network\":\"testnet\"}}");
+                    println!(
+                        "{}",
+                        serde_json::json!({"preflight": true, "network": runtime.network})
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
