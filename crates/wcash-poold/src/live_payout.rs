@@ -24,6 +24,7 @@ use tokio::{
     time,
 };
 use uuid::Uuid;
+use wcash_pool_portal::ChainNetwork;
 use wcash_pool_store::{
     Chain, PayoutBatchState, PayoutConfirmation, PayoutReorg, PayoutWatch, SignedPayoutArtifact,
     WalletObservation,
@@ -381,6 +382,7 @@ pub(crate) enum LivePayoutConfigError {
 #[derive(Clone)]
 pub(crate) struct NodePayoutAuthority {
     chain: Chain,
+    network: ChainNetwork,
     rpc: Arc<dyn BoundedRpcClient>,
     expected_genesis_display: String,
     expected_branch: &'static str,
@@ -406,10 +408,29 @@ impl NodePayoutAuthority {
         expected_genesis_wire.reverse();
         Ok(Self {
             chain,
+            network: ChainNetwork::Testnet,
             rpc,
             expected_genesis_display: hex::encode(expected_genesis_wire),
             expected_branch: expected_branch(chain),
         })
+    }
+
+    /// Selects only the frozen local Regtest identities in an explicitly enabled build.
+    #[cfg(feature = "regtest")]
+    pub(crate) fn with_regtest_network(mut self) -> Result<Self, LivePayoutConfigError> {
+        let genesis = match self.chain {
+            Chain::Wcash => wcash_wec_payout_signer::WCASH_REGTEST_GENESIS_HASH,
+            Chain::Zcash => "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327",
+        };
+        if self.expected_genesis_display != genesis {
+            return Err(LivePayoutConfigError::AuthorityMismatch);
+        }
+        self.network = ChainNetwork::Regtest;
+        self.expected_branch = match self.chain {
+            Chain::Wcash => wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID,
+            Chain::Zcash => ZCASH_NU6_3_BRANCH_ID,
+        };
+        Ok(self)
     }
 
     pub(crate) async fn verified_tip(&self) -> Result<VerifiedTip, ObservationFailure> {
@@ -423,10 +444,24 @@ impl NodePayoutAuthority {
         let best_tip_hash = parse_display_hash_to_wire(&info.best_block_hash)
             .filter(|hash| *hash != [0; 32])
             .ok_or(ObservationFailure::Invariant)?;
+        // Zebra's BIP70 name is "test" for both Testnet and Regtest. Only the
+        // explicitly selected, exact Regtest genesis may precede NU6.3 at height 1.
+        let at_regtest_genesis = match self.network {
+            #[cfg(feature = "regtest")]
+            ChainNetwork::Regtest => {
+                info.blocks == 0 && info.best_block_hash == self.expected_genesis_display
+            }
+            _ => false,
+        };
+        let expected_tip_branch = if at_regtest_genesis {
+            "00000000"
+        } else {
+            self.expected_branch
+        };
         if info.chain != "test"
-            || info.blocks == 0
+            || (info.blocks == 0 && !at_regtest_genesis)
             || info.headers != info.blocks
-            || info.consensus.chain_tip != self.expected_branch
+            || info.consensus.chain_tip != expected_tip_branch
             || info.consensus.next_block != self.expected_branch
         {
             return Err(ObservationFailure::Invariant);
@@ -1017,6 +1052,7 @@ fn map_boundary_observation_failure(failure: ObservationFailure) -> BoundaryFail
 /// Seedless, synchronized Zallet observation restricted to one Ironwood-only
 /// collector account.
 pub(crate) struct ZalletObservationSource {
+    network: ChainNetwork,
     rpc: Arc<dyn BoundedRpcClient>,
     account_id: Uuid,
     account_index: u32,
@@ -1056,12 +1092,20 @@ impl ZalletObservationSource {
             return Err(LivePayoutConfigError::AuthorityMismatch);
         }
         Ok(Self {
+            network: ChainNetwork::Testnet,
             rpc,
             account_id,
             account_index,
             minimum_confirmations,
             expected_payout_commitment,
         })
+    }
+
+    /// Uses Regtest collector address encoding only in an explicitly enabled build.
+    #[cfg(feature = "regtest")]
+    pub(crate) fn with_regtest_network(mut self) -> Self {
+        self.network = ChainNetwork::Regtest;
+        self
     }
 
     async fn observe_inner(&self) -> Result<WalletObservation, ObservationFailure> {
@@ -1208,6 +1252,7 @@ impl ZalletObservationSource {
         let account: DetailedAccount =
             serde_json::from_value(value).map_err(|_| ObservationFailure::Invariant)?;
         account.verify(
+            self.network,
             self.account_id,
             self.account_index,
             expected_seed_fingerprint,
@@ -1306,6 +1351,7 @@ struct DetailedAccount {
 impl DetailedAccount {
     fn verify(
         self,
+        network: ChainNetwork,
         expected_account: Uuid,
         expected_index: u32,
         expected_seed_fingerprint: [u8; 32],
@@ -1335,7 +1381,17 @@ impl DetailedAccount {
 
         let mut matching = self.addresses.iter().filter_map(|address| {
             address.ua.as_deref().and_then(|candidate| {
-                validated_parent_payout_address_commitment(candidate)
+                let commitment = match network {
+                    ChainNetwork::Testnet => validated_parent_payout_address_commitment(candidate),
+                    #[cfg(feature = "regtest")]
+                    ChainNetwork::Regtest => {
+                        wcash_zec_payout_signer::validated_regtest_parent_payout_address_commitment(
+                            candidate,
+                        )
+                    }
+                    _ => return None,
+                };
+                commitment
                     .ok()
                     .filter(|commitment| *commitment == expected_commitment)
             })
@@ -1638,6 +1694,87 @@ mod tests {
 
     fn authority(chain: Chain, rpc: Arc<ScriptedRpc>) -> NodePayoutAuthority {
         NodePayoutAuthority::with_client(chain, rpc, GENESIS).expect("valid authority")
+    }
+
+    #[tokio::test]
+    async fn default_node_authority_rejects_genesis_and_regtest_branch() {
+        for (height, branch) in [(0, WCASH_TESTNET_BRANCH_ID), (100, "c3a6678a")] {
+            let mut steps = tip_steps_with_direct(branch, GENESIS, height, json!(GENESIS));
+            steps.truncate(1);
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            assert_eq!(
+                authority(Chain::Wcash, Arc::clone(&rpc))
+                    .verified_tip()
+                    .await,
+                Err(ObservationFailure::Invariant)
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[cfg(feature = "regtest")]
+    #[tokio::test]
+    async fn regtest_node_authority_binds_exact_genesis_and_both_branches() {
+        for (chain, genesis_display, branch) in [
+            (
+                Chain::Wcash,
+                wcash_wec_payout_signer::WCASH_REGTEST_GENESIS_HASH,
+                wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID,
+            ),
+            (
+                Chain::Zcash,
+                "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327",
+                ZCASH_NU6_3_BRANCH_ID,
+            ),
+        ] {
+            let genesis = parse_display_hash_to_wire(genesis_display).expect("canonical genesis");
+            for height in [0, 1] {
+                let tip = if height == 0 { genesis } else { TIP };
+                let mut steps = tip_steps_with_direct(branch, tip, height, json!(tip));
+                steps[0].result.as_mut().expect("info")["consensus"]["chaintip"] =
+                    json!(if height == 0 { "00000000" } else { branch });
+                steps[1].result = Ok(json!(genesis_display));
+                let rpc = Arc::new(ScriptedRpc::new(steps));
+                let selected = NodePayoutAuthority::with_client(chain, rpc.clone(), genesis)
+                    .expect("node authority")
+                    .with_regtest_network()
+                    .expect("exact regtest");
+                assert_eq!(
+                    selected.verified_tip().await,
+                    Ok(VerifiedTip { hash: tip, height })
+                );
+                rpc.assert_drained();
+            }
+            for (tip, tip_branch, next_branch) in [
+                (genesis, "00000000", "deadbeef"),
+                (genesis, "deadbeef", branch),
+                (TIP, "00000000", branch),
+            ] {
+                let mut steps = tip_steps_with_direct(branch, tip, 0, json!(tip));
+                let info = steps[0].result.as_mut().expect("info");
+                info["consensus"]["chaintip"] = json!(tip_branch);
+                info["consensus"]["nextblock"] = json!(next_branch);
+                steps.truncate(1);
+                let rpc = Arc::new(ScriptedRpc::new(steps));
+                let selected = NodePayoutAuthority::with_client(chain, rpc.clone(), genesis)
+                    .expect("node authority")
+                    .with_regtest_network()
+                    .expect("exact regtest");
+                assert_eq!(
+                    selected.verified_tip().await,
+                    Err(ObservationFailure::Invariant)
+                );
+                rpc.assert_drained();
+            }
+            assert!(NodePayoutAuthority::with_client(
+                chain,
+                Arc::new(ScriptedRpc::new(Vec::new())),
+                GENESIS
+            )
+            .expect("test fixture")
+            .with_regtest_network()
+            .is_err());
+        }
     }
 
     fn watch() -> PayoutWatch {
@@ -2293,11 +2430,42 @@ mod tests {
         };
         assert!(
             account(json!([{"diversifier_index": 0, "ua": ZEC_COLLECTOR}]))
-                .verify(ACCOUNT, 0, fingerprint.to_bytes(), commitment)
+                .verify(
+                    ChainNetwork::Testnet,
+                    ACCOUNT,
+                    0,
+                    fingerprint.to_bytes(),
+                    commitment
+                )
                 .is_ok()
         );
+        #[cfg(feature = "regtest")]
+        {
+            let observer = ZalletObservationSource::with_client(
+                Arc::new(ScriptedRpc::new(Vec::new())),
+                ACCOUNT,
+                0,
+                100,
+                commitment,
+            )
+            .expect("valid observer")
+            .with_regtest_network();
+            assert_eq!(observer.network, ChainNetwork::Regtest);
+            assert_eq!(
+                account(json!([{"diversifier_index": 0, "ua": ZEC_COLLECTOR}])).verify(
+                    observer.network,
+                    ACCOUNT,
+                    0,
+                    fingerprint.to_bytes(),
+                    commitment,
+                ),
+                Err(ObservationFailure::Invariant),
+                "a Testnet collector must not pass the Regtest observer",
+            );
+        }
         assert_eq!(
             account(json!([{"diversifier_index": 0, "ua": ZEC_COLLECTOR}])).verify(
+                ChainNetwork::Testnet,
                 ACCOUNT,
                 0,
                 fingerprint.to_bytes(),
@@ -2310,7 +2478,13 @@ mod tests {
                 {"diversifier_index": 0, "ua": ZEC_COLLECTOR},
                 {"diversifier_index": 1, "ua": ZEC_COLLECTOR},
             ]))
-            .verify(ACCOUNT, 0, fingerprint.to_bytes(), commitment),
+            .verify(
+                ChainNetwork::Testnet,
+                ACCOUNT,
+                0,
+                fingerprint.to_bytes(),
+                commitment
+            ),
             Err(ObservationFailure::Invariant)
         );
         let mut reversed = commitment;
