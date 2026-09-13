@@ -20,8 +20,8 @@ import uuid
 from typing import NoReturn
 
 
-ATTESTATION_SCHEMA_VERSION = 2
-CAPTURE_SCHEMA_VERSION = 2
+ATTESTATION_SCHEMA_VERSION = 3
+CAPTURE_SCHEMA_VERSION = 3
 TRUSTED_UID = 0
 ZCASH_TESTNET_GENESIS = (
     "05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38"
@@ -29,6 +29,8 @@ ZCASH_TESTNET_GENESIS = (
 ZCASH_NU6_3_BRANCH_ID = "37a5165b"
 PAYOUT_COMMITMENT_DOMAIN = b"Wcash/Zcash parent payout address/v1\0"
 ACCOUNT_NAME = "ZecWec Testnet collector"
+DEFAULT_RECEIVER_TYPES = ("orchard", "sapling", "p2pkh")
+MAX_DIVERSIFIER_INDEX = 2**88 - 1
 BECH32M_RESIDUE = 0x2BC830A3
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 BECH32_VALUES = {character: index for index, character in enumerate(BECH32_CHARSET)}
@@ -57,6 +59,8 @@ TRANSCRIPT_FIELDS = {
     "pre_status",
     "pre_accounts",
     "account_operation",
+    "account_before_collector",
+    "default_address",
     "derived_address",
     "account",
     "accounts",
@@ -66,6 +70,8 @@ PORTABLE_FIELDS = (
     "seedfp",
     "zip32_account_index",
     "birthday_height",
+    "default_diversifier_index",
+    "default_unified_address",
     "diversifier_index",
     "receiver_types",
     "unified_address",
@@ -446,6 +452,92 @@ def recovery_operation_params(pair: object, birthday: int) -> list:
     return params
 
 
+def validate_account_result(value: object, expected_uuid: str, label: str) -> dict:
+    expected_fields = {
+        "account_uuid",
+        "name",
+        "seedfp",
+        "zip32_account_index",
+        "addresses",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        fail(f"{label} z_getaccount response has an unexpected schema")
+    if value["account_uuid"] != expected_uuid or value["name"] != ACCOUNT_NAME:
+        fail(f"{label} z_getaccount identity differs from the operation")
+    seedfp = validate_seedfp(value["seedfp"])
+    account_index = value["zip32_account_index"]
+    if type(account_index) is not int or not 0 <= account_index < 2**31:
+        fail(f"{label} z_getaccount ZIP-32 account index is invalid")
+    addresses = value["addresses"]
+    if not isinstance(addresses, list):
+        fail(f"{label} z_getaccount addresses are not a list")
+    validated_addresses: list[dict[str, object]] = []
+    seen_indices: set[int] = set()
+    seen_addresses: set[str] = set()
+    for entry in addresses:
+        if not isinstance(entry, dict) or set(entry) != {"diversifier_index", "ua"}:
+            fail(f"{label} z_getaccount address has an unexpected schema")
+        index = entry["diversifier_index"]
+        address = entry["ua"]
+        if (
+            type(index) is not int
+            or not 0 <= index <= MAX_DIVERSIFIER_INDEX
+            or not isinstance(address, str)
+            or not 8 <= len(address) <= 512
+            or not address.isascii()
+            or any(character.isspace() for character in address)
+        ):
+            fail(f"{label} z_getaccount address is invalid")
+        if index in seen_indices or address in seen_addresses:
+            fail(f"{label} z_getaccount address set contains a duplicate")
+        seen_indices.add(index)
+        seen_addresses.add(address)
+        validated_addresses.append({"diversifier_index": index, "ua": address})
+    return {
+        "seedfp": seedfp,
+        "zip32_account_index": account_index,
+        "addresses": validated_addresses,
+    }
+
+
+def validate_derived_address(
+    value: object,
+    expected_uuid: str,
+    expected_index: int,
+    expected_receiver_types: list[str],
+    label: str,
+) -> str:
+    expected_fields = {
+        "account_uuid",
+        "diversifier_index",
+        "receiver_types",
+        "address",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        fail(f"{label} response has an unexpected schema")
+    address = value["address"]
+    if (
+        value["account_uuid"] != expected_uuid
+        or type(value["diversifier_index"]) is not int
+        or value["diversifier_index"] != expected_index
+        or value["receiver_types"] != expected_receiver_types
+        or not isinstance(address, str)
+        or not 8 <= len(address) <= 512
+        or not address.isascii()
+        or any(character.isspace() for character in address)
+    ):
+        fail(f"{label} differs from the frozen derivation policy")
+    return address
+
+
+def collector_diversifier_index(default_index: int) -> int:
+    # Zallet beta.3 creates and exposes a default AllAvailableKeys UA as part
+    # of account creation. Preserve the preferred Orchard index zero unless
+    # that default already occupies it; index one is then the deterministic
+    # non-colliding choice. Orchard derivation accepts either index.
+    return 0 if default_index != 0 else 1
+
+
 def validate_capture(
     value: dict, expected_kind: str, settings: dict[str, str], native_program: str
 ) -> dict:
@@ -546,68 +638,83 @@ def validate_capture(
         ):
             fail("z_recoveraccounts response differs from its request")
 
+    account_before_result = validate_rpc_pair(
+        transcript["account_before_collector"],
+        nonce,
+        4,
+        "z_getaccount",
+        [account_uuid],
+        "account-before-collector",
+    )
+    account_before = validate_account_result(
+        account_before_result, account_uuid, "pre-collector"
+    )
+    if len(account_before["addresses"]) != 1:
+        fail("new account does not contain exactly Zallet's automatic default address")
+    default_entry = account_before["addresses"][0]
+    default_index = default_entry["diversifier_index"]
+    default_address = default_entry["ua"]
+
+    default_result = validate_rpc_pair(
+        transcript["default_address"],
+        nonce,
+        5,
+        "z_getaddressforaccount",
+        [account_uuid, list(DEFAULT_RECEIVER_TYPES), default_index],
+        "default-address",
+    )
+    rederived_default = validate_derived_address(
+        default_result,
+        account_uuid,
+        default_index,
+        list(DEFAULT_RECEIVER_TYPES),
+        "default address",
+    )
+    if rederived_default != default_address:
+        fail("Zallet's automatic default address cannot be re-derived exactly")
+
+    collector_index = collector_diversifier_index(default_index)
     address_result = validate_rpc_pair(
         transcript["derived_address"],
         nonce,
-        4,
+        6,
         "z_getaddressforaccount",
-        [account_uuid, ["orchard"], 0],
+        [account_uuid, ["orchard"], collector_index],
         "derived-address",
     )
-    expected_address_fields = {
-        "account_uuid",
-        "diversifier_index",
-        "receiver_types",
-        "address",
-    }
-    if not isinstance(address_result, dict) or set(address_result) != expected_address_fields:
-        fail("z_getaddressforaccount response has an unexpected schema")
-    if (
-        address_result["account_uuid"] != account_uuid
-        or type(address_result["diversifier_index"]) is not int
-        or address_result["diversifier_index"] != 0
-        or address_result["receiver_types"] != ["orchard"]
-        or not isinstance(address_result["address"], str)
-    ):
-        fail("derived collector address differs from Orchard index-zero policy")
-    address = address_result["address"]
+    address = validate_derived_address(
+        address_result,
+        account_uuid,
+        collector_index,
+        ["orchard"],
+        "derived collector address",
+    )
     native_validate(native_program, address)
 
     account_result = validate_rpc_pair(
-        transcript["account"], nonce, 5, "z_getaccount", [account_uuid], "account"
+        transcript["account"], nonce, 7, "z_getaccount", [account_uuid], "account"
     )
-    expected_account_fields = {
-        "account_uuid",
-        "name",
-        "seedfp",
-        "zip32_account_index",
-        "addresses",
+    account = validate_account_result(account_result, account_uuid, "post-collector")
+    seedfp = account["seedfp"]
+    account_index = account["zip32_account_index"]
+    if (
+        seedfp != account_before["seedfp"]
+        or account_index != account_before["zip32_account_index"]
+    ):
+        fail("z_getaccount derivation identity changed during the ceremony")
+    expected_addresses = {
+        (default_index, default_address),
+        (collector_index, address),
     }
-    if not isinstance(account_result, dict) or set(account_result) != expected_account_fields:
-        fail("z_getaccount response has an unexpected schema")
-    if (
-        account_result["account_uuid"] != account_uuid
-        or account_result["name"] != ACCOUNT_NAME
-    ):
-        fail("z_getaccount identity differs from the operation")
-    seedfp = validate_seedfp(account_result["seedfp"])
-    account_index = account_result["zip32_account_index"]
-    if type(account_index) is not int or not 0 <= account_index < 2**31:
-        fail("z_getaccount ZIP-32 account index is invalid")
-    addresses = account_result["addresses"]
-    if (
-        not isinstance(addresses, list)
-        or len(addresses) != 1
-        or not isinstance(addresses[0], dict)
-        or set(addresses[0]) != {"diversifier_index", "ua"}
-        or type(addresses[0]["diversifier_index"]) is not int
-        or addresses[0]["diversifier_index"] != 0
-        or addresses[0]["ua"] != address
-    ):
-        fail("z_getaccount address set is not exactly the frozen Orchard collector")
+    actual_addresses = {
+        (entry["diversifier_index"], entry["ua"])
+        for entry in account["addresses"]
+    }
+    if len(account["addresses"]) != 2 or actual_addresses != expected_addresses:
+        fail("z_getaccount address set is not exactly the default and frozen collector")
 
     accounts_result = validate_rpc_pair(
-        transcript["accounts"], nonce, 6, "z_listaccounts", [False], "accounts"
+        transcript["accounts"], nonce, 8, "z_listaccounts", [False], "accounts"
     )
     if not isinstance(accounts_result, list) or len(accounts_result) != 1:
         fail("z_listaccounts did not return exactly one collector")
@@ -619,7 +726,7 @@ def validate_capture(
         fail("z_listaccounts and z_getaccount derivation data disagree")
 
     post_status = validate_rpc_pair(
-        transcript["post_status"], nonce, 7, "getwalletstatus", [], "post-status"
+        transcript["post_status"], nonce, 9, "getwalletstatus", [], "post-status"
     )
     post_tip_height = validate_status(
         post_status, "post-operation wallet status", True
@@ -631,7 +738,9 @@ def validate_capture(
         "seedfp": seedfp,
         "zip32_account_index": account_index,
         "birthday_height": birthday,
-        "diversifier_index": 0,
+        "default_diversifier_index": default_index,
+        "default_unified_address": default_address,
+        "diversifier_index": collector_index,
         "receiver_types": ["orchard"],
         "unified_address": address,
         "collector_payout_commitment": commitment,
@@ -769,6 +878,8 @@ def require_output_absent(path: str) -> None:
         for name, label in (
             (target.name, "capture output"),
             (f"{target.name}.mutation-intent", "mutation intent"),
+            (f"{target.name}.mutation-receipt", "mutation receipt"),
+            (f"{target.name}.pending", "pending capture"),
         ):
             try:
                 os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -786,6 +897,14 @@ def mutation_intent_name(output: str) -> str:
     if not target.is_absolute() or target.name in {"", ".", ".."}:
         fail("capture output path must be absolute")
     return f"{target.name}.mutation-intent"
+
+
+def mutation_receipt_path(output: str) -> str:
+    return f"{output}.mutation-receipt"
+
+
+def pending_capture_path(output: str) -> str:
+    return f"{output}.pending"
 
 
 def create_mutation_intent(output: str, operation: str, nonce: str) -> bytes:
@@ -823,10 +942,10 @@ def create_mutation_intent(output: str, operation: str, nonce: str) -> bytes:
     return serialized
 
 
-def clear_mutation_intent(output: str, expected: bytes) -> None:
-    target = pathlib.Path(output)
+def remove_exact_private_file(path: str, expected: bytes, label: str) -> None:
+    target = pathlib.Path(path)
     directory = output_directory(target.parent)
-    name = mutation_intent_name(output)
+    name = target.name
     try:
         try:
             descriptor = os.open(
@@ -835,7 +954,7 @@ def clear_mutation_intent(output: str, expected: bytes) -> None:
                 dir_fd=directory,
             )
         except OSError:
-            fail("mutation intent is unavailable after the RPC operation")
+            fail(f"{label} is unavailable after the RPC operation")
         try:
             metadata = os.fstat(descriptor)
             if (
@@ -845,16 +964,25 @@ def clear_mutation_intent(output: str, expected: bytes) -> None:
                 or metadata.st_nlink != 1
                 or read_descriptor(descriptor, len(expected)) != expected
             ):
-                fail("mutation intent changed during the RPC operation")
+                fail(f"{label} changed during the RPC operation")
         finally:
             os.close(descriptor)
         try:
             os.unlink(name, dir_fd=directory)
         except OSError:
-            fail("mutation intent cannot be removed after durable capture")
+            fail(f"{label} cannot be removed after durable capture")
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def clear_mutation_intent(output: str, expected: bytes) -> None:
+    target = pathlib.Path(output)
+    remove_exact_private_file(
+        os.fspath(target.parent / mutation_intent_name(output)),
+        expected,
+        "mutation intent",
+    )
 
 
 def verify_existing(descriptor: int, name: str, serialized: bytes) -> bool:
@@ -973,6 +1101,22 @@ def capture_original(
     operation = rpc_call(
         host, port, cookie, nonce, 3, "z_getnewaccount", [ACCOUNT_NAME]
     )
+    receipt = {
+        "schema_version": 1,
+        "capture_kind": "original_wallet_creation",
+        "network": "testnet",
+        "genesis_hash": settings["ZCASH_GENESIS_DISPLAY"],
+        "consensus_branch_id": ZCASH_NU6_3_BRANCH_ID,
+        "capture_nonce": nonce,
+        "birthday_height": birthday,
+        "rpc_transcript": {
+            "pre_status": pre_status,
+            "pre_accounts": pre_accounts,
+            "account_operation": operation,
+        },
+    }
+    receipt_path = mutation_receipt_path(output)
+    write_once(receipt_path, receipt)
     operation_result = operation["response"]["result"]
     if not isinstance(operation_result, dict) or set(operation_result) != {
         "account_uuid"
@@ -981,14 +1125,42 @@ def capture_original(
     account_uuid = validate_uuid(
         operation_result["account_uuid"], "created account UUID"
     )
+    account_before_collector = rpc_call(
+        host, port, cookie, nonce, 4, "z_getaccount", [account_uuid]
+    )
+    account_before_result = validate_rpc_pair(
+        account_before_collector,
+        nonce,
+        4,
+        "z_getaccount",
+        [account_uuid],
+        "account-before-collector",
+    )
+    account_before = validate_account_result(
+        account_before_result, account_uuid, "pre-collector"
+    )
+    if len(account_before["addresses"]) != 1:
+        fail("new account does not contain exactly Zallet's automatic default address")
+    default_entry = account_before["addresses"][0]
+    default_index = default_entry["diversifier_index"]
+    default_address = rpc_call(
+        host,
+        port,
+        cookie,
+        nonce,
+        5,
+        "z_getaddressforaccount",
+        [account_uuid, list(DEFAULT_RECEIVER_TYPES), default_index],
+    )
+    collector_index = collector_diversifier_index(default_index)
     address = rpc_call(
         host,
         port,
         cookie,
         nonce,
-        4,
+        6,
         "z_getaddressforaccount",
-        [account_uuid, ["orchard"], 0],
+        [account_uuid, ["orchard"], collector_index],
     )
     address_result = address["response"]["result"]
     if not isinstance(address_result, dict) or not isinstance(
@@ -996,11 +1168,11 @@ def capture_original(
     ):
         fail("z_getaddressforaccount response is invalid")
     native_validate(native_program, address_result["address"])
-    account = rpc_call(host, port, cookie, nonce, 5, "z_getaccount", [account_uuid])
+    account = rpc_call(host, port, cookie, nonce, 7, "z_getaccount", [account_uuid])
     accounts = rpc_call(
-        host, port, cookie, nonce, 6, "z_listaccounts", [False]
+        host, port, cookie, nonce, 8, "z_listaccounts", [False]
     )
-    post_status = wait_for_status(host, port, cookie, nonce, 7, True)
+    post_status = wait_for_status(host, port, cookie, nonce, 9, True)
     capture = {
         "schema_version": CAPTURE_SCHEMA_VERSION,
         "capture_kind": "original_wallet_creation",
@@ -1013,14 +1185,24 @@ def capture_original(
             "pre_status": pre_status,
             "pre_accounts": pre_accounts,
             "account_operation": operation,
+            "account_before_collector": account_before_collector,
+            "default_address": default_address,
             "derived_address": address,
             "account": account,
             "accounts": accounts,
             "post_status": post_status,
         },
     }
+    pending_path = pending_capture_path(output)
+    write_once(pending_path, capture)
     validate_capture(capture, "original_wallet_creation", settings, native_program)
     write_once(output, capture)
+    remove_exact_private_file(
+        pending_path, canonical_json(capture), "pending capture"
+    )
+    remove_exact_private_file(
+        receipt_path, canonical_json(receipt), "mutation receipt"
+    )
     clear_mutation_intent(output, intent)
 
 
@@ -1069,6 +1251,22 @@ def capture_recovered(
         "z_recoveraccounts",
         [[recovery_account]],
     )
+    receipt = {
+        "schema_version": 1,
+        "capture_kind": "independent_mnemonic_recovery",
+        "network": "testnet",
+        "genesis_hash": settings["ZCASH_GENESIS_DISPLAY"],
+        "consensus_branch_id": ZCASH_NU6_3_BRANCH_ID,
+        "capture_nonce": nonce,
+        "birthday_height": birthday,
+        "rpc_transcript": {
+            "pre_status": pre_status,
+            "pre_accounts": pre_accounts,
+            "account_operation": operation,
+        },
+    }
+    receipt_path = mutation_receipt_path(output)
+    write_once(receipt_path, receipt)
     operation_result = operation["response"]["result"]
     if (
         not isinstance(operation_result, dict)
@@ -1081,14 +1279,42 @@ def capture_recovered(
         operation_result["accounts"][0].get("account_uuid"),
         "recovered account UUID",
     )
+    account_before_collector = rpc_call(
+        host, port, cookie, nonce, 4, "z_getaccount", [account_uuid]
+    )
+    account_before_result = validate_rpc_pair(
+        account_before_collector,
+        nonce,
+        4,
+        "z_getaccount",
+        [account_uuid],
+        "account-before-collector",
+    )
+    account_before = validate_account_result(
+        account_before_result, account_uuid, "pre-collector"
+    )
+    if len(account_before["addresses"]) != 1:
+        fail("recovered account does not contain exactly Zallet's automatic default address")
+    default_entry = account_before["addresses"][0]
+    default_index = default_entry["diversifier_index"]
+    default_address = rpc_call(
+        host,
+        port,
+        cookie,
+        nonce,
+        5,
+        "z_getaddressforaccount",
+        [account_uuid, list(DEFAULT_RECEIVER_TYPES), default_index],
+    )
+    collector_index = collector_diversifier_index(default_index)
     address = rpc_call(
         host,
         port,
         cookie,
         nonce,
-        4,
+        6,
         "z_getaddressforaccount",
-        [account_uuid, ["orchard"], 0],
+        [account_uuid, ["orchard"], collector_index],
     )
     address_result = address["response"]["result"]
     if not isinstance(address_result, dict) or not isinstance(
@@ -1096,11 +1322,11 @@ def capture_recovered(
     ):
         fail("z_getaddressforaccount response is invalid")
     native_validate(native_program, address_result["address"])
-    account = rpc_call(host, port, cookie, nonce, 5, "z_getaccount", [account_uuid])
+    account = rpc_call(host, port, cookie, nonce, 7, "z_getaccount", [account_uuid])
     accounts = rpc_call(
-        host, port, cookie, nonce, 6, "z_listaccounts", [False]
+        host, port, cookie, nonce, 8, "z_listaccounts", [False]
     )
-    post_status = wait_for_status(host, port, cookie, nonce, 7, True)
+    post_status = wait_for_status(host, port, cookie, nonce, 9, True)
     capture = {
         "schema_version": CAPTURE_SCHEMA_VERSION,
         "capture_kind": "independent_mnemonic_recovery",
@@ -1113,18 +1339,28 @@ def capture_recovered(
             "pre_status": pre_status,
             "pre_accounts": pre_accounts,
             "account_operation": operation,
+            "account_before_collector": account_before_collector,
+            "default_address": default_address,
             "derived_address": address,
             "account": account,
             "accounts": accounts,
             "post_status": post_status,
         },
     }
+    pending_path = pending_capture_path(output)
+    write_once(pending_path, capture)
     recovered = validate_capture(
         capture, "independent_mnemonic_recovery", settings, native_program
     )
     if any(original[field] != recovered[field] for field in PORTABLE_FIELDS):
         fail("independent recovery differs from the original portable collector identity")
     write_once(output, capture)
+    remove_exact_private_file(
+        pending_path, canonical_json(capture), "pending capture"
+    )
+    remove_exact_private_file(
+        receipt_path, canonical_json(receipt), "mutation receipt"
+    )
     clear_mutation_intent(output, intent)
 
 

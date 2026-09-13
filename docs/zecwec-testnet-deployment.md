@@ -499,12 +499,21 @@ sudo "$ZECWEC_CEREMONY_RELEASE/deployment/scripts/deploy/verify-zec-wallet-recov
   "$ZECWEC_CEREMONY_RELEASE/wcash-poold"
 ```
 
-The command requires a synchronized zero-account wallet, performs the single
-`z_getnewaccount`, derives exactly one Orchard receiver at diversifier zero,
-and records internally consistent authenticated envelopes. A create-only,
-fsynced mutation intent is written immediately before the RPC and removed only
-after the capture is durable. Any leftover intent is a hard taint requiring
-manual review; never retry blindly or hand-author a capture.
+The command requires a synchronized zero-account wallet and performs the single
+`z_getnewaccount`. Pinned Zallet creates one default Unified Address containing
+its available Orchard, Sapling, and P2PKH receivers as part of that operation.
+The verifier re-derives that default exactly, then derives the pool's
+Orchard-only collector at diversifier zero unless the default already occupies
+zero, in which case it deterministically uses one. The final authenticated
+account must contain exactly those two addresses.
+
+A create-only, fsynced mutation intent is written immediately before the RPC.
+After the RPC returns, a root-only mutation receipt is durable before response
+validation, and the complete root-only pending transcript is durable before
+post-operation validation. All three are removed only after the final capture
+is durable. Any leftover intent, receipt, or pending capture is a hard taint
+requiring manual review; this is evidence preservation, not automatic resume.
+Never retry blindly or hand-author a capture.
 
 Back up the original database and stop the service. Import the Testnet phrase
 through the release-paired no-echo helper:
@@ -541,8 +550,10 @@ sudo "$ZECWEC_CEREMONY_RELEASE/deployment/scripts/deploy/verify-zec-wallet-recov
 
 This proves the restored wallet began with zero accounts, submits
 `z_recoveraccounts` using the original RPC-derived fingerprint, index, and
-birthday, derives diversifier zero again, and captures every envelope. UUIDs
-are database-local and only need internal consistency; they are never compared
+birthday, re-derives the deterministic default and Orchard-only collector, and
+captures every envelope. The default and collector addresses and their
+diversifier indices must match the original portable identity. UUIDs are
+database-local and only need internal consistency; they are never compared
 across databases. Stop the recovery instance and remove both cookie snapshots:
 
 ```bash
