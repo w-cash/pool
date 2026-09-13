@@ -91,8 +91,9 @@ service mounts; the Internet-facing pool UID cannot read any custody path.
    well. The non-key-bearing credential path watcher remains enabled so a
    dormant deployment records node-cookie rotation; while the target and all
    runtime roles are inactive, reconciliation cannot start an authority.
-10. Apply `restrict-mining-firewall.sh` with explicit ASIC CIDRs, enable the
-    private Stratum edge, and run `start-testnet-pool.sh`. The script waits up
+10. Apply `restrict-mining-firewall.sh` with either the explicit public-Testnet
+    marker or exact ASIC addresses, enable the Stratum edge, and run
+    `start-testnet-pool.sh`. The script waits up
     to the reviewed startup deadline for Zallet synchronization, journal
     recovery, payout reconciliation, and the worker's ready heartbeat before
     full health can pass. Any startup or credential-refresh failure stops the
@@ -101,9 +102,9 @@ service mounts; the Internet-facing pool UID cannot read any custody path.
     `zecwec-testnet-pool-start.service` as the only boot entry point; the raw
     target and health timer are never enabled independently. Scheduled health
     failure closes miner intake instead of only emitting an alert. A dedicated
-    first-position IPv4/IPv6 `INPUT` guard enforces exact-host access to the two
-    current ports and drops the legacy port before any unrelated host rule can
-    accept it; the UFW allowlist remains the persistent second enforcement
+    first-position IPv4/IPv6 `INPUT` guard exposes the two current ports only
+    under that reviewed policy and drops the legacy port before any unrelated
+    host rule can accept it; UFW remains the persistent second enforcement
     layer.
 
 `zecwec-testnet-pool.target` supervises the projector, public service, payout
@@ -124,8 +125,8 @@ The HTTP origin is deployed API-only: nginx exposes `/api/v1/*`, `/readyz`, and
 reviewed frontend must use this same protected origin so the strict session,
 CSRF, and origin policy remains intact. The origin must remain behind
 Cloudflare Full (strict) plus Authenticated Origin Pulls. The mining hostname
-is DNS-only and protected by firewall CIDRs; generic Cloudflare HTTP proxying
-does not carry ZIP-301 TCP.
+is DNS-only and protected by the explicit Testnet firewall policy; generic
+Cloudflare HTTP proxying does not carry ZIP-301 TCP.
 
 See [`docs/zecwec-testnet-deployment.md`](../docs/zecwec-testnet-deployment.md)
 for the detailed ceremony, launch gates, health contract, and rollback rules.

@@ -136,6 +136,25 @@ def verify_guard(
             fail("managed guard loopback exception is not exact")
         source_rules = source_rules[1:]
 
+    if mode == "public":
+        if len(source_rules) != 2:
+            fail("managed guard public exceptions are incomplete")
+        for tokens, expected_port in zip(
+            source_rules,
+            (plain_port, tls_port),
+            strict=True,
+        ):
+            values = parse_guard_rule(tokens)
+            expected_values = {
+                "-p": "tcp",
+                "module": "tcp",
+                "--dport": str(expected_port),
+                "-j": "RETURN",
+            }
+            if values != expected_values:
+                fail("managed guard public exception is not exact")
+        source_rules = []
+
     expected_returns = {
         (source, port) for source in sources for port in (plain_port, tls_port)
     } if mode == "open" else set()
@@ -188,13 +207,13 @@ def verify_guard(
 
 
 def main() -> None:
-    if len(sys.argv) < 7:
+    if len(sys.argv) < 6:
         fail(
-            "usage: verify-mining-firewall.py <ipv4|ipv6> <open|closed> "
-            "<plain-port> <tls-port> <legacy-port> <source>..."
+            "usage: verify-mining-firewall.py <ipv4|ipv6> <open|public|closed> "
+            "<plain-port> <tls-port> <legacy-port> [source...]"
         )
     family_name, mode = sys.argv[1:3]
-    if family_name not in {"ipv4", "ipv6"} or mode not in {"open", "closed"}:
+    if family_name not in {"ipv4", "ipv6"} or mode not in {"open", "public", "closed"}:
         fail("invalid family or mode")
     family = 4 if family_name == "ipv4" else 6
     try:
@@ -204,6 +223,9 @@ def main() -> None:
     managed = {plain_port, tls_port, legacy_port}
     if len(managed) != 3 or any(not 1 <= port <= 65535 for port in managed):
         fail("managed ports are invalid or overlap")
+
+    if mode == "public" and sys.argv[6:]:
+        fail("public mining policy cannot include source addresses")
 
     sources: set[str] = set()
     for raw_source in sys.argv[6:]:
@@ -215,14 +237,17 @@ def main() -> None:
             fail("approved mining sources must be exact host addresses")
         if network.version == family:
             sources.add(str(network))
-    expected = (
-        {(source, port) for source in sources for port in (plain_port, tls_port)}
-        if mode == "open"
-        else set()
-    )
+    any_source = "0.0.0.0/0" if family == 4 else "::/0"
+    if mode == "open":
+        expected = {
+            (source, port) for source in sources for port in (plain_port, tls_port)
+        }
+    elif mode == "public":
+        expected = {(any_source, port) for port in (plain_port, tls_port)}
+    else:
+        expected = set()
     seen: set[tuple[str, int]] = set()
     expected_chain = "ufw-user-input" if family == 4 else "ufw6-user-input"
-    any_source = "0.0.0.0/0" if family == 4 else "::/0"
 
     chain_policies: dict[str, str] = {}
     rules: list[list[str]] = []

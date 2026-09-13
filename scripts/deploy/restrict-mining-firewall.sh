@@ -38,27 +38,14 @@ done
 [[ $plain_port == 3333 && $tls_port == 3443 && $legacy_port == 28237 ]] \
     || die "firewall ports do not match the reviewed Testnet deployment contract"
 
-cidrs=$(python3 - "$cidr_file" <<'PY'
-import ipaddress
-import pathlib
-import sys
-
-values = []
-for raw in pathlib.Path(sys.argv[1]).read_text(encoding="ascii").splitlines():
-    value = raw.strip()
-    if not value or value.startswith("#"):
-        continue
-    network = ipaddress.ip_network(value, strict=False)
-    if network.prefixlen != network.max_prefixlen or network.is_unspecified:
-        raise SystemExit("mining allowlist entries must be exact host addresses")
-    canonical = str(network)
-    if canonical not in values:
-        values.append(canonical)
-if not 1 <= len(values) <= 32:
-    raise SystemExit("provide between one and 32 explicit miner CIDRs")
-print("\n".join(values))
-PY
-) || die "miner CIDR policy is invalid"
+policy_output=$(
+    python3 "$script_dir/parse-mining-firewall-policy.py" "$cidr_file"
+) || die "mining ingress policy is invalid"
+readarray -t policy_lines <<<"$policy_output"
+firewall_policy=${policy_lines[0]}
+cidrs=("${policy_lines[@]:1}")
+[[ $firewall_policy == open || $firewall_policy == public ]] \
+    || die "mining ingress policy mode is invalid"
 
 readonly guard_chain=ZECWEC-MINING-GUARD
 
@@ -106,7 +93,7 @@ install_mining_guard() {
     local firewall save staging source port snapshot stale
     local -a stale_chains=()
 
-    [[ $guard_mode == open || $guard_mode == closed ]] \
+    [[ $guard_mode == open || $guard_mode == public || $guard_mode == closed ]] \
         || die "invalid mining guard mode"
     case $family in
         4) firewall=iptables; save=iptables-save ;;
@@ -130,8 +117,7 @@ install_mining_guard() {
             "$firewall" --wait 5 -t filter -A "$staging" \
                 -i lo -s ::1/128 -p tcp --dport "$plain_port" -j RETURN
         fi
-        while IFS= read -r source; do
-            [[ -n $source ]] || continue
+        for source in "${cidrs[@]}"; do
             if [[ $family == 4 && $source == *:* ]] \
                 || [[ $family == 6 && $source != *:* ]]; then
                 continue
@@ -140,7 +126,12 @@ install_mining_guard() {
                 "$firewall" --wait 5 -t filter -A "$staging" \
                     -s "$source" -p tcp --dport "$port" -j RETURN
             done
-        done <<<"$cidrs"
+        done
+    elif [[ $guard_mode == public ]]; then
+        for port in "$plain_port" "$tls_port"; do
+            "$firewall" --wait 5 -t filter -A "$staging" \
+                -p tcp --dport "$port" -j RETURN
+        done
     fi
     for port in "$plain_port" "$tls_port" "$legacy_port"; do
         "$firewall" --wait 5 -t filter -A "$staging" \
@@ -200,22 +191,27 @@ if [[ $mode == apply || $mode == close ]]; then
     done
     # UFW is permitted to reload its owned chains while deleting persisted
     # rules. Reassert the closed rule-one guard before either returning closed
-    # or installing the new exact-host allows.
+    # or installing the reviewed restricted/public policy.
     install_mining_guard 4 closed
     install_mining_guard 6 closed
     if [[ $mode == apply ]]; then
-        while IFS= read -r cidr; do
-            ufw allow proto tcp from "$cidr" to any port "$plain_port" comment 'ZecWec Testnet plaintext'
-            ufw allow proto tcp from "$cidr" to any port "$tls_port" comment 'ZecWec Testnet TLS'
-        done <<<"$cidrs"
-        install_mining_guard 4 open
-        install_mining_guard 6 open
+        if [[ $firewall_policy == public ]]; then
+            ufw allow proto tcp to any port "$plain_port" comment 'ZecWec public Testnet plaintext'
+            ufw allow proto tcp to any port "$tls_port" comment 'ZecWec public Testnet TLS'
+        else
+            for cidr in "${cidrs[@]}"; do
+                ufw allow proto tcp from "$cidr" to any port "$plain_port" comment 'ZecWec Testnet plaintext'
+                ufw allow proto tcp from "$cidr" to any port "$tls_port" comment 'ZecWec Testnet TLS'
+            done
+        fi
+        install_mining_guard 4 "$firewall_policy"
+        install_mining_guard 6 "$firewall_policy"
     fi
 fi
 
 rules=$(ufw status)
-if awk -v one="$plain_port/tcp" -v two="$tls_port/tcp" -v old="$legacy_port/tcp" '
-    $1 == one || $1 == two || $1 == old {
+if [[ $firewall_policy != public ]] && awk -v one="$plain_port/tcp" -v two="$tls_port/tcp" '
+    $1 == one || $1 == two {
         allowed = 0
         anywhere = 0
         for (field = 2; field <= NF; field += 1) {
@@ -228,7 +224,7 @@ if awk -v one="$plain_port/tcp" -v two="$tls_port/tcp" -v old="$legacy_port/tcp"
     }
     END { exit found ? 0 : 1 }
 ' <<<"$rules"; then
-    die "a world-open current or legacy mining rule remains"
+    die "a world-open current mining rule remains outside public policy"
 fi
 if awk -v old="$legacy_port/tcp" '
     $1 == old {
@@ -259,17 +255,16 @@ if [[ $mode == close ]]; then
     done
     raw_mode=closed
 else
-    raw_mode=open
+    raw_mode=$firewall_policy
 fi
-readarray -t cidr_array <<<"$cidrs"
 iptables-save -t filter \
     | python3 "$script_dir/verify-mining-firewall.py" \
         ipv4 "$raw_mode" "$plain_port" "$tls_port" "$legacy_port" \
-        "${cidr_array[@]}"
+        "${cidrs[@]}"
 ip6tables-save -t filter \
     | python3 "$script_dir/verify-mining-firewall.py" \
         ipv6 "$raw_mode" "$plain_port" "$tls_port" "$legacy_port" \
-        "${cidr_array[@]}"
+        "${cidrs[@]}"
 if [[ $mode == close ]]; then
     log "mining firewall is closed for every current and legacy Stratum port"
     exit 0
@@ -277,23 +272,44 @@ fi
 for port in "$plain_port" "$tls_port"; do
     grep -Eq "^${port}/tcp[[:space:]]+ALLOW" <<<"$rules" \
         || grep -Eq "^${port}/tcp[[:space:]]+\(v6\)[[:space:]]+ALLOW" <<<"$rules" \
-        || die "no source-restricted allow rule exists for port $port"
-    while IFS= read -r cidr; do
-        awk -v target="$port/tcp" -v source="$cidr" '
+        || die "no mining allow rule exists for port $port"
+    if [[ $firewall_policy == public ]]; then
+        awk -v target="$port/tcp" '
             $1 == target {
                 allowed = 0
-                matched = 0
+                anywhere = 0
                 for (field = 2; field <= NF; field += 1) {
                     allowed = allowed || $field == "ALLOW"
-                    matched = matched || $field == source
+                    anywhere = anywhere || $field ~ /^Anywhere/
                 }
-                if (allowed && matched) {
+                if (allowed && anywhere) {
                     found = 1
                 }
             }
             END { exit found ? 0 : 1 }
-        ' <<<"$rules" || die "configured source $cidr is not allowed on port $port"
-    done <<<"$cidrs"
+        ' <<<"$rules" || die "public Testnet access is not allowed on port $port"
+    else
+        for cidr in "${cidrs[@]}"; do
+            awk -v target="$port/tcp" -v source="$cidr" '
+                $1 == target {
+                    allowed = 0
+                    matched = 0
+                    for (field = 2; field <= NF; field += 1) {
+                        allowed = allowed || $field == "ALLOW"
+                        matched = matched || $field == source
+                    }
+                    if (allowed && matched) {
+                        found = 1
+                    }
+                }
+                END { exit found ? 0 : 1 }
+            ' <<<"$rules" || die "configured source $cidr is not allowed on port $port"
+        done
+    fi
 done
 
-log "mining firewall is active, default-deny, source-restricted, and legacy-port closed"
+if [[ $firewall_policy == public ]]; then
+    log "mining firewall is active, default-deny, public on current Testnet ports, and legacy-port closed"
+else
+    log "mining firewall is active, default-deny, source-restricted, and legacy-port closed"
+fi

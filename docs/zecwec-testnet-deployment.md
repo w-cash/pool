@@ -94,8 +94,8 @@ this runbook and requires a separately reviewed ledger migration.
 | Portal backend | loopback | Registration, dashboard, payout settings |
 | Apex web | Cloudflare-proxied plus origin mTLS after the launch gate | `zecwec.com`, redirects to Testnet |
 | Portal HTTPS | Cloudflare-proxied plus origin mTLS after the launch gate | `testnet.zecwec.com` |
-| ZIP-301 plaintext | approved source CIDRs only | Legacy ASIC compatibility |
-| ZIP-301 TLS | approved source CIDRs only, nginx TLS | Preferred ASIC endpoint |
+| ZIP-301 plaintext | explicitly public Testnet or approved exact hosts | Legacy ASIC compatibility |
+| ZIP-301 TLS | explicitly public Testnet or approved exact hosts, nginx TLS | Preferred ASIC endpoint |
 | Wcash/Zcash/PostgreSQL RPC | loopback only | Live mining authorities |
 | Zallet payout RPC | loopback only | Isolated hot Testnet ZEC collector; no public listener |
 | Backend Unix socket | pool/backend group only | Immutable job and share authority |
@@ -126,7 +126,7 @@ for the end-to-end launch gate.
 nginx enforces the real client-IP connection limit for TLS before forwarding
 to the loopback pool listener. The pool sees nginx as the TLS peer, so its
 process-level per-source ceiling is deliberately equal to the global ceiling;
-the plaintext port remains protected by source-restricted firewall rules.
+the plaintext port remains protected by the reviewed firewall policy.
 
 ## 1. Build and stage a release
 
@@ -194,9 +194,9 @@ snapshotted script for all remaining preparation steps below. Verify the
 literal path is one installed, root-owned, immutable release; never substitute
 `/opt/wcash/current`. Creating `backend-authority-protocol-v2.json` alone is not
 an activation signal. First finish the final render and preflight, install the
-exact miner CIDRs and publicly trusted mining certificate, and close the
-firewall as described through section 8. A clean host whose selector already
-names the epoch-2 release uses `start-testnet-pool.sh` in section 9. A scoped,
+reviewed mining-ingress policy and publicly trusted mining certificate, and
+close the firewall as described through section 8. A clean host whose selector
+already names the epoch-2 release uses `start-testnet-pool.sh` in section 9. A scoped,
 never-activated prototype selector uses `activate-release.sh` once to perform
 the fail-closed selector change, database migration, preflight, start, edge
 enablement, and health gate.
@@ -724,8 +724,8 @@ public mining unit requires and binds to that projector, conflicts with
 bootstrap and recovery wallets, and has inaccessible-path fences over all
 payout custody. After `ExecStartPre` returns,
 `wcash-poold serve` validates the two node tips against Wolf's exact generation
-and binds the source-restricted listener. It cannot compose automatic payout
-mode or read either spending key. The separate `wcash-payout-worker.service`
+and binds the firewall-policy-controlled listener. It cannot compose automatic
+payout mode or read either spending key. The separate `wcash-payout-worker.service`
 has no listener and cannot read portal authentication credentials. It obtains
 the payout database role, acquires its DB-clock lease, begins heartbeating,
 then performs signer recovery and reconciliation. Readiness remains disabled
@@ -750,27 +750,43 @@ sudo journalctl -u zecwec-zallet -u wcash-pool-backend \
   -u zecwec-cookie-refresh --since today
 ```
 
-## 8. Restrict the firewall and enable the edge
+## 8. Select the firewall policy and enable the edge
 
-Create `/etc/wcash-pool/miner-cidrs`, root-owned mode `0600`, with one approved
-ASIC public CIDR per line. World-open CIDRs are rejected. The script removes
-generic rules for the current and legacy mining ports, preserves unrelated
-firewall rules, and requires UFW to already be active with default-deny input.
-It also owns a `ZECWEC-MINING-GUARD` chain in each filter ruleset and requires
-one unconditional jump to that chain as the first `INPUT` rule. The guard
-returns only exact approved IPv4 `/32` and IPv6 `/128` sources on ports 3333
-and 3443 plus the exact loopback interface/source used by nginx to reach the
-plaintext backend. It drops every other source plus every legacy-port attempt,
-then returns unrelated traffic to the host policy. This first-position guard
-makes an earlier direct `ACCEPT` or jump to another accepting chain a
-verification failure instead of an allowlist bypass.
+Create `/etc/wcash-pool/miner-cidrs`, root-owned mode `0600`, with exactly one
+of these policies:
+
+- For intentionally public Testnet Stratum, make the sole non-comment line:
+
+  ```text
+  PUBLIC_TESTNET_STRATUM
+  ```
+
+- For restricted testing, put one approved ASIC address per line. Only exact
+  IPv4 `/32` and IPv6 `/128` hosts are accepted.
+
+The public marker cannot be mixed with an address. Broad CIDRs such as
+`0.0.0.0/0` and `::/0` remain invalid, so public exposure requires the literal,
+reviewable opt-in rather than an easily overlooked network entry. Under public
+policy, only Testnet ports 3333 and 3443 are world-accessible; legacy port 28237
+remains closed in both address families.
+
+The script removes generic rules for the current and legacy mining ports,
+preserves unrelated firewall rules, and requires UFW to already be active with
+default-deny input. It also owns a `ZECWEC-MINING-GUARD` chain in each filter
+ruleset and requires one unconditional jump to that chain as the first `INPUT`
+rule. The guard returns ports 3333 and 3443 either publicly or only for the
+exact approved hosts (plus the exact loopback path used by nginx in restricted
+mode). It always drops every legacy-port attempt, then returns unrelated traffic
+to the host policy. This first-position guard makes an earlier direct `ACCEPT`
+or jump to another accepting chain a verification failure instead of a policy
+bypass.
 
 `apply` and `close` stage a closed replacement guard before changing UFW. The
-open replacement is activated only after the exact persistent UFW allowlist is
+open replacement is activated only after the exact persistent UFW policy is
 installed. Guard replacement uses a new populated chain and a rule-one hook,
 so it never flushes the active chain in place. `check` is read-only and proves
-the exact guard order and contents in both address families as well as the UFW
-rule set.
+the selected public/restricted guard contents in both address families, the
+legacy-port drop, and the matching UFW rule set.
 
 ```bash
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
@@ -778,8 +794,9 @@ sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
   close /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
 ```
 
-Do not open the allowlist manually for launch. The readiness-gated start command
-does that only after the payout worker proves a fresh lease. On the first start,
+Do not open the mining ports manually for launch. The readiness-gated start
+command applies the selected policy only after the payout worker proves a fresh
+lease. On the first start,
 that command validates the installed nginx configuration and starts nginx while
 mining ingress is still closed. A missing stream-capable nginx installation or
 failed start aborts before preflight and leaves the pool inaccessible.
@@ -799,7 +816,7 @@ certificate/key pairs because nginx loads both web virtual hosts. Install
 Cloudflare's current official Authenticated Origin Pull CA at the exact
 configured root-owned path and do not substitute an arbitrary client CA. nginx
 snippets are staged in `sites-available` and `streams-available`. The start
-command enables only the source-restricted TLS mining edge and deliberately
+command enables only the policy-controlled TLS mining edge and deliberately
 leaves the portal site disabled. An SSH tunnel may be used for service
 diagnostics, but it is not browser E2E evidence: it does not exercise the
 canonical HTTPS origin, `Secure`/`__Host-` cookies, or Cloudflare Authenticated
@@ -809,9 +826,9 @@ If an older pool uses a different unit name but still occupies either mining
 port, archive and disable that unit before continuing. The listener-free
 preflight refuses any process that already owns the plaintext port.
 
-## 9. Private start and ASIC gate
+## 9. Readiness-gated start and ASIC gate
 
-Only after source review, deterministic tests, final policy, miner CIDRs, and
+Only after source review, deterministic tests, final mining-ingress policy, and
 the mining certificate gate are complete may the runtime start. On the scoped
 never-activated prototype described in section 1, activate the pinned release;
 this is the operation that atomically changes its stale selector and starts it:
@@ -838,8 +855,9 @@ sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
 Both paths first remove all current and legacy mining allow rules, repeat
 probe-only listener-free preflight, start the full Testnet target behind the
 closed firewall, and waits a bounded interval for signer recovery and a fresh
-payout-worker heartbeat. Only then does it restore the exact source allowlist,
-reconcile nginx to the durable portal launch mode, and run health. Health requires the public pool, backend,
+payout-worker heartbeat. Only then does it restore the selected public or
+exact-host firewall policy, reconcile nginx to the durable portal launch mode,
+and run health. Health requires the public pool, backend,
 payout worker, and payout Zallet to be active; Zallet must listen only on
 literal loopback, `/readyz` must report `payout_execution=enabled`, and a
 failure stops every public/key-bearing pool component and closes mining ingress.
@@ -899,7 +917,7 @@ Before telling an operator to point an ASIC, prove all of the following:
 - WEC-only, ZEC-only, and dual winner paths conserve accounting;
 - restart/reorganization handling neither loses nor duplicates mining
   liabilities;
-- one actual ASIC share is accepted through the source-restricted endpoint;
+- one actual ASIC share is accepted through the policy-controlled endpoint;
 - payout execution reports `enabled` only from a fresh exact-owner DB heartbeat;
 - a matured Testnet payout can be constructed, journaled, broadcast through
   the independent node path, confirmed, and recovered idempotently after a
