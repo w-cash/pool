@@ -1086,14 +1086,14 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" finalize \
     --pool-uid 12345 \
     --payout-uid 12346
 
-python3 - "$temporary/output" <<'PY'
+python3 - "$temporary/output" "$repo_root" <<'PY'
 import json
 import pathlib
 import re
 import sys
 import tomllib
 
-root = pathlib.Path(sys.argv[1])
+root, repo = map(pathlib.Path, sys.argv[1:])
 runtime = tomllib.loads((root / "pool.runtime.toml").read_text(encoding="utf-8"))
 migrate = tomllib.loads((root / "pool.migrate.toml").read_text(encoding="utf-8"))
 preflight = tomllib.loads((root / "pool.preflight.toml").read_text(encoding="utf-8"))
@@ -1586,6 +1586,29 @@ assert "ZCASH_AUTHORITY_SIGNER_ACCOUNT_INDEX=" not in backend_environment
 assert "WCASH_SHARE_JOURNAL=/var/lib/wcash-pool-backend/share-journal-protocol-v2.jsonl" in backend_environment
 assert "WCASH_POOL_BACKEND_IDENTITY=/var/lib/wcash-pool-backend/backend-identity-protocol-v2.json" in backend_environment
 assert "WCASH_POOL_BACKEND_JOURNAL=/var/lib/wcash-pool-backend/backend-journal-protocol-v2.jsonl" in backend_environment
+
+backend_entrypoint = (
+    repo / "scripts/deploy/backend-entrypoint.sh"
+).read_text(encoding="utf-8")
+peer_uid_bindings = {
+    "WCASH_POOL_BACKEND_SUBMIT_UID": "wcash-pool",
+    "WCASH_POOL_BACKEND_PROJECTOR_UID": "wcash-pool-projector",
+    "WCASH_POOL_BACKEND_PAYOUT_UID": "wcash-payout",
+}
+peer_export = backend_entrypoint[
+    backend_entrypoint.index("export WCASH_POOL_BACKEND_SUBMIT_UID"):
+    backend_entrypoint.index('binary="$ZECWEC_RELEASE_PATH/wcash-merge-miner"')
+]
+for variable, identity in peer_uid_bindings.items():
+    assert f"{variable}=$(id -u {identity})" in backend_entrypoint
+    assert variable in peer_export
+assert "WCASH_POOL_BACKEND_PEER_UID" not in backend_entrypoint
+assert "backend peer UIDs must be distinct" in backend_entrypoint
+assert "backend rejects SubmitShare from either read-only identity" in backend_entrypoint
+assert (
+    "WCASH_POOL_BACKEND_SOCKET_GID=$(getent group wcash-pool-socket | cut -d: -f3)"
+    in backend_entrypoint
+)
 
 stratum = (root / "nginx/zecwec-testnet-stratum.conf").read_text(encoding="utf-8")
 assert "listen 3443 ssl;" in stratum

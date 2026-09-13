@@ -162,11 +162,35 @@ trap - EXIT
 WCASH_PAYOUT_IVK_FILE="$RUNTIME_DIRECTORY/wcash-payout-ivk"
 export WCASH_PAYOUT_IVK_FILE
 
-WCASH_POOL_BACKEND_PEER_UID=$(id -u wcash-pool)
-WCASH_POOL_BACKEND_SOCKET_GID=$(getent group wcash-pool-socket | cut -d: -f3)
-[[ $WCASH_POOL_BACKEND_PEER_UID =~ ^[0-9]+$ ]] || die "pool UID lookup failed"
-[[ $WCASH_POOL_BACKEND_SOCKET_GID =~ ^[0-9]+$ ]] || die "socket GID lookup failed"
-export WCASH_POOL_BACKEND_PEER_UID WCASH_POOL_BACKEND_SOCKET_GID
+# The backend authenticates each connection with SO_PEERCRED.  Keep mining
+# submission authority on the public pool identity alone.  The isolated
+# projector and payout identities may only perform the protocol handshake,
+# replay events, subscribe to a race-free job snapshot, and check health; the
+# backend rejects SubmitShare from either read-only identity.
+WCASH_POOL_BACKEND_SUBMIT_UID=$(id -u wcash-pool) \
+    || die "pool submit UID lookup failed"
+WCASH_POOL_BACKEND_PROJECTOR_UID=$(id -u wcash-pool-projector) \
+    || die "projector UID lookup failed"
+WCASH_POOL_BACKEND_PAYOUT_UID=$(id -u wcash-payout) \
+    || die "payout UID lookup failed"
+WCASH_POOL_BACKEND_SOCKET_GID=$(getent group wcash-pool-socket | cut -d: -f3) \
+    || die "socket GID lookup failed"
+for peer_uid in \
+    "$WCASH_POOL_BACKEND_SUBMIT_UID" \
+    "$WCASH_POOL_BACKEND_PROJECTOR_UID" \
+    "$WCASH_POOL_BACKEND_PAYOUT_UID"; do
+    [[ $peer_uid =~ ^[1-9][0-9]{0,9}$ && $peer_uid -le 4294967294 ]] \
+        || die "backend peer UID is invalid"
+done
+[[ $WCASH_POOL_BACKEND_SOCKET_GID =~ ^[1-9][0-9]{0,9}$ \
+    && $WCASH_POOL_BACKEND_SOCKET_GID -le 4294967294 ]] \
+    || die "socket GID is invalid"
+[[ $WCASH_POOL_BACKEND_SUBMIT_UID != "$WCASH_POOL_BACKEND_PROJECTOR_UID" \
+    && $WCASH_POOL_BACKEND_SUBMIT_UID != "$WCASH_POOL_BACKEND_PAYOUT_UID" \
+    && $WCASH_POOL_BACKEND_PROJECTOR_UID != "$WCASH_POOL_BACKEND_PAYOUT_UID" ]] \
+    || die "backend peer UIDs must be distinct"
+export WCASH_POOL_BACKEND_SUBMIT_UID WCASH_POOL_BACKEND_PROJECTOR_UID \
+    WCASH_POOL_BACKEND_PAYOUT_UID WCASH_POOL_BACKEND_SOCKET_GID
 
 binary="$ZECWEC_RELEASE_PATH/wcash-merge-miner"
 [[ $ZECWEC_RELEASE_PATH == /opt/wcash/releases/* && -d $ZECWEC_RELEASE_PATH \
