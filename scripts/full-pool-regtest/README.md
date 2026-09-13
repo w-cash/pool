@@ -3,7 +3,7 @@
 This harness exercises actual Wcash and Zcash nodes, the native authenticated
 backend, PostgreSQL 16, `wcash-poold projector`, `wcash-poold serve`, account and
 worker creation through the portal API, and real Equihash 200,9 submissions through
-ZIP-301. The default 101 merged blocks preserve the production 100-confirmation
+ZIP-301. The default 102 merged blocks preserve the production 100-confirmation
 policy. Wallet payout execution is a separate final stage being integrated here.
 
 The isolated network is opt-in at compile time:
@@ -43,7 +43,7 @@ python3 scripts/full-pool-regtest/run.py \
   --wcash-node "$REGTEST_WCASH_NODE" \
   --zcash-node "$REGTEST_ZCASH_NODE" \
   --poold "$REGTEST_POOLD" \
-  --blocks 101 --keep-running
+  --blocks 102 --keep-running
 ```
 
 Use `--blocks 1` only for a mining smoke; it does not prove mature balances or
@@ -52,8 +52,41 @@ All wallet output, passwords, tokens, RPC credentials, logs and intermediate
 responses remain in the protected runtime directory. The stdout progress excludes
 these values. Ctrl-C stops only processes launched by this harness.
 
+When ordinary mining is idle and projection has caught up, check a real proof
+replay through the existing edge:
+
+```sh
+python3 scripts/full-pool-regtest/replay.py \
+  --runtime "$REGTEST_RUNTIME" --miner "$REGTEST_MERGE_MINER"
+```
+
+The loopback proxy on port 18238 retains the authorized connection and replays
+the identical submission with a new request ID. It accepts protocol-valid
+idempotent success or an explicit stale/duplicate rejection, and requires that
+shares, winner allocations, and the original reward ledger remain unchanged.
+Its protected transcript contains credentials. This same-session check does
+not substitute for restarting services and proving durable recovery.
+
 Local limitations are explicit: all functional processes run as the current Unix
 UID, so the submitter credential is also used for read-only backend operations;
 production UID and database-role separation must additionally pass the deployment
 smoke. The portal API uses its exact HTTPS origin contract over the loopback
 upstream HTTP listener; nginx TLS termination is tested separately.
+
+After both coinbase maturity and payout confirmation depth have been reached,
+run the independent read-only check:
+
+```sh
+python3 scripts/full-pool-regtest/verify.py --runtime "$REGTEST_RUNTIME"
+```
+
+It queries the live database and both real nodes. It requires mature miner
+credits on both chains, conserving sealed ledger transactions, and confirmed
+Wcash shielded plus Zcash transparent and shielded payments. Every referenced
+transaction must appear in its independently fetched best-chain block at the
+unaltered 100-confirmation depth. A mining-only run cannot pass this check.
+Recipient wallet receipts and restart/replay scenarios remain separately
+required; block inclusion alone does not decrypt a shielded recipient output.
+The verifier's fixture-based boundary tests are runnable with
+`python3 -m unittest discover -s scripts/full-pool-regtest -p 'test_*.py'` and
+are explicitly not chain acceptance evidence.
