@@ -432,6 +432,26 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "regtest")]
+    #[test]
+    fn isolated_payout_boundary_cannot_cross_networks() {
+        let default = TestnetPayoutBoundary::new(Arc::new(FixedSigner));
+        let isolated = TestnetPayoutBoundary::new(Arc::new(FixedSigner)).with_regtest_network();
+        assert_eq!(
+            default.execute(&request(ChainNetwork::Regtest)),
+            Err(SignerError::WrongNetwork)
+        );
+        assert_eq!(
+            isolated.execute(&request(ChainNetwork::Testnet)),
+            Err(SignerError::WrongNetwork)
+        );
+        assert_eq!(
+            isolated.execute(&request(ChainNetwork::Mainnet)),
+            Err(SignerError::WrongNetwork)
+        );
+        assert!(isolated.execute(&request(ChainNetwork::Regtest)).is_ok());
+    }
+
     #[test]
     fn exact_receipt_is_accepted() {
         let boundary = TestnetPayoutBoundary::new(Arc::new(FixedSigner));

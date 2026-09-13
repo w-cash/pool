@@ -478,7 +478,12 @@ async fn connect_store(config: &RuntimeConfig) -> Result<PostgresStore, Bootstra
 fn deployment_identity(config: &RuntimeConfig) -> DeploymentIdentity {
     DeploymentIdentity {
         id: config.deployment_id,
-        network: DeploymentNetwork::Testnet,
+        network: match config.network {
+            wcash_pool_portal::ChainNetwork::Testnet => DeploymentNetwork::Testnet,
+            wcash_pool_portal::ChainNetwork::Mainnet => DeploymentNetwork::Mainnet,
+            #[cfg(feature = "regtest")]
+            wcash_pool_portal::ChainNetwork::Regtest => DeploymentNetwork::Regtest,
+        },
         wcash_genesis: config.wcash_genesis,
         zcash_genesis: config.zcash_genesis,
         chain_id: config.chain_id,

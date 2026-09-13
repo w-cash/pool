@@ -17,6 +17,7 @@ use rustix::{
 };
 use serde::Deserialize;
 use uuid::Uuid;
+use wcash_pool_portal::ChainNetwork;
 use zeroize::Zeroizing;
 
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
@@ -26,6 +27,8 @@ pub(crate) const MAX_WCASH_WALLET_SYNC_TIMEOUT: Duration = Duration::from_secs(9
 /// Fully decoded, immutable Testnet service policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
+    /// Explicit chain environment; Regtest exists only in integration builds.
+    pub network: ChainNetwork,
     /// Stable database namespace.
     pub deployment_id: Uuid,
     /// Stable pool process identity used by Wolf receipts and nonce leases.
@@ -227,6 +230,25 @@ struct RawConfig {
 }
 
 impl RuntimeConfig {
+    /// Exact wallet network corresponding to this validated deployment.
+    pub(crate) fn wallet_network(&self) -> wcash_wec_payout_signer::WalletNetwork {
+        match self.network {
+            ChainNetwork::Testnet => wcash_wec_payout_signer::WalletNetwork::Testnet,
+            ChainNetwork::Mainnet => wcash_wec_payout_signer::WalletNetwork::Mainnet,
+            #[cfg(feature = "regtest")]
+            ChainNetwork::Regtest => wcash_wec_payout_signer::WalletNetwork::Regtest,
+        }
+    }
+
+    /// Frozen signature branch for the explicitly selected Wcash environment.
+    pub(crate) fn wcash_branch_id(&self) -> &'static str {
+        #[cfg(feature = "regtest")]
+        if self.network == ChainNetwork::Regtest {
+            return wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID;
+        }
+        wcash_wec_payout_signer::WCASH_TESTNET_BRANCH_ID
+    }
+
     /// Reads one protected, bounded TOML policy without accepting symlinks.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let bytes = read_protected(path, MAX_CONFIG_BYTES, false)?;
@@ -259,9 +281,13 @@ impl TryFrom<RawConfig> for RuntimeConfig {
     type Error = ConfigError;
 
     fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
-        if raw.network != "testnet" {
-            return Err(ConfigError::MainnetDisabled);
-        }
+        let network = match raw.network.as_str() {
+            "testnet" => ChainNetwork::Testnet,
+            #[cfg(feature = "regtest")]
+            "regtest" => ChainNetwork::Regtest,
+            _ => return Err(ConfigError::MainnetDisabled),
+        };
+        let isolated = network.as_str() == "regtest";
         if raw.deployment_id.is_nil()
             || raw.pool_instance.is_nil()
             || raw.backend_instance.is_nil()
@@ -284,7 +310,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
         }
         let automatic_payout = parse_automatic_payout(&raw)?;
         if raw.stratum_listen.port() == 0
-            || raw.stratum_listen.ip().is_loopback()
+            || (raw.stratum_listen.ip().is_loopback() != isolated)
             || raw.stratum_listen.ip().is_multicast()
             || raw.portal_listen.port() == 0
             || !raw.portal_listen.ip().is_loopback()
@@ -307,6 +333,20 @@ impl TryFrom<RawConfig> for RuntimeConfig {
         }
         let wcash_genesis = decode_hex32("wcash_genesis", &raw.wcash_genesis)?;
         let zcash_genesis = decode_hex32("zcash_genesis", &raw.zcash_genesis)?;
+        #[cfg(feature = "regtest")]
+        if isolated {
+            let mut child = wcash_genesis;
+            let mut parent = zcash_genesis;
+            child.reverse();
+            parent.reverse();
+            if hex::encode(child)
+                != "70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c"
+                || hex::encode(parent)
+                    != "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327"
+            {
+                return Err(ConfigError::InvalidIdentity);
+            }
+        }
         let wcash_payout_commitment =
             decode_hex32("wcash_payout_commitment", &raw.wcash_payout_commitment)?;
         let zcash_payout_commitment =
@@ -331,6 +371,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             return Err(ConfigError::InvalidIdentity);
         }
         Ok(Self {
+            network,
             deployment_id: raw.deployment_id,
             pool_instance: raw.pool_instance,
             backend_instance: raw.backend_instance,
@@ -909,6 +950,51 @@ policy_version = 1
             RuntimeConfig::load(&contaminated),
             Err(ConfigError::InvalidPolicy)
         ));
+    }
+
+    #[test]
+    fn regtest_configuration_is_feature_gated_and_chain_pinned() {
+        let directory = TempDir::new().expect("temp dir");
+        let fixture = fixture(&directory, "regtest").replace("0.0.0.0:28237", "127.0.0.1:28237");
+        let path = write_file(&directory, "regtest.toml", fixture.as_bytes(), 0o600);
+        #[cfg(not(feature = "regtest"))]
+        assert!(matches!(
+            RuntimeConfig::load(&path),
+            Err(ConfigError::MainnetDisabled)
+        ));
+        #[cfg(feature = "regtest")]
+        {
+            assert!(matches!(
+                RuntimeConfig::load(&path),
+                Err(ConfigError::InvalidIdentity)
+            ));
+            let child = "70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c";
+            let parent = "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327";
+            let wire = |display: &str| {
+                let mut bytes = hex::decode(display).expect("genesis hex");
+                bytes.reverse();
+                hex::encode(bytes)
+            };
+            let fixture = fixture
+                .replace(&"01".repeat(32), &wire(child))
+                .replace(&"02".repeat(32), &wire(parent));
+            write_path(&path, fixture.as_bytes(), 0o600);
+            assert_eq!(
+                RuntimeConfig::load(&path).expect("isolated policy").network,
+                ChainNetwork::Regtest
+            );
+            write_path(
+                &path,
+                fixture
+                    .replace("127.0.0.1:28237", "0.0.0.0:28237")
+                    .as_bytes(),
+                0o600,
+            );
+            assert!(matches!(
+                RuntimeConfig::load(&path),
+                Err(ConfigError::InvalidPolicy)
+            ));
+        }
     }
 
     #[test]

@@ -133,10 +133,10 @@ async fn main() -> ExitCode {
                     return Err(config::ConfigError::WeakCredential);
                 }
                 drop((database, token, totp));
-                Ok(())
+                Ok(runtime.network)
             }) {
-                Ok(()) => {
-                    println!("{{\"valid\":true,\"network\":\"testnet\"}}");
+                Ok(network) => {
+                    println!("{}", serde_json::json!({"valid": true, "network": network}));
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
@@ -154,10 +154,13 @@ async fn main() -> ExitCode {
                 }
                 let database = runtime.database_url()?;
                 drop(database);
-                Ok(())
+                Ok(runtime.network)
             }) {
-                Ok(()) => {
-                    println!("{{\"valid\":true,\"network\":\"testnet\",\"scope\":\"payout\"}}");
+                Ok(network) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"valid": true, "network": network, "scope": "payout"})
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(error) => {

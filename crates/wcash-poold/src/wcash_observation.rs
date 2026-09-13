@@ -68,9 +68,18 @@ impl WcashWalletObserver {
         genesis_hash_display.reverse();
         let genesis_hash = hex::encode(genesis_hash_display);
         let branch_id = branch_id.into();
-        if network != WalletNetwork::Testnet
-            || genesis_hash != WCASH_TESTNET_GENESIS_HASH
-            || branch_id != WCASH_TESTNET_BRANCH_ID
+        let valid_network = match network {
+            WalletNetwork::Testnet => {
+                genesis_hash == WCASH_TESTNET_GENESIS_HASH && branch_id == WCASH_TESTNET_BRANCH_ID
+            }
+            #[cfg(feature = "regtest")]
+            WalletNetwork::Regtest => {
+                genesis_hash == wcash_wec_payout_signer::WCASH_REGTEST_GENESIS_HASH
+                    && branch_id == wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID
+            }
+            _ => false,
+        };
+        if !valid_network
             || account_id.is_nil()
             || fund_source != WalletFundSource::Ironwood
             || payout_commitment == [0; 32]

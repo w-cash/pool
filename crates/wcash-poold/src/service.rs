@@ -18,10 +18,7 @@ use wcash_pool_store::{
     Chain, NonceNamespaceClaim, PostgresEventProjector, PostgresPoolDataSource, PostgresStore,
     StoreError,
 };
-use wcash_wec_payout_signer::{
-    SeedSource, WalletFundSource, WalletNetwork, WecPayoutSigner, WecSignerConfig,
-    WCASH_TESTNET_BRANCH_ID,
-};
+use wcash_wec_payout_signer::{SeedSource, WalletFundSource, WecPayoutSigner, WecSignerConfig};
 use wcash_zec_payout_signer::{
     validate_zallet_configuration, LoopbackHttpTransport, ZecPcztSigner, ZecSignerConfig,
 };
@@ -765,7 +762,7 @@ struct LivePreflightProbe<'a> {
 impl PreflightProbe for LivePreflightProbe<'_> {
     async fn address_authority(&mut self) -> Result<(), ServiceError> {
         let validator = build_address_validator(self.config)?;
-        verify_address_authority(Arc::clone(&validator)).await?;
+        verify_address_authority(Arc::clone(&validator), self.config.network).await?;
         self.validator = Some(validator);
         Ok(())
     }
@@ -819,7 +816,7 @@ async fn run_started(
     let started = bootstrap.as_ref().ok_or(ServiceError::Invariant)?;
 
     let validator = build_address_validator(config)?;
-    verify_address_authority(Arc::clone(&validator)).await?;
+    verify_address_authority(Arc::clone(&validator), config.network).await?;
     let payout_boundary = build_probe_only_payout_boundary(config, &started.jobs).await?;
 
     let pool_data = PostgresPoolDataSource::new(started.store.as_ref().clone());
@@ -992,16 +989,24 @@ fn build_address_validator(
         ADDRESS_VALIDATION_TIMEOUT,
     )
     .map_err(|_| ServiceError::AddressAuthorityUnavailable)?;
-    Ok(Arc::new(TestnetAddressValidator::new(command)))
+    let validator = TestnetAddressValidator::new(command);
+    #[cfg(feature = "regtest")]
+    let validator = if config.network == ChainNetwork::Regtest {
+        validator.with_regtest_network()
+    } else {
+        validator
+    };
+    Ok(Arc::new(validator))
 }
 
 async fn verify_address_authority(
     validator: Arc<dyn AddressValidator>,
+    network: ChainNetwork,
 ) -> Result<(), ServiceError> {
     tokio::task::spawn_blocking(move || {
         validator
-            .readiness(Asset::Wec, ChainNetwork::Testnet)
-            .and_then(|()| validator.readiness(Asset::Zec, ChainNetwork::Testnet))
+            .readiness(Asset::Wec, network)
+            .and_then(|()| validator.readiness(Asset::Zec, network))
     })
     .await
     .map_err(|_| ServiceError::AddressAuthorityUnavailable)?
@@ -1056,7 +1061,14 @@ async fn build_probe_only_payout_boundary(
 
     // Preflight composes the portal without giving it an execution-capable
     // signer. No listener is opened, and the boundary is dropped on return.
-    Ok(Arc::new(TestnetPayoutBoundary::deferred()))
+    let boundary = TestnetPayoutBoundary::deferred();
+    #[cfg(feature = "regtest")]
+    let boundary = if config.network == ChainNetwork::Regtest {
+        boundary.with_regtest_network()
+    } else {
+        boundary
+    };
+    Ok(Arc::new(boundary))
 }
 
 fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<(), ServiceError> {
@@ -1079,6 +1091,12 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
         payout.wcash_lightwalletd_endpoint.clone(),
     )
     .map_err(|_| ServiceError::SignerConfiguration)?;
+    #[cfg(feature = "regtest")]
+    let wallet = if config.network == ChainNetwork::Regtest {
+        wallet.with_regtest_network()
+    } else {
+        wallet
+    };
     wallet
         .probe_readonly_boundary()
         .map_err(|_| ServiceError::SignerConfiguration)?;
@@ -1094,6 +1112,13 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
         seed,
     )
     .and_then(|configured| {
+        #[cfg(feature = "regtest")]
+        if config.network == ChainNetwork::Regtest {
+            return configured.with_regtest_network();
+        }
+        Ok(configured)
+    })
+    .and_then(|configured| {
         configured.with_confirmations(config.wcash_policy.required_confirmations)
     })
     .and_then(|configured| {
@@ -1102,6 +1127,12 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
     .and_then(|configured| configured.with_max_fee_zat(config.wcash_policy.maximum_network_fee_zat))
     .map_err(|_| ServiceError::SignerConfiguration)?;
 
+    #[cfg(feature = "regtest")]
+    let validate_zallet_configuration = if config.network == ChainNetwork::Regtest {
+        wcash_zec_payout_signer::validate_zallet_regtest_configuration
+    } else {
+        validate_zallet_configuration
+    };
     validate_zallet_configuration(&payout.zallet_configuration)
         .map_err(|_| ServiceError::SignerConfiguration)?;
     let _zallet = LoopbackHttpTransport::new(payout.zallet_rpc, payout.zallet_cookie_file.clone())
@@ -1115,6 +1146,13 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
         payout.zcash_signer_account,
         config.zcash_payout_commitment,
     )
+    .and_then(|configured| {
+        #[cfg(feature = "regtest")]
+        if config.network == ChainNetwork::Regtest {
+            return configured.with_regtest_network();
+        }
+        Ok(configured)
+    })
     .and_then(|configured| {
         configured.with_min_confirmations(config.zcash_policy.required_confirmations)
     })
@@ -1154,6 +1192,13 @@ async fn build_payout_services(
             payout.wcash_wallet_database.clone(),
             payout.wcash_lightwalletd_endpoint.clone(),
         )
+        .map(|wallet| {
+            #[cfg(feature = "regtest")]
+            if config.network == ChainNetwork::Regtest {
+                return wallet.with_regtest_network();
+            }
+            wallet
+        })
         .map_err(|_| ServiceError::SignerConfiguration)?,
     );
     let wec_config = WecSignerConfig::new(
@@ -1162,6 +1207,13 @@ async fn build_payout_services(
         config.wcash_payout_commitment,
         SeedSource::protected_file(payout.wcash_wallet_seed_file.clone(), payout.wcash_seed_uid),
     )
+    .and_then(|configured| {
+        #[cfg(feature = "regtest")]
+        if config.network == ChainNetwork::Regtest {
+            return configured.with_regtest_network();
+        }
+        Ok(configured)
+    })
     .and_then(|configured| {
         configured.with_confirmations(config.wcash_policy.required_confirmations)
     })
@@ -1189,6 +1241,13 @@ async fn build_payout_services(
         payout.zcash_signer_account,
         config.zcash_payout_commitment,
     )
+    .and_then(|configured| {
+        #[cfg(feature = "regtest")]
+        if config.network == ChainNetwork::Regtest {
+            return configured.with_regtest_network();
+        }
+        Ok(configured)
+    })
     .and_then(|configured| {
         configured.with_min_confirmations(config.zcash_policy.required_confirmations)
     })
@@ -1224,9 +1283,9 @@ async fn build_payout_services(
         WcashObservationSource::new(
             WcashWalletObserver::new(
                 wallet.as_ref().clone(),
-                WalletNetwork::Testnet,
+                config.wallet_network(),
                 config.wcash_genesis,
-                WCASH_TESTNET_BRANCH_ID,
+                config.wcash_branch_id(),
                 payout.wcash_signer_account,
                 WalletFundSource::Ironwood,
                 config.wcash_payout_commitment,
@@ -1547,6 +1606,11 @@ fn build_preflight_portal(
     payout: Arc<TestnetPayoutBoundary>,
 ) -> Result<PortalApp, ServiceError> {
     let mut portal_config = PortalConfig::testnet();
+    portal_config.network = config.network;
+    #[cfg(feature = "regtest")]
+    if config.network == ChainNetwork::Regtest {
+        portal_config.payout_change_hold_secs = 1;
+    }
     portal_config
         .canonical_origin
         .clone_from(&config.portal_origin);
@@ -2380,6 +2444,7 @@ mod tests {
             policy_version: 1,
         };
         let config = RuntimeConfig {
+            network: wcash_pool_portal::ChainNetwork::Testnet,
             deployment_id: Uuid::from_u128(1),
             pool_instance: Uuid::from_u128(2),
             backend_instance: Uuid::from_u128(3),

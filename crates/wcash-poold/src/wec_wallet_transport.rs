@@ -161,6 +161,7 @@ impl PinnedWolfProgramInner {
 /// Synchronous, deadline-bounded implementation of Wolf's native payout API.
 #[derive(Clone)]
 pub struct WolfWalletTransport {
+    network: WalletNetwork,
     program: PinnedWolfProgram,
     wallet_database: PathBuf,
     lightwalletd_endpoint: String,
@@ -185,7 +186,15 @@ impl WolfWalletTransport {
             wallet_database,
             lightwalletd_endpoint,
             invocation_lock: Arc::new(Mutex::new(())),
+            network: WalletNetwork::Testnet,
         })
+    }
+
+    /// Selects the isolated wallet CLI network in integration builds.
+    #[cfg(feature = "regtest")]
+    pub fn with_regtest_network(mut self) -> Self {
+        self.network = WalletNetwork::Regtest;
+        self
     }
 
     /// Revalidates the executable and opens the existing wallet database for
@@ -240,7 +249,11 @@ impl WolfWalletTransport {
         }
         let mut arguments = vec![
             OsString::from("--network"),
-            OsString::from("testnet"),
+            OsString::from(match self.network {
+                WalletNetwork::Testnet => "testnet",
+                WalletNetwork::Regtest => "regtest",
+                WalletNetwork::Mainnet => "mainnet",
+            }),
             OsString::from("--db"),
             self.wallet_database.as_os_str().to_owned(),
         ];
@@ -730,10 +743,23 @@ fn parse_wire_identity(bytes: &[u8]) -> Result<WalletIdentity, NativeWalletError
 }
 
 fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWalletError> {
+    let network = match identity.network.as_str() {
+        "testnet"
+            if identity.genesis_hash == WCASH_TESTNET_GENESIS_HASH
+                && identity.branch_id == WCASH_TESTNET_BRANCH_ID =>
+        {
+            WalletNetwork::Testnet
+        }
+        #[cfg(feature = "regtest")]
+        "regtest"
+            if identity.genesis_hash == wcash_wec_payout_signer::WCASH_REGTEST_GENESIS_HASH
+                && identity.branch_id == wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID =>
+        {
+            WalletNetwork::Regtest
+        }
+        _ => return Err(NativeWalletError::ProtocolViolation),
+    };
     if identity.protocol_version != WCASH_WALLET_SUCCESS_PROTOCOL_VERSION
-        || identity.network != "testnet"
-        || identity.genesis_hash != WCASH_TESTNET_GENESIS_HASH
-        || identity.branch_id != WCASH_TESTNET_BRANCH_ID
         || identity.fund_source != "ironwood"
     {
         return Err(NativeWalletError::ProtocolViolation);
@@ -744,7 +770,7 @@ fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWallet
         return Err(NativeWalletError::ProtocolViolation);
     }
     Ok(WalletIdentity {
-        network: WalletNetwork::Testnet,
+        network,
         genesis_hash: identity.genesis_hash,
         branch_id: identity.branch_id,
         account_id,
@@ -757,12 +783,12 @@ fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWallet
 fn parse_signed_payout(
     response: WireSignedPayout,
 ) -> Result<ParsedSignedPayout, NativeWalletError> {
+    let identity = parse_identity(response.identity)?;
     if response.protocol_version != WCASH_WALLET_SUCCESS_PROTOCOL_VERSION
-        || response.branch_id != WCASH_TESTNET_BRANCH_ID
+        || response.branch_id != identity.branch_id
     {
         return Err(NativeWalletError::ProtocolViolation);
     }
-    let identity = parse_identity(response.identity)?;
     let batch_id = parse_uuid(&response.batch_id)?;
     let request_commitment = parse_hex32(&response.request_commitment)?;
     let _request_facts_digest = parse_hex32(&response.request_facts_digest)?;

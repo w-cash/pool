@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+# Isolated local chain integration only; never enabled in deployment builds.
+regtest = ["wcash-pool-portal/regtest", "wcash-pool-store/regtest", "wcash-pool-address/regtest", "wcash-wec-payout-signer/regtest", "wcash-zec-payout-signer/regtest"]
+
 [dependencies]
 base64.workspace = true
 clap.workspace = true

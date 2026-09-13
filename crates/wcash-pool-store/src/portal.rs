@@ -16,7 +16,7 @@ use wcash_pool_protocol::JobDescriptor;
 
 use crate::{
     postgres::{unix_i64, unix_u64},
-    Chain, DeploymentNetwork, NewPortalSessionRecord, PostgresStore, StoreError,
+    Chain, NewPortalSessionRecord, PostgresStore, StoreError,
 };
 
 const PAYOUT_CONFIGURATION_HOLD_SECS: u64 = 48 * 60 * 60;
@@ -518,8 +518,7 @@ async fn configure_payout(
     if change.account_id.is_nil()
         || change.threshold_zat == 0
         || change.threshold_zat > MAXIMUM_MONEY_ZAT
-        || change.replacement_hold_secs
-            != payout_configuration_hold_secs(change.network)
+        || change.replacement_hold_secs != payout_configuration_hold_secs(change.network)
         || change.address_digest.iter().all(|byte| *byte == 0)
     {
         return Err(RepositoryError::InvalidState);
