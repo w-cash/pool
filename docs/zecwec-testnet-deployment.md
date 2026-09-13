@@ -383,13 +383,17 @@ internally consistent database-local account UUID, and exact equality of
 network, genesis, branch ID, both seed-derived addresses, birthday, and payout
 commitment. The UUID itself is deliberately not compared with the live wallet:
 `zcash_client_sqlite` assigns a new random database-local UUID on each fresh
-restore. The verifier writes only a deterministic root-only attestation,
-changes the seed and its parent to `root:root` mode `0400`/`0700`, and proves
-with a dropped-privilege access check that `wcash-pool` cannot read it. Securely
-erase the temporary recovery output files after review. Re-running host
-provisioning preserves this sealed state. The payout worker receives a private
-systemd snapshot of the sealed seed; the public pool and backend identities
-remain unable to traverse or read its source directory.
+restore. The verifier writes only a deterministic root-only attestation and
+changes the seed and its parent to `root:root` mode `0400`/`0700`. It freezes
+the public wallet authority as `root:wcash-payout` mode `0440`, so the
+payout-only wallet initializer can verify that exact binding after sealing.
+Dropped-privilege checks prove that the public pool, projector, and backend
+identities cannot traverse the authority's `wcash-payout` mode-`0700` parent or
+read the source file; backend services receive only a private systemd
+credential snapshot. Securely erase the temporary recovery output files after
+review. Re-running host provisioning preserves this sealed state. The payout
+worker receives a private systemd snapshot of the sealed seed; the public pool
+and backend identities remain unable to traverse or read its source directory.
 
 The wallet-bootstrap render also installs a disabled, manual-only recovery
 configuration and unit. The recovery instance has a distinct Unix identity,

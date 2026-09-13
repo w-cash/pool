@@ -84,6 +84,24 @@ require_unreadable_by_user() {
     [[ $result == unreadable ]] || die "$label is readable by the mining identity"
 }
 
+require_untraversable_by_user() {
+    local path=${1:?path is required}
+    local user=${2:?user is required}
+    local label=${3:-protected directory}
+    require_command runuser
+    [[ -d $path && ! -L $path ]] || die "$label is unavailable or unsafe"
+    local result
+    # $1 belongs to the deliberately isolated child shell.
+    # shellcheck disable=SC2016
+    if ! result=$(runuser --user "$user" -- /bin/sh -c \
+        'if /usr/bin/test -x "$1"; then printf traversable; else printf untraversable; fi' \
+        sh "$path"); then
+        die "$label traversal probe could not enter the isolated identity"
+    fi
+    [[ $result == untraversable ]] \
+        || die "$label is traversable by the isolated identity"
+}
+
 require_exact_user_groups() {
     local user=${1:?user is required}
     local expected=${2:?expected groups are required}
@@ -441,8 +459,9 @@ require_sealed_wcash_custody() {
     local seed=${1:?seed path is required}
     local authority=${2:?authority path is required}
     local attestation=${3:?attestation path is required}
-    local parent
+    local parent authority_parent
     parent=$(dirname -- "$seed")
+    authority_parent=$(dirname -- "$authority")
     [[ -d $parent && ! -L $parent \
         && $(stat -c '%U:%G:%a' -- "$parent") == root:root:700 ]] \
         || die "sealed Wcash custody directory is unsafe"
@@ -452,12 +471,23 @@ require_sealed_wcash_custody() {
     [[ -f $attestation && ! -L $attestation \
         && $(stat -c '%U:%G:%a:%h' -- "$attestation") == root:root:400:1 ]] \
         || die "Wcash recovery attestation is unsafe"
+    [[ -d $authority_parent && ! -L $authority_parent \
+        && $(stat -c '%U:%G:%a' -- "$authority_parent") == \
+            wcash-payout:wcash-payout:700 ]] \
+        || die "frozen Wcash authority parent is unsafe"
     [[ -f $authority && ! -L $authority \
-        && $(stat -c '%U:%G:%a:%h' -- "$authority") == root:root:400:1 ]] \
+        && $(stat -c '%U:%G:%a:%h' -- "$authority") == \
+            root:wcash-payout:440:1 ]] \
         || die "frozen Wcash authority is unsafe"
     require_unreadable_by_user "$parent" wcash-pool "sealed Wcash custody directory"
     require_unreadable_by_user "$seed" wcash-pool "sealed Wcash seed"
-    require_unreadable_by_user "$authority" wcash-pool "frozen Wcash authority"
+    local isolated_identity
+    for isolated_identity in wcash-pool wcash-pool-projector wcash-pool-backend; do
+        require_untraversable_by_user "$authority_parent" "$isolated_identity" \
+            "frozen Wcash authority parent"
+        require_unreadable_by_user "$authority" "$isolated_identity" \
+            "frozen Wcash authority"
+    done
     python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-wcash-wallet-recovery.py" \
         verify "$authority" "$attestation"
 }
