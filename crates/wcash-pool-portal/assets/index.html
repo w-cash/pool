@@ -3,105 +3,57 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light dark">
   <title>ZecWec Pool — Testnet</title>
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/forms.css">
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="#overview" aria-label="ZecWec pool overview">
-      <span class="mark">ZW</span>
-      <span>ZecWec</span>
-    </a>
-    <span class="network">Testnet · no monetary value</span>
-    <div class="session-actions">
-      <span id="account-name" class="muted"></span>
-      <button id="sign-out" class="button quiet hidden" type="button">Sign out</button>
-    </div>
-  </header>
-
+  <header class="topbar"><a class="brand" href="#overview" aria-label="ZecWec pool overview">ZecWec</a><span class="network">TESTNET <span>· no monetary value</span></span><div class="session-actions"><span id="account-name" class="muted"></span><button id="sign-out" class="button quiet hidden" type="button">Sign out</button></div></header>
   <main>
     <section id="auth-view" class="auth-shell">
-      <div class="auth-copy">
-        <p class="eyebrow">Equihash merged mining</p>
-        <h1>One worker.<br>Two independent rewards.</h1>
-        <p>Track WEC and ZEC without putting wallet keys or payout addresses in your ASIC.</p>
-        <dl class="facts">
-          <div><dt>Preferred</dt><dd>Encrypted Stratum</dd></div>
-          <div><dt>Accounting</dt><dd>Independent PPLNS</dd></div>
-          <div><dt>Privacy</dt><dd>Miner data stays private</dd></div>
-        </dl>
-      </div>
+      <div class="auth-copy"><p class="eyebrow">Zcash + Wcash</p><h1>Your miner.<br>Two test networks.</h1><p>Connect one Equihash ASIC to the ZecWec pool. Manage workers and follow each chain’s rewards separately.</p><ol class="setup-intro"><li>Create an account</li><li>Add your payout destinations</li><li>Copy your worker details to the ASIC</li></ol><p class="fineprint">Your account password stays in the portal. Your ASIC uses a separate mining-only token.</p></div>
       <form id="auth-form" class="panel auth-panel">
-        <div class="segmented" role="tablist" aria-label="Account action">
-          <button class="segment active" data-auth-mode="login" type="button">Sign in</button>
-          <button class="segment" data-auth-mode="register" type="button">Create account</button>
-        </div>
-        <label>Account name<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
-        <label>Password<input name="password" type="password" autocomplete="current-password" minlength="12" maxlength="256" required></label>
-        <label id="totp-login-field">Authenticator code <span class="optional">if enabled</span><input name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
-        <p id="auth-error" class="notice error hidden" role="alert"></p>
-        <button id="auth-submit" class="button primary full" type="submit">Sign in</button>
-        <p class="fineprint">The worker token you enter in an ASIC is separate from this password.</p>
+        <div class="segmented" aria-label="Account action"><button class="segment active" data-auth-mode="login" type="button" aria-pressed="true">Sign in</button><button class="segment" data-auth-mode="register" type="button" aria-pressed="false">Create account</button></div>
+        <label for="auth-username">Username<input id="auth-username" name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z][A-Za-z0-9_]{2,31}" required aria-describedby="username-help"></label><p id="username-help" class="field-help">3–32 letters, numbers or underscores. Start with a letter.</p>
+        <label for="auth-password">Password<input id="auth-password" name="password" type="password" autocomplete="current-password" minlength="12" maxlength="256" required aria-describedby="password-help"></label><p id="password-help" class="field-help">At least 12 characters. Keep this separate from your worker token.</p>
+        <label id="totp-login-field" for="auth-totp">Authenticator code <span class="optional">if enabled</span><input id="auth-totp" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
+        <p id="auth-error" class="notice error hidden" role="alert"></p><button id="auth-submit" class="button primary full" type="submit">Sign in</button><p class="fineprint">Two-factor authentication is optional at setup. No wallet keys are needed.</p>
       </form>
     </section>
-
     <section id="app-view" class="app-shell hidden">
-      <nav class="tabs" aria-label="Pool account">
-        <button data-page="overview" class="tab active">Overview</button>
-        <button data-page="workers" class="tab">Workers</button>
-        <button data-page="rewards" class="tab">Rewards</button>
-        <button data-page="blocks" class="tab">Blocks</button>
-        <button data-page="payouts" class="tab">Payouts</button>
-        <button data-page="settings" class="tab">Settings</button>
-      </nav>
-
+      <nav class="tabs" aria-label="Pool account"><button data-page="overview" class="tab active" type="button" aria-current="page">Overview</button><button data-page="workers" class="tab" type="button">Workers</button><button data-page="rewards" class="tab" type="button">Rewards</button><button data-page="blocks" class="tab" type="button">Blocks</button><button data-page="payouts" class="tab" type="button">Payouts</button><button data-page="settings" class="tab" type="button">Settings</button><p class="nav-note">Independent balances.<br>One pool connection.</p></nav>
       <div id="page-overview" class="page active">
-        <div class="page-head"><div><p class="eyebrow">Pool account</p><h1>Overview</h1></div><span id="data-state" class="status warning">Connecting</span></div>
-        <div class="metric-grid">
-          <article class="metric"><span>Pool hashrate</span><strong id="pool-hashrate">Loading</strong><small id="pool-hashrate-note">public pool estimate</small></article>
-          <article class="metric"><span>Pool active workers</span><strong id="pool-active-workers">Loading</strong><small>all accounts · last 5 minutes</small></article>
-          <article class="metric"><span>Wcash height</span><strong id="wcash-height">—</strong><small>WEC settlement chain</small></article>
-          <article class="metric"><span>Zcash height</span><strong id="zcash-height">—</strong><small>ZEC parent chain</small></article>
-        </div>
-        <div class="metric-grid private-metrics" aria-label="Private account share telemetry">
-          <article class="metric"><span>Your online workers</span><strong id="miner-active-workers">Loading</strong><small>authorized connections</small></article>
-          <article class="metric"><span>Accepted shares</span><strong id="accepted-shares">Loading</strong><small>current service run</small></article>
-          <article class="metric"><span>Stale shares</span><strong id="stale-shares">Loading</strong><small>current service run</small></article>
-          <article class="metric"><span>Invalid / duplicate</span><strong id="rejected-shares">Loading</strong><small>current service run</small></article>
-        </div>
-        <div class="two-column">
-          <article class="asset-card wec"><div><span class="coin">W</span><h2>WEC</h2></div><p>Your independent Testnet balance</p><strong id="wec-balance">Loading</strong><dl class="balance-lines"><div><dt>Immature</dt><dd id="wec-immature">—</dd></div><div><dt>Payable</dt><dd id="wec-payable">—</dd></div><div><dt>Pending payout</dt><dd id="wec-pending">—</dd></div></dl><p id="wec-fee">Service and network fee policy loading</p></article>
-          <article class="asset-card zec"><div><span class="coin">Z</span><h2>ZEC</h2></div><p>Your independent Testnet balance</p><strong id="zec-balance">Loading</strong><dl class="balance-lines"><div><dt>Immature</dt><dd id="zec-immature">—</dd></div><div><dt>Payable</dt><dd id="zec-payable">—</dd></div><div><dt>Pending payout</dt><dd id="zec-pending">—</dd></div></dl><p id="zec-fee">Service and network fee policy loading</p></article>
-        </div>
-      </div>
-
-      <div id="page-workers" class="page">
-        <div class="page-head"><div><p class="eyebrow">ASIC access</p><h1>Workers</h1></div><button id="new-worker" class="button primary">New worker</button></div>
-        <div id="worker-create" class="panel compact hidden">
-          <form id="worker-form" class="inline-form"><label>Worker label<input name="label" placeholder="z15-01" maxlength="32" required></label><button class="button primary">Create token</button></form>
-          <div id="worker-secret" class="secret-box hidden" role="status"></div>
-        </div>
-        <div class="panel table-wrap"><table><thead><tr><th>Worker</th><th>Mining username</th><th>Status</th><th>Accepted</th><th>Stale</th><th>Invalid</th><th>Duplicate</th><th>Last share</th><th></th></tr></thead><tbody id="workers-body"><tr><td colspan="9" class="empty">Loading workers…</td></tr></tbody></table></div>
-      </div>
-
-      <div id="page-rewards" class="page"><div class="page-head"><div><p class="eyebrow">PPLNS</p><h1>Rewards</h1></div><span id="rewards-state" class="status warning" role="status">Loading</span></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Block</th><th>Block hash</th><th>Your allocation</th><th>State</th></tr></thead><tbody id="rewards-body"><tr><td colspan="5" class="empty">Loading reward history…</td></tr></tbody></table></div><button id="rewards-more" class="button secondary history-more hidden" type="button">Load older rewards</button></div>
-      <div id="page-blocks" class="page"><div class="page-head"><div><p class="eyebrow">Merged mining</p><h1>Blocks</h1></div><span id="blocks-state" class="status warning" role="status">Loading</span></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Height</th><th>Block hash</th><th>Coinbase reward</th><th>Lifecycle</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty">Loading found blocks…</td></tr></tbody></table></div><button id="blocks-more" class="button secondary history-more hidden" type="button">Load older blocks</button></div>
-      <div id="page-payouts" class="page"><div class="page-head"><div><p class="eyebrow">Settlement</p><h1>Payouts</h1></div><span id="payouts-state" class="status warning" role="status">Loading</span></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Gross</th><th>Fee reserve</th><th>Actual fee</th><th>Refund</th><th>Net output</th><th>Status</th><th>Batch</th><th>Transaction ID</th><th>Confirmed at</th></tr></thead><tbody id="payouts-body"><tr><td colspan="10" class="empty">Loading payout history…</td></tr></tbody></table></div><button id="payouts-more" class="button secondary history-more hidden" type="button">Load older payouts</button></div>
-
-      <div id="page-settings" class="page">
-        <div class="page-head"><div><p class="eyebrow">Account security</p><h1>Settings</h1></div></div>
-        <section class="settings-grid">
-          <form class="panel payout-form" data-asset="wec"><div class="card-title"><span class="coin wec-bg">W</span><div><h2>WEC destination</h2><p>Wcash Testnet · Ironwood only</p></div></div><label>Destination<input name="destination" autocomplete="off" required></label><div class="form-row"><label>Threshold, zatoshi<input name="threshold_zat" type="number" min="1" required></label><label class="check"><input name="automatic" type="checkbox" checked> Automatic payouts</label></div><label>Current password<input name="password" type="password" autocomplete="current-password" required></label><label>Authenticator code <span class="optional">if enabled</span><input name="totp_code" inputmode="numeric" pattern="[0-9]{6}"></label><button class="button primary">Save WEC setting</button><p class="setting-result muted"></p></form>
-          <form class="panel payout-form" data-asset="zec"><div class="card-title"><span class="coin zec-bg">Z</span><div><h2>ZEC destination</h2><p>Zcash Testnet · Ironwood-capable UA only</p></div></div><label>Destination<input name="destination" autocomplete="off" required></label><div class="form-row"><label>Threshold, zatoshi<input name="threshold_zat" type="number" min="1" required></label><label class="check"><input name="automatic" type="checkbox" checked> Automatic payouts</label></div><label>Current password<input name="password" type="password" autocomplete="current-password" required></label><label>Authenticator code <span class="optional">if enabled</span><input name="totp_code" inputmode="numeric" pattern="[0-9]{6}"></label><button class="button primary">Save ZEC setting</button><p class="setting-result muted"></p></form>
-          <div class="panel"><form id="totp-form"><div class="card-title"><span class="security-icon">⌁</span><div><h2>Authenticator</h2><p>Required for payout changes after enrollment</p></div></div><label>Current password<input name="password" type="password" autocomplete="current-password" required></label><label>Existing code <span class="optional">if already enabled</span><input name="totp_code" inputmode="numeric" pattern="[0-9]{6}"></label><button class="button secondary">Begin enrollment</button></form><div id="totp-secret" class="secret-box hidden"></div><div id="totp-confirm" class="confirm-row hidden"><label>New authenticator code<input id="totp-confirm-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label><button id="totp-confirm-button" class="button primary" type="button">Confirm and sign out</button></div></div>
+        <div class="page-head"><div><p class="eyebrow">Your pool account</p><h1>Mining overview</h1></div><button id="refresh-data" class="button secondary" type="button">Refresh</button></div><div class="data-line"><span id="data-state" class="status warning" role="status">Checking pool</span><span id="last-updated" class="muted">Waiting for pool data</span></div>
+        <section id="setup-guide" class="panel setup-guide"><div><h2>Set up your miner</h2><p class="muted">One account, two separate payout destinations.</p></div><div class="setup-actions"><button class="button secondary" type="button" data-go="settings">1. Payout destinations <span id="setup-addresses" class="step-state">Checking</span></button><button class="button secondary" type="button" data-go="workers">2. Worker connection <span id="setup-workers" class="step-state">Checking</span></button></div></section>
+        <section class="panel account-telemetry" aria-label="Your share telemetry"><div class="section-head"><h2>Your mining activity</h2><span id="telemetry-state" class="muted" role="status">Checking activity</span></div><div class="metric-grid private-metrics"><article class="metric"><span>Online workers</span><strong id="miner-active-workers">—</strong></article><article class="metric"><span>Accepted shares</span><strong id="accepted-shares">—</strong></article><article class="metric"><span>Stale shares</span><strong id="stale-shares">—</strong></article><article class="metric"><span>Invalid / duplicate</span><strong id="rejected-shares">—</strong></article></div><p class="fineprint">Share counters cover the current service run. Rewards are recorded only when a chain’s block is accepted and allocated.</p></section>
+        <section aria-label="Independent Testnet balances" class="two-column">
+          <article class="asset-card"><div class="section-head"><div><h2>TWC</h2><p>Test Wcash</p></div><button class="text-button" type="button" data-go="settings">Destination</button></div><strong id="wec-balance">Loading</strong><small>Total outstanding</small><dl class="balance-lines"><div><dt>Immature</dt><dd id="wec-immature">—</dd></div><div><dt>Available</dt><dd id="wec-payable">—</dd></div><div><dt>Pending payout</dt><dd id="wec-pending">—</dd></div></dl><p id="wec-payout-status" class="payout-status">Checking payout settings</p><details><summary>Fees</summary><p id="wec-fee">Service and network fee policy loading</p></details></article>
+          <article class="asset-card"><div class="section-head"><div><h2>ZEC</h2><p>Zcash Testnet</p></div><button class="text-button" type="button" data-go="settings">Destination</button></div><strong id="zec-balance">Loading</strong><small>Total outstanding</small><dl class="balance-lines"><div><dt>Immature</dt><dd id="zec-immature">—</dd></div><div><dt>Available</dt><dd id="zec-payable">—</dd></div><div><dt>Pending payout</dt><dd id="zec-pending">—</dd></div></dl><p id="zec-payout-status" class="payout-status">Checking payout settings</p><details><summary>Fees</summary><p id="zec-fee">Service and network fee policy loading</p></details></article>
         </section>
+        <section class="panel pool-summary"><h2>Pool and network</h2><div class="metric-grid"><article class="metric"><span>Pool hashrate</span><strong id="pool-hashrate">—</strong><small id="pool-hashrate-note">Pool estimate</small></article><article class="metric"><span>Pool active workers</span><strong id="pool-active-workers">—</strong><small>All accounts · last 5 minutes</small></article><article class="metric"><span>Wcash height</span><strong id="wcash-height">—</strong><small>Wcash Testnet</small></article><article class="metric"><span>Zcash height</span><strong id="zcash-height">—</strong><small>Zcash Testnet</small></article></div></section>
       </div>
+      <div id="page-workers" class="page">
+        <div class="page-head"><div><p class="eyebrow">ASIC connection</p><h1>Workers</h1></div><button id="new-worker" class="button primary" type="button" aria-expanded="false" aria-controls="worker-create">Add worker</button></div>
+        <section class="panel connection-guide" aria-labelledby="connection-heading"><div class="section-head"><h2 id="connection-heading">Connect to ZecWec</h2><span class="status warning" id="connection-readiness">Checking pool</span></div><div class="connection-fields"><label for="stratum-transport">Connection<select id="stratum-transport"><option value="tls">TLS · preferred</option><option value="tcp">TCP · hardware compatibility</option></select></label><div><label for="stratum-url">Pool URL</label><div class="copy-row"><input id="stratum-url" readonly value="stratum+ssl://testnet-mine.zecwec.com:3443"><button class="button secondary" type="button" data-copy="stratum-url">Copy URL</button></div></div></div><p id="transport-help" class="fineprint">Use TLS when your ASIC firmware supports it.</p><p class="fineprint">Algorithm: Equihash 200,9. Use one pool slot for both chains. Pool 2 and Pool 3 are failovers; leave them empty until separate failover endpoints are published.</p></section>
+        <section id="worker-create" class="panel compact hidden"><form id="worker-form" class="inline-form"><label for="worker-label">Worker label<input id="worker-label" name="label" placeholder="rig-01" maxlength="32" pattern="[a-z0-9\-]{1,32}" required aria-describedby="worker-label-help"></label><button class="button primary" type="submit">Create worker token</button></form><p id="worker-label-help" class="fineprint">1–32 lowercase letters, numbers or hyphens.</p><p id="worker-error" class="notice error hidden" role="alert"></p><div id="worker-secret" class="secret-box hidden" role="status"></div></section>
+        <p id="workers-state" class="muted" role="status">Loading workers…</p><div class="panel table-wrap"><table><caption class="sr-only">Your workers and shares during the current service run</caption><thead><tr><th scope="col">Worker</th><th scope="col">Mining username</th><th scope="col">Status</th><th scope="col">Accepted</th><th scope="col">Stale</th><th scope="col">Invalid</th><th scope="col">Duplicate</th><th scope="col">Last share</th><th scope="col">Access</th></tr></thead><tbody id="workers-body"><tr><td colspan="9" class="empty">Loading workers…</td></tr></tbody></table></div><p class="fineprint">Tokens authorize mining only. Lost a token? Revoke that worker and create another. Revoking a worker does not remove earned rewards.</p>
+      </div>
+      <div id="page-rewards" class="page"><div class="page-head"><div><p class="eyebrow">Independent PPLNS allocation</p><h1>Rewards</h1></div><span id="rewards-state" class="status warning" role="status">Loading</span></div><p class="page-description">An accepted share is not a block reward. Each chain allocates and matures its own rewards.</p><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Block</th><th>Block hash</th><th>Your allocation</th><th>State</th></tr></thead><tbody id="rewards-body"><tr><td colspan="5" class="empty">Loading reward history…</td></tr></tbody></table></div><button id="rewards-more" class="button secondary history-more hidden" type="button">Load older rewards</button></div>
+      <div id="page-blocks" class="page"><div class="page-head"><div><p class="eyebrow">Merged mining</p><h1>Blocks</h1></div><span id="blocks-state" class="status warning" role="status">Loading</span></div><p class="page-description">Blocks attributed to your account. A solution can qualify for either chain or both.</p><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Height</th><th>Block hash</th><th>Coinbase reward</th><th>Lifecycle</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty">Loading found blocks…</td></tr></tbody></table></div><button id="blocks-more" class="button secondary history-more hidden" type="button">Load older blocks</button></div>
+      <div id="page-payouts" class="page"><div class="page-head"><div><p class="eyebrow">Separate chain settlement</p><h1>Payouts</h1></div><span id="payouts-state" class="status warning" role="status">Loading</span></div><p class="page-description">Follow pending and completed payouts, including the transaction fee and returned reserve.</p><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>Gross</th><th>Fee reserve</th><th>Actual fee</th><th>Refund</th><th>Net output</th><th>Status</th><th>Batch</th><th>Transaction ID</th><th>Confirmed at</th></tr></thead><tbody id="payouts-body"><tr><td colspan="10" class="empty">Loading payout history…</td></tr></tbody></table></div><button id="payouts-more" class="button secondary history-more hidden" type="button">Load older payouts</button></div>
+      <div id="page-settings" class="page">
+        <div class="page-head"><div><p class="eyebrow">Destinations and security</p><h1>Settings</h1></div></div><p class="page-description">Add a separate Testnet destination for each chain. Each new or changed destination has a 48-hour safety hold; the exact release time appears after saving. Rewards continue to accumulate while payouts are held.</p>
+        <section class="settings-grid" aria-label="Independent payout destinations">
+          <form class="panel payout-form" data-asset="wec"><div class="card-title"><h2>TWC destination</h2><p>Test Wcash · shielded Unified Address</p></div><div class="setting-summary" data-setting-summary="wec"><p>Checking saved destination</p></div><label for="wec-destination">Wcash Testnet address<input id="wec-destination" name="destination" autocomplete="off" spellcheck="false" required></label><p class="field-help">Use a Wcash Testnet Unified Address with a supported shielded receiver. A Zcash address cannot receive TWC.</p><label for="wec-threshold">Minimum payout, TWC<input id="wec-threshold" name="threshold_coin" inputmode="decimal" placeholder="0.01000000" pattern="[0-9]+(\.[0-9]{1,8})?" required></label><p class="field-help">Up to 8 decimal places.</p><label class="check"><input name="automatic" type="checkbox" checked> Automatic payouts after maturity and threshold</label><label for="wec-password">Current password<input id="wec-password" name="password" type="password" autocomplete="current-password" required></label><label class="totp-sensitive-field" for="wec-totp">Authenticator code <span class="optional">if enabled</span><input id="wec-totp" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label><button class="button primary" type="submit">Save TWC destination</button><p class="setting-result muted" role="status"></p></form>
+          <form class="panel payout-form" data-asset="zec"><div class="card-title"><h2>ZEC destination</h2><p>Zcash Testnet</p></div><div class="setting-summary" data-setting-summary="zec"><p>Checking saved destination</p></div><label for="zec-address-type">Address type<select id="zec-address-type" name="address_type"><option value="shielded">Shielded Unified Address</option><option value="transparent">Transparent address</option></select></label><label for="zec-destination">Zcash Testnet address<input id="zec-destination" name="destination" autocomplete="off" spellcheck="false" required aria-describedby="zec-address-help"></label><p id="zec-address-help" class="field-help">Use a Zcash Testnet Unified Address with a supported shielded receiver.</p><label for="zec-threshold">Minimum payout, ZEC<input id="zec-threshold" name="threshold_coin" inputmode="decimal" placeholder="0.01000000" pattern="[0-9]+(\.[0-9]{1,8})?" required></label><p class="field-help">Up to 8 decimal places.</p><label class="check"><input name="automatic" type="checkbox" checked> Automatic payouts after maturity and threshold</label><label for="zec-password">Current password<input id="zec-password" name="password" type="password" autocomplete="current-password" required></label><label class="totp-sensitive-field" for="zec-totp">Authenticator code <span class="optional">if enabled</span><input id="zec-totp" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label><button class="button primary" type="submit">Save ZEC destination</button><p class="setting-result muted" role="status"></p></form>
+        </section>
+        <section class="panel security-panel"><form id="totp-form"><div class="card-title"><h2>Two-factor authentication</h2><p id="totp-status">Optional protection for your account</p></div><p class="fineprint">After enrollment, an authenticator code is required for sign-in and payout changes. Enrollment signs out existing sessions.</p><label for="totp-password">Current password<input id="totp-password" name="password" type="password" autocomplete="current-password" required></label><label for="totp-existing">Existing code <span class="optional">if already enabled</span><input id="totp-existing" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label><button class="button secondary" type="submit">Begin enrollment</button></form><div id="totp-secret" class="secret-box hidden"></div><div id="totp-confirm" class="confirm-row hidden"><label for="totp-confirm-code">New authenticator code<input id="totp-confirm-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label><button id="totp-confirm-button" class="button primary" type="button">Confirm and sign out</button></div></section>
+      </div>
+      <p id="app-feedback" class="app-feedback" role="status" aria-live="polite"></p>
     </section>
   </main>
-
   <footer><span>ZecWec Testnet pool</span><span>Never provide a seed phrase or private key.</span></footer>
 </body>
 </html>

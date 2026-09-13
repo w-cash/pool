@@ -7,11 +7,22 @@ let authMode = "login";
 let cachedWorkers = [];
 let cachedTelemetry = null;
 let authGeneration = 0;
+let currentAccount = null;
+let refreshTimer = null;
+let refreshInFlight = false;
+let cachedSettings = null;
+let workerListAvailable = false;
+let workersRequest = 0;
+let settingsRequest = 0;
+const STRATUM_ENDPOINTS = {
+  tls: "stratum+ssl://testnet-mine.zecwec.com:3443",
+  tcp: "stratum+tcp://testnet-mine.zecwec.com:3333",
+};
 
 const history = {
-  rewards: { cursor: null, columns: 5 },
-  blocks: { cursor: null, columns: 5 },
-  payouts: { cursor: null, columns: 10 },
+  rewards: { cursor: null, columns: 5, request: 0 },
+  blocks: { cursor: null, columns: 5, request: 0 },
+  payouts: { cursor: null, columns: 10, request: 0 },
 };
 
 function csrfToken() {
@@ -28,11 +39,28 @@ async function api(path, options = {}) {
   if (options.method && !["GET", "HEAD"].includes(options.method)) {
     headers.set("x-csrf-token", csrfToken());
   }
-  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
-  const contentType = response.headers.get("content-type") || "";
-  const body = contentType.includes("json") ? await response.json() : null;
-  if (!response.ok) throw new Error(body?.message || `Request failed (${response.status})`);
-  return body;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  const generation = authGeneration;
+  try {
+    const response = await fetch(path, { ...options, headers, credentials: "same-origin", signal: controller.signal });
+    const contentType = response.headers.get("content-type") || "";
+    const body = contentType.includes("json") ? await response.json() : null;
+    if (!response.ok) {
+      if (response.status === 401 && !options.method && currentAccount && currentGeneration(generation)) {
+        showSignedOut();
+        setText("#auth-error", "Your session expired. Sign in again.");
+        $("#auth-error").className = "notice";
+      }
+      throw new Error(body?.message || `Request failed (${response.status})`);
+    }
+    return body;
+  } catch (reason) {
+    if (reason.name === "AbortError") throw new Error("Request timed out. Check the pool status before retrying.");
+    throw reason;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function setText(selector, value) {
@@ -48,7 +76,26 @@ function formatCoin(value, asset) {
   if (!Number.isSafeInteger(value) || value < 0) return "Unavailable";
   const whole = Math.floor(value / ATOMIC_UNITS).toLocaleString();
   const fraction = String(value % ATOMIC_UNITS).padStart(8, "0");
-  return `${whole}.${fraction} ${String(asset).toUpperCase()}`;
+  return `${whole}.${fraction} ${assetLabel(asset)}`;
+}
+
+function assetLabel(asset) {
+  return asset === "wec" ? "TWC" : asset === "zec" ? "ZEC" : "Unknown asset";
+}
+
+// Parse decimal coin input before converting to the API's safe integer range.
+// Floating-point multiplication can silently round eight-decimal amounts.
+function parseCoinInput(value) {
+  const match = /^(\d+)(?:\.(\d{1,8}))?$/.exec(String(value).trim());
+  if (!match || match[1].length > 16) throw new Error("Enter a positive coin amount with up to 8 decimal places.");
+  const atomic = BigInt(match[1]) * 100000000n + BigInt((match[2] || "").padEnd(8, "0"));
+  if (atomic <= 0n || atomic > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("The payout threshold is outside the supported range.");
+  return Number(atomic);
+}
+
+function coinInputValue(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return "";
+  return `${Math.floor(value / ATOMIC_UNITS)}.${String(value % ATOMIC_UNITS).padStart(8, "0")}`;
 }
 
 function formatOptionalCoin(value, asset) {
@@ -118,15 +165,25 @@ function currentGeneration(generation) {
 function resetPrivateViews() {
   cachedWorkers = [];
   cachedTelemetry = null;
+  cachedSettings = null;
+  workerListAvailable = false;
+  workersRequest++;
+  settingsRequest++;
+  $$("form").forEach((form) => { setFormBusy(form, false); form.dataset.dirty = "false"; });
   const workerSecret = $("#worker-secret");
   workerSecret.textContent = "";
   workerSecret.classList.add("hidden");
   $("#worker-create").classList.add("hidden");
   $("#worker-form").reset();
+  $("#worker-error").classList.add("hidden");
+  $("#worker-error").textContent = "";
+  $("#new-worker").setAttribute("aria-expanded", "false");
+  $("#new-worker").disabled = false;
 
   $$(".payout-form").forEach((form) => {
     form.reset();
     $(".setting-result", form).textContent = "";
+    $(".setting-summary", form).textContent = "Checking saved destination";
   });
   $("#totp-form").reset();
   $("#totp-secret").textContent = "";
@@ -136,6 +193,13 @@ function resetPrivateViews() {
   $("#auth-form").reset();
   $("#auth-error").textContent = "";
   $("#auth-error").className = "notice error hidden";
+  setText("#app-feedback", "");
+  setText("#telemetry-state", "Checking activity");
+  setText("#workers-state", "Checking workers");
+  setText("#setup-addresses", "Checking");
+  setText("#setup-workers", "Checking");
+  $("#setup-guide").classList.remove("hidden");
+  updateAddressType();
 
   for (const asset of ["wec", "zec"]) {
     for (const field of ["balance", "immature", "payable", "pending"]) {
@@ -148,6 +212,7 @@ function resetPrivateViews() {
   renderTableMessage($("#workers-body"), 9, "Sign in to view private workers.");
   Object.entries(history).forEach(([kind, state]) => {
     state.cursor = null;
+    state.request++;
     $(`#${kind}-more`).classList.add("hidden");
     renderTableMessage($(`#${kind}-body`), state.columns, "Sign in to view private history.");
   });
@@ -158,19 +223,23 @@ function showAuthenticated(account) {
   // Defensively erase any prior account's one-time credentials before
   // rendering the newly authenticated session.
   resetPrivateViews();
+  currentAccount = account;
   $("#auth-view").classList.add("hidden");
   $("#app-view").classList.remove("hidden");
   $("#sign-out").classList.remove("hidden");
   setText("#account-name", account.username);
-  refreshOverview(generation);
-  refreshBalances(generation);
-  refreshWorkers(generation);
-  refreshPayoutSettings(generation);
+  setText("#totp-status", account.totp_enabled ? "Authenticator enabled" : "Optional protection for your account");
+  $$(".totp-sensitive-field").forEach((field) => field.classList.toggle("hidden", !account.totp_enabled));
+  navigate("overview", false);
+  refreshAll(generation);
   Object.keys(history).forEach((kind) => refreshHistory(kind, false, generation));
 }
 
 function showSignedOut() {
   ++authGeneration;
+  currentAccount = null;
+  clearTimeout(refreshTimer);
+  refreshInFlight = false;
   $("#auth-view").classList.remove("hidden");
   $("#app-view").classList.add("hidden");
   $("#sign-out").classList.add("hidden");
@@ -178,33 +247,89 @@ function showSignedOut() {
   resetPrivateViews();
 }
 
+function navigate(page, refresh = true) {
+  if (!$("#page-" + page)) return;
+  if (currentAccount && ((page !== "workers" && $("#worker-form").dataset.busy === "true") || (page !== "settings" && $("#totp-form").dataset.busy === "true"))) {
+    setText("#app-feedback", "Wait for the one-time credential request to finish before changing pages.");
+    return;
+  }
+  $$(".tab").forEach((button) => {
+    const active = button.dataset.page === page;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+  });
+  $$(".page").forEach((node) => node.classList.toggle("active", node.id === `page-${page}`));
+  if (page !== "workers") clearWorkerSecret();
+  if (page !== "settings") {
+    $$('.payout-form input[type="password"], .payout-form input[name="totp_code"]').forEach((input) => { input.value = ""; });
+    $("#totp-form").reset();
+    $("#totp-secret").textContent = "";
+    $("#totp-secret").classList.add("hidden");
+    $("#totp-confirm").classList.add("hidden");
+    $("#totp-confirm-code").value = "";
+  }
+  setText("#app-feedback", "");
+  if (refresh && currentAccount) {
+    if (history[page]) refreshHistory(page);
+    else refreshAll();
+  }
+}
+
+async function refreshAll(generation = authGeneration) {
+  if (!currentAccount || refreshInFlight) return;
+  refreshInFlight = true;
+  clearTimeout(refreshTimer);
+  $("#refresh-data").disabled = true;
+  try {
+    await Promise.all([refreshOverview(generation), refreshBalances(generation), refreshWorkers(generation), refreshPayoutSettings(generation)]);
+  } finally {
+    if (currentGeneration(generation)) {
+      refreshInFlight = false;
+      $("#refresh-data").disabled = false;
+      if (currentAccount && !document.hidden) refreshTimer = setTimeout(() => refreshAll(), 15000);
+    }
+  }
+}
+
+function updateSetupGuide() {
+  const configured = cachedSettings?.filter((setting) => setting.active_destination || setting.pending_destination).length;
+  const workers = cachedWorkers.filter((worker) => !worker.revoked_at).length;
+  setText("#setup-addresses", cachedSettings ? `${configured} of 2 added` : "Unavailable");
+  setText("#setup-workers", workerListAvailable ? (workers ? `${workers} created` : "Add your first worker") : "Unavailable");
+  $("#setup-guide").classList.toggle("hidden", configured === 2 && workerListAvailable && workers > 0);
+}
+
 async function refreshOverview(generation = authGeneration) {
   try {
-    const data = await api("/api/v1/overview");
+    const [data, readiness] = await Promise.all([api("/api/v1/overview"), api("/readyz").then(() => true, () => false)]);
     if (!currentGeneration(generation)) return;
-    setText("#pool-hashrate", data.hashrate_sol_s == null ? "Not calibrated" : formatCount(data.hashrate_sol_s));
-    setText("#pool-hashrate-note", data.hashrate_sol_s == null ? "no verified sol/s projection" : "solutions / second");
+    setText("#pool-hashrate", data.hashrate_sol_s == null ? "Unavailable" : formatCount(data.hashrate_sol_s));
+    setText("#pool-hashrate-note", data.hashrate_sol_s == null ? "No hashrate estimate yet" : "solutions / second");
     setText("#pool-active-workers", formatCount(data.active_workers));
     setText("#wcash-height", formatCount(data.wcash_height));
     setText("#zcash-height", formatCount(data.zcash_height));
     setText("#wec-fee", formatFeePolicy(data, "wec"));
     setText("#zec-fee", formatFeePolicy(data, "zec"));
-    setText("#data-state", data.available ? "Pool projection live" : "Pool projection offline");
-    $("#data-state").className = `status ${data.available ? "ok" : "warning"}`;
+    setText("#data-state", data.available ? (readiness ? "Pool services ready" : "Pool not ready") : "Pool data unavailable");
+    $("#data-state").className = `status ${data.available && readiness ? "ok" : "warning"}`;
+    setText("#connection-readiness", data.available && readiness ? "Pool services ready" : "Not ready · keep miner disconnected");
+    $("#connection-readiness").className = `status ${data.available && readiness ? "ok" : "warning"}`;
+    setText("#last-updated", data.updated_at ? `Pool data as of ${formatTime(data.updated_at)}` : "Pool update time unavailable");
+    if (!data.available) {
+      for (const id of ["pool-hashrate", "pool-active-workers", "wcash-height", "zcash-height"]) setText(`#${id}`, "Unavailable");
+    }
   } catch (reason) {
     if (!currentGeneration(generation)) return;
     setText("#data-state", reason.message);
     $("#data-state").className = "status warning";
+    setText("#connection-readiness", "Status unavailable · check before connecting");
+    $("#connection-readiness").className = "status warning";
+    for (const id of ["pool-hashrate", "pool-active-workers", "wcash-height", "zcash-height"]) setText(`#${id}`, "Unavailable");
+    setText("#last-updated", "Pool data unavailable");
   }
 }
 
 async function refreshBalances(generation = authGeneration) {
-  for (const asset of ["wec", "zec"]) {
-    setText(`#${asset}-balance`, "Loading");
-    setText(`#${asset}-immature`, "—");
-    setText(`#${asset}-payable`, "—");
-    setText(`#${asset}-pending`, "—");
-  }
   try {
     const { balances } = await api("/api/v1/balances");
     if (!currentGeneration(generation)) return;
@@ -219,26 +344,38 @@ async function refreshBalances(generation = authGeneration) {
     }
   } catch (reason) {
     if (!currentGeneration(generation)) return;
-    for (const asset of ["wec", "zec"]) setText(`#${asset}-balance`, reason.message);
+    for (const asset of ["wec", "zec"]) {
+      setText(`#${asset}-balance`, "Unavailable");
+      for (const field of ["immature", "payable", "pending"]) setText(`#${asset}-${field}`, "—");
+    }
+    setText("#app-feedback", reason.message);
   }
 }
 
 async function refreshWorkers(generation = authGeneration) {
   const body = $("#workers-body");
-  renderTableMessage(body, 9, "Loading workers…");
+  const request = ++workersRequest;
   try {
     const [workerResponse, telemetry] = await Promise.all([
       api("/api/v1/workers"),
       api("/api/v1/telemetry"),
     ]);
-    if (!currentGeneration(generation)) return;
-    cachedWorkers = Array.isArray(workerResponse.workers) ? workerResponse.workers : [];
+    if (!currentGeneration(generation) || request !== workersRequest) return;
+    if (!Array.isArray(workerResponse.workers)) throw new Error("Worker data is unavailable.");
+    cachedWorkers = workerResponse.workers;
+    workerListAvailable = true;
     cachedTelemetry = telemetry;
     renderWorkerTelemetry();
     renderAccountTelemetry();
+    updateSetupGuide();
   } catch (reason) {
-    if (!currentGeneration(generation)) return;
+    if (!currentGeneration(generation) || request !== workersRequest) return;
     renderTableMessage(body, 9, reason.message, "empty error-text");
+    workerListAvailable = false;
+    cachedTelemetry = null;
+    setText("#workers-state", "Worker data unavailable");
+    setText("#telemetry-state", "Telemetry unavailable");
+    updateSetupGuide();
     for (const id of ["miner-active-workers", "accepted-shares", "stale-shares", "rejected-shares"]) {
       setText(`#${id}`, "Unavailable");
     }
@@ -250,6 +387,7 @@ function renderAccountTelemetry() {
     for (const id of ["miner-active-workers", "accepted-shares", "stale-shares", "rejected-shares"]) {
       setText(`#${id}`, "Unavailable");
     }
+    setText("#telemetry-state", "Telemetry unavailable");
     return;
   }
   setText("#miner-active-workers", formatCount(cachedTelemetry.active_workers));
@@ -259,6 +397,7 @@ function renderAccountTelemetry() {
     ? cachedTelemetry.invalid + cachedTelemetry.duplicate
     : null;
   setText("#rejected-shares", formatCount(rejected));
+  setText("#telemetry-state", cachedTelemetry.updated_at ? `Updated ${formatTime(cachedTelemetry.updated_at)}` : "Current service run");
 }
 
 function renderWorkerTelemetry() {
@@ -266,20 +405,21 @@ function renderWorkerTelemetry() {
   body.replaceChildren();
   if (!cachedWorkers.length) {
     renderTableMessage(body, 9, "No workers yet. Create one to connect an ASIC.");
+    setText("#workers-state", "No workers created");
     return;
   }
   const byWorker = new Map((cachedTelemetry?.workers || []).map((item) => [item.worker_id, item]));
   cachedWorkers.forEach((worker) => {
-    const telemetry = byWorker.get(worker.id);
+    const telemetry = cachedTelemetry?.available ? byWorker.get(worker.id) : undefined;
     const row = body.insertRow();
     appendCell(row, worker.label);
     appendCell(row, worker.mining_username, "mono");
-    const status = worker.revoked_at ? "Revoked" : telemetry?.connections > 0 ? "Online" : "Offline";
+    const status = worker.revoked_at ? "Revoked" : !cachedTelemetry?.available ? "Unknown" : telemetry?.connections > 0 ? "Online" : "Offline";
     appendCell(row, status, status === "Online" ? "ok-text" : "");
-    appendCell(row, formatCount(telemetry?.accepted ?? 0));
-    appendCell(row, formatCount(telemetry?.stale ?? 0));
-    appendCell(row, formatCount(telemetry?.invalid ?? 0));
-    appendCell(row, formatCount(telemetry?.duplicate ?? 0));
+    appendCell(row, formatCount(telemetry?.accepted ?? (cachedTelemetry?.available ? 0 : null)));
+    appendCell(row, formatCount(telemetry?.stale ?? (cachedTelemetry?.available ? 0 : null)));
+    appendCell(row, formatCount(telemetry?.invalid ?? (cachedTelemetry?.available ? 0 : null)));
+    appendCell(row, formatCount(telemetry?.duplicate ?? (cachedTelemetry?.available ? 0 : null)));
     appendCell(row, formatTime(telemetry?.last_share_at));
     const action = row.insertCell();
     if (!worker.revoked_at) {
@@ -288,49 +428,139 @@ function renderWorkerTelemetry() {
       button.type = "button";
       button.textContent = "Revoke";
       button.addEventListener("click", async () => {
+        if (!window.confirm(`Revoke mining access for ${worker.label}? Earned rewards are kept.`)) return;
         const generation = authGeneration;
+        button.disabled = true;
         try {
           await api(`/api/v1/workers/${worker.id}`, { method: "DELETE" });
-          if (currentGeneration(generation)) await refreshWorkers(generation);
+          if (currentGeneration(generation)) { clearWorkerSecret(); await refreshWorkers(generation); }
         } catch (reason) {
           if (!currentGeneration(generation)) return;
-          renderTableMessage(body, 9, reason.message, "empty error-text");
+          setText("#app-feedback", reason.message);
+          button.disabled = false;
         }
       });
       action.append(button);
     }
   });
+  setText("#workers-state", cachedTelemetry?.available ? "Current service run · refreshes every 15 seconds" : "Worker list loaded · telemetry unavailable");
 }
 
 async function refreshPayoutSettings(generation = authGeneration) {
+  const request = ++settingsRequest;
   try {
     const { settings } = await api("/api/v1/settings/payouts");
-    if (!currentGeneration(generation)) return;
-    settings.forEach((setting) => {
-      const form = $(`.payout-form[data-asset="${setting.asset}"]`);
-      if (!form) return;
-      const result = $(".setting-result", form);
-      const parts = [];
-      if (setting.active_destination) {
-        const mode = setting.automatic ? "automatic" : "paused";
-        parts.push(`Active: ${setting.active_destination} · threshold ${formatCoin(setting.threshold_zat, setting.asset)} · ${mode} · revision ${setting.revision}`);
-      }
-      if (setting.pending_destination) {
-        const pendingMode = setting.pending_automatic ? "automatic" : "paused";
-        parts.push(`Pending until ${formatTime(setting.pending_effective_at)}: ${setting.pending_destination} · threshold ${formatCoin(setting.pending_threshold_zat, setting.asset)} · ${pendingMode} · revision ${setting.pending_revision}`);
-      }
-      result.textContent = parts.length ? parts.join(" · ") : "No payout destination configured.";
-      if (setting.threshold_zat) form.elements.threshold_zat.value = setting.threshold_zat;
-      form.elements.automatic.checked = setting.automatic;
-    });
+    if (!currentGeneration(generation) || request !== settingsRequest) return;
+    if (!Array.isArray(settings)) throw new Error("Payout settings are unavailable.");
+    cachedSettings = settings.filter((setting) => ["wec", "zec"].includes(setting.asset));
+    for (const asset of ["wec", "zec"]) renderPayoutSetting(asset, cachedSettings.find((setting) => setting.asset === asset));
+    updateSetupGuide();
   } catch (reason) {
-    if (!currentGeneration(generation)) return;
-    $$(".setting-result").forEach((result) => { result.textContent = reason.message; });
+    if (!currentGeneration(generation) || request !== settingsRequest) return;
+    cachedSettings = null;
+    $$(".setting-summary").forEach((result) => { result.textContent = "Saved settings unavailable. Refresh before making a change."; });
+    for (const asset of ["wec", "zec"]) setText(`#${asset}-payout-status`, "Payout settings unavailable");
+    updateSetupGuide();
   }
 }
 
+function renderPayoutSetting(asset, setting) {
+  const form = $(`.payout-form[data-asset="${asset}"]`);
+  const summary = $(".setting-summary", form);
+  summary.replaceChildren();
+  const line = (value) => { const node = document.createElement("p"); node.textContent = value; summary.append(node); };
+  if (!setting || (!setting.active_destination && !setting.pending_destination)) {
+    line("No payout destination added.");
+    setText(`#${asset}-payout-status`, "Payouts paused: add this chain’s destination. Earned rewards stay in its balance.");
+    return;
+  }
+  if (setting.active_destination) {
+    const receiver = setting.active_receiver === "transparent" ? "Transparent address" : "Shielded Unified Address";
+    line(`${receiver}: ${setting.active_destination}`);
+    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${setting.automatic ? "automatic" : "paused"}`);
+  }
+  if (setting.pending_destination) {
+    line(`Pending destination: ${setting.pending_destination}`);
+    line(`Safety hold until ${formatTime(setting.pending_effective_at)}. Payouts remain paused until the change is active.`);
+    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${setting.pending_automatic ? "automatic" : "paused"}`);
+    setText(`#${asset}-payout-status`, `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`);
+  } else {
+    setText(`#${asset}-payout-status`, setting.automatic ? `Automatic payouts after maturity and ${formatCoin(setting.threshold_zat, asset)} threshold.` : "Automatic payouts paused. Earned rewards remain in this balance.");
+  }
+  // Never refill a masked destination or replace an in-progress edit with a poll.
+  if (form.dataset.dirty !== "true") {
+    form.elements.threshold_coin.value = coinInputValue(setting.pending_threshold_zat ?? setting.threshold_zat);
+    form.elements.automatic.checked = setting.pending_automatic ?? setting.automatic;
+    if (asset === "zec" && !setting.pending_destination) {
+      form.elements.address_type.value = setting.active_receiver === "transparent" ? "transparent" : "shielded";
+      updateAddressType();
+    }
+  }
+}
+
+function updateAddressType() {
+  const transparent = $("#zec-address-type").value === "transparent";
+  setText("#zec-address-help", transparent
+    ? "Use a Zcash Testnet transparent address. Its payout amount and destination are public on the chain."
+    : "Use a Zcash Testnet Unified Address with a supported shielded receiver.");
+}
+
+function clearWorkerSecret() {
+  const workerSecret = $("#worker-secret");
+  $$("input", workerSecret).forEach((input) => { input.value = ""; });
+  workerSecret.textContent = "";
+  workerSecret.classList.add("hidden");
+  $("#new-worker").disabled = false;
+  $("#worker-form button").disabled = false;
+}
+
+async function copyInput(input) {
+  const generation = authGeneration;
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+    await navigator.clipboard.writeText(input.value);
+    if (currentGeneration(generation)) setText("#app-feedback", "Copied.");
+  } catch (_) {
+    if (!currentGeneration(generation) || !input.isConnected) return;
+    input.focus(); input.select();
+    setText("#app-feedback", "Value selected. Press Ctrl+C or ⌘C to copy.");
+  }
+}
+
+function renderWorkerSecret(worker) {
+  const target = $("#worker-secret");
+  target.replaceChildren();
+  const title = document.createElement("h3");
+  title.textContent = "Save your worker token now";
+  const note = document.createElement("p");
+  note.className = "fineprint";
+  note.textContent = "Shown once. Copy these into the ASIC’s username and password fields. Leaving this page clears the token.";
+  target.append(title, note);
+  for (const [id, label, value] of [["issued-worker-username", "Mining username", worker.mining_username], ["issued-worker-token", "Miner password · mining-only token", worker.token]]) {
+    const field = document.createElement("div"); field.className = "secret-field";
+    const heading = document.createElement("label"); heading.htmlFor = id; heading.textContent = label;
+    const row = document.createElement("div"); row.className = "copy-row";
+    const input = document.createElement("input"); input.id = id; input.readOnly = true; input.value = value;
+    const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.textContent = "Copy"; copy.setAttribute("aria-label", `Copy ${label}`);
+    copy.addEventListener("click", () => copyInput(input));
+    row.append(input, copy); field.append(heading, row); target.append(field);
+  }
+  const actions = document.createElement("div"); actions.className = "secret-actions";
+  const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.className = "button secondary"; dismiss.textContent = "I saved it · hide token";
+  dismiss.addEventListener("click", () => { clearWorkerSecret(); $("#worker-create").classList.add("hidden"); $("#new-worker").setAttribute("aria-expanded", "false"); });
+  actions.append(dismiss); target.append(actions); target.classList.remove("hidden");
+  $("#new-worker").disabled = true;
+  $("#worker-form button").disabled = true;
+}
+
+function setFormBusy(form, busy) {
+  form.dataset.busy = String(busy);
+  form.setAttribute("aria-busy", String(busy));
+  $$('button[type="submit"]', form).forEach((button) => { button.disabled = busy; });
+}
+
 function renderReward(row, item) {
-  appendCell(row, String(item.asset || "").toUpperCase());
+  appendCell(row, assetLabel(item.asset));
   appendCell(row, formatCount(item.block_height));
   appendCell(row, item.block_hash || "—", "mono hash");
   appendCell(row, formatCoin(item.amount_zat, item.asset || ""));
@@ -338,7 +568,7 @@ function renderReward(row, item) {
 }
 
 function renderBlock(row, item) {
-  appendCell(row, String(item.asset || "").toUpperCase());
+  appendCell(row, assetLabel(item.asset));
   appendCell(row, formatCount(item.height));
   appendCell(row, item.block_hash || "—", "mono hash");
   appendCell(row, formatCoin(item.reward_zat, item.asset || ""));
@@ -346,7 +576,7 @@ function renderBlock(row, item) {
 }
 
 function renderPayout(row, item) {
-  appendCell(row, String(item.asset || "").toUpperCase());
+  appendCell(row, assetLabel(item.asset));
   appendCell(row, formatCoin(item.gross_amount_zat, item.asset || ""));
   appendCell(row, formatOptionalCoin(item.reserved_network_fee_zat, item.asset || ""));
   appendCell(row, formatOptionalCoin(item.actual_network_fee_zat, item.asset || ""));
@@ -360,6 +590,7 @@ function renderPayout(row, item) {
 
 async function refreshHistory(kind, append = false, generation = authGeneration) {
   const state = history[kind];
+  const request = ++state.request;
   const body = $(`#${kind}-body`);
   const more = $(`#${kind}-more`);
   if (!append) {
@@ -371,7 +602,7 @@ async function refreshHistory(kind, append = false, generation = authGeneration)
   try {
     const query = state.cursor == null ? "?limit=50" : `?limit=50&before=${state.cursor}`;
     const page = await api(`/api/v1/${kind}${query}`);
-    if (!currentGeneration(generation)) return;
+    if (!currentGeneration(generation) || request !== state.request) return;
     if (!Array.isArray(page.items)) throw new Error("History data is unavailable.");
     if (!append) body.replaceChildren();
     const renderer = kind === "rewards" ? renderReward : kind === "blocks" ? renderBlock : renderPayout;
@@ -381,36 +612,43 @@ async function refreshHistory(kind, append = false, generation = authGeneration)
     more.classList.toggle("hidden", state.cursor == null);
     setHistoryState(kind, page.items.length ? "Account data" : "No records", "ok");
   } catch (reason) {
-    if (!currentGeneration(generation)) return;
+    if (!currentGeneration(generation) || request !== state.request) return;
     if (!append || !body.rows.length) renderTableMessage(body, state.columns, reason.message, "empty error-text");
     setHistoryState(kind, "Unavailable", "warning");
     more.classList.add("hidden");
   } finally {
-    if (currentGeneration(generation)) more.disabled = false;
+    if (currentGeneration(generation) && request === state.request) more.disabled = false;
   }
 }
 
 $$('[data-auth-mode]').forEach((button) => button.addEventListener("click", () => {
+  if ($("#auth-form").dataset.busy === "true") return;
   authMode = button.dataset.authMode;
-  $$('[data-auth-mode]').forEach((item) => item.classList.toggle("active", item === button));
+  $$('[data-auth-mode]').forEach((item) => { item.classList.toggle("active", item === button); item.setAttribute("aria-pressed", String(item === button)); });
   setText("#auth-submit", authMode === "login" ? "Sign in" : "Create account");
   $("#totp-login-field").classList.toggle("hidden", authMode !== "login");
   $("#auth-form").elements.password.autocomplete = authMode === "login" ? "current-password" : "new-password";
+  $("#auth-form").elements.totp_code.disabled = authMode !== "login";
+  $("#auth-error").classList.add("hidden");
 }));
 
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
+  if (form.dataset.busy === "true") return;
+  setFormBusy(form, true);
   const error = $("#auth-error");
+  const mode = authMode;
   const generation = ++authGeneration;
   error.classList.add("hidden");
   const payload = { username: form.elements.username.value, password: form.elements.password.value };
-  if (authMode === "login" && form.elements.totp_code.value) payload.totp_code = form.elements.totp_code.value;
+  if (mode === "login" && form.elements.totp_code.value) payload.totp_code = form.elements.totp_code.value;
   try {
-    await api(`/api/v1/auth/${authMode}`, { method: "POST", body: JSON.stringify(payload) });
+    await api(`/api/v1/auth/${mode}`, { method: "POST", body: JSON.stringify(payload) });
     if (!currentGeneration(generation)) return;
-    if (authMode === "register") {
+    if (mode === "register") {
       authMode = "login";
+      setFormBusy(form, false);
       $('[data-auth-mode="login"]').click();
       error.textContent = "Account created. Sign in to continue.";
       error.className = "notice";
@@ -424,73 +662,118 @@ $("#auth-form").addEventListener("submit", async (event) => {
     if (!currentGeneration(generation)) return;
     error.textContent = reason.message;
     error.className = "notice error";
+  } finally {
+    form.elements.password.value = "";
+    form.elements.totp_code.value = "";
+    if (currentGeneration(generation) || form.dataset.busy === "true") setFormBusy(form, false);
   }
 });
 
 $("#sign-out").addEventListener("click", async () => {
   const request = api("/api/v1/auth/logout", { method: "POST" });
   showSignedOut();
-  try { await request; } catch (_) { /* local secrets are already cleared */ }
+  try { await request; } catch (_) {
+    if (!currentAccount) {
+      setText("#auth-error", "Private data cleared from this page, but sign-out could not be confirmed. Retry Sign out before leaving this device.");
+      $("#auth-error").className = "notice error";
+      $("#sign-out").classList.remove("hidden");
+    }
+  }
 });
 
-$$('.tab').forEach((button) => button.addEventListener("click", () => {
-  $$('.tab').forEach((item) => item.classList.toggle("active", item === button));
-  $$('.page').forEach((page) => page.classList.toggle("active", page.id === `page-${button.dataset.page}`));
-}));
+$$('.tab').forEach((button) => button.addEventListener("click", () => navigate(button.dataset.page)));
+$$('[data-go]').forEach((button) => button.addEventListener("click", () => navigate(button.dataset.go)));
+$(".brand").addEventListener("click", () => { if (currentAccount) navigate("overview"); });
+$("#refresh-data").addEventListener("click", () => refreshAll());
+$("#stratum-transport").addEventListener("change", () => {
+  const transport = $("#stratum-transport").value;
+  $("#stratum-url").value = STRATUM_ENDPOINTS[transport];
+  setText("#transport-help", transport === "tls" ? "Use TLS when your ASIC firmware supports it." : "TCP is unencrypted. Use it only when your ASIC cannot use TLS. Enter the mining-only token, never your account password.");
+});
+$$('[data-copy]').forEach((button) => button.addEventListener("click", () => copyInput(document.getElementById(button.dataset.copy))));
+$("#zec-address-type").addEventListener("change", updateAddressType);
+document.addEventListener("visibilitychange", () => { clearTimeout(refreshTimer); if (!document.hidden && currentAccount) refreshAll(); });
 
 Object.keys(history).forEach((kind) => {
   $(`#${kind}-more`).addEventListener("click", () => refreshHistory(kind, true));
 });
 
-$("#new-worker").addEventListener("click", () => $("#worker-create").classList.toggle("hidden"));
+$("#new-worker").addEventListener("click", () => {
+  const hidden = $("#worker-create").classList.toggle("hidden");
+  $("#new-worker").setAttribute("aria-expanded", String(!hidden));
+  if (!hidden) $("#worker-label").focus();
+});
 $("#worker-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
-  const secret = $("#worker-secret");
+  if (form.dataset.busy === "true" || !$("#worker-secret").classList.contains("hidden")) return;
+  setFormBusy(form, true);
+  const error = $("#worker-error");
+  error.classList.add("hidden");
   const generation = authGeneration;
   try {
     const { worker } = await api("/api/v1/workers", { method: "POST", body: JSON.stringify({ label: form.elements.label.value }) });
     if (!currentGeneration(generation)) return;
-    secret.textContent = `Username: ${worker.mining_username}\nToken (shown once): ${worker.token}`;
-    secret.classList.remove("hidden");
+    renderWorkerSecret(worker);
     form.reset();
     await refreshWorkers(generation);
   } catch (reason) {
     if (!currentGeneration(generation)) return;
-    secret.textContent = reason.message;
-    secret.classList.remove("hidden");
+    error.textContent = reason.message;
+    error.classList.remove("hidden");
+  } finally {
+    if (currentGeneration(generation)) {
+      setFormBusy(form, false);
+      $("#worker-form button").disabled = !$("#worker-secret").classList.contains("hidden");
+    }
   }
 });
 
 $$('.payout-form').forEach((form) => form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (form.dataset.busy === "true") return;
   const result = $(".setting-result", form);
   const generation = authGeneration;
-  const payload = {
-    destination: form.elements.destination.value,
-    threshold_zat: Number(form.elements.threshold_zat.value),
-    automatic: form.elements.automatic.checked,
-    password: form.elements.password.value,
-  };
-  if (form.elements.totp_code.value) payload.totp_code = form.elements.totp_code.value;
+  setFormBusy(form, true);
   try {
+    const payload = {
+      destination: form.elements.destination.value,
+      threshold_zat: parseCoinInput(form.elements.threshold_coin.value),
+      automatic: form.elements.automatic.checked,
+      password: form.elements.password.value,
+    };
+    if (form.elements.totp_code.value) payload.totp_code = form.elements.totp_code.value;
     const setting = await api(`/api/v1/settings/payouts/${form.dataset.asset}`, { method: "PUT", body: JSON.stringify(payload) });
     if (!currentGeneration(generation)) return;
     result.textContent = setting.pending_destination
-      ? `Pending until ${formatTime(setting.pending_effective_at)}: ${setting.pending_destination} · threshold ${formatCoin(setting.pending_threshold_zat, setting.asset)} · ${setting.pending_automatic ? "automatic" : "paused"} · revision ${setting.pending_revision}. No payout is created during the hold.`
-      : `Active: ${setting.active_destination} · threshold ${formatCoin(setting.threshold_zat, setting.asset)} · ${setting.automatic ? "automatic" : "paused"} · revision ${setting.revision}.`;
+      ? `Saved. Payouts are held until ${formatTime(setting.pending_effective_at)}. No payout is created during the hold.`
+      : "Payout setting saved.";
     form.elements.destination.value = "";
     form.elements.password.value = "";
     form.elements.totp_code.value = "";
+    form.dataset.dirty = "false";
+    renderPayoutSetting(form.dataset.asset, setting);
+    await refreshPayoutSettings(generation);
   } catch (reason) {
     if (!currentGeneration(generation)) return;
     result.textContent = reason.message;
+  } finally {
+    form.elements.password.value = "";
+    form.elements.totp_code.value = "";
+    if (currentGeneration(generation)) setFormBusy(form, false);
   }
 }));
+
+$$('.payout-form').forEach((form) => {
+  form.addEventListener("input", () => { form.dataset.dirty = "true"; });
+  form.addEventListener("change", () => { form.dataset.dirty = "true"; });
+});
 
 $("#totp-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
+  if (form.dataset.busy === "true") return;
+  setFormBusy(form, true);
   const target = $("#totp-secret");
   const generation = authGeneration;
   const payload = { password: form.elements.password.value };
@@ -498,37 +781,50 @@ $("#totp-form").addEventListener("submit", async (event) => {
   try {
     const data = await api("/api/v1/security/totp/begin", { method: "POST", body: JSON.stringify(payload) });
     if (!currentGeneration(generation)) return;
-    target.textContent = `Add this key to your authenticator:\n${data.secret_base32}`;
+    target.textContent = `Add this setup key to your authenticator: ${data.secret_base32}. Confirm before ${formatTime(data.expires_at)}.`;
     target.classList.remove("hidden");
     $("#totp-confirm").classList.remove("hidden");
   } catch (reason) {
     if (!currentGeneration(generation)) return;
     target.textContent = reason.message;
     target.classList.remove("hidden");
+  } finally {
+    if (currentGeneration(generation)) {
+      form.elements.password.value = "";
+      form.elements.totp_code.value = "";
+      setFormBusy(form, false);
+    }
   }
 });
 
 $("#totp-confirm-button").addEventListener("click", async () => {
   const target = $("#totp-secret");
   const generation = authGeneration;
+  if (!/^[0-9]{6}$/.test($("#totp-confirm-code").value)) { target.textContent = "Enter the six-digit authenticator code."; return; }
+  $("#totp-confirm-button").disabled = true;
   try {
     await api("/api/v1/security/totp/confirm", { method: "POST", body: JSON.stringify({ code: $("#totp-confirm-code").value }) });
     if (!currentGeneration(generation)) return;
-    target.textContent = "Authenticator enabled. Sign in again.";
-    setTimeout(() => {
-      if (currentGeneration(generation)) showSignedOut();
-    }, 900);
+    showSignedOut();
+    setText("#auth-error", "Authenticator enabled. Sign in again with your code.");
+    $("#auth-error").className = "notice";
   } catch (reason) {
     if (!currentGeneration(generation)) return;
     target.textContent = reason.message;
+  } finally {
+    $("#totp-confirm-code").value = "";
+    $("#totp-confirm-button").disabled = false;
   }
 });
 
-const initialGeneration = authGeneration;
-api("/api/v1/me")
-  .then((account) => {
-    if (currentGeneration(initialGeneration)) showAuthenticated(account);
-  })
-  .catch(() => {
-    if (currentGeneration(initialGeneration)) showSignedOut();
-  });
+function restoreSession() {
+  const generation = authGeneration;
+  api("/api/v1/me")
+    .then((account) => { if (currentGeneration(generation)) showAuthenticated(account); })
+    .catch(() => { if (currentGeneration(generation)) showSignedOut(); });
+}
+
+// A browser back/forward cache must not preserve a revealed worker or TOTP key.
+window.addEventListener("pagehide", showSignedOut);
+window.addEventListener("pageshow", (event) => { if (event.persisted) restoreSession(); });
+restoreSession();
