@@ -311,6 +311,13 @@ interactive pinned `zallet confirm-backup` command against this exact datadir.
 Zallet Testnet intentionally refuses `z_getnewaccount` until that confirmation
 succeeds. Do not keep a plaintext phrase on this host.
 
+Those two CLI commands take Zallet's exclusive datadir lock. Stop
+`zecwec-zallet.service` first, prove it is inactive, and run both commands as
+the `zecwec-zallet` identity with the same immutable binary, datadir, and
+configuration used by the unit. Never run an offline wallet command alongside
+the service. Restart the unit after confirmation and wait for its authenticated
+readiness gate to pass before copying the new cookie used below.
+
 Account creation is not a hand-authored JSON step. Create a private root-owned
 ceremony directory, make a root-owned mode-`0400` snapshot of the active Zallet
 cookie, ensure the capture output path does not already exist, and let the
