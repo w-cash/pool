@@ -21,11 +21,15 @@ The ordered patch set is deliberately small:
    generated build metadata. Both can contain the ephemeral source path; they
    are unused by Zallet at runtime and make otherwise identical binaries
    non-reproducible.
-4. Backport upstream commit
-   `b2d15011dc28a7284222f95e843880e53c4efe94`, which fixes issue #766 by
-   observing the batch decryptor's asynchronous abort with a bounded retry.
-   The original beta.3 test raced a single reload request against cancellation
-   and could fail even though the task was shutting down.
+4. Replace the flaky request-based shutdown assertion tracked by upstream issue
+   #766 with a narrow test observer. The observer captures the spawned batch
+   task's `AbortHandle` only after the abort-on-drop guard owns it, then checks
+   bounded eventual task completion directly. It never injects reload requests
+   that can keep the engine queue ready and mask Tokio cancellation. The normal
+   production entry point uses a no-op observer and retains the same task
+   ownership and return contract. This is the local deterministic signal/barrier
+   resolution described as option 1 in issue #766; it is not the reload-polling
+   workaround proposed by the still-open pull request #768.
 
 The capacity patch is not a substitute for upstream's broader RPC
 resource-ordering work in pull request #716. ZecWec serializes collector
