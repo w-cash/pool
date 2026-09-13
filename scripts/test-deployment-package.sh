@@ -1245,10 +1245,14 @@ assert "LoadCredential=portal-" not in migrate_unit
 assert "SocketBindDeny=any" in migrate_unit
 assert "wcash-poold config-check" not in migrate_unit
 assert (
-    "grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url "
+    "ExecStart=" + str(
+        root.parent / "release" / "deployment" / "scripts" / "deploy"
+        / "migrate-and-grant-runtime.sh"
+    ) + " "
     "zecwec_pool_migrator zecwec_pool_runtime zecwec_pool_projector "
     "zecwec_pool_payout"
 ) in migrate_unit
+assert "ExecStartPost=" not in migrate_unit
 assert "User=wcash-pool-backend\n" in backend_unit
 assert "Group=wcash-pool-socket\n" in backend_unit
 assert "SupplementaryGroups=wcash-pool-backend\n" in backend_unit
@@ -1602,6 +1606,22 @@ assert "location ^~ /api/v1/ {" in portal
 assert "location = /readyz {" in portal
 assert "location / {\n        return 404;\n    }" in portal
 assert "location / {\n        limit_req" not in portal
+PY
+
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/migrate-and-grant-runtime.sh" <<'PY'
+import pathlib
+import sys
+
+entrypoint = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "${CREDENTIALS_DIRECTORY:-}" in entrypoint
+assert "/run/credentials/wcash-pool-migrate.service" in entrypoint
+migration = entrypoint.index('"$release_root/wcash-poold" migrate')
+grant = entrypoint.index(
+    '"$release_root/deployment/scripts/deploy/grant-runtime.sh"'
+)
+assert migration < grant
+assert "ExecStartPost" not in entrypoint
 PY
 
 PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/grant-runtime.sh" <<'PY'

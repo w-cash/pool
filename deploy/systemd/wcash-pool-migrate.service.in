@@ -14,8 +14,7 @@ UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
 LoadCredential=database-url:@DATABASE_MIGRATOR_URL_CREDENTIAL@
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
-ExecStart=@WCASH_RELEASE_ROOT@/wcash-poold migrate --config /etc/wcash-pool/pool.migrate.toml
-ExecStartPost=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url @POSTGRES_MIGRATOR_ROLE@ @POSTGRES_RUNTIME_ROLE@ @POSTGRES_PROJECTOR_ROLE@ @POSTGRES_PAYOUT_ROLE@
+ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/migrate-and-grant-runtime.sh @POSTGRES_MIGRATOR_ROLE@ @POSTGRES_RUNTIME_ROLE@ @POSTGRES_PROJECTOR_ROLE@ @POSTGRES_PAYOUT_ROLE@
 RemainAfterExit=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
