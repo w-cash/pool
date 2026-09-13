@@ -208,7 +208,7 @@ grep -Fq '[[ ${#zallet_core_test_harnesses[@]} -eq 1 ]]' \
 # shellcheck disable=SC2016
 grep -Fq '[[ -f $candidate && ! -L $candidate && -x $candidate ]]' \
     "$repo_root/scripts/build-zallet-testnet.sh"
-grep -Fq 'for _stress_iteration in {1..100}; do' \
+grep -Fq 'for _stress_iteration in {1..200}; do' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 # shellcheck disable=SC2016
 grep -Fq 'cd "$source_dir/zallet-core"' \
@@ -227,7 +227,13 @@ grep -Fq '.runtime(deadpool::Runtime::Tokio1)' \
 grep -Fq 'denied_build_constants.extend([CARGO_MANIFEST_DIR, CARGO_TREE]);' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0003-remove-nonreproducible-shadow-paths.patch"
 grep -Fq 'tokio::time::timeout(Duration::from_secs(30), async {' \
-    "$repo_root/patches/zallet-v0.1.0-beta.3/0004-deflake-batch-decryptor-shutdown-test.patch"
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0004-observe-batch-decryptor-shutdown.patch"
+grep -Fq 'async fn spawn_observed<C, F>' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0004-observe-batch-decryptor-shutdown.patch"
+grep -Fq 'observe_batch_task(batch_decryptor_task.abort_handle());' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0004-observe-batch-decryptor-shutdown.patch"
+grep -Fq 'while !batch_task_abort.is_finished()' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0004-observe-batch-decryptor-shutdown.patch"
 grep -Fq 'generated shadow metadata contains its build path' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 # shellcheck disable=SC2016

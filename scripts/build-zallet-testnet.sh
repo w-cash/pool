@@ -68,7 +68,7 @@ patches=(
     "$patch_dir/0001-reserve-wallet-database-capacity.patch"
     "$patch_dir/0002-signal-data-requests-after-chain-writes.patch"
     "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch"
-    "$patch_dir/0004-deflake-batch-decryptor-shutdown-test.patch"
+    "$patch_dir/0004-observe-batch-decryptor-shutdown.patch"
 )
 applied_patch_list=$temporary/applied-patches
 printf '%s\n' "${patches[@]}" >"$applied_patch_list"
@@ -115,14 +115,14 @@ grep -Fx "libprotoc $protoc_version" "$temporary/protoc-version" >/dev/null
     }
     zallet_core_test_harness=${zallet_core_test_harnesses[0]}
     # beta.3's original assertion raced a reload request against Tokio's
-    # asynchronous task abort. The audited upstream #766 backport observes
-    # eventual shutdown with its own 30-second bound; repeat it to exercise the
-    # scheduling boundary before accepting the full sync suite.
+    # asynchronous task abort. The audited test seam observes the spawned task
+    # itself with a 30-second bound; repeat it to exercise the scheduling
+    # boundary before accepting the full sync suite.
     # Invoke the exact harness already built by the pool-config gate so Cargo
     # cannot rebuild or relink inside the per-execution timeout.
     (
         cd "$source_dir/zallet-core"
-        for _stress_iteration in {1..100}; do
+        for _stress_iteration in {1..200}; do
             timeout --signal=TERM --kill-after=10s 40s \
                 "$zallet_core_test_harness" \
                 components::sync::tests::wallet_sync_error_shuts_down_the_spawned_batch_decryptor \

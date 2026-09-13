@@ -29,7 +29,7 @@ for patch in \
     "$patch_dir/0001-reserve-wallet-database-capacity.patch" \
     "$patch_dir/0002-signal-data-requests-after-chain-writes.patch" \
     "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch" \
-    "$patch_dir/0004-deflake-batch-decryptor-shutdown-test.patch"; do
+    "$patch_dir/0004-observe-batch-decryptor-shutdown.patch"; do
     git -C "$source_dir" apply --check "$patch"
     git -C "$source_dir" apply "$patch"
 done
@@ -44,6 +44,8 @@ grep -Fq '.deny_const(denied_build_constants)' \
     "$source_dir/zallet-core/build.rs"
 grep -Fq 'tokio::time::timeout(Duration::from_secs(30), async {' \
     "$source_dir/zallet-core/src/components/sync.rs"
-grep -Fq 'A served reload' \
+grep -Fq 'observe_batch_task(batch_decryptor_task.abort_handle());' \
+    "$source_dir/zallet-core/src/components/sync.rs"
+grep -Fq 'while !batch_task_abort.is_finished()' \
     "$source_dir/zallet-core/src/components/sync.rs"
 printf 'zallet-patch-test: exact beta.3 patch set applies cleanly\n'

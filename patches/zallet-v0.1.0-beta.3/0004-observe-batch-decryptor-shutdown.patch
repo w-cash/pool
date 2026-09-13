@@ -1,0 +1,97 @@
+diff --git a/zallet-core/src/components/sync.rs b/zallet-core/src/components/sync.rs
+index 5719792..0499e6b 100644
+--- a/zallet-core/src/components/sync.rs
++++ b/zallet-core/src/components/sync.rs
+@@ -143,6 +143,33 @@ impl WalletSync {
+         decryptor_engine: WalletDecryptorEngine,
+         status: SyncStatusWriter,
+     ) -> Result<(TaskHandle, TaskHandle, TaskHandle, TaskHandle), Error> {
++        Self::spawn_observed(
++            config,
++            db,
++            chain,
++            shutdown_height,
++            decryptor,
++            decryptor_engine,
++            status,
++            |_| {},
++        )
++        .await
++    }
++
++    async fn spawn_observed<C, F>(
++        config: &ZalletConfig,
++        db: Database,
++        chain: C,
++        shutdown_height: Option<BlockHeight>,
++        decryptor: WalletDecryptorHandle,
++        decryptor_engine: WalletDecryptorEngine,
++        status: SyncStatusWriter,
++        observe_batch_task: F,
++    ) -> Result<(TaskHandle, TaskHandle, TaskHandle, TaskHandle), Error>
++    where
++        C: Chain,
++        F: FnOnce(AbortHandle) + Send,
++    {
+         let params = config.consensus.network();
+         let recover_batch_size = config.sync.recover_batch_size();
+ 
+@@ -155,6 +182,7 @@ impl WalletSync {
+             })
+         };
+         let mut pending_tasks = PendingWalletSyncTasks::new(&batch_decryptor_task);
++        observe_batch_task(batch_decryptor_task.abort_handle());
+ 
+         // Ensure the wallet is in a state that the sync tasks can work with.
+         let mut db_data = db.handle().await?;
+@@ -1698,10 +1726,10 @@ mod tests {
+             .await
+             .expect("creates a wallet database");
+         let (decryptor, decryptor_engine) = WalletSync::build_decryptor();
+-        let decryptor_observer = decryptor.clone();
++        let (batch_task_observed, batch_task_observer) = tokio::sync::oneshot::channel();
+         let (status, _status_reader) = status::channel(config.sync.lock_threshold());
+ 
+-        let result = WalletSync::spawn(
++        let result = WalletSync::spawn_observed(
+             &config,
+             database,
+             MockChain::reporting(Vec::new(), 0),
+@@ -1709,21 +1737,26 @@ mod tests {
+             decryptor,
+             decryptor_engine,
+             status,
++            move |abort_handle| {
++                let _ = batch_task_observed.send(abort_handle);
++            },
+         )
+         .await;
+ 
+         assert!(result.is_err(), "mock chain rejects wallet sync startup");
+-        // `reload_keys` returns `None` only when the decryptor handle has no engine to
+-        // reload, which itself indicates the engine was dropped during the failed
+-        // startup. Either outcome proves the batch decryptor is not left running;
+-        // assert the `Some` case explicitly, and accept `None` as equivalent shutdown.
+-        if let Some(reload_finished) = decryptor_observer.reload_keys().await {
+-            assert!(
+-                reload_finished.await.is_err(),
+-                "failed wallet sync startup must not leave its batch decryptor running",
+-            );
+-        }
+-        // `None` means there is no engine to reload — the decryptor is already down.
++        let batch_task_abort = batch_task_observer
++            .await
++            .expect("batch decryptor task is observed before wallet sync startup");
++        // Observe the task itself instead of injecting reload requests into the engine.
++        // Requests that race an asynchronous Tokio abort can keep the engine's queue
++        // continuously ready and are not a deterministic proxy for task shutdown.
++        tokio::time::timeout(Duration::from_secs(30), async {
++            while !batch_task_abort.is_finished() {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("failed wallet sync startup must not leave its batch decryptor running");
+     }
+ 
+     // Regression for zallet#136: when a sibling task fails and `steady_state` is
