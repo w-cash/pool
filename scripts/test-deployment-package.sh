@@ -1540,6 +1540,10 @@ listener_gate = edge.index('require_public_tls_listener "$mining_host"')
 assert certificate_gate < stream_enable < nginx_reload < listener_gate
 assert 'rm -f -- "$stream_link"' in edge[listener_gate:]
 assert "require_public_tls_listener" in health
+assert (
+    'systemctl is-active --quiet nginx.service || die "nginx TLS edge is not active"'
+    in health
+)
 PY
 grep -Fq '"payout_execution": "enabled"' \
     "$repo_root/scripts/deploy/health-check.sh"
@@ -1758,6 +1762,10 @@ assert barrier in rollback
 assert rollback.index(barrier) < rollback.index("stop_loaded_unit_strict")
 assert 'ZECWEC_RELEASE_PATH=$target "$script_dir/verify-release.sh"' in rollback
 assert '"$target/deployment/scripts/deploy/verify-release.sh"' not in rollback
+tls_gate = rollback.index("require_public_tls_certificate")
+firewall_close = rollback.index('restrict-mining-firewall.sh" close')
+runtime_stop = rollback.index("stop_loaded_unit_strict")
+assert tls_gate < firewall_close < runtime_stop
 assert "printf '2\\n'" in installer
 assert '$(cat -- "$package/DEPLOYMENT-SCHEMA") == 2' in verifier
 assert 'ZECWEC_DEPLOYMENT_SCHEMA) == 2' in health
@@ -1775,6 +1783,8 @@ for bootstrap_contract in \
     'First security-epoch-2 bootstrap' \
     'ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE"' \
     'never substitute' \
+    'Creating `backend-authority-protocol-v2.json` alone is not' \
+    'activate the pinned release' \
     'at least seven days remaining'; do
     grep -Fq "$bootstrap_contract" \
         "$repo_root/docs/zecwec-testnet-deployment.md" || {
