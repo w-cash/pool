@@ -120,6 +120,14 @@ jobs:
         env:
           WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
 
+      - name: Run authenticated payout lifecycle
+        run: >-
+          cargo test --locked -p wcash-poold --test settlement
+          payout_lifecycle::authenticated_winner_reaches_confirmed_recipient_ledger
+          -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
       - name: Run required confirmed-payout rotation regression
         run: >-
           cargo test --locked -p wcash-pool-store --test payout_watch_rotation

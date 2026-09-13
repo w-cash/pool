@@ -5,3 +5,6 @@
 
 #[path = "../src/settlement.rs"]
 mod settlement;
+
+#[path = "settlement/payout_lifecycle.rs"]
+mod payout_lifecycle;
