@@ -145,11 +145,13 @@ test("payouts submit exact coin amounts, preserve the other chain, and display t
     assert.equal(await page.locator("#zec-password").inputValue(), "");
     assert.match(await page.locator('[data-setting-summary="zec"]').textContent(), /Safety hold until/);
     assert.match(await page.locator("#zec-payout-status").textContent(), /Payouts on hold until/);
-    const exact = await page.evaluate(() => ({ tiny: parseCoinInput("0.00000001"), edge: parseCoinInput("90071992.54740991"), rendered: coinInputValue(123456789) }));
-    assert.deepEqual(exact, { tiny: 1, edge: Number.MAX_SAFE_INTEGER, rendered: "1.23456789" });
-    for (const value of ["0", "-1", "1e3", "0.000000001", "90071992.54740992"]) {
+    const exact = await page.evaluate(() => ({ tiny: parseCoinInput("0.00000001"), edge: parseCoinInput("21000000.00000000"), rendered: coinInputValue(123456789) }));
+    assert.deepEqual(exact, { tiny: 1, edge: 2100000000000000, rendered: "1.23456789" });
+    for (const value of ["0", "-1", "1e3", "0.000000001", "21000000.00000001", "90071992.54740991"]) {
       assert.equal(await page.evaluate((candidate) => { try { parseCoinInput(candidate); return false; } catch { return true; } }, value), true);
     }
+    await page.getByText("Supported Zcash addresses", { exact: true }).click();
+    assert.equal(await page.getByText("Transparent: Zcash Testnet P2PKH or P2SH. Shielded: an Ironwood-capable Unified Address. Bare Sapling and TEX addresses are not supported.", { exact: true }).isVisible(), true);
     assert.deepEqual(state.errors, []);
   } finally { await context.close(); }
 });
@@ -190,6 +192,20 @@ test("late worker creation cannot repopulate credentials after sign-out", async 
     assert.equal(await page.locator("#account-name").textContent(), "");
     assert.deepEqual(state.errors, []);
   } finally { release(); await context.close(); }
+});
+
+test("sign-out clears payout metadata and account history states as well as amounts", async () => {
+  const { page, context, state } = await fixture({ settings: [{ asset: "wec", active_destination: "fixture…private", active_receiver: "ironwood", threshold_zat: 12345678, automatic: true, revision: 1, pending_destination: null }] });
+  try {
+    await page.locator("#wec-payout-status").filter({ hasText: "0.12345678 TWC" }).waitFor();
+    await page.getByRole("button", { name: "Sign out", exact: true }).click();
+    await page.locator("#auth-view").waitFor({ state: "visible" });
+    assert.equal(await page.locator("#wec-payout-status").textContent(), "Checking payout settings");
+    assert.equal(await page.locator("#zec-payout-status").textContent(), "Checking payout settings");
+    assert.equal(await page.locator("#payouts-state").textContent(), "Sign in");
+    assert.doesNotMatch(await page.locator("#app-view").textContent(), /fixture…private|0\.12345678/);
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
 });
 
 test("untrusted API strings render as text and the shell fits 320px through desktop", async () => {

@@ -77,6 +77,13 @@ input[readonly] {
   margin:0;
   overflow-wrap:anywhere;
 }
+.compatibility-note {
+  color:var(--muted);
+  font-size:12px;
+}
+.compatibility-note p {
+  margin:8px 0 0;
+}
 .check {
   display:flex;
   align-items:center;

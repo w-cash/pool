@@ -3,6 +3,7 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const ATOMIC_UNITS = 100_000_000;
+const MAX_PAYOUT_THRESHOLD_ZAT = 2_100_000_000_000_000n;
 let authMode = "login";
 let cachedWorkers = [];
 let cachedTelemetry = null;
@@ -89,7 +90,7 @@ function parseCoinInput(value) {
   const match = /^(\d+)(?:\.(\d{1,8}))?$/.exec(String(value).trim());
   if (!match || match[1].length > 16) throw new Error("Enter a positive coin amount with up to 8 decimal places.");
   const atomic = BigInt(match[1]) * 100000000n + BigInt((match[2] || "").padEnd(8, "0"));
-  if (atomic <= 0n || atomic > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("The payout threshold is outside the supported range.");
+  if (atomic <= 0n || atomic > MAX_PAYOUT_THRESHOLD_ZAT) throw new Error("Enter a payout threshold above zero and no greater than 21,000,000 coins.");
   return Number(atomic);
 }
 
@@ -190,6 +191,7 @@ function resetPrivateViews() {
   $("#totp-secret").classList.add("hidden");
   $("#totp-confirm").classList.add("hidden");
   $("#totp-confirm-code").value = "";
+  $("#totp-confirm-button").disabled = false;
   $("#auth-form").reset();
   $("#auth-error").textContent = "";
   $("#auth-error").className = "notice error hidden";
@@ -198,10 +200,12 @@ function resetPrivateViews() {
   setText("#workers-state", "Checking workers");
   setText("#setup-addresses", "Checking");
   setText("#setup-workers", "Checking");
+  setText("#totp-status", "Optional protection for your account");
   $("#setup-guide").classList.remove("hidden");
   updateAddressType();
 
   for (const asset of ["wec", "zec"]) {
+    setText(`#${asset}-payout-status`, "Checking payout settings");
     for (const field of ["balance", "immature", "payable", "pending"]) {
       setText(`#${asset}-${field}`, "—");
     }
@@ -214,6 +218,7 @@ function resetPrivateViews() {
     state.cursor = null;
     state.request++;
     $(`#${kind}-more`).classList.add("hidden");
+    setHistoryState(kind, "Sign in", "warning");
     renderTableMessage($(`#${kind}-body`), state.columns, "Sign in to view private history.");
   });
 }
@@ -663,9 +668,11 @@ $("#auth-form").addEventListener("submit", async (event) => {
     error.textContent = reason.message;
     error.className = "notice error";
   } finally {
-    form.elements.password.value = "";
-    form.elements.totp_code.value = "";
-    if (currentGeneration(generation) || form.dataset.busy === "true") setFormBusy(form, false);
+    if (currentGeneration(generation)) {
+      form.elements.password.value = "";
+      form.elements.totp_code.value = "";
+      setFormBusy(form, false);
+    }
   }
 });
 
@@ -758,9 +765,11 @@ $$('.payout-form').forEach((form) => form.addEventListener("submit", async (even
     if (!currentGeneration(generation)) return;
     result.textContent = reason.message;
   } finally {
-    form.elements.password.value = "";
-    form.elements.totp_code.value = "";
-    if (currentGeneration(generation)) setFormBusy(form, false);
+    if (currentGeneration(generation)) {
+      form.elements.password.value = "";
+      form.elements.totp_code.value = "";
+      setFormBusy(form, false);
+    }
   }
 }));
 
@@ -812,8 +821,10 @@ $("#totp-confirm-button").addEventListener("click", async () => {
     if (!currentGeneration(generation)) return;
     target.textContent = reason.message;
   } finally {
-    $("#totp-confirm-code").value = "";
-    $("#totp-confirm-button").disabled = false;
+    if (currentGeneration(generation)) {
+      $("#totp-confirm-code").value = "";
+      $("#totp-confirm-button").disabled = false;
+    }
   }
 });
 
