@@ -419,7 +419,23 @@ case $1 in
             missing:LoadState) printf 'not-found\n' ;;
             masked:LoadState) printf 'masked\n' ;;
             *:LoadState) printf 'loaded\n' ;;
+            failed:ActiveState | reset-failure:ActiveState)
+                if grep -q '^reset-failed ' "$STRICT_STOP_LOG"; then
+                    printf 'inactive\n'
+                else
+                    printf 'failed\n'
+                fi
+                ;;
+            active:ActiveState)
+                if grep -q '^stop ' "$STRICT_STOP_LOG"; then
+                    printf 'inactive\n'
+                else
+                    printf 'active\n'
+                fi
+                ;;
             stuck:ActiveState) printf 'active\n' ;;
+            activating:ActiveState) printf 'activating\n' ;;
+            deactivating:ActiveState) printf 'deactivating\n' ;;
             *:ActiveState) printf 'inactive\n' ;;
             *:SubState) printf 'dead\n' ;;
             *:MainPID | *:ControlPID) printf '0\n' ;;
@@ -431,7 +447,8 @@ case $1 in
         printf 'stop %s\n' "$2" >>"$STRICT_STOP_LOG"
         ;;
     reset-failed)
-        [[ $STRICT_STOP_SCENARIO != reset-failure ]] || exit 8
+        [[ $STRICT_STOP_SCENARIO != reset-failure \
+            && $STRICT_STOP_SCENARIO != inactive-v249 ]] || exit 8
         printf 'reset-failed %s\n' "$2" >>"$STRICT_STOP_LOG"
         ;;
     *) exit 2 ;;
@@ -466,11 +483,26 @@ run_strict_stop_scenario missing pass
     exit 1
 }
 run_strict_stop_scenario loaded pass
-[[ $(cat "$strict_stop_test/loaded.log") == $'stop test.service\nreset-failed test.service' ]] || {
-    printf 'deployment-package-test: strict stop omitted its stop/reset sequence\n' >&2
+[[ $(cat "$strict_stop_test/loaded.log") == 'stop test.service' ]] || {
+    printf 'deployment-package-test: strict stop reset a healthy inactive unit\n' >&2
     exit 1
 }
-for rejected_stop_scenario in masked stop-failure reset-failure stuck; do
+run_strict_stop_scenario inactive-v249 pass
+[[ $(cat "$strict_stop_test/inactive-v249.log") == 'stop test.service' ]] || {
+    printf 'deployment-package-test: strict stop invoked systemd 249 reset-failed for an inactive unit\n' >&2
+    exit 1
+}
+run_strict_stop_scenario active pass
+[[ $(cat "$strict_stop_test/active.log") == 'stop test.service' ]] || {
+    printf 'deployment-package-test: strict stop mishandled an active unit\n' >&2
+    exit 1
+}
+run_strict_stop_scenario failed pass
+[[ $(cat "$strict_stop_test/failed.log") == $'reset-failed test.service\nstop test.service' ]] || {
+    printf 'deployment-package-test: strict stop did not clear a failed unit\n' >&2
+    exit 1
+}
+for rejected_stop_scenario in masked stop-failure reset-failure stuck activating deactivating; do
     run_strict_stop_scenario "$rejected_stop_scenario" fail
 done
 
