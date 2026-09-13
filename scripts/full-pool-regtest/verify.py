@@ -69,13 +69,15 @@ class Verifier:
         require(not body.get('error'), 'live node RPC method failed')
         return body['result']
 
-    def canonical_transaction(self, chain, height, wire_block_hash, txid, depth):
+    def canonical_transaction(self, chain, height, wire_block_hash, txid, depth, *, coinbase=False):
         block_hash = self.rpc(chain, 'getblockhash', [height])
         require(block_hash == display_block(wire_block_hash), 'stored block is outside the current best chain')
         block = self.rpc(chain, 'getblock', [block_hash, 1])
         require(block.get('height') == height and block.get('confirmations', 0) >= depth,
                 'block has insufficient independent node confirmations')
         require(txid in block.get('tx', []), 'stored transaction is absent from the independently fetched block')
+        if coinbase:
+            require(block['tx'][0] == txid, 'stored winner transaction is not the actual coinbase')
 
     def run(self):
         dep = "'" + self.deployment + "'::uuid"
@@ -96,21 +98,22 @@ class Verifier:
                 OR COALESCE(sum(e.amount_zat),1) <> 0""")
         require(not invalid, 'ledger contains an unsealed or non-conserving transaction')
         winners = self.query(f"""SELECT w.chain,w.height,encode(w.block_hash_le,'hex') AS block_hash,
-            encode(w.coinbase_txid_le,'hex') AS coinbase,w.maturity_confirmations
-            FROM winners w WHERE w.deployment_id={dep} AND w.state='matured'
-            AND EXISTS (SELECT 1 FROM ledger_transactions t JOIN ledger_entries e
+            encode(w.coinbase_txid_le,'hex') AS coinbase,w.maturity_confirmations,
+            EXISTS (SELECT 1 FROM ledger_transactions t JOIN ledger_entries e
                 ON (e.deployment_id,e.transaction_id)=(t.deployment_id,t.id)
                 WHERE t.deployment_id=w.deployment_id AND t.chain=w.chain
                 AND t.backend_event_seq=w.active_maturity_event_seq AND t.kind='winner_matured'
-                AND e.ledger_account='miner_payable' AND e.amount_zat < 0)""")
+                AND e.ledger_account='miner_payable' AND e.amount_zat < 0) AS has_miner_credit
+            FROM winners w WHERE w.deployment_id={dep} AND w.state='matured'""")
         require({row['chain'] for row in winners} == set(GENESIS), 'missing mature miner credit on one or both chains')
         for row in winners:
+            require(row['has_miner_credit'], 'matured winner is missing its active miner credit posting')
             require(row['maturity_confirmations'] >= 100, 'coinbase maturity policy was shortened')
             self.canonical_transaction(row['chain'], row['height'], row['block_hash'],
-                                       display_block(row['coinbase']), row['maturity_confirmations'])
+                                       display_block(row['coinbase']), row['maturity_confirmations'], coinbase=True)
         payouts = self.query(f"""SELECT b.id,b.chain,encode(b.transaction_id,'hex') AS txid,
             encode(b.confirmation_block_hash,'hex') AS block_hash,b.confirmation_height AS height,
-            b.confirmation_count,p.required_confirmations,d.receiver_kind,i.amount_zat,
+            b.confirmation_count,p.required_confirmations,d.receiver_kind,i.account_id,i.amount_zat,
             i.liability_amount_zat,b.network_fee_zat,
             (SELECT count(*) FROM ledger_transactions t WHERE t.deployment_id=b.deployment_id
              AND t.chain=b.chain AND t.kind='payout_confirmed' AND t.reference=b.id::text) AS postings
@@ -120,6 +123,13 @@ class Verifier:
             WHERE b.deployment_id={dep} AND b.state='confirmed'""")
         require(REQUIRED_PAYMENTS <= {(r['chain'], r['receiver_kind']) for r in payouts},
                 'missing confirmed Wcash shielded, Zcash shielded, or Zcash transparent payout')
+        settlement = self.query(f"""SELECT t.reference AS batch_id,e.account_id,e.ledger_account,e.amount_zat
+            FROM ledger_transactions t JOIN ledger_entries e
+              ON (e.deployment_id,e.transaction_id)=(t.deployment_id,t.id)
+            JOIN payout_batches b ON b.deployment_id=t.deployment_id AND b.id::text=t.reference
+              AND b.chain=t.chain AND b.state='confirmed'
+            WHERE t.deployment_id={dep} AND t.kind='payout_confirmed'""")
+        check_settlement(payouts, settlement)
         seen = set()
         for row in payouts:
             require(row['required_confirmations'] >= 100
@@ -142,6 +152,35 @@ class Verifier:
                 'ledger_conserves': True,
                 'additional_required_evidence': ['recipient wallet receipts', 'restart and replay scenario',
                                                  'production feature guards', 'Ubuntu role and origin isolation']}
+
+
+def check_settlement(payouts, settlement):
+    for batch in {r['id'] for r in payouts}:
+        items = [r for r in payouts if r['id'] == batch]
+        lines = [r for r in settlement if r['batch_id'] == batch]
+        fee = items[0]['network_fee_zat']
+        net = sum(r['amount_zat'] for r in items)
+        gross = sum(r['liability_amount_zat'] for r in items)
+        require(0 <= fee <= gross - net, 'settled fee exceeds the miner reserve')
+        expected_accounts = {r['account_id']: r['liability_amount_zat'] for r in items}
+        pending = {}
+        totals = {}
+        for row in lines:
+            account, kind, amount = row['account_id'], row['ledger_account'], row['amount_zat']
+            totals[kind] = totals.get(kind, 0) + amount
+            if kind == 'payout_pending':
+                require(account in expected_accounts and amount > 0, 'invalid pending liability settlement account')
+                pending[account] = pending.get(account, 0) + amount
+            elif kind == 'miner_payable':
+                require(account in expected_accounts and amount < 0, 'invalid miner fee refund account')
+            else:
+                require(account is None, 'pool settlement entry unexpectedly identifies a miner account')
+        expected = {'payout_pending': gross, 'collector_spendable_asset': -(net + fee),
+                    'miner_payable': -(gross - net - fee), 'network_fee_expense': fee,
+                    'miner_network_fee_contribution': -fee}
+        require(pending == expected_accounts, 'settlement does not discharge the exact per-miner liabilities')
+        require({k: v for k, v in totals.items() if v} == {k: v for k, v in expected.items() if v},
+                'settlement does not conserve the exact payout, fee, and refund amounts')
 
 
 def main():
