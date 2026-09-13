@@ -268,13 +268,22 @@ require_loaded_unit_fully_inactive() {
 # absent, and a real stop failure is fatal.
 stop_loaded_unit_strict() {
     local unit=${1:?unit is required}
-    local load_state
+    local load_state active_state
     load_state=$(systemctl_value_strict "$unit" LoadState)
     case $load_state in
         loaded)
+            active_state=$(systemctl_value_strict "$unit" ActiveState)
+            case $active_state in
+                active | inactive) ;;
+                failed)
+                    systemctl reset-failed "$unit" \
+                        || die "could not clear the unit's failure state: $unit"
+                    ;;
+                *)
+                    die "$unit has unexpected systemd active state: $active_state"
+                    ;;
+            esac
             systemctl stop "$unit" || die "could not stop loaded unit: $unit"
-            systemctl reset-failed "$unit" \
-                || die "could not clear the stopped unit's failure state: $unit"
             require_loaded_unit_fully_inactive "$unit"
             ;;
         not-found) ;;
