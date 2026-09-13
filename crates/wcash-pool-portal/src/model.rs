@@ -480,6 +480,12 @@ pub struct PoolOverview {
 pub trait PoolDataSource: Send + Sync {
     /// Returns aggregate pool telemetry without private miner information.
     fn overview(&self) -> PoolOverview;
+
+    /// Reports whether the live mining authority currently admits work.
+    /// Historical telemetry alone cannot establish readiness.
+    fn mining_ready(&self) -> bool {
+        false
+    }
 }
 
 /// A fail-closed read model used until the durable projector is connected.

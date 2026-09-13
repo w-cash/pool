@@ -38,6 +38,7 @@ pub enum JobUpdate {
 #[derive(Debug)]
 struct RouterState {
     registry: GenerationRegistry,
+    health_paused: bool,
     force_clean_jobs: bool,
     backend_authority: Option<BackendAuthority>,
     connection_binding: Option<BackendConnectionBinding>,
@@ -51,6 +52,9 @@ impl RouterState {
     ) -> Result<Option<JobUpdate>, JobRouterError> {
         Ok(match event {
             BackendEvent::JobActivated { job, .. } => {
+                if self.health_paused {
+                    return Ok(None);
+                }
                 let id = JobId::new(*job.job_id.as_bytes())?;
                 let generation = self
                     .registry
@@ -133,6 +137,7 @@ impl JobRouter {
         Ok(Self {
             state: Arc::new(Mutex::new(RouterState {
                 registry,
+                health_paused: false,
                 force_clean_jobs: false,
                 backend_authority: Some(snapshot.authority().clone()),
                 connection_binding: Some(snapshot.connection_binding()),
@@ -326,11 +331,65 @@ impl JobRouter {
         Ok(state.registry.last_event_seq() == client.live_event_cursor())
     }
 
+    /// Stops miner admission during an authenticated, temporary unhealthy status.
+    /// The contiguous registry, immutable assignments, and original deadlines
+    /// remain intact while every new submission is refused.
+    pub(crate) fn pause_for_health(&self, client: &BackendClient) -> Result<(), JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        if !state
+            .connection_binding
+            .as_ref()
+            .is_some_and(|binding| client.is_bound_to(binding))
+        {
+            return Err(JobRouterError::BackendConnectionMismatch);
+        }
+        state.registry.admissible_job_ids(self.timeline.now_ms()?)?;
+        if !state.health_paused {
+            state.health_paused = true;
+            state.force_clean_jobs = true;
+        }
+        Ok(())
+    }
+
+    /// Reopens admission only after the owning live client reports healthy and
+    /// all events through that response have been applied. This does not recover
+    /// a suspended registry or refresh any generation's lifetime.
+    pub(crate) fn resume_after_health(&self, client: &BackendClient) -> Result<(), JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        if !state
+            .connection_binding
+            .as_ref()
+            .is_some_and(|binding| client.is_bound_to(binding))
+        {
+            return Err(JobRouterError::BackendConnectionMismatch);
+        }
+        if state.registry.last_event_seq() != client.live_event_cursor() {
+            return Err(JobRouterError::BackendConnectionMismatch);
+        }
+        let current = state
+            .registry
+            .current_generation(self.timeline.now_ms()?)?
+            .cloned();
+        if state.health_paused {
+            state.health_paused = false;
+            state.force_clean_jobs = true;
+            if let Some(generation) = current {
+                let _ = self.updates.send(JobUpdate::Activated {
+                    generation: Box::new(generation),
+                    clean_jobs: true,
+                });
+                state.force_clean_jobs = false;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the current admissible generation at this process's monotonic time.
     pub fn current_generation(&self) -> Result<Option<BackendGeneration>, JobRouterError> {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         let now_ms = self.timeline.now_ms()?;
-        Ok(state.registry.current_generation(now_ms)?.cloned())
+        let current = state.registry.current_generation(now_ms)?.cloned();
+        Ok(if state.health_paused { None } else { current })
     }
 
     /// Returns every generation that may still begin a submission.
@@ -338,6 +397,22 @@ impl JobRouter {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         let now_ms = self.timeline.now_ms()?;
         let admissible = state.registry.admissible_job_ids(now_ms)?;
+        if state.health_paused {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(1 + admissible.recent().len());
+        if let Some(current) = admissible.current() {
+            ids.push(current);
+        }
+        ids.extend_from_slice(admissible.recent());
+        Ok(ids)
+    }
+
+    /// Retains immutable connection assignments during a health pause. This is
+    /// only for reconciliation; public admission must use `admissible_job_ids`.
+    pub(crate) fn retained_job_ids(&self) -> Result<Vec<JobId>, JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        let admissible = state.registry.admissible_job_ids(self.timeline.now_ms()?)?;
         let mut ids = Vec::with_capacity(1 + admissible.recent().len());
         if let Some(current) = admissible.current() {
             ids.push(current);
@@ -359,6 +434,10 @@ impl JobRouter {
     ) -> Result<SubmissionContext, JobRouterError> {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         let now_ms = self.timeline.now_ms()?;
+        if state.health_paused {
+            state.registry.admissible_job_ids(now_ms)?;
+            return Err(SessionError::Registry(JobRegistryError::StaleJob(job_id)).into());
+        }
         Ok(session.prepare_submission(
             claimed_login,
             job_id,
@@ -386,6 +465,7 @@ impl JobRouter {
         Ok(Self {
             state: Arc::new(Mutex::new(RouterState {
                 registry,
+                health_paused: false,
                 force_clean_jobs: false,
                 backend_authority: None,
                 connection_binding: None,
@@ -457,6 +537,7 @@ impl JobRouter {
         state.force_clean_jobs = true;
         match apply(&mut state.registry) {
             Ok(()) => {
+                state.health_paused = false;
                 if let Some((authority, binding)) = replacement_binding {
                     state.backend_authority = Some(authority);
                     state.connection_binding = Some(binding);

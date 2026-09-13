@@ -8,10 +8,10 @@ use std::{ffi::OsStr, os::unix::net::UnixDatagram, path::Path};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time};
 use wcash_pool_address::{TestnetAddressValidator, WcashCommandValidator};
 use wcash_pool_backend_client::BackendClient;
-use wcash_pool_edge::BackendEventConsumer;
+use wcash_pool_edge::{BackendEventConsumer, JobRouter, ShareRouterError};
 use wcash_pool_portal::{
     serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
-    MinerTelemetrySource, PoolDataSource, PortalApp, PortalBuildError, PortalConfig,
+    MinerTelemetrySource, PoolDataSource, PoolOverview, PortalApp, PortalBuildError, PortalConfig,
     PortalRepository, PortalSecrets, TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
@@ -786,6 +786,7 @@ impl PreflightProbe for LivePreflightProbe<'_> {
             Arc::clone(&self.started.store),
             validator,
             pool_data,
+            self.started.jobs.clone(),
             Arc::new(LiveMinerTelemetry::default()),
             payout,
         )?;
@@ -909,7 +910,7 @@ async fn run_started(
                 None
             }
             result = tasks.join_next() => Some(classify_task_exit(result)),
-            () = wait_for_share_router_exit(shares) => Some(Err(ServiceError::ShareRouterExited)),
+            reason = wait_for_share_router_exit(shares) => Some(Err(ServiceError::ShareRouterExited(reason))),
         }
     };
 
@@ -1611,6 +1612,7 @@ fn build_portal(
         Arc::clone(&bootstrap.store),
         validator,
         pool_data,
+        bootstrap.jobs.clone(),
         miner_telemetry,
         payout,
     )
@@ -1621,6 +1623,7 @@ fn build_preflight_portal(
     store: Arc<PostgresStore>,
     validator: Arc<dyn AddressValidator>,
     pool_data: PostgresPoolDataSource,
+    jobs: JobRouter,
     miner_telemetry: Arc<dyn MinerTelemetrySource>,
     payout: Arc<TestnetPayoutBoundary>,
 ) -> Result<PortalApp, ServiceError> {
@@ -1637,7 +1640,10 @@ fn build_preflight_portal(
     let totp = RuntimeConfig::portal_secret(&config.portal_totp_key_file)?;
     let secrets = PortalSecrets::new(*token, *totp);
     let repository: Arc<dyn PortalRepository> = store;
-    let data: Arc<dyn PoolDataSource> = Arc::new(pool_data);
+    let data: Arc<dyn PoolDataSource> = Arc::new(LivePoolDataSource {
+        projection: pool_data,
+        jobs,
+    });
     PortalApp::new_with_telemetry(
         portal_config,
         secrets,
@@ -1648,6 +1654,24 @@ fn build_preflight_portal(
         payout,
     )
     .map_err(ServiceError::from)
+}
+
+/// Combines durable history with the current mining authority's admission gate.
+struct LivePoolDataSource {
+    projection: PostgresPoolDataSource,
+    jobs: JobRouter,
+}
+
+impl PoolDataSource for LivePoolDataSource {
+    fn overview(&self) -> PoolOverview {
+        self.projection.overview()
+    }
+
+    fn mining_ready(&self) -> bool {
+        self.jobs
+            .current_generation()
+            .is_ok_and(|generation| generation.is_some())
+    }
 }
 
 async fn refresh_portal(
@@ -1716,12 +1740,14 @@ async fn maintain_nonce_namespace(
     }
 }
 
-async fn wait_for_share_router_exit(shares: &wcash_pool_edge::ShareRouter) {
+async fn wait_for_share_router_exit(shares: &wcash_pool_edge::ShareRouter) -> ShareRouterError {
     let mut interval = time::interval(COMPONENT_POLL_INTERVAL);
     loop {
         interval.tick().await;
         if shares.is_finished() {
-            return;
+            return shares
+                .terminal_error()
+                .unwrap_or(ShareRouterError::TaskFailed);
         }
     }
 }
@@ -1877,8 +1903,8 @@ pub enum ServiceError {
     #[error(transparent)]
     Edge(#[from] EdgeRuntimeError),
     /// The authoritative share router stopped while listeners were live.
-    #[error("authoritative share router exited")]
-    ShareRouterExited,
+    #[error("authoritative share router exited: {0}")]
+    ShareRouterExited(#[source] ShareRouterError),
     /// A serving component stopped without a process shutdown request.
     #[error("serving component exited unexpectedly: {0}")]
     UnexpectedComponentExit(&'static str),
@@ -1969,6 +1995,22 @@ mod tests {
         Program,
         Signer,
         Authority,
+    }
+
+    #[test]
+    fn share_router_exit_retains_the_sanitized_terminal_reason() {
+        let error = ServiceError::ShareRouterExited(
+            wcash_pool_edge::ShareRouterError::BackendHealthDeadline,
+        );
+        assert_eq!(
+            error.to_string(),
+            "authoritative share router exited: backend remained unhealthy beyond the 30-second job-rollover deadline"
+        );
+        assert!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<wcash_pool_edge::ShareRouterError>())
+            .is_some_and(
+                |source| *source == wcash_pool_edge::ShareRouterError::BackendHealthDeadline
+            ));
     }
 
     #[cfg(unix)]

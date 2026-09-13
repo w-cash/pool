@@ -25,10 +25,10 @@ use wcash_pool_portal::{
     AuthenticatedSession, BroadcastReceipt, ChainNetwork, Clock, DisabledPayoutSigner,
     IsolatedPayoutSigner, MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary,
     MinerTelemetrySource, MinerTelemetrySummary, NewSession, Page, PageRequest, PayoutBatchRequest,
-    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PortalApp, PortalConfig,
-    PortalRepository, PortalSecrets, ProvisionedWorker, ReceiverKind, RepositoryError,
-    RepositoryFuture, RewardSummary, SignerError, TestnetPayoutBoundary, UnavailableMinerTelemetry,
-    UnavailablePoolData, ValidatedDestination, WorkerSummary,
+    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolOverview, PortalApp,
+    PortalConfig, PortalRepository, PortalSecrets, ProvisionedWorker, ReceiverKind,
+    RepositoryError, RepositoryFuture, RewardSummary, SignerError, TestnetPayoutBoundary,
+    UnavailableMinerTelemetry, UnavailablePoolData, ValidatedDestination, WorkerSummary,
 };
 
 const ORIGIN: &str = "https://testnet.zecwec.com";
@@ -695,6 +695,25 @@ fn fixture_totp(encoded_secret: &str, now: u64) -> String {
 
 struct ReadySigner;
 
+#[derive(Default)]
+struct FixturePoolData(AtomicBool);
+
+impl FixturePoolData {
+    fn ready() -> Self {
+        Self(AtomicBool::new(true))
+    }
+}
+
+impl PoolDataSource for FixturePoolData {
+    fn overview(&self) -> PoolOverview {
+        PoolOverview::default()
+    }
+
+    fn mining_ready(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 impl IsolatedPayoutSigner for ReadySigner {
     fn readiness(&self) -> Result<(), SignerError> {
         Ok(())
@@ -709,6 +728,22 @@ impl IsolatedPayoutSigner for ReadySigner {
 }
 
 struct BlockingReadinessSigner;
+
+struct PausingReadinessSigner(Arc<FixturePoolData>);
+
+impl IsolatedPayoutSigner for PausingReadinessSigner {
+    fn readiness(&self) -> Result<(), SignerError> {
+        self.0.as_ref().0.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sign_and_broadcast(
+        &self,
+        _request: &PayoutBatchRequest,
+    ) -> Result<BroadcastReceipt, SignerError> {
+        Err(SignerError::Rejected)
+    }
+}
 
 impl IsolatedPayoutSigner for BlockingReadinessSigner {
     fn readiness(&self) -> Result<(), SignerError> {
@@ -746,7 +781,7 @@ fn portal_with_repository_and_telemetry(
         PortalSecrets::new([3; 32], [7; 32]),
         repository,
         Arc::new(FixtureValidator),
-        Arc::new(UnavailablePoolData),
+        Arc::new(FixturePoolData::ready()),
         telemetry,
         Arc::new(TestnetPayoutBoundary::new(Arc::new(ReadySigner))),
         clock,
@@ -1213,6 +1248,78 @@ fn unavailable_overview_is_explicit() {
     let overview = UnavailablePoolData.overview();
     assert!(!overview.available);
     assert_eq!(overview.hashrate_sol_s, None);
+    assert!(!UnavailablePoolData.mining_ready());
+}
+
+#[tokio::test]
+async fn readiness_tracks_mining_pause_and_resume_without_losing_overview() {
+    let pool_data = Arc::new(FixturePoolData::ready());
+    let app = PortalApp::with_clock(
+        PortalConfig::testnet(),
+        PortalSecrets::new([3; 32], [7; 32]),
+        Arc::new(MemoryRepository::default()),
+        Arc::new(FixtureValidator),
+        pool_data.clone(),
+        Arc::new(TestnetPayoutBoundary::new(Arc::new(ReadySigner))),
+        Arc::new(FixedClock::default()),
+    )
+    .expect("valid mining-readiness portal")
+    .router();
+
+    for (ready, expected) in [
+        (true, StatusCode::OK),
+        (false, StatusCode::SERVICE_UNAVAILABLE),
+        (true, StatusCode::OK),
+    ] {
+        pool_data.0.store(ready, Ordering::SeqCst);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/readyz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("readiness response");
+        assert_eq!(response.status(), expected);
+        let overview = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("overview response");
+        assert_eq!(overview.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn readiness_rechecks_mining_after_awaiting_other_dependencies() {
+    let pool_data = Arc::new(FixturePoolData::ready());
+    let app = PortalApp::with_clock(
+        PortalConfig::testnet(),
+        PortalSecrets::new([3; 32], [7; 32]),
+        Arc::new(MemoryRepository::default()),
+        Arc::new(FixtureValidator),
+        pool_data.clone(),
+        Arc::new(TestnetPayoutBoundary::new(Arc::new(
+            PausingReadinessSigner(pool_data),
+        ))),
+        Arc::new(FixedClock::default()),
+    )
+    .expect("valid mining-readiness portal")
+    .router();
+    let response = app
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -1240,7 +1347,7 @@ async fn readiness_fails_closed_without_signer() {
         PortalSecrets::new([3; 32], [7; 32]),
         Arc::new(MemoryRepository::default()),
         Arc::new(FixtureValidator),
-        Arc::new(UnavailablePoolData),
+        Arc::new(FixturePoolData::ready()),
         Arc::new(TestnetPayoutBoundary::new(Arc::new(DisabledPayoutSigner))),
         clock,
     )
@@ -1266,7 +1373,7 @@ async fn readiness_times_out_without_blocking_tokio_workers() {
         PortalSecrets::new([3; 32], [7; 32]),
         Arc::new(MemoryRepository::default()),
         Arc::new(FixtureValidator),
-        Arc::new(UnavailablePoolData),
+        Arc::new(FixturePoolData::ready()),
         Arc::new(TestnetPayoutBoundary::new(Arc::new(
             BlockingReadinessSigner,
         ))),

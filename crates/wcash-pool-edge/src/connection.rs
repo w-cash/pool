@@ -562,7 +562,8 @@ impl ConnectionActor {
                 | ShareRouterError::EventConsumerUnusable
                 | ShareRouterError::TaskFailed
                 | ShareRouterError::BackendNotLive
-                | ShareRouterError::BackendConnectionMismatch,
+                | ShareRouterError::BackendConnectionMismatch
+                | ShareRouterError::BackendHealthDeadline,
             ) => {
                 self.queue_error(
                     response_id,
@@ -611,7 +612,9 @@ impl ConnectionActor {
     /// Removes assignments no longer admitted by Wolf's exact local lifetime.
     pub fn reconcile_jobs(&mut self) -> Result<(), ConnectionActorError> {
         self.require_open()?;
-        let admissible: HashSet<_> = self.router.admissible_job_ids()?.into_iter().collect();
+        // A health pause blocks admission without revoking the generation's
+        // immutable target assignment. Only real expiry/invalidation removes it.
+        let admissible: HashSet<_> = self.router.retained_job_ids()?.into_iter().collect();
         self.assignments.retain(|job_id, _| {
             if admissible.contains(job_id) {
                 true
@@ -801,25 +804,34 @@ impl ConnectionActor {
         } else if self.assignments.contains_key(&generation.id()) {
             return Ok(());
         }
-        let binding = match self.vardiff.as_mut() {
-            Some(vardiff) => vardiff.update_network_targets(
-                generation.wcash_network_target(),
-                generation.zcash_network_target(),
-            )?,
-            None => {
-                let vardiff = VardiffController::new(
-                    self.policy.vardiff,
+        let binding = if let Some(binding) = self.assignments.get(&generation.id()) {
+            // A clean reannouncement may resume the same generation after a
+            // health pause. Its nonce namespace and target attribution cannot
+            // change; a pending vardiff adjustment belongs to a new generation.
+            *binding
+        } else {
+            match self.vardiff.as_mut() {
+                Some(vardiff) => vardiff.update_network_targets(
                     generation.wcash_network_target(),
                     generation.zcash_network_target(),
-                    self.policy.initial_target,
-                    1,
-                )?;
-                let binding = vardiff.binding();
-                self.vardiff = Some(vardiff);
-                binding
+                )?,
+                None => {
+                    let vardiff = VardiffController::new(
+                        self.policy.vardiff,
+                        generation.wcash_network_target(),
+                        generation.zcash_network_target(),
+                        self.policy.initial_target,
+                        1,
+                    )?;
+                    let binding = vardiff.binding();
+                    self.vardiff = Some(vardiff);
+                    binding
+                }
             }
         };
-        let send_target = self.current_assigned_target()? != Some(binding.target());
+        // An idle miner may have received a provisional suggestion response
+        // during a pause. Reassert the exact target on every clean notification.
+        let send_target = clean_jobs || self.current_assigned_target()? != Some(binding.target());
         let required = usize::from(send_target) + 1;
         self.ensure_outbound_capacity(required)?;
 
@@ -1410,6 +1422,59 @@ mod tests {
             .expect("duplicate activation is harmless");
         assert!(actor.pop_outbound().is_none());
         assert_eq!(actor.assignments.get(&generation.id()), Some(&original));
+    }
+
+    #[test]
+    fn clean_reannouncement_preserves_immutable_target_and_nonce_after_vardiff_change() {
+        let mut actor = actor(8);
+        authorize(&mut actor);
+        while actor.pop_outbound().is_some() {}
+        let original = actor.binding().expect("vardiff exists");
+        let generation = actor
+            .router
+            .current_generation()
+            .expect("query succeeds")
+            .expect("generation exists");
+        let submission = |actor: &ConnectionActor| {
+            actor.router.prepare_submission(
+                &actor.session,
+                "account.rig",
+                generation.id(),
+                generation.header_time(),
+                NonceSuffix::TwentyEight(Hex28::new([0xa5; 28])),
+                Box::new(Hex1344::new([0; 1344])),
+            )
+        };
+        let before = submission(&actor).expect("original assignment admits work");
+        let vardiff = actor.vardiff.as_mut().expect("vardiff exists");
+        vardiff.tick(0).expect("clock starts");
+        assert!(matches!(
+            vardiff.tick(120_001).expect("inactivity update succeeds"),
+            wcash_pool_core::VardiffUpdate::Changed { .. }
+        ));
+        let pending = actor.binding().expect("new vardiff binding exists");
+        assert_ne!(pending, original);
+
+        actor
+            .announce_generation(&generation, true)
+            .expect("same-generation clean resume succeeds");
+        assert!(matches!(
+            actor.pop_outbound(),
+            Some(Zip301ServerMessage::SetTarget { target_be })
+                if target_be == original.target().to_zip301()
+        ));
+        let notify = pop_notify(&mut actor);
+        assert!(notify.clean_jobs);
+        assert_eq!(notify.job_id, generation.id().to_protocol());
+        assert!(actor.pop_outbound().is_none());
+        assert!(!actor.is_closed());
+        assert_eq!(actor.assignments.get(&generation.id()), Some(&original));
+        assert_eq!(actor.binding(), Some(pending), "vardiff remains pending");
+
+        let after = submission(&actor).expect("resumed assignment admits work");
+        assert_eq!(after.target_le(), before.target_le());
+        assert_eq!(after.nonce(), before.nonce());
+        assert_eq!(after.time(), before.time());
     }
 
     #[test]

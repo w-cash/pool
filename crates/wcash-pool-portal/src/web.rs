@@ -238,6 +238,9 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+    if !state.pool_data.mining_ready() {
+        return Err(AppError::Unavailable);
+    }
     state.store.readiness().await?;
     if !state.store.payout_worker_is_live().await? {
         return Err(AppError::Unavailable);
@@ -245,6 +248,10 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
     address_validator_readiness(&state, Asset::Wec).await?;
     address_validator_readiness(&state, Asset::Zec).await?;
     state.payout.readiness_bounded(READINESS_TIMEOUT).await?;
+    // Mining can pause while the other dependency checks are awaiting I/O.
+    if !state.pool_data.mining_ready() {
+        return Err(AppError::Unavailable);
+    }
     Ok(Json(json!({
         "ready": true,
         "component": "miner-portal",

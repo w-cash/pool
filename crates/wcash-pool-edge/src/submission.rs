@@ -1,6 +1,11 @@
 //! Bounded serialization of shares and live events through one Wolf client.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::{
@@ -20,6 +25,7 @@ use crate::JobRouter;
 const MAXIMUM_QUEUE_CAPACITY: usize = 4_096;
 const MAXIMUM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const MAXIMUM_EVENT_CONSUMER_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKEND_HEALTH_GRACE: Duration = Duration::from_secs(30);
 
 /// Finite queue and time policy for the one live Wolf actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +154,7 @@ enum SubmitCommand {
 
 enum ActorWork {
     Heartbeat,
+    HealthDeadline,
     Command(Option<SubmitCommand>),
 }
 
@@ -186,6 +193,7 @@ impl ShareRouterHandle {
 pub struct ShareRouter {
     handle: ShareRouterHandle,
     task: JoinHandle<()>,
+    terminal_error: Arc<Mutex<Option<ShareRouterError>>>,
 }
 
 impl ShareRouter {
@@ -227,7 +235,9 @@ impl ShareRouter {
         let (sender, receiver) = mpsc::channel(config.queue_capacity());
         let handle = ShareRouterHandle { sender };
         let first_heartbeat_deadline = Instant::now() + config.heartbeat_interval();
-        let task = tokio::spawn(run_submission_actor(
+        let terminal_error = Arc::new(Mutex::new(None));
+        let actor_error = terminal_error.clone();
+        let actor = run_submission_actor(
             client,
             job_router,
             receiver,
@@ -235,8 +245,19 @@ impl ShareRouter {
             config,
             event_consumer,
             first_heartbeat_deadline,
-        ));
-        Ok(Self { handle, task })
+        );
+        let task = tokio::spawn(async move {
+            if let Err(error) = actor.await {
+                if let Ok(mut terminal) = actor_error.lock() {
+                    *terminal = Some(error);
+                }
+            }
+        });
+        Ok(Self {
+            handle,
+            task,
+            terminal_error,
+        })
     }
 
     /// Returns a producer for connection actors.
@@ -252,6 +273,13 @@ impl ShareRouter {
         self.task.is_finished()
     }
 
+    /// Returns the stable terminal category without raw backend or storage detail.
+    pub fn terminal_error(&self) -> Option<ShareRouterError> {
+        self.terminal_error
+            .lock()
+            .map_or(Some(ShareRouterError::TaskFailed), |error| error.clone())
+    }
+
     /// Stops accepting work after draining commands queued before shutdown.
     ///
     /// The currently executing bounded backend exchange and shares ahead of the
@@ -260,17 +288,19 @@ impl ShareRouter {
     /// cloned handles therefore cannot keep shutdown alive indefinitely.
     pub async fn shutdown(mut self) -> Result<(), ShareRouterError> {
         let (complete, acknowledged) = oneshot::channel();
-        self.handle
+        let sent = self
+            .handle
             .sender
             .send(SubmitCommand::Shutdown { complete })
             .await
-            .map_err(|_| ShareRouterError::Unavailable)?;
-        acknowledged
-            .await
-            .map_err(|_| ShareRouterError::TaskFailed)?;
+            .is_ok();
+        if sent {
+            let _ = acknowledged.await;
+        }
         (&mut self.task)
             .await
-            .map_err(|_| ShareRouterError::TaskFailed)
+            .map_err(|_| ShareRouterError::TaskFailed)?;
+        self.terminal_error().map_or(Ok(()), Err)
     }
 }
 
@@ -291,36 +321,83 @@ async fn run_submission_actor(
     config: ShareRouterConfig,
     event_consumer: Arc<dyn BackendEventConsumer>,
     first_heartbeat_deadline: Instant,
-) {
+) -> Result<(), ShareRouterError> {
     let mut heartbeat = interval_at(first_heartbeat_deadline, config.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut health_deadline = None;
 
     loop {
         let work = tokio::select! {
             // Once due, one health exchange wins over an already-ready submission.
             // This bounds event lag while the submission queue remains non-empty.
             biased;
+            _ = async {
+                match health_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => ActorWork::HealthDeadline,
             _ = heartbeat.tick() => ActorWork::Heartbeat,
             command = receiver.recv() => ActorWork::Command(command),
         };
         match work {
             ActorWork::Heartbeat => {
-                if pump_health(
+                let health = pump_health(
                     &mut client,
                     &job_router,
                     event_consumer.as_ref(),
                     config.event_consumer_timeout(),
-                )
-                .await
-                .is_err()
-                {
+                );
+                let health = match health_deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, health)
+                        .await
+                        .unwrap_or(Err(ShareRouterError::BackendHealthDeadline)),
+                    None => health.await,
+                };
+                let result = if health_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    Err(ShareRouterError::BackendHealthDeadline)
+                } else {
+                    match health {
+                        Ok((healthy, observed_at)) => {
+                            if !healthy {
+                                health_deadline.get_or_insert(observed_at + BACKEND_HEALTH_GRACE);
+                            }
+                            if health_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                Err(ShareRouterError::BackendHealthDeadline)
+                            } else if healthy {
+                                let resumed = job_router
+                                    .resume_after_health(&client)
+                                    .map_err(|_| ShareRouterError::JobStreamUnusable);
+                                health_deadline = None;
+                                resumed
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                if let Err(error) = result {
                     suspension.suspend();
                     receiver.close();
                     fail_pending(&mut receiver).await;
-                    break;
+                    return Err(error);
                 }
             }
+            ActorWork::HealthDeadline => {
+                suspension.suspend();
+                receiver.close();
+                fail_pending(&mut receiver).await;
+                return Err(ShareRouterError::BackendHealthDeadline);
+            }
             ActorWork::Command(Some(SubmitCommand::Share { context, response })) => {
+                if health_deadline.is_some() {
+                    // Contexts queued before the health response must not bypass
+                    // the pause. Preserve the connection with a normal stale job.
+                    let _ =
+                        response.send(Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob)));
+                    continue;
+                }
                 // This guard is declared after `response`, so unwinding or task
                 // cancellation suspends admission before dropping the response
                 // sender and waking its caller with an unavailable result.
@@ -342,8 +419,9 @@ async fn run_submission_actor(
                 let terminal = result
                     .as_ref()
                     .err()
-                    .is_some_and(ShareRouterError::is_terminal);
-                if terminal {
+                    .filter(|error| error.is_terminal())
+                    .cloned();
+                if terminal.is_some() {
                     // Stop every current and future miner session before exposing
                     // the terminal share outcome to its caller.
                     response_suspension.suspend();
@@ -352,10 +430,10 @@ async fn run_submission_actor(
                 }
                 drop(response_suspension);
                 let _ = response.send(result);
-                if terminal {
+                if let Some(error) = terminal {
                     receiver.close();
                     fail_pending(&mut receiver).await;
-                    break;
+                    return Err(error);
                 }
             }
             ActorWork::Command(Some(SubmitCommand::Shutdown { complete })) => {
@@ -368,6 +446,7 @@ async fn run_submission_actor(
             ActorWork::Command(None) => break,
         }
     }
+    Ok(())
 }
 
 /// Ensures cancellation, panic, or loss of every producer cannot leave stale work live.
@@ -443,18 +522,38 @@ async fn pump_health(
     job_router: &JobRouter,
     event_consumer: &dyn BackendEventConsumer,
     event_consumer_timeout: Duration,
-) -> Result<(), ShareRouterError> {
+) -> Result<(bool, Instant), ShareRouterError> {
     // Drain any valid events received before a failing response as well. Their
     // durable journal facts remain authoritative even when this stream is terminal.
     let health = client.health().await.map_err(ShareRouterError::from_client);
-    drain_backend_events(client, job_router, event_consumer, event_consumer_timeout).await?;
-    let health = health?;
-    if !health.healthy {
-        return Err(ShareRouterError::Rejected(
-            BackendErrorCode::BackendUnhealthy,
-        ));
+    let observed_at = Instant::now();
+    let unhealthy = health.as_ref().is_ok_and(|health| !health.healthy);
+    if unhealthy {
+        job_router
+            .pause_for_health(client)
+            .map_err(|_| ShareRouterError::JobStreamUnusable)?;
     }
-    Ok(())
+    if unhealthy {
+        let deadline = observed_at + BACKEND_HEALTH_GRACE;
+        let drained = tokio::time::timeout_at(
+            deadline,
+            drain_backend_events(
+                client,
+                job_router,
+                event_consumer,
+                event_consumer_timeout.min(BACKEND_HEALTH_GRACE),
+            ),
+        )
+        .await;
+        if Instant::now() >= deadline {
+            return Err(ShareRouterError::BackendHealthDeadline);
+        }
+        drained.map_err(|_| ShareRouterError::BackendHealthDeadline)??;
+    } else {
+        drain_backend_events(client, job_router, event_consumer, event_consumer_timeout).await?;
+    }
+    let health = health?;
+    Ok((health.healthy, observed_at))
 }
 
 async fn drain_backend_events(
@@ -550,6 +649,9 @@ pub enum ShareRouterError {
     /// The mandatory event consumer rejected or timed out on a live journal batch.
     #[error("backend event consumer is unavailable")]
     EventConsumerUnusable,
+    /// An authenticated unhealthy status outlasted the bounded job-rollover window.
+    #[error("backend remained unhealthy beyond the 30-second job-rollover deadline")]
+    BackendHealthDeadline,
     /// Wolf rejected the exact share with a stable protocol category.
     #[error("backend rejected share with {0:?}")]
     Rejected(BackendErrorCode),
@@ -577,6 +679,7 @@ impl ShareRouterError {
                 | Self::EventConsumerUnusable
                 | Self::TaskFailed
                 | Self::BackendConnectionMismatch
+                | Self::BackendHealthDeadline
         ) || matches!(self, Self::Rejected(BackendErrorCode::BackendUnhealthy))
     }
 }
@@ -951,7 +1054,11 @@ mod tests {
             let _ = started.send(());
             future::pending::<()>().await;
         });
-        let service = ShareRouter { handle, task };
+        let service = ShareRouter {
+            handle,
+            task,
+            terminal_error: Arc::new(Mutex::new(None)),
+        };
         actor_started.await?;
 
         let shutdown = tokio::spawn(service.shutdown());
@@ -1192,6 +1299,338 @@ mod tests {
 
         service.shutdown().await?;
         server.await??;
+        Ok(())
+    }
+
+    async fn reply_health(
+        stream: &mut UnixStream,
+        id: u64,
+        event_seq: u64,
+        healthy: bool,
+    ) -> TestResult {
+        write_message(
+            stream,
+            &BackendMessage::HealthStatus {
+                version: BACKEND_PROTOCOL_VERSION,
+                id,
+                event_seq,
+                healthy,
+                pending_wcash: 0,
+                quarantined_wcash: 0,
+                pending_zcash: 0,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unhealthy_rollover_preserves_stream_and_rejects_prequeued_submission() -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let first = descriptor(0x61);
+        let second = descriptor(0x62);
+        let server_first = first.clone();
+        let (pause_started, pausing) = oneshot::channel();
+        let (allow_pause, pause_allowed) = oneshot::channel();
+        let (allow_resume, resume_allowed) = oneshot::channel();
+        let (finish_server, server_finished) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            establish_live_stream(&mut stream, server_first).await?;
+            let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("initial heartbeat missing".into());
+            };
+            reply_health(&mut stream, id, 10, true).await?;
+            let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("rollover heartbeat missing".into());
+            };
+            let _ = pause_started.send(());
+            pause_allowed.await?;
+            reply_health(&mut stream, id, 10, false).await?;
+
+            // A context queued before the false status must not reach the wire.
+            let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("paused actor transmitted a queued share".into());
+            };
+            resume_allowed.await?;
+            write_message(
+                &mut stream,
+                &BackendMessage::Event {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    event: BackendEvent::JobActivated {
+                        event_seq: 11,
+                        job: second.clone(),
+                    },
+                },
+            )
+            .await?;
+            reply_health(&mut stream, id, 11, true).await?;
+            let share = read_request(&mut stream).await?;
+            commit_share(&mut stream, share, &second, 12).await?;
+            server_finished.await?;
+            TestResult::Ok(())
+        });
+        let timeline = MonotonicTimeline::new();
+        let mut client = BackendClient::connect(client_config(&socket.path)?, uuid(9), 10).await?;
+        let snapshot = client.subscribe_jobs(10).await?;
+        let router =
+            JobRouter::from_snapshot(&snapshot, GenerationRegistryConfig::new(2, 8)?, timeline, 8)?;
+        let queued_context = prepared_context(&router, 0x51)?;
+        let old_generation = router
+            .current_generation()?
+            .ok_or("missing initial generation")?;
+        let mut updates = router.subscribe();
+        let consumer = Arc::new(RecordingEventConsumer::default());
+        let service = ShareRouter::spawn(
+            client,
+            router.clone(),
+            ShareRouterConfig::new(2, Duration::from_millis(30), Duration::from_secs(1))?,
+            consumer.clone(),
+        )
+        .await?;
+        let handle = service.handle();
+        pausing.await?;
+        let (response, result) = oneshot::channel();
+        handle
+            .sender
+            .try_send(SubmitCommand::Share {
+                context: queued_context,
+                response,
+            })
+            .map_err(|_| "could not enqueue context during health exchange")?;
+        let _ = allow_pause.send(());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while router.current_generation().ok().flatten().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(router.current_generation()?.is_none());
+        assert!(router.admissible_job_ids()?.is_empty());
+        assert_eq!(router.retained_job_ids()?, vec![old_generation.id()]);
+        assert_eq!(
+            result.await?,
+            Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob))
+        );
+        let session = wcash_pool_core::MiningSession::new(Uuid::from_u128(4), 2)?;
+        assert!(matches!(
+            router.prepare_submission(
+                &session,
+                "account.worker",
+                old_generation.id(),
+                old_generation.header_time(),
+                NonceSuffix::TwentyEight(Hex28::new([0x52; 28])),
+                Box::new(Hex1344::new([0x61; 1_344]))
+            ),
+            Err(JobRouterError::Session(
+                wcash_pool_core::SessionError::Registry(
+                    wcash_pool_core::JobRegistryError::StaleJob(_)
+                )
+            ))
+        ));
+        assert!(!service.is_finished());
+        let _ = allow_resume.send(());
+        assert!(
+            matches!(updates.receive().await?, JobUpdate::Activated { generation, clean_jobs: true }
+            if generation.id().into_bytes() == [0x62; 32])
+        );
+        assert_eq!(
+            router
+                .current_generation()?
+                .ok_or("rollover did not resume")?
+                .id()
+                .into_bytes(),
+            [0x62; 32]
+        );
+        assert_eq!(
+            handle
+                .submit(prepared_context(&router, 0x53)?)
+                .await?
+                .receipt()
+                .event_seq,
+            12
+        );
+        assert_eq!(
+            consumer
+                .events()?
+                .iter()
+                .map(BackendEvent::event_seq)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        service.shutdown().await?;
+        let _ = finish_server.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unhealthy_rollover_deadline_is_finite_and_not_extended_by_repeated_status(
+    ) -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            establish_live_stream(&mut stream, descriptor(0x63)).await?;
+            while let Ok(request) = read_request(&mut stream).await {
+                let BackendRequest::Health { id, .. } = request else {
+                    return TestResult::Err("paused actor sent a non-health request".into());
+                };
+                reply_health(&mut stream, id, 10, false).await?;
+            }
+            TestResult::Ok(())
+        });
+        let timeline = MonotonicTimeline::new();
+        let mut client = BackendClient::connect(client_config(&socket.path)?, uuid(9), 10).await?;
+        let snapshot = client.subscribe_jobs(10).await?;
+        let router =
+            JobRouter::from_snapshot(&snapshot, GenerationRegistryConfig::new(2, 8)?, timeline, 8)?;
+        let mut updates = router.subscribe();
+        let service = ShareRouter::spawn(
+            client,
+            router.clone(),
+            ShareRouterConfig::new(2, Duration::from_secs(10), Duration::from_secs(1))?,
+            Arc::new(RecordingEventConsumer::default()),
+        )
+        .await?;
+        // Keep real Unix I/O from causing automatic virtual-time jumps.
+        let (stop_guard, mut guard_stopped) = oneshot::channel();
+        let guard = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut guard_stopped => break,
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        });
+        tokio::time::advance(Duration::from_secs(10)).await;
+        while router.current_generation()?.is_some() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(29)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!service.is_finished());
+        assert!(router.current_generation()?.is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        while !service.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            service.terminal_error(),
+            Some(ShareRouterError::BackendHealthDeadline)
+        );
+        assert!(matches!(updates.receive().await?, JobUpdate::Suspended));
+        assert_eq!(
+            service.shutdown().await,
+            Err(ShareRouterError::BackendHealthDeadline)
+        );
+        let _ = stop_guard.send(());
+        guard.await?;
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unhealthy_rollover_deadline_includes_first_batch_and_following_rpc() -> TestResult {
+        for stall_following_rpc in [false, true] {
+            let socket = TestSocket::new()?;
+            let listener = UnixListener::bind(&socket.path)?;
+            let (finish_peer, peer_finished) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                establish_live_stream(&mut stream, descriptor(0x64)).await?;
+                let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                    return TestResult::Err("initial heartbeat missing".into());
+                };
+                if !stall_following_rpc {
+                    write_message(
+                        &mut stream,
+                        &BackendMessage::Event {
+                            version: BACKEND_PROTOCOL_VERSION,
+                            event: BackendEvent::JobActivated {
+                                event_seq: 11,
+                                job: descriptor(0x65),
+                            },
+                        },
+                    )
+                    .await?;
+                }
+                reply_health(
+                    &mut stream,
+                    id,
+                    if stall_following_rpc { 10 } else { 11 },
+                    false,
+                )
+                .await?;
+                if stall_following_rpc
+                    && !matches!(
+                        read_request(&mut stream).await?,
+                        BackendRequest::Health { .. }
+                    )
+                {
+                    return TestResult::Err("paused actor sent non-health request".into());
+                }
+                peer_finished.await?;
+                TestResult::Ok(())
+            });
+            let timeline = MonotonicTimeline::new();
+            let config = client_config(&socket.path)?
+                .with_timeouts(Duration::from_secs(1), Duration::from_secs(60))?;
+            let mut client = BackendClient::connect(config, uuid(9), 10).await?;
+            let snapshot = client.subscribe_jobs(10).await?;
+            let router = JobRouter::from_snapshot(
+                &snapshot,
+                GenerationRegistryConfig::new(2, 8)?,
+                timeline,
+                8,
+            )?;
+            let consumer: Arc<dyn BackendEventConsumer> = if stall_following_rpc {
+                Arc::new(RecordingEventConsumer::default())
+            } else {
+                Arc::new(PendingEventConsumer)
+            };
+            let service = ShareRouter::spawn(
+                client,
+                router.clone(),
+                ShareRouterConfig::new(2, Duration::from_secs(10), Duration::from_secs(60))?,
+                consumer,
+            )
+            .await?;
+            let (stop_guard, mut guard_stopped) = oneshot::channel();
+            let guard = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut guard_stopped => break,
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
+            });
+            tokio::time::advance(Duration::from_secs(10)).await;
+            while router.current_generation()?.is_some() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(29)).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!service.is_finished());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            while !service.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                service.shutdown().await,
+                Err(ShareRouterError::BackendHealthDeadline)
+            );
+            let _ = stop_guard.send(());
+            let _ = finish_peer.send(());
+            guard.await?;
+            server.await??;
+        }
         Ok(())
     }
 
