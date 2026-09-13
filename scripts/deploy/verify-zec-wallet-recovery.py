@@ -308,8 +308,13 @@ def validate_status(value: object, label: str, accounts_exist: bool) -> int:
     expected = {"node_tip", "wallet_tip", "locked"}
     if accounts_exist:
         expected.add("fully_synced_height")
-    if set(value) != expected or value["locked"] is not False:
+    if set(value) != expected:
         fail(f"{label} is not an exact unlocked fully-synced status")
+    if accounts_exist:
+        if value["locked"] is not False:
+            fail(f"{label} is not an exact unlocked fully-synced status")
+    elif value["locked"] is not True and value["locked"] is not False:
+        fail(f"{label} has an invalid synchronization-lock state")
     node_height, node_hash = validate_tip(value["node_tip"], f"{label} node tip")
     wallet_height, wallet_hash = validate_tip(value["wallet_tip"], f"{label} wallet tip")
     if (wallet_height, wallet_hash) != (node_height, node_hash):
