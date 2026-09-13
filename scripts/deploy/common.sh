@@ -215,6 +215,32 @@ systemctl_value_strict() {
     printf '%s\n' "$value"
 }
 
+require_inactive_unit_process_state() {
+    local unit=${1:?unit is required}
+    local field value
+    require_command systemctl
+    case $unit in
+        *.service | *.target | *.timer | *.path) ;;
+        *) die "unsupported managed systemd unit type: $unit" ;;
+    esac
+    for field in MainPID ControlPID; do
+        value=$(systemctl show --property="$field" --value "$unit") \
+            || die "could not inspect $field for $unit"
+        [[ $value != *$'\n'* ]] \
+            || die "systemd returned an ambiguous $field for $unit"
+        case $unit in
+            *.service)
+                [[ $value == 0 ]] \
+                    || die "$unit retains a service process"
+                ;;
+            *.target | *.timer | *.path)
+                [[ -z $value || $value == 0 ]] \
+                    || die "$unit returned an unexpected process identifier"
+                ;;
+        esac
+    done
+}
+
 require_unit_without_dropins() {
     local unit=${1:?systemd unit is required}
     local paths
@@ -231,10 +257,10 @@ require_loaded_unit_fully_inactive() {
     local unit=${1:?unit is required}
     [[ $(systemctl_value_strict "$unit" LoadState) == loaded \
         && $(systemctl_value_strict "$unit" ActiveState) == inactive \
-        && $(systemctl_value_strict "$unit" SubState) == dead \
-        && $(systemctl_value_strict "$unit" MainPID) == 0 \
-        && $(systemctl_value_strict "$unit" ControlPID) == 0 ]] \
+        && $(systemctl_value_strict "$unit" SubState) == dead ]] \
         || die "$unit is not loaded and fully inactive"
+
+    require_inactive_unit_process_state "$unit"
 }
 
 # Stop a unit when it exists, but allow an older release not to have introduced
@@ -494,7 +520,7 @@ require_deployment_source_tree_safe() {
 }
 
 stop_backend_units_for_zec_sealing() {
-    local unit field expected actual
+    local unit
     require_command systemctl
     for unit in \
         zecwec-testnet-pool-start.service \
@@ -515,16 +541,7 @@ stop_backend_units_for_zec_sealing() {
             || die "backend-capable service is missing or not loaded"
         systemctl stop "$unit" >/dev/null 2>&1 \
             || die "could not stop a backend-capable service before sealing"
-        for field in ActiveState SubState MainPID ControlPID; do
-            case $field in
-                ActiveState) expected=inactive ;;
-                SubState) expected=dead ;;
-                MainPID | ControlPID) expected=0 ;;
-            esac
-            actual=$(systemctl_value_strict "$unit" "$field")
-            [[ $actual == "$expected" ]] \
-                || die "backend-capable service is not fully inactive before sealing"
-        done
+        require_loaded_unit_fully_inactive "$unit"
     done
     require_no_processes_for_user wcash-pool-backend "backend identity"
 }

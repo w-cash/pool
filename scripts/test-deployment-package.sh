@@ -2113,6 +2113,10 @@ case $1 in
             stop-failure:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
             nonzero-pid:wcash-pool.service:LoadState) printf 'not-found\n' ;;
             nonzero-pid:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
+            empty-service:wcash-pool.service:LoadState) printf 'not-found\n' ;;
+            empty-service:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
+            processless-nonzero:wcash-pool.service:LoadState) printf 'not-found\n' ;;
+            processless-nonzero:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
             *:zecwec-testnet-pool.target:ActiveState \
                 | *:wcash-pool.service:ActiveState \
                 | *:wcash-pool-projector.service:ActiveState \
@@ -2128,15 +2132,20 @@ case $1 in
                 printf 'dead\n'
                 ;;
             nonzero-pid:wcash-pool-wallet-init.service:MainPID) printf '17\n' ;;
+            empty-service:wcash-pool-wallet-init.service:MainPID) : ;;
+            processless-nonzero:zecwec-testnet-pool.target:MainPID) printf '17\n' ;;
             *:zecwec-testnet-pool.target:MainPID \
-                | *:wcash-pool.service:MainPID \
+                | *:zecwec-testnet-pool.target:ControlPID)
+                # Real systemd target units expose neither process property.
+                :
+                ;;
+            *:wcash-pool.service:MainPID \
                 | *:wcash-pool-projector.service:MainPID \
                 | *:wcash-payout-worker.service:MainPID \
                 | *:wcash-pool-wallet-init.service:MainPID)
                 printf '0\n'
                 ;;
-            *:zecwec-testnet-pool.target:ControlPID \
-                | *:wcash-pool.service:ControlPID \
+            *:wcash-pool.service:ControlPID \
                 | *:wcash-pool-projector.service:ControlPID \
                 | *:wcash-payout-worker.service:ControlPID \
                 | *:wcash-pool-wallet-init.service:ControlPID)
@@ -2188,7 +2197,8 @@ run_custody_systemctl_scenario expected pass
         printf 'deployment-package-test: custody seal did not stop exactly the loaded wallet unit\n' >&2
         exit 1
     }
-for scenario in missing-wallet masked-pool stop-failure nonzero-pid; do
+for scenario in missing-wallet masked-pool stop-failure nonzero-pid \
+    empty-service processless-nonzero; do
     run_custody_systemctl_scenario "$scenario" fail
 done
 
@@ -2207,9 +2217,14 @@ case $1 in
         unit=$4
         case "$SYSTEMCTL_SCENARIO:$unit:$property" in
             active-backend:wcash-pool-backend.service:MainPID) printf '17\n' ;;
+            empty-service:wcash-pool-backend.service:MainPID) : ;;
+            processless-nonzero:wcash-pool-health.timer:MainPID) printf '17\n' ;;
             *:*:LoadState) printf 'loaded\n' ;;
             *:*:ActiveState) printf 'inactive\n' ;;
             *:*:SubState) printf 'dead\n' ;;
+            *:*.target:MainPID | *:*.target:ControlPID \
+                | *:*.timer:MainPID | *:*.timer:ControlPID \
+                | *:*.path:MainPID | *:*.path:ControlPID) : ;;
             *:*:MainPID | *:*:ControlPID) printf '0\n' ;;
             *) exit 2 ;;
         esac
@@ -2262,6 +2277,8 @@ zec_stopped_units=$(wc -l <"$zec_seal_systemctl_test/expected.stops")
     exit 1
 }
 run_zec_seal_systemctl_scenario active-backend fail
+run_zec_seal_systemctl_scenario empty-service fail
+run_zec_seal_systemctl_scenario processless-nonzero fail
 if PATH="$zec_seal_systemctl_test/bin:$temporary/fake-bin:$PATH" \
     SYSTEMCTL_SCENARIO=expected \
     SYSTEMCTL_STOP_LOG="$zec_seal_systemctl_test/rogue.stops" \
@@ -2280,15 +2297,21 @@ set -eu
 [[ $1 == show ]] || exit 2
 [[ ${UNIT_STATE_SCENARIO:-} != error ]] || exit 2
 property=${2#--property=}
-case "$UNIT_STATE_SCENARIO:$property" in
-    missing:LoadState) printf 'not-found\n' ;;
-    masked:LoadState) printf 'masked\n' ;;
-    *:LoadState) printf 'loaded\n' ;;
-    activating:ActiveState) printf 'activating\n' ;;
-    *:ActiveState) printf 'inactive\n' ;;
-    *:SubState) printf 'dead\n' ;;
-    nonzero-pid:MainPID) printf '17\n' ;;
-    *:MainPID | *:ControlPID) printf '0\n' ;;
+unit=$4
+case "$UNIT_STATE_SCENARIO:$unit:$property" in
+    missing:*:LoadState) printf 'not-found\n' ;;
+    masked:*:LoadState) printf 'masked\n' ;;
+    *:*:LoadState) printf 'loaded\n' ;;
+    activating:*:ActiveState) printf 'activating\n' ;;
+    *:*:ActiveState) printf 'inactive\n' ;;
+    *:*:SubState) printf 'dead\n' ;;
+    nonzero-pid:*.service:MainPID) printf '17\n' ;;
+    empty-service:*.service:MainPID) : ;;
+    processless-nonzero:*.target:MainPID) printf '17\n' ;;
+    *:*.target:MainPID | *:*.target:ControlPID \
+        | *:*.timer:MainPID | *:*.timer:ControlPID \
+        | *:*.path:MainPID | *:*.path:ControlPID) : ;;
+    *:*.service:MainPID | *:*.service:ControlPID) printf '0\n' ;;
     *) exit 2 ;;
 esac
 SH
@@ -2296,9 +2319,10 @@ chmod 0755 "$unit_state_test/bin/systemctl"
 run_unit_state_scenario() {
     local scenario=$1
     local expected=$2
+    local unit=${3:-zecwec-zallet.service}
     if PATH="$unit_state_test/bin:$PATH" UNIT_STATE_SCENARIO=$scenario \
         bash -c 'source "$1"; require_loaded_unit_fully_inactive "$2"' \
-        bash "$repo_root/scripts/deploy/common.sh" zecwec-zallet.service \
+        bash "$repo_root/scripts/deploy/common.sh" "$unit" \
         >/dev/null 2>&1; then
         [[ $expected == pass ]] || {
             printf 'deployment-package-test: unit state scenario %s passed unexpectedly\n' \
@@ -2314,9 +2338,14 @@ run_unit_state_scenario() {
     fi
 }
 run_unit_state_scenario expected pass
-for scenario in missing masked error activating nonzero-pid; do
+for unit in test.target test.timer test.path; do
+    run_unit_state_scenario expected pass "$unit"
+done
+for scenario in missing masked error activating nonzero-pid empty-service; do
     run_unit_state_scenario "$scenario" fail
 done
+run_unit_state_scenario processless-nonzero fail test.target
+run_unit_state_scenario expected fail test.socket
 
 dropin_test="$temporary/dropin-test"
 mkdir -p "$dropin_test/bin"
