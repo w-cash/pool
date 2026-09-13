@@ -128,6 +128,22 @@ jobs:
         env:
           WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
 
+      - name: Run required payout-effect migration regression
+        run: >-
+          cargo test --locked -p wcash-pool-store --test payout_effect_migration
+          payout_effect_fence_upgrade_waits_for_old_writer_and_is_atomic
+          -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
+      - name: Run required winner-maturity regression
+        run: >-
+          cargo test --locked -p wcash-pool-store --test winner_maturity_regression
+          winner_maturity_upgrade_and_confirmation_lock_are_deterministic
+          -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
   deployment-package:
     name: Deployment package
     runs-on: ubuntu-24.04
