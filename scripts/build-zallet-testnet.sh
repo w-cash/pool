@@ -8,6 +8,9 @@ base_commit=987382f67e622915228686e9f956c6a9c9a7514c
 upstream=https://github.com/zcash/zallet.git
 patch_dir="$repo_root/patches/zallet-v0.1.0-beta.3"
 toolchain=1.95.0
+protoc_version=25.9
+protoc_sha256=88f2d0c78a1072c4f84c59e9f9785b74849953e882a573188bc2d0518915b03e
+protoc_url="https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-x86_64.zip"
 
 [[ $# -eq 1 ]] || {
     printf 'build-zallet-testnet: usage: build-zallet-testnet.sh <output-directory>\n' >&2
@@ -19,7 +22,7 @@ output=$1
     exit 1
 }
 
-for command in cargo git install python3 rustc rustup sha256sum; do
+for command in cargo curl git install python3 rustc rustup sha256sum unzip; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'build-zallet-testnet: missing command: %s\n' "$command" >&2
         exit 1
@@ -32,6 +35,17 @@ trap 'rm -rf -- "$temporary"' EXIT
 source_dir="$temporary/source"
 target_dir="$temporary/target"
 cargo_home="$temporary/cargo-home"
+protoc_root="$temporary/protoc"
+protoc_archive="$temporary/protoc.zip"
+
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --location --fail --silent --show-error \
+    --output "$protoc_archive" "$protoc_url"
+printf '%s  %s\n' "$protoc_sha256" "$protoc_archive" | sha256sum --check --status
+install -d -m 0700 "$protoc_root"
+unzip -q "$protoc_archive" -d "$protoc_root"
+[[ -f $protoc_root/bin/protoc && ! -L $protoc_root/bin/protoc \
+    && -x $protoc_root/bin/protoc && -d $protoc_root/include ]]
 
 git init --quiet "$source_dir"
 git -C "$source_dir" remote add origin "$upstream"
@@ -52,6 +66,8 @@ unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTDOCFLAGS
 export CARGO_HOME="$cargo_home"
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="$target_dir"
+export PROTOC="$protoc_root/bin/protoc"
+export PROTOC_INCLUDE="$protoc_root/include"
 export SOURCE_DATE_EPOCH=1787546182
 export LANG=C
 export LC_ALL=C
@@ -62,6 +78,8 @@ export CXXFLAGS="-include cstdint $CFLAGS"
 install -d -m 0700 "$cargo_home"
 rustc "+$toolchain" -vV >"$temporary/rustc-version"
 cargo "+$toolchain" -vV >"$temporary/cargo-version"
+"$PROTOC" --version >"$temporary/protoc-version"
+grep -Fx "libprotoc $protoc_version" "$temporary/protoc-version" >/dev/null
 (
     cd "$source_dir"
     cargo "+$toolchain" fmt --all -- --check
@@ -85,9 +103,12 @@ python3 - \
     "$patch_dir" \
     "$temporary/rustc-version" \
     "$temporary/cargo-version" \
+    "$temporary/protoc-version" \
     "$source_dir" \
     "$output/zallet" \
-    "$temporary" <<'PY'
+    "$temporary" \
+    "$protoc_version" \
+    "$protoc_sha256" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -96,9 +117,9 @@ import sys
 
 output = pathlib.Path(sys.argv[1])
 patches = sorted(pathlib.Path(sys.argv[3]).glob("*.patch"))
-source_dir = pathlib.Path(sys.argv[6])
-binary = pathlib.Path(sys.argv[7])
-temporary = sys.argv[8].encode("utf-8")
+source_dir = pathlib.Path(sys.argv[7])
+binary = pathlib.Path(sys.argv[8])
+temporary = sys.argv[9].encode("utf-8")
 binary_bytes = binary.read_bytes()
 if temporary in binary_bytes:
     raise SystemExit("build-zallet-testnet: binary contains its temporary build path")
@@ -113,6 +134,11 @@ record = {
     "features": ["rpc-cli", "zcashd-import"],
     "rustc": pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").strip(),
     "cargo": pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").strip(),
+    "protoc": {
+        "version": pathlib.Path(sys.argv[6]).read_text(encoding="utf-8").strip(),
+        "release": sys.argv[10],
+        "archive_sha256": sys.argv[11],
+    },
     "source_date_epoch": 1787546182,
     "source_patch_sha256": hashlib.sha256(source_diff).hexdigest(),
     "binary_sha256": hashlib.sha256(binary_bytes).hexdigest(),
