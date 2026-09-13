@@ -120,6 +120,7 @@ staged evidence required before any public endpoint is listed is in the
 
 ## Documentation
 
+- [Miner and API onboarding](docs/pool-onboarding.md)
 - [Product and miner experience](docs/product-design.md)
 - [Miner portal and payout boundary](docs/miner-portal.md)
 - [Architecture and consensus boundary](docs/architecture.md)
