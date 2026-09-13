@@ -37,10 +37,10 @@ require_inactive_custody_unit() {
     local unit=$1
 
     [[ $(systemctl_value "$unit" ActiveState) == inactive \
-        && $(systemctl_value "$unit" SubState) == dead \
-        && $(systemctl_value "$unit" MainPID) == 0 \
-        && $(systemctl_value "$unit" ControlPID) == 0 ]] \
+        && $(systemctl_value "$unit" SubState) == dead ]] \
         || die "$unit is not fully inactive before sealing custody"
+
+    require_inactive_unit_process_state "$unit"
 }
 
 stop_custody_units_for_sealing() {
