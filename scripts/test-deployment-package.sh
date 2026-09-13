@@ -1548,7 +1548,7 @@ def stopped_after(unit):
 pool_config = tomllib.loads((root / "pool.runtime.toml").read_text(encoding="utf-8"))
 assert pool_config["stratum_listen"] == "0.0.0.0:3333"
 assert pool_config["portal_listen"] == "127.0.0.1:8080"
-assert "wcash-poold serve --config /etc/wcash-pool/pool.runtime.toml" in pool_unit
+assert "deployment/scripts/deploy/pool-entrypoint.sh serve" in pool_unit
 for failed_authority in ("wcash-payout-worker.service", "zecwec-zallet-payout.service"):
     assert "wcash-pool.service" in stopped_after(failed_authority), (
         f"{failed_authority} failure leaves Stratum or portal running"
@@ -2168,6 +2168,33 @@ grep -Fq 'trap refresh_failed ERR' \
 grep -Fq 'stop_testnet_runtime_after_failure' \
     "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
 grep -Fq 'wait_payout_ready.py' "$repo_root/scripts/deploy/start-testnet-pool.sh"
+# systemd 249 can retire LoadCredential mounts between separate service
+# commands. Both pool modes must retain one main entrypoint process until the
+# final daemon/probe replaces it.
+grep -Fq 'ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/pool-entrypoint.sh preflight' \
+    "$repo_root/deploy/systemd/wcash-pool-preflight.service.in"
+grep -Fq 'ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/pool-entrypoint.sh serve' \
+    "$repo_root/deploy/systemd/wcash-pool.service.in"
+if grep -Eq '^ExecStart(Pre)?=@WCASH_RELEASE_ROOT@/wcash-poold (config-check|preflight)' \
+    "$repo_root/deploy/systemd/wcash-pool-preflight.service.in" \
+    "$repo_root/deploy/systemd/wcash-pool.service.in"; then
+    printf 'deployment-package-test: pool credentials cross a service command boundary\n' >&2
+    exit 1
+fi
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/pool-entrypoint.sh" <<'PY'
+import pathlib
+import sys
+
+entrypoint = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+check = entrypoint.index('"$release_root/wcash-poold" config-check')
+probe = entrypoint.rindex('"$release_root/wcash-poold" preflight')
+serve = entrypoint.index('exec "$release_root/wcash-poold" serve')
+assert check < probe < serve
+assert 'exec "$release_root/wcash-poold" preflight' in entrypoint
+assert "/run/credentials/wcash-pool-preflight.service" in entrypoint
+assert "/run/credentials/wcash-pool.service" in entrypoint
+PY
 # shellcheck disable=SC2016
 grep -Fq '"http://$portal/readyz" 4200' \
     "$repo_root/scripts/deploy/start-testnet-pool.sh"
