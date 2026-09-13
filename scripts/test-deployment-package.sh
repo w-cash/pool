@@ -2,6 +2,7 @@
 
 set -Eeuo pipefail
 set +x
+export PYTHONDONTWRITEBYTECODE=1
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 temporary=$(mktemp -d)
@@ -27,8 +28,39 @@ shellcheck "$repo_root"/scripts/deploy/*.sh \
     "$repo_root/scripts/build-zallet-testnet.sh" \
     "$repo_root/scripts/test-zallet-patches.sh" \
     "$repo_root/scripts/test-deployment-package.sh"
+python3 "$repo_root/scripts/deploy/test_wait_payout_ready.py"
+python3 "$repo_root/scripts/deploy/test_verify_mining_firewall.py"
 
 mkdir -p "$temporary/fake-bin"
+for supported_postgres_version in 160000 160015 170000; do
+    PG_TEST_VERSION=$supported_postgres_version bash -c '
+        source "$1"
+        runuser() { printf "%s\n" "$PG_TEST_VERSION"; }
+        psql() { :; }
+        require_supported_postgres_server
+    ' sh "$repo_root/scripts/deploy/common.sh"
+done
+for rejected_postgres_version in 140024 159999 malformed '160000 170000'; do
+    if PG_TEST_VERSION=$rejected_postgres_version bash -c '
+        source "$1"
+        runuser() { printf "%s\n" "$PG_TEST_VERSION"; }
+        psql() { :; }
+        require_supported_postgres_server
+    ' sh "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        printf 'deployment-package-test: unsupported PostgreSQL version passed: %s\n' \
+            "$rejected_postgres_version" >&2
+        exit 1
+    fi
+done
+if bash -c '
+    source "$1"
+    runuser() { return 1; }
+    psql() { :; }
+    require_supported_postgres_server
+' sh "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+    printf 'deployment-package-test: failed PostgreSQL version query passed\n' >&2
+    exit 1
+fi
 # shellcheck disable=SC2016
 printf '#!/bin/sh\nexit "$PGREP_TEST_STATUS"\n' >"$temporary/fake-bin/pgrep"
 chmod 0555 "$temporary/fake-bin/pgrep"
@@ -50,6 +82,12 @@ cat >"$temporary/fake-bin/id" <<'SH'
 case "$1:$2" in
     -u:wcash-pool) printf '1101\n' ;;
     -g:wcash-pool) printf '1201\n' ;;
+    -u:wcash-pool-migrate) printf '1107\n' ;;
+    -g:wcash-pool-migrate) printf '1207\n' ;;
+    -u:wcash-payout) printf '1105\n' ;;
+    -g:wcash-payout) printf '1205\n' ;;
+    -u:wcash-pool-projector) printf '1106\n' ;;
+    -g:wcash-pool-projector) printf '1206\n' ;;
     -u:wcash-pool-backend) printf '1102\n' ;;
     -g:wcash-pool-backend) printf '1202\n' ;;
     -u:zecwec-zallet) printf '1103\n' ;;
@@ -148,6 +186,99 @@ for find_gate in \
         exit 1
     fi
 done
+
+failure_cleanup_test="$temporary/failure-cleanup-test"
+mkdir -p "$failure_cleanup_test/bin"
+cat >"$failure_cleanup_test/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >"$SYSTEMCTL_FAILURE_CLEANUP_LOG"
+exit "${SYSTEMCTL_FAILURE_CLEANUP_STATUS:-0}"
+SH
+chmod 0555 "$failure_cleanup_test/bin/systemctl"
+for cleanup_status in 0 7; do
+    cleanup_log="$failure_cleanup_test/$cleanup_status.log"
+    PATH="$failure_cleanup_test/bin:$PATH" \
+        SYSTEMCTL_FAILURE_CLEANUP_LOG=$cleanup_log \
+        SYSTEMCTL_FAILURE_CLEANUP_STATUS=$cleanup_status \
+        bash -c 'source "$1"; stop_testnet_runtime_after_failure' \
+        bash "$repo_root/scripts/deploy/common.sh"
+    [[ $(cat "$cleanup_log") == \
+        "stop zecwec-testnet-pool.target wcash-pool-health.timer wcash-payout-worker.service zecwec-zallet-payout.service wcash-pool.service wcash-pool-projector.service" ]] \
+        || {
+            printf 'deployment-package-test: failure cleanup omitted a runtime unit\n' >&2
+            exit 1
+        }
+done
+
+strict_stop_test="$temporary/strict-stop-test"
+mkdir -p "$strict_stop_test/bin"
+cat >"$strict_stop_test/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+
+case $1 in
+    show)
+        property=${2#--property=}
+        case "${STRICT_STOP_SCENARIO:?}:$property" in
+            missing:LoadState) printf 'not-found\n' ;;
+            masked:LoadState) printf 'masked\n' ;;
+            *:LoadState) printf 'loaded\n' ;;
+            stuck:ActiveState) printf 'active\n' ;;
+            *:ActiveState) printf 'inactive\n' ;;
+            *:SubState) printf 'dead\n' ;;
+            *:MainPID | *:ControlPID) printf '0\n' ;;
+            *) exit 2 ;;
+        esac
+        ;;
+    stop)
+        [[ $STRICT_STOP_SCENARIO != stop-failure ]] || exit 7
+        printf 'stop %s\n' "$2" >>"$STRICT_STOP_LOG"
+        ;;
+    reset-failed)
+        [[ $STRICT_STOP_SCENARIO != reset-failure ]] || exit 8
+        printf 'reset-failed %s\n' "$2" >>"$STRICT_STOP_LOG"
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0555 "$strict_stop_test/bin/systemctl"
+
+run_strict_stop_scenario() {
+    local scenario=$1
+    local expected=$2
+    local log="$strict_stop_test/$scenario.log"
+    : >"$log"
+    if PATH="$strict_stop_test/bin:$PATH" \
+        STRICT_STOP_SCENARIO=$scenario STRICT_STOP_LOG=$log \
+        bash -c 'source "$1"; stop_loaded_unit_strict test.service' \
+        bash "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        [[ $expected == pass ]] || {
+            printf 'deployment-package-test: strict stop accepted %s\n' "$scenario" >&2
+            exit 1
+        }
+    else
+        [[ $expected == fail ]] || {
+            printf 'deployment-package-test: strict stop rejected %s\n' "$scenario" >&2
+            exit 1
+        }
+    fi
+}
+
+run_strict_stop_scenario missing pass
+[[ ! -s $strict_stop_test/missing.log ]] || {
+    printf 'deployment-package-test: strict stop mutated an absent unit\n' >&2
+    exit 1
+}
+run_strict_stop_scenario loaded pass
+[[ $(cat "$strict_stop_test/loaded.log") == $'stop test.service\nreset-failed test.service' ]] || {
+    printf 'deployment-package-test: strict stop omitted its stop/reset sequence\n' >&2
+    exit 1
+}
+for rejected_stop_scenario in masked stop-failure reset-failure stuck; do
+    run_strict_stop_scenario "$rejected_stop_scenario" fail
+done
+
 "$repo_root/scripts/test-zallet-patches.sh" >/dev/null
 # shellcheck disable=SC2016
 [[ $(grep -Fc 'require_tcp_listener_absent "$listener"' \
@@ -167,6 +298,27 @@ grep -Fq 'require_deployment_source_tree_safe "$deployment_source"' \
 # shellcheck disable=SC2016
 grep -Fq 'require_deployment_source_tree_safe "$source_root"' \
     "$repo_root/scripts/deploy/provision-host.sh"
+# shellcheck disable=SC2016
+grep -Fq 'deployment_staging=$(mktemp -d /usr/local/share/.zecwec-deploy.new.XXXXXX)' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq 'for directory in deploy scripts docs patches; do' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+# shellcheck disable=SC2016
+grep -Fq 'mv -T -- "$deployment_staging" "$deployment_destination"' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+# shellcheck disable=SC2016
+grep -Fq 'find "$ZECWEC_LIBEXEC" -mindepth 1 -maxdepth 1 -type l -delete' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq 'patches/zallet-v0.1.0-beta.3' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq 'patches/zallet-v0.1.0-beta.3' \
+    "$repo_root/scripts/deploy/install-release.sh"
+grep -Fq 'scripts/verify-zallet-build.py' \
+    "$repo_root/scripts/deploy/install-release.sh"
+grep -Fq 'deployment/patches/zallet-v0.1.0-beta.3' \
+    "$repo_root/scripts/deploy/install-release.sh"
+grep -Fq 'deployment/patches/zallet-v0.1.0-beta.3' \
+    "$repo_root/scripts/deploy/verify-release.sh"
 grep -Fq 'deployment package file inventory cannot be inspected' \
     "$repo_root/scripts/deploy/verify-release.sh"
 if grep -Fq '<(find ' "$repo_root/scripts/deploy/verify-release.sh"; then
@@ -175,6 +327,20 @@ if grep -Fq '<(find ' "$repo_root/scripts/deploy/verify-release.sh"; then
 fi
 grep -Fq 'base_commit=987382f67e622915228686e9f956c6a9c9a7514c' \
     "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'zallet-release:' "$repo_root/.github/workflows/ci.yml"
+grep -Fq 'runs-on: ubuntu-22.04' "$repo_root/.github/workflows/ci.yml"
+# shellcheck disable=SC2016
+[[ $(grep -Fc 'bash scripts/build-zallet-testnet.sh "$RUNNER_TEMP/zallet-release-' \
+    "$repo_root/.github/workflows/ci.yml") -eq 2 ]]
+grep -Fq 'python3 scripts/verify-zallet-build.py' \
+    "$repo_root/.github/workflows/ci.yml"
+# shellcheck disable=SC2016
+grep -Fq '"$RUNNER_TEMP/zallet-release-a/ZALLET_SHA256SUM"' \
+    "$repo_root/.github/workflows/ci.yml"
+# shellcheck disable=SC2016
+grep -Fq '"$RUNNER_TEMP/zallet-release-b/ZALLET_SHA256SUM"' \
+    "$repo_root/.github/workflows/ci.yml"
+grep -Fq 'cmp --silent' "$repo_root/.github/workflows/ci.yml"
 grep -Fq 'toolchain=1.95.0' "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'protoc_version=25.9' "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'protoc_sha256=88f2d0c78a1072c4f84c59e9f9785b74849953e882a573188bc2d0518915b03e' \
@@ -263,6 +429,7 @@ if grep -Fq '/usr/local/libexec' "$repo_root/scripts/deploy/wait-zallet-ready.sh
 fi
 PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile \
     "$repo_root"/scripts/deploy/*.py \
+    "$repo_root/scripts/verify-zallet-build.py" \
     "$repo_root/scripts/test-zec-wallet-recovery.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-zec-wallet-recovery.py" >/dev/null
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-import-zallet-mnemonic.py" >/dev/null
@@ -410,12 +577,95 @@ for binary in wcash-poold wcash-merge-miner wcash-wallet zallet; do
     cp /bin/sh "$temporary/release/$binary"
     chmod 0555 "$temporary/release/$binary"
 done
+python3 - \
+    "$temporary/release" \
+    "$repo_root/patches/zallet-v0.1.0-beta.3" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+release = pathlib.Path(sys.argv[1])
+patch_dir = pathlib.Path(sys.argv[2])
+binary_sha256 = hashlib.sha256((release / "zallet").read_bytes()).hexdigest()
+patch_names = [
+    "0001-reserve-wallet-database-capacity.patch",
+    "0002-signal-data-requests-after-chain-writes.patch",
+    "0003-remove-nonreproducible-shadow-paths.patch",
+    "0004-observe-batch-decryptor-shutdown.patch",
+    "zewif-zcashd-0.1.0-rc.5-relocatable-db-dump.patch",
+]
+record = {
+    "schema_version": 1,
+    "upstream": "https://github.com/zcash/zallet",
+    "base_commit": "987382f67e622915228686e9f956c6a9c9a7514c",
+    "binary": "zallet-zaino renamed to zallet",
+    "features": ["rpc-cli", "zcashd-import"],
+    "rustc": "rustc 1.95.0 (test fixture)",
+    "cargo": "cargo 1.95.0 (test fixture)",
+    "protoc": {
+        "version": "libprotoc 25.9",
+        "release": "25.9",
+        "archive_sha256": "88f2d0c78a1072c4f84c59e9f9785b74849953e882a573188bc2d0518915b03e",
+    },
+    "source_date_epoch": 1787546182,
+    "source_patch_sha256": "2bb4146e3c581d847ed943ac537564edf5a36eb971548a7f20ffaa838f1cdd5b",
+    "binary_sha256": binary_sha256,
+    "cargo_lock": {
+        "path": "backends/zaino/Cargo.lock",
+        "sha256": "3915e0b4907510b8f76b9deebba1840a7ec233c2a265bc5e0e9fe52e21b682d2",
+    },
+    "patched_dependencies": [
+        {
+            "name": "zewif-zcashd",
+            "version": "0.1.0-rc.5",
+            "archive": "https://static.crates.io/crates/zewif-zcashd/zewif-zcashd-0.1.0-rc.5.crate",
+            "archive_sha256": "b67252cc55aad73afc6d608f29d14711d86e2b06bffcb76585aba31ee6310901",
+        }
+    ],
+    "patches": [
+        {
+            "name": name,
+            "sha256": hashlib.sha256((patch_dir / name).read_bytes()).hexdigest(),
+        }
+        for name in patch_names
+    ],
+}
+(release / "ZALLET_SHA256SUM").write_text(
+    f"{binary_sha256}  zallet\n", encoding="ascii"
+)
+(release / "PROVENANCE.json").write_text(
+    json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+python3 "$repo_root/scripts/verify-zallet-build.py" \
+    "$temporary/release" "$repo_root/patches/zallet-v0.1.0-beta.3" >/dev/null
+cp "$temporary/release/PROVENANCE.json" "$temporary/provenance.good"
+python3 - "$temporary/release/PROVENANCE.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+record = json.loads(path.read_text(encoding="utf-8"))
+record["binary_sha256"] = "0" * 64
+path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if python3 "$repo_root/scripts/verify-zallet-build.py" \
+    "$temporary/release" "$repo_root/patches/zallet-v0.1.0-beta.3" \
+    >/dev/null 2>&1; then
+    printf 'deployment-package-test: invalid Zallet provenance was accepted\n' >&2
+    exit 1
+fi
+mv "$temporary/provenance.good" "$temporary/release/PROVENANCE.json"
 (
     cd "$temporary/release"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum wcash-poold wcash-merge-miner wcash-wallet zallet >SHA256SUMS
+        sha256sum wcash-poold wcash-merge-miner wcash-wallet zallet \
+            PROVENANCE.json ZALLET_SHA256SUM >SHA256SUMS
     else
-        shasum -a 256 wcash-poold wcash-merge-miner wcash-wallet zallet >SHA256SUMS
+        shasum -a 256 wcash-poold wcash-merge-miner wcash-wallet zallet \
+            PROVENANCE.json ZALLET_SHA256SUM >SHA256SUMS
     fi
 )
 
@@ -478,7 +728,7 @@ authority.write_text(
             "journal_stream": "66666666-6666-4666-8666-666666666666",
             "event_seq": 0,
             "chain_id": 1464025427,
-            "listener_workers": 2,
+            "listener_workers": 4,
             "wcash_genesis": bytes.fromhex(wcash_display)[::-1].hex(),
             "zcash_genesis": bytes.fromhex(zcash_display)[::-1].hex(),
             "wcash_payout_commitment": bytes(range(65, 97)).hex(),
@@ -498,7 +748,8 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" finalize \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/output" \
-    --pool-uid 12345
+    --pool-uid 12345 \
+    --payout-uid 12346
 
 python3 - "$temporary/output" <<'PY'
 import json
@@ -511,11 +762,15 @@ root = pathlib.Path(sys.argv[1])
 runtime = tomllib.loads((root / "pool.runtime.toml").read_text(encoding="utf-8"))
 migrate = tomllib.loads((root / "pool.migrate.toml").read_text(encoding="utf-8"))
 preflight = tomllib.loads((root / "pool.preflight.toml").read_text(encoding="utf-8"))
+projector = tomllib.loads((root / "pool.projector.toml").read_text(encoding="utf-8"))
+payout = tomllib.loads((root / "pool.payout.toml").read_text(encoding="utf-8"))
 zallet = tomllib.loads((root / "zallet.toml").read_text(encoding="utf-8"))
+zallet_payout = tomllib.loads((root / "zallet-payout.toml").read_text(encoding="utf-8"))
 zallet_recovery = tomllib.loads(
     (root / "zallet-recovery.toml").read_text(encoding="utf-8")
 )
 manifest = json.loads((root / "render-manifest.json").read_text(encoding="utf-8"))
+release_policy = (root / "release.env").read_text(encoding="utf-8")
 
 assert runtime["network"] == "testnet"
 assert runtime["wcash_wallet_uid"] == 0
@@ -529,8 +784,11 @@ assert runtime["wcash_node_cookie_file"] == "/run/credentials/wcash-pool.service
 assert migrate["database_url_file"] == "/run/credentials/wcash-pool-migrate.service/database-url"
 assert preflight["database_url_file"] == "/run/credentials/wcash-pool-preflight.service/database-url"
 assert preflight["wcash_node_cookie_file"] == "/run/credentials/wcash-pool-preflight.service/wcash-node-cookie"
+assert projector["database_url_file"] == (
+    "/run/credentials/wcash-pool-projector.service/database-url"
+)
 assert runtime["wcash_wallet_program"] == str(root.parent / "release" / "wcash-wallet")
-for policy in (runtime, migrate, preflight):
+for policy in (runtime, migrate, preflight, projector):
     assert policy["payout_mode"] == "deferred"
     for payout_only in (
         "wcash_wallet_database",
@@ -549,11 +807,30 @@ for policy in (runtime, migrate, preflight):
         "zcash_signer_account_index",
     ):
         assert payout_only not in policy
+assert payout["payout_mode"] == "automatic"
+assert payout["database_url_file"] == (
+    "/run/credentials/wcash-payout-worker.service/database-url"
+)
+assert payout["wcash_wallet_seed_file"] == (
+    "/run/credentials/wcash-payout-worker.service/wcash-seed"
+)
+assert payout["wcash_seed_uid"] == 12346
+assert payout["wcash_wallet_database"] == "/var/lib/wcash-payout/wcash-wallet.sqlite"
+assert payout["wcash_signer_journal_directory"] == "/var/lib/wcash-payout/wec-payout-journal"
+assert payout["zcash_signer_journal_directory"] == "/var/lib/wcash-payout/zec-payout-journal"
+assert payout["zallet_configuration"] == (
+    "/run/credentials/wcash-payout-worker.service/zallet-config"
+)
 assert zallet["consensus"]["network"] == "test"
 assert zallet["builder"] == {"limits": {}}
 assert zallet["external"]["broadcast"] is False
 assert zallet["features"]["as_of_version"] == "0.1.0-beta.3"
 assert zallet["rpc"]["bind"] == ["127.0.0.1:28232"]
+assert zallet_payout["external"]["broadcast"] is False
+assert zallet_payout["keystore"]["encryption_identity"] == (
+    "/run/credentials/zecwec-zallet-payout.service/encryption-identity"
+)
+assert zallet_payout["rpc"]["bind"] == ["127.0.0.1:28232"]
 assert zallet_recovery["consensus"]["network"] == "test"
 assert zallet_recovery["external"]["broadcast"] is False
 assert zallet_recovery["features"]["as_of_version"] == "0.1.0-beta.3"
@@ -563,7 +840,8 @@ assert zallet_recovery["indexer"]["validator_cookie_path"] == (
 )
 assert manifest["network"] == "testnet"
 assert manifest["release_root"] == str(root.parent / "release")
-assert manifest["deployment_schema"] == 1
+assert manifest["deployment_schema"] == 2
+assert "ZECWEC_DEPLOYMENT_SCHEMA=2\n" in release_policy
 
 for path in root.rglob("*"):
     if path.is_file():
@@ -573,6 +851,8 @@ for path in root.rglob("*"):
         assert re.search(r"@[A-Z][A-Z0-9_]*@", text) is None
 
 pool_unit = (root / "systemd/wcash-pool.service").read_text(encoding="utf-8")
+projector_unit = (root / "systemd/wcash-pool-projector.service").read_text(encoding="utf-8")
+migrate_unit = (root / "systemd/wcash-pool-migrate.service").read_text(encoding="utf-8")
 backend_unit = (root / "systemd/wcash-pool-backend.service").read_text(encoding="utf-8")
 assert "User=wcash-pool\n" in pool_unit
 assert "SupplementaryGroups=wcash-pool-socket" in pool_unit
@@ -586,21 +866,60 @@ assert (
 ) in pool_unit
 assert (
     "After=network-online.target postgresql.service wcash-pool-migrate.service "
-    "wcash-pool-backend.service wcash-pool-custody-gate.service "
+    "wcash-pool-backend.service wcash-pool-projector.service "
+    "wcash-pool-custody-gate.service "
     "zecwec-zallet.service zecwec-zallet-recovery.service "
     "wcash-pool-wallet-init.service "
     "wcash-pool-zec-authority-bootstrap.service"
 ) in pool_unit
 assert "Requires=" in pool_unit and "wcash-pool-custody-gate.service" in pool_unit
+assert "Requires=" in pool_unit and "wcash-pool-projector.service" in pool_unit
+assert "BindsTo=" in pool_unit and "wcash-pool-projector.service" in pool_unit
 for forbidden_credential in ("wcash-seed", "zallet-cookie", "signer-journal"):
     assert f"LoadCredential={forbidden_credential}" not in pool_unit
 assert "InaccessiblePaths=" in pool_unit
 assert "/opt/wcash/current" not in pool_unit
 assert str(root.parent / "release") in pool_unit
+assert "User=wcash-pool-projector\n" in projector_unit
+assert "Group=wcash-pool-projector\n" in projector_unit
+assert "SupplementaryGroups=wcash-pool-socket\n" in projector_unit
+assert (
+    "LoadCredential=database-url:/etc/wcash-pool/credentials/database-url-projector"
+    in projector_unit
+)
+assert (
+    "ExecStart=" + str(root.parent / "release" / "wcash-poold") + " projector"
+    in projector_unit
+)
+assert " projector --config /etc/wcash-pool/pool.projector.toml" in projector_unit
+assert "SocketBindDeny=any" in projector_unit
+assert "ListenStream=" not in projector_unit
+for forbidden_credential in (
+    "wcash-seed",
+    "wcash-node-cookie",
+    "zcash-node-cookie",
+    "zallet-cookie",
+    "portal-token-pepper",
+    "portal-totp-key",
+):
+    assert f"LoadCredential={forbidden_credential}" not in projector_unit
+assert "User=wcash-pool-migrate\n" in migrate_unit
+assert "Group=wcash-pool-migrate\n" in migrate_unit
+assert migrate_unit.count("LoadCredential=") == 1
+assert "LoadCredential=database-url:" in migrate_unit
+assert "LoadCredential=portal-" not in migrate_unit
+assert "SocketBindDeny=any" in migrate_unit
+assert "wcash-poold config-check" not in migrate_unit
+assert (
+    "grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url "
+    "zecwec_pool_migrator zecwec_pool_runtime zecwec_pool_projector "
+    "zecwec_pool_payout"
+) in migrate_unit
 assert "User=wcash-pool-backend\n" in backend_unit
 assert "Group=wcash-pool-socket\n" in backend_unit
+assert "SupplementaryGroups=wcash-pool-backend\n" in backend_unit
 assert "LoadCredential=wcash-payout-ivk:" in backend_unit
-assert "LoadCredential=wcash-wallet-authority:/var/lib/wcash-pool/wcash-wallet-authority.json" in backend_unit
+assert "LoadCredential=wcash-wallet-authority:/var/lib/wcash-payout/wcash-wallet-authority.json" in backend_unit
 assert "LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml" in backend_unit
 assert "LoadCredential=zec-initial-zero-result:/var/lib/zecwec-custody/zec-collector-initial-zero.json" in backend_unit
 assert "LoadCredential=zec-initial-zero-attestation:/var/lib/zecwec-custody/zec-collector-initial-zero.attestation" in backend_unit
@@ -609,15 +928,23 @@ assert "zec-authority-bootstrap.sh verify" in backend_unit
 preflight_unit = (root / "systemd/wcash-pool-preflight.service").read_text(encoding="utf-8")
 zallet_unit = (root / "systemd/zecwec-zallet.service").read_text(encoding="utf-8")
 backend_init_unit = (root / "systemd/wcash-pool-backend-init.service").read_text(encoding="utf-8")
+health_unit = (root / "systemd/wcash-pool-health.service").read_text(encoding="utf-8")
+assert "User=root\n" in health_unit
+assert "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID" in health_unit
+assert "ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock" in health_unit
+assert "SupplementaryGroups=wcash-pool-backend\n" in backend_init_unit
 executable_condition_units = {
     "wcash-pool-backend-init.service",
     "wcash-pool-backend.service",
     "wcash-pool-migrate.service",
+    "wcash-pool-projector.service",
     "wcash-pool-preflight.service",
     "wcash-pool-wallet-init.service",
+    "wcash-payout-worker.service",
     "wcash-pool-zec-authority-bootstrap.service",
     "wcash-pool.service",
     "zecwec-zallet.service",
+    "zecwec-zallet-payout.service",
 }
 found_executable_conditions = set()
 for service in (root / "systemd").glob("*.service"):
@@ -644,6 +971,49 @@ assert "ConditionFileIsExecutable=" in zallet_unit
 assert "ConditionPathIsExecutable=" not in zallet_unit
 assert "WantedBy=zecwec-testnet-pool.target" not in zallet_unit
 
+# Every local systemd Before=/After= edge must be acyclic. In particular, the
+# mutually exclusive recovery ceremony is ordered before the runtime only from
+# the runtime side; mirroring that edge would make target startup impossible.
+systemd_units = {
+    path.name.removesuffix(".in"): path
+    for path in (root / "systemd").glob("*.in")
+    if path.name.endswith((".service.in", ".target.in", ".socket.in", ".path.in", ".timer.in"))
+}
+ordering = {unit: set() for unit in systemd_units}
+for unit, path in systemd_units.items():
+    section = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            section = line
+            continue
+        if section != "[Unit]" or not line.startswith(("After=", "Before=")):
+            continue
+        relation, values = line.split("=", 1)
+        for other in values.split():
+            if other not in systemd_units:
+                continue
+            if relation == "After":
+                ordering[unit].add(other)
+            else:
+                ordering[other].add(unit)
+
+visited = set()
+active = set()
+def assert_acyclic(unit):
+    if unit in active:
+        raise AssertionError(f"systemd ordering cycle reaches {unit}")
+    if unit in visited:
+        return
+    active.add(unit)
+    for dependency in ordering[unit]:
+        assert_acyclic(dependency)
+    active.remove(unit)
+    visited.add(unit)
+
+for systemd_unit in systemd_units:
+    assert_acyclic(systemd_unit)
+
 custody_gate_unit = (root / "systemd/wcash-pool-custody-gate.service").read_text(
     encoding="utf-8"
 )
@@ -658,25 +1028,144 @@ assert (
     "wcash-pool-wallet-init.service "
     "wcash-pool-zec-authority-bootstrap.service"
 ) in custody_gate_unit
+assert "After=zecwec-zallet.service zecwec-zallet-payout.service" not in custody_gate_unit
+assert "After=wcash-payout-worker.service" not in custody_gate_unit
 assert "ConditionPathExists=" not in custody_gate_unit
 assert "ConditionFileIsExecutable=" not in custody_gate_unit
 
+zallet_recovery_unit = (
+    root / "systemd/zecwec-zallet-recovery.service"
+).read_text(encoding="utf-8")
+assert (
+    "After=network-online.target zcash-validator-testnet.service zecwec-zallet.service"
+    in zallet_recovery_unit
+)
+zallet_recovery_after = next(
+    line for line in zallet_recovery_unit.splitlines() if line.startswith("After=")
+)
+assert "wcash-pool-projector.service" not in zallet_recovery_after
+assert "wcash-pool.service" not in zallet_recovery_after
+assert "wcash-pool-zec-authority-bootstrap.service" not in zallet_recovery_after
+
 for mining_unit in (
     pool_unit,
+    projector_unit,
     preflight_unit,
     backend_unit,
     backend_init_unit,
-    (root / "systemd/wcash-pool-migrate.service").read_text(encoding="utf-8"),
+    migrate_unit,
 ):
     assert "LoadCredential=wcash-seed" not in mining_unit
     assert "LoadCredential=zallet-cookie" not in mining_unit
 
 wallet_init_unit = (root / "systemd/wcash-pool-wallet-init.service").read_text(encoding="utf-8")
+assert "User=wcash-payout\n" in wallet_init_unit
+assert "LoadCredential=wcash-seed:" in wallet_init_unit
 assert "EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env" in wallet_init_unit
 assert "TimeoutStartSec=1200s" in wallet_init_unit
 wallet_bootstrap = (root / "wcash-wallet-bootstrap.env").read_text(encoding="utf-8")
 assert "WCASH_WALLET_BIRTHDAY=1" in wallet_bootstrap
-assert "WCASH_WALLET_AUTHORITY=/var/lib/wcash-pool/wcash-wallet-authority.json" in wallet_bootstrap
+assert "WCASH_WALLET_AUTHORITY=/var/lib/wcash-payout/wcash-wallet-authority.json" in wallet_bootstrap
+payout_unit = (root / "systemd/wcash-payout-worker.service").read_text(encoding="utf-8")
+assert "Type=notify\n" in payout_unit
+assert "NotifyAccess=main\n" in payout_unit
+assert "TimeoutStartSec=4200s\n" in payout_unit
+assert "User=wcash-payout\n" in payout_unit
+assert "SupplementaryGroups=wcash-pool-socket\n" in payout_unit
+assert "payout-config-check --config /etc/wcash-pool/pool.payout.toml" in payout_unit
+assert "wcash-poold preflight --config /etc/wcash-pool/pool.payout.toml" not in payout_unit
+assert "LoadCredential=database-url:/etc/wcash-pool/credentials/database-url-payout" in payout_unit
+assert "LoadCredential=wcash-seed:/var/lib/wcash-pool-secrets/wcash-seed" in payout_unit
+assert "LoadCredential=portal-" not in payout_unit
+for inaccessible in (
+    "/var/lib/wcash-pool",
+    "/var/lib/wcash-pool-secrets/wcash-seed",
+    "/etc/wcash-pool/credentials/zallet-encryption-identity",
+    "/etc/wcash-pool/credentials/portal-token-pepper",
+    "/etc/wcash-pool/credentials/portal-totp-key",
+    "/var/lib/zecwec-custody",
+):
+    assert inaccessible in payout_unit
+assert "ExecStart=" + str(root.parent / "release" / "wcash-poold") + " payout-worker" in payout_unit
+zallet_payout_unit = (root / "systemd/zecwec-zallet-payout.service").read_text(encoding="utf-8")
+assert "LoadCredential=encryption-identity:" in zallet_payout_unit
+assert "WantedBy=zecwec-testnet-pool.target" in zallet_payout_unit
+assert "StartLimitIntervalSec=300" in payout_unit
+assert "StartLimitBurst=3" in payout_unit
+target_unit = (root / "systemd/zecwec-testnet-pool.target").read_text(encoding="utf-8")
+startup_unit = (root / "systemd/zecwec-testnet-pool-start.service").read_text(
+    encoding="utf-8"
+)
+health_timer = (root / "systemd/wcash-pool-health.timer").read_text(encoding="utf-8")
+cookie_refresh_path = (root / "systemd/zecwec-cookie-refresh.path").read_text(
+    encoding="utf-8"
+)
+assert (
+    "Upholds=wcash-pool-projector.service wcash-pool.service "
+    "wcash-payout-worker.service zecwec-zallet-payout.service"
+) in target_unit
+assert "wcash-pool-health.timer" not in target_unit
+assert "WantedBy=multi-user.target" not in target_unit
+assert "WantedBy=timers.target" not in health_timer
+assert "PartOf=zecwec-testnet-pool.target" in cookie_refresh_path
+assert "Type=oneshot" in startup_unit
+assert "User=root\n" in startup_unit
+assert "start-testnet-pool.sh /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs" in startup_unit
+assert "TimeoutStartSec=7200s" in startup_unit
+assert "WantedBy=multi-user.target" in startup_unit
+
+# Model the post-start failure domain instead of trusting a health timer: a
+# BindsTo edge propagates an inactive dependency to its owner, and a PartOf edge
+# propagates the target stop to each runtime member. Both payout authorities
+# must therefore reach the one process that owns the Stratum and portal sockets.
+runtime_units = {
+    name: (root / "systemd" / name).read_text(encoding="utf-8")
+    for name in (
+        "zecwec-testnet-pool.target",
+        "wcash-pool.service",
+        "wcash-pool-projector.service",
+        "wcash-payout-worker.service",
+        "zecwec-zallet-payout.service",
+    )
+}
+target_name = "zecwec-testnet-pool.target"
+critical_members = set(runtime_units) - {target_name}
+target_binds = next(line for line in target_unit.splitlines() if line.startswith("BindsTo="))
+assert set(target_binds.removeprefix("BindsTo=").split()) == critical_members
+for member in critical_members:
+    assert f"PartOf={target_name}" in runtime_units[member]
+
+stop_edges = {name: set() for name in runtime_units}
+for owner, text in runtime_units.items():
+    for line in text.splitlines():
+        if line.startswith("BindsTo="):
+            for dependency in line.removeprefix("BindsTo=").split():
+                if dependency in stop_edges:
+                    stop_edges[dependency].add(owner)
+        elif line.startswith("PartOf="):
+            for whole in line.removeprefix("PartOf=").split():
+                if whole in stop_edges:
+                    stop_edges[whole].add(owner)
+
+def stopped_after(unit):
+    stopped = {unit}
+    pending = [unit]
+    while pending:
+        current = pending.pop()
+        for affected in stop_edges[current]:
+            if affected not in stopped:
+                stopped.add(affected)
+                pending.append(affected)
+    return stopped
+
+pool_config = tomllib.loads((root / "pool.runtime.toml").read_text(encoding="utf-8"))
+assert pool_config["stratum_listen"] == "0.0.0.0:3333"
+assert pool_config["portal_listen"] == "127.0.0.1:8080"
+assert "wcash-poold serve --config /etc/wcash-pool/pool.runtime.toml" in pool_unit
+for failed_authority in ("wcash-payout-worker.service", "zecwec-zallet-payout.service"):
+    assert "wcash-pool.service" in stopped_after(failed_authority), (
+        f"{failed_authority} failure leaves Stratum or portal running"
+    )
 zec_authority = tomllib.loads((root / "zec-authority.testnet.toml").read_text(encoding="utf-8"))
 assert zec_authority["network"] == "testnet"
 assert zec_authority["zcash_genesis_wire"] == bytes.fromhex(bytes(range(33, 65)).hex())[::-1].hex()
@@ -687,11 +1176,15 @@ assert zec_authority["required_confirmations"] == 100
 assert zec_authority["zallet_cookie_file"] == "/run/credentials/wcash-pool-zec-authority-bootstrap.service/zallet-cookie"
 assert zec_authority["zcash_node_cookie_file"] == "/run/credentials/wcash-pool-zec-authority-bootstrap.service/zcash-node-cookie"
 zec_authority_unit = (root / "systemd/wcash-pool-zec-authority-bootstrap.service").read_text(encoding="utf-8")
+assert "SupplementaryGroups=wcash-pool-backend\n" in zec_authority_unit
 assert "Before=wcash-pool-backend-init.service" not in zec_authority_unit
 assert "wcash-poold zec-authority-check" not in zec_authority_unit
 assert "zec-authority-bootstrap.sh reconcile" in zec_authority_unit
 assert "BindsTo=zecwec-zallet.service" not in zec_authority_unit
-assert "Conflicts=wcash-pool.service zecwec-zallet-recovery.service" in zec_authority_unit
+assert (
+    "Conflicts=wcash-pool-projector.service wcash-pool.service "
+    "zecwec-zallet-recovery.service"
+) in zec_authority_unit
 
 backend_environment = (root / "backend.env").read_text(encoding="utf-8")
 assert "WCASH_SHARE_TARGET=" + bytes(range(129, 161)).hex() in backend_environment
@@ -709,6 +1202,9 @@ assert "server 127.0.0.1:3333;" in stratum
 
 portal = (root / "nginx/zecwec-testnet-portal.conf").read_text(encoding="utf-8")
 assert portal.count("ssl_verify_client on;") == 2
+assert portal.count("listen 443 ssl http2;") == 2
+assert portal.count("listen [::]:443 ssl http2;") == 2
+assert "http2 on;" not in portal
 assert portal.count("ssl_client_certificate /etc/wcash-pool/tls/cloudflare-origin-pull-ca.pem;") == 2
 assert "proxy_set_header X-Forwarded-For $http_cf_connecting_ip;" in portal
 assert "limit_req_zone $zecwec_credential_client zone=zecwec_portal_credentials:10m rate=6r/m;" in portal
@@ -718,18 +1214,190 @@ assert '\"POST:/api/v1/workers\" $http_cf_connecting_ip;' in portal
 assert "return 444;" in portal
 PY
 
+PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/grant-runtime.sh" <<'PY'
+import pathlib
+import sys
+
+grants = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES" not in grants
+assert "GRANT UPDATE (last_event_seq, updated_at) ON TABLE backend_cursors" in grants
+assert "GRANT UPDATE (state, active_observation_event_seq, active_maturity_event_seq)" in grants
+assert "GRANT UPDATE (sealed_at, sealed_entry_count)" in grants
+assert "public.configure_payout_destination_v1(" in grants
+assert "public.activate_due_payout_destinations_v1(UUID,TEXT)" in grants
+assert "public.freeze_chain_payouts_v1(UUID,TEXT,BIGINT,TEXT)" in grants
+assert "public.lock_backend_projection_v1(UUID)" in grants
+assert "public.lock_chain_safety_v1(UUID,TEXT)" in grants
+cursor_signature = (
+    "public.advance_confirmed_payout_watch_cursor_v1(\n"
+    "    UUID,TEXT,BIGINT,UUID,UUID\n)"
+)
+assert grants.count(cursor_signature) == 2
+assert (
+    f"REVOKE ALL ON FUNCTION {cursor_signature} "
+    'FROM :"public_role", :"projector_role", :"payout_role";'
+) in grants
+assert (
+    f"GRANT EXECUTE ON FUNCTION {cursor_signature} TO :\"payout_role\";"
+) in grants
+payout_select_start = grants.index(
+    "GRANT SELECT ON TABLE\n    deployments,\n    backend_cursors,\n    chain_policies,"
+)
+payout_select_end = grants.index('TO :"payout_role";', payout_select_start)
+assert "payout_watch_cursors," in grants[payout_select_start:payout_select_end]
+assert "GRANT SELECT (deployment_id, event_seq, payload_sha256)" in grants
+assert 'ON TABLE backend_events TO :"payout_role";' in grants
+assert 'ALTER DEFAULT PRIVILEGES FOR ROLE :"migrator_role" IN SCHEMA public' in grants
+assert 'ALTER DEFAULT PRIVILEGES FOR ROLE :"migrator_role"\n' in grants
+assert "REVOKE ALL PRIVILEGES ON TABLES" in grants
+assert "REVOKE ALL PRIVILEGES ON SEQUENCES" in grants
+assert "REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC" in grants
+assert "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC" in grants
+assert "GRANT UPDATE ON TABLE\n    chain_safety_state" not in grants
+assert "GRANT UPDATE ON TABLE\n    payout_destinations" not in grants
+PY
+
+# Model a clean host: every literal install(1) owner/group used by the renderer
+# must be created by provision-host before rendering can begin. This catches a
+# package that only succeeds on a developer host with an unrelated stale group.
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/render-deployment.sh" \
+    "$repo_root/scripts/deploy/provision-host.sh" <<'PY'
+import pathlib
+import re
+import sys
+
+renderer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").replace("\\\n", " ")
+provisioner = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+owners = set()
+groups = set()
+for line in renderer.splitlines():
+    if not re.match(r"^\s*install\s", line):
+        continue
+    for kind, identity in re.findall(
+        r"(?:^|\s)-(o|g)\s+([a-z][a-z0-9-]*)", line
+    ):
+        (owners if kind == "o" else groups).add(identity)
+for owner in owners - {"root"}:
+    assert f"id -u {owner} " in provisioner, f"renderer owner is not provisioned: {owner}"
+for group in groups - {"root"}:
+    assert f"getent group {group} " in provisioner, f"renderer group is not provisioned: {group}"
+PY
+
+# shellcheck disable=SC2016
+grep -Fq 'install -o root -g wcash-pool-projector -m 0640 "$staging/pool.projector.toml"' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+# shellcheck disable=SC2016
+grep -Fq 'install -o root -g wcash-pool-migrate -m 0640 "$staging/pool.migrate.toml"' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+# shellcheck disable=SC2016
+grep -Fq 'install -o root -g wcash-payout -m 0640 "$staging/wcash-wallet-bootstrap.env"' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+# shellcheck disable=SC2016
+grep -Fq 'install -o root -g zecwec-zallet -m 0640 "$staging/zallet.toml"' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+# shellcheck disable=SC2016
+grep -Fq 'install -o root -g zecwec-zallet -m 0640 "$staging/zallet-payout.toml"' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+grep -Fq 'systemctl disable zecwec-testnet-pool-start.service' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+grep -Fq 'root:zecwec-zallet:640:1' "$repo_root/scripts/deploy/common.sh"
+# shellcheck disable=SC2016
+grep -Fq 'runuser --user zecwec-zallet -- /usr/bin/test -r "$zallet_config"' \
+    "$repo_root/scripts/deploy/common.sh"
+# shellcheck disable=SC2016
+grep -Fq 'runuser --user zecwec-zallet -- /usr/bin/test -r "$zallet_payout_config"' \
+    "$repo_root/scripts/deploy/common.sh"
 grep -Fq 'stage-portal)' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
 grep -Fq -- '--ack-cloudflare-access' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
 grep -Fq 'Cloudflare Access did not deny the anonymous staging probe' \
     "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+# shellcheck disable=SC2016
+grep -Fq 'require_direct_origin_mtls_rejection "$portal_host" 127.0.0.1' \
+    "$repo_root/scripts/deploy/enable-nginx-edge.sh"
 grep -Fq 'public_status != 200' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
 grep -Fq 'public_body != '\''{"status":"ok"}'\''' \
     "$repo_root/scripts/deploy/enable-nginx-edge.sh"
-grep -Fq '"payout_execution": "deferred"' \
+grep -Fq 'reconcile)' "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+grep -Fq 'portal_state=/etc/wcash-pool/portal-edge-mode' \
+    "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+# shellcheck disable=SC2016
+grep -Fq 'effective_mode=$(cat -- "$portal_state")' \
+    "$repo_root/scripts/deploy/enable-nginx-edge.sh"
+
+cat >"$temporary/fake-bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+output=
+while (($#)); do
+    case "$1" in
+        --output) output=$2; shift 2 ;;
+        --write-out) shift 2 ;;
+        *) shift ;;
+    esac
+done
+[[ -n $output ]]
+printf '%s' "${CURL_TEST_BODY:-}" >"$output"
+printf '%s' "${CURL_TEST_ERROR:-}" >&2
+printf '%s\n%s\n' "${CURL_TEST_HTTP_STATUS:-000}" "${CURL_TEST_VERIFY_RESULT:-0}"
+exit "${CURL_TEST_EXIT_STATUS:-0}"
+SH
+chmod 0555 "$temporary/fake-bin/curl"
+for accepted_origin_rejection in tls-alert nginx-http-400; do
+    curl_exit=0
+    curl_http=400
+    curl_body='No required SSL certificate was sent'
+    curl_error=
+    if [[ $accepted_origin_rejection == tls-alert ]]; then
+        curl_exit=56
+        curl_http=000
+        curl_body=
+        curl_error='OpenSSL SSL_read: tlsv13 alert certificate required'
+    fi
+    PATH="$temporary/fake-bin:$PATH" \
+        CURL_TEST_EXIT_STATUS=$curl_exit \
+        CURL_TEST_HTTP_STATUS=$curl_http \
+        CURL_TEST_VERIFY_RESULT=0 \
+        CURL_TEST_BODY=$curl_body \
+        CURL_TEST_ERROR=$curl_error \
+        bash -c 'source "$1"; require_direct_origin_mtls_rejection pool.example 127.0.0.1' \
+        bash "$repo_root/scripts/deploy/common.sh"
+done
+for rejected_origin_probe in accepted generic-tls-failure untrusted-server; do
+    curl_exit=0
+    curl_http=200
+    curl_verify=0
+    curl_error=
+    case $rejected_origin_probe in
+        generic-tls-failure)
+            curl_exit=35
+            curl_http=000
+            curl_error='OpenSSL SSL_connect: connection reset by peer'
+            ;;
+        untrusted-server)
+            curl_exit=60
+            curl_http=000
+            curl_verify=20
+            curl_error='SSL certificate problem: unable to get local issuer certificate'
+            ;;
+    esac
+    if PATH="$temporary/fake-bin:$PATH" \
+        CURL_TEST_EXIT_STATUS=$curl_exit \
+        CURL_TEST_HTTP_STATUS=$curl_http \
+        CURL_TEST_VERIFY_RESULT=$curl_verify \
+        CURL_TEST_ERROR=$curl_error \
+        bash -c 'source "$1"; require_direct_origin_mtls_rejection pool.example 127.0.0.1' \
+        bash "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        printf 'deployment-package-test: direct origin probe accepted %s\n' \
+            "$rejected_origin_probe" >&2
+        exit 1
+    fi
+done
+grep -Fq '"payout_execution": "enabled"' \
     "$repo_root/scripts/deploy/health-check.sh"
-grep -Fq 'require_offline_collector_custody' \
+grep -Fq 'require_hot_testnet_payout_custody' \
     "$repo_root/scripts/deploy/preflight.sh"
-grep -Fq 'require_offline_collector_custody' \
+grep -Fq 'require_hot_testnet_payout_custody' \
     "$repo_root/scripts/deploy/health-check.sh"
 grep -Fq 'zec-wallet-original.rpc.json' "$repo_root/scripts/deploy/common.sh"
 grep -Fq 'zec-wallet-recovered.rpc.json' "$repo_root/scripts/deploy/common.sh"
@@ -746,6 +1414,8 @@ grep -Fq -- '--ack-independent-offline-backup-recovery' \
     "$repo_root/scripts/deploy/seal-wcash-custody.sh"
 grep -Fq 'stop_custody_units_for_sealing' \
     "$repo_root/scripts/deploy/seal-wcash-custody.sh"
+grep -Fq 'require_no_processes_for_user wcash-pool-projector "accounting projector identity"' \
+    "$repo_root/scripts/deploy/seal-wcash-custody.sh"
 grep -Fq 'runuser --user' \
     "$repo_root/scripts/deploy/common.sh"
 grep -Fq 'usermod --gid wcash-pool --groups wcash-pool-socket wcash-pool' \
@@ -754,8 +1424,41 @@ grep -Fq "usermod --gid zecwec-zallet --groups '' zecwec-zallet" \
     "$repo_root/scripts/deploy/provision-host.sh"
 grep -Fq 'require_distinct_service_identities' \
     "$repo_root/scripts/deploy/provision-host.sh"
-if grep -Fq 'ZALLET_COOKIE' "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"; then
-    printf 'deployment-package-test: deferred credential refresh retained Zallet coupling\n' >&2
+grep -Fq 'REVOKE ALL PRIVILEGES ON TABLES FROM %I' \
+    "$repo_root/scripts/deploy/provision-postgres.sh"
+grep -Fq 'REVOKE ALL PRIVILEGES ON SEQUENCES FROM %I' \
+    "$repo_root/scripts/deploy/provision-postgres.sh"
+grep -Fq 'REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC' \
+    "$repo_root/scripts/deploy/provision-postgres.sh"
+grep -Fq "'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC'" \
+    "$repo_root/scripts/deploy/provision-postgres.sh"
+grep -Fq 'FROM pg_auth_members membership' \
+    "$repo_root/scripts/deploy/provision-postgres.sh"
+grep -Fq "format('REVOKE %I FROM %I', granted_role.rolname, member_role.rolname)" \
+    "$repo_root/scripts/deploy/provision-postgres.sh"
+grep -Fq "readonly ZECWEC_MINIMUM_POSTGRES_VERSION_NUM=160000" \
+    "$repo_root/scripts/deploy/common.sh"
+grep -Fq -- "--command='SHOW server_version_num'" \
+    "$repo_root/scripts/deploy/common.sh"
+for postgres_gate_script in provision-postgres.sh preflight.sh; do
+    grep -Fq 'require_supported_postgres_server' \
+        "$repo_root/scripts/deploy/$postgres_gate_script"
+done
+provision_version_line=$(grep -n '^require_supported_postgres_server$' \
+    "$repo_root/scripts/deploy/provision-postgres.sh")
+provision_version_line=${provision_version_line%%:*}
+provision_mutation_line=$(grep -n '^install -d -o root -g root -m 0700' \
+    "$repo_root/scripts/deploy/provision-postgres.sh")
+provision_mutation_line=${provision_mutation_line%%:*}
+preflight_version_line=$(grep -n '^require_supported_postgres_server$' \
+    "$repo_root/scripts/deploy/preflight.sh")
+preflight_version_line=${preflight_version_line%%:*}
+preflight_mutation_line=$(grep -n '^systemctl stop zecwec-testnet-pool.target' \
+    "$repo_root/scripts/deploy/preflight.sh")
+preflight_mutation_line=${preflight_mutation_line%%:*}
+if ((provision_version_line >= provision_mutation_line \
+    || preflight_version_line >= preflight_mutation_line)); then
+    printf 'deployment-package-test: PostgreSQL version gate runs after a deployment mutation\n' >&2
     exit 1
 fi
 if grep -Fq '@ZALLET_STATE_DIR@/.cookie' \
@@ -764,11 +1467,142 @@ if grep -Fq '@ZALLET_STATE_DIR@/.cookie' \
     exit 1
 fi
 if grep -Eq 'systemctl (start|restart) zecwec-zallet' \
-    "$repo_root/scripts/deploy/preflight.sh" \
-    "$repo_root/scripts/deploy/rollback-release.sh"; then
-    printf 'deployment-package-test: deferred lifecycle can start Zallet\n' >&2
+    "$repo_root/scripts/deploy/preflight.sh"; then
+    printf 'deployment-package-test: preflight can start a key-bearing Zallet\n' >&2
     exit 1
 fi
+PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/preflight.sh" <<'PY'
+import pathlib
+import sys
+
+preflight = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "trap stop_preflight_authorities EXIT" in preflight
+assert "wcash-pool-backend.service >/dev/null 2>&1 || true" in preflight
+snapshot = preflight.index('"$script_dir/refresh-runtime-credentials.sh" snapshot')
+projector_stop = preflight.rindex("systemctl stop wcash-pool-projector.service")
+projector_inactive = preflight.rindex(
+    "require_loaded_unit_fully_inactive wcash-pool-projector.service"
+)
+backend_stop = preflight.rindex("systemctl stop wcash-pool-backend.service")
+backend_inactive = preflight.rindex(
+    "require_loaded_unit_fully_inactive wcash-pool-backend.service"
+)
+assert snapshot < projector_stop < projector_inactive < backend_stop < backend_inactive
+assert backend_inactive < preflight.index("trap - EXIT")
+PY
+grep -Fq 'systemctl start zecwec-zallet-payout.service' \
+    "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
+grep -Fq 'systemctl stop wcash-pool-health.timer' \
+    "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
+grep -Fq 'wait_payout_ready.py' \
+    "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
+grep -Fq 'systemctl start wcash-pool-health.timer' \
+    "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
+grep -Fq 'trap refresh_failed ERR' \
+    "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
+grep -Fq 'stop_testnet_runtime_after_failure' \
+    "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
+grep -Fq 'wait_payout_ready.py' "$repo_root/scripts/deploy/start-testnet-pool.sh"
+# shellcheck disable=SC2016
+grep -Fq '"http://$portal/readyz" 4200' \
+    "$repo_root/scripts/deploy/start-testnet-pool.sh"
+grep -Fq 'systemctl enable zecwec-testnet-pool-start.service' \
+    "$repo_root/scripts/deploy/start-testnet-pool.sh"
+grep -Fq 'systemctl start wcash-pool-health.timer' \
+    "$repo_root/scripts/deploy/start-testnet-pool.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/start-testnet-pool.sh" \
+    "$repo_root/scripts/deploy/common.sh" \
+    "$repo_root/scripts/deploy/restrict-mining-firewall.sh" <<'PY'
+import pathlib
+import sys
+
+start, common, firewall = (
+    pathlib.Path(path).read_text(encoding="utf-8") for path in sys.argv[1:]
+)
+close = start.index('restrict-mining-firewall.sh" close')
+preflight = start.index('preflight.sh"')
+runtime = start.index("systemctl start zecwec-testnet-pool.target")
+ready = start.index('wait_payout_ready.py')
+apply = start.index('restrict-mining-firewall.sh" apply')
+edge = start.index('enable-nginx-edge.sh" reconcile')
+health = start.index('health-check.sh" --settings')
+assert close < preflight < runtime < ready < apply < edge < health
+assert 'restrict-mining-firewall.sh" close' in common
+assert "mode == apply || $mode == close" in firewall
+assert "a mining allow rule remains after closing port" in firewall
+closed_guard = firewall.index("install_mining_guard 4 closed")
+ufw_mutation = firewall.index('ufw --force delete "$number"')
+open_guard = firewall.index("install_mining_guard 4 open")
+assert closed_guard < ufw_mutation < open_guard
+assert firewall.count("install_mining_guard 4 closed") == 2
+assert firewall.count("install_mining_guard 6 closed") == 2
+assert firewall.count("install_mining_guard 4 open") == 1
+assert firewall.count("install_mining_guard 6 open") == 1
+assert '"$firewall" --wait 5 -t filter -I INPUT 1 -j "$staging"' in firewall
+assert 'readonly guard_chain=ZECWEC-MINING-GUARD' in firewall
+PY
+grep -Fq 'trap health_check_exit EXIT' \
+    "$repo_root/scripts/deploy/health-check.sh"
+grep -Fq 'stop_testnet_runtime_after_failure' \
+    "$repo_root/scripts/deploy/health-check.sh"
+grep -Fq 'systemctl start zecwec-testnet-pool.target' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+grep -Fq 'zecwec-testnet-pool-start.service' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+grep -Fq 'zecwec-cookie-refresh.service' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+# shellcheck disable=SC2016
+grep -Fq 'stop_loaded_unit_strict "$unit"' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+grep -Fq 'wait_payout_ready.py' "$repo_root/scripts/deploy/rollback-release.sh"
+# shellcheck disable=SC2016
+grep -Fq '"http://$portal/readyz" 4200' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+grep -Fq -- '--ack-forward-schema-compatible' \
+    "$repo_root/scripts/deploy/activate-release.sh"
+# shellcheck disable=SC2016
+grep -Fq 'ZECWEC_RELEASE_TRANSITION=activation exec "$script_dir/rollback-release.sh"' \
+    "$repo_root/scripts/deploy/activate-release.sh"
+# shellcheck disable=SC2016
+grep -Fq 'transition=${ZECWEC_RELEASE_TRANSITION:-rollback}' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+grep -Fq 'activated verified release' \
+    "$repo_root/scripts/deploy/rollback-release.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/activate-release.sh" \
+    "$repo_root/scripts/deploy/rollback-release.sh" \
+    "$repo_root/scripts/deploy/install-release.sh" \
+    "$repo_root/scripts/deploy/verify-release.sh" \
+    "$repo_root/scripts/deploy/health-check.sh" <<'PY'
+import pathlib
+import sys
+
+activation, rollback, installer, verifier, health = (
+    pathlib.Path(path).read_text(encoding="utf-8") for path in sys.argv[1:]
+)
+assert 'exec "$script_dir/rollback-release.sh"' in activation
+assert "systemctl " not in activation
+assert activation.index("[[ $# -eq 5") < activation.index(
+    'exec "$script_dir/rollback-release.sh"'
+)
+barrier = '$(cat -- "$target_schema") == 2'
+assert barrier in rollback
+assert rollback.index(barrier) < rollback.index("stop_loaded_unit_strict")
+assert 'ZECWEC_RELEASE_PATH=$target "$script_dir/verify-release.sh"' in rollback
+assert '"$target/deployment/scripts/deploy/verify-release.sh"' not in rollback
+assert "printf '2\\n'" in installer
+assert '$(cat -- "$package/DEPLOYMENT-SCHEMA") == 2' in verifier
+assert 'ZECWEC_DEPLOYMENT_SCHEMA) == 2' in health
+assert health.index("trap health_check_exit EXIT") < health.index("require_command curl")
+assert health.index("stop_testnet_runtime_after_failure") < health.rindex("trap - EXIT")
+PY
+for release_command in activate-release.sh rollback-release.sh; do
+    grep -Fq "$release_command" "$repo_root/docs/zecwec-testnet-deployment.md" || {
+        printf 'deployment-package-test: runbook omits %s\n' "$release_command" >&2
+        exit 1
+    }
+done
 for documented_step in \
     import-zallet-mnemonic.py \
     zecwec-zallet-recovery.service \
@@ -798,6 +1632,13 @@ case $1 in
         property=${2#--property=}
         unit=$4
         case "$SYSTEMCTL_SCENARIO:$unit:$property" in
+            *:zecwec-testnet-pool-start.service:LoadState) printf 'not-found\n' ;;
+            *:wcash-pool-health.timer:LoadState) printf 'not-found\n' ;;
+            *:zecwec-cookie-refresh.path:LoadState) printf 'not-found\n' ;;
+            *:zecwec-cookie-refresh.service:LoadState) printf 'not-found\n' ;;
+            *:zecwec-testnet-pool.target:LoadState) printf 'not-found\n' ;;
+            *:wcash-payout-worker.service:LoadState) printf 'not-found\n' ;;
+            *:wcash-pool-projector.service:LoadState) printf 'not-found\n' ;;
             expected:wcash-pool.service:LoadState) printf 'not-found\n' ;;
             expected:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
             missing-wallet:wcash-pool.service:LoadState) printf 'not-found\n' ;;
@@ -808,17 +1649,33 @@ case $1 in
             stop-failure:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
             nonzero-pid:wcash-pool.service:LoadState) printf 'not-found\n' ;;
             nonzero-pid:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
-            *:wcash-pool.service:ActiveState | *:wcash-pool-wallet-init.service:ActiveState)
+            *:zecwec-testnet-pool.target:ActiveState \
+                | *:wcash-pool.service:ActiveState \
+                | *:wcash-pool-projector.service:ActiveState \
+                | *:wcash-payout-worker.service:ActiveState \
+                | *:wcash-pool-wallet-init.service:ActiveState)
                 printf 'inactive\n'
                 ;;
-            *:wcash-pool.service:SubState | *:wcash-pool-wallet-init.service:SubState)
+            *:zecwec-testnet-pool.target:SubState \
+                | *:wcash-pool.service:SubState \
+                | *:wcash-pool-projector.service:SubState \
+                | *:wcash-payout-worker.service:SubState \
+                | *:wcash-pool-wallet-init.service:SubState)
                 printf 'dead\n'
                 ;;
             nonzero-pid:wcash-pool-wallet-init.service:MainPID) printf '17\n' ;;
-            *:wcash-pool.service:MainPID | *:wcash-pool-wallet-init.service:MainPID)
+            *:zecwec-testnet-pool.target:MainPID \
+                | *:wcash-pool.service:MainPID \
+                | *:wcash-pool-projector.service:MainPID \
+                | *:wcash-payout-worker.service:MainPID \
+                | *:wcash-pool-wallet-init.service:MainPID)
                 printf '0\n'
                 ;;
-            *:wcash-pool.service:ControlPID | *:wcash-pool-wallet-init.service:ControlPID)
+            *:zecwec-testnet-pool.target:ControlPID \
+                | *:wcash-pool.service:ControlPID \
+                | *:wcash-pool-projector.service:ControlPID \
+                | *:wcash-payout-worker.service:ControlPID \
+                | *:wcash-pool-wallet-init.service:ControlPID)
                 printf '0\n'
                 ;;
             *) exit 2 ;;
@@ -935,8 +1792,8 @@ run_zec_seal_systemctl_scenario() {
 
 run_zec_seal_systemctl_scenario expected pass
 zec_stopped_units=$(wc -l <"$zec_seal_systemctl_test/expected.stops")
-((zec_stopped_units == 5)) || {
-    printf 'deployment-package-test: ZEC seal stopped %s backend-capable units, expected 5\n' \
+((zec_stopped_units == 14)) || {
+    printf 'deployment-package-test: ZEC seal stopped %s backend-capable units, expected 14\n' \
         "$zec_stopped_units" >&2
     exit 1
 }
@@ -996,6 +1853,35 @@ run_unit_state_scenario expected pass
 for scenario in missing masked error activating nonzero-pid; do
     run_unit_state_scenario "$scenario" fail
 done
+
+dropin_test="$temporary/dropin-test"
+mkdir -p "$dropin_test/bin"
+cat >"$dropin_test/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[[ $1 == show && $2 == --property=DropInPaths && $3 == --value ]] || exit 2
+[[ ${DROPIN_TEST_SCENARIO:-} != error ]] || exit 2
+if [[ ${DROPIN_TEST_SCENARIO:-} == present ]]; then
+    printf '/etc/systemd/system/test.service.d/override.conf\n'
+fi
+SH
+chmod 0555 "$dropin_test/bin/systemctl"
+PATH="$dropin_test/bin:$PATH" DROPIN_TEST_SCENARIO=empty \
+    bash -c 'source "$1"; require_unit_without_dropins test.service' \
+    bash "$repo_root/scripts/deploy/common.sh"
+for rejected_dropin_scenario in present error; do
+    if PATH="$dropin_test/bin:$PATH" DROPIN_TEST_SCENARIO=$rejected_dropin_scenario \
+        bash -c 'source "$1"; require_unit_without_dropins test.service' \
+        bash "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        printf 'deployment-package-test: unmanaged drop-in scenario passed: %s\n' \
+            "$rejected_dropin_scenario" >&2
+        exit 1
+    fi
+done
+# shellcheck disable=SC2016
+grep -Fq 'require_unit_without_dropins "$(basename -- "$unit")"' \
+    "$repo_root/scripts/deploy/render-deployment.sh"
+grep -Fq 'DropInPaths' "$repo_root/scripts/deploy/disable-legacy-pool.sh"
 
 mkdir -p "$temporary/config-check-credentials"
 chmod 0700 "$temporary/config-check-credentials"
@@ -1058,7 +1944,8 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" wallet-bootstrap \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/wallet-bootstrap-output" \
-    --pool-uid 12345
+    --pool-uid 12345 \
+    --payout-uid 12346
 [[ ! -e $temporary/wallet-bootstrap-output/backend.env \
     && ! -e $temporary/wallet-bootstrap-output/zec-authority.testnet.toml \
     && ! -e $temporary/wallet-bootstrap-output/pool.runtime.toml \
@@ -1403,7 +2290,8 @@ if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/rejected-discovery-bootstrap" \
-    --pool-uid 12345 >/dev/null 2>&1; then
+    --pool-uid 12345 \
+    --payout-uid 12346 >/dev/null 2>&1; then
     printf 'deployment-package-test: authority bootstrap accepted discovery sentinels\n' >&2
     exit 1
 fi
@@ -1413,7 +2301,8 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/ironwood-output" \
-    --pool-uid 12345
+    --pool-uid 12345 \
+    --payout-uid 12346
 grep -Fq 'LoadCredential=wcash-payout-ivk:' \
     "$temporary/ironwood-output/systemd/wcash-pool-backend.service" \
     || {
@@ -1428,7 +2317,8 @@ if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/transparent-output" \
-    --pool-uid 12345 >/dev/null 2>&1; then
+    --pool-uid 12345 \
+    --payout-uid 12346 >/dev/null 2>&1; then
     printf 'deployment-package-test: renderer accepted a transparent launch collector\n' >&2
     exit 1
 fi
@@ -1451,7 +2341,8 @@ if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/rejected" \
-    --pool-uid 12345 >/dev/null 2>&1; then
+    --pool-uid 12345 \
+    --payout-uid 12346 >/dev/null 2>&1; then
     printf 'deployment-package-test: renderer accepted mismatched genesis byte order\n' >&2
     exit 1
 fi
@@ -1472,7 +2363,8 @@ if python3 "$repo_root/scripts/deploy/render_deployment.py" finalize \
     --source-root "$repo_root" \
     --release-root "$temporary/release" \
     --output "$temporary/rejected-authority" \
-    --pool-uid 12345 >/dev/null 2>&1; then
+    --pool-uid 12345 \
+    --payout-uid 12346 >/dev/null 2>&1; then
     printf 'deployment-package-test: renderer accepted a mismatched target authority\n' >&2
     exit 1
 fi
@@ -1483,7 +2375,8 @@ if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --source-root "$repo_root" \
     --release-root "$temporary/release-link" \
     --output "$temporary/rejected-symlink-release" \
-    --pool-uid 12345 >/dev/null 2>&1; then
+    --pool-uid 12345 \
+    --payout-uid 12346 >/dev/null 2>&1; then
     printf 'deployment-package-test: renderer accepted a symlink release root\n' >&2
     exit 1
 fi

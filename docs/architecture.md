@@ -17,8 +17,8 @@ The pool and wolf have deliberately different responsibilities.
 The pool owns miner-facing ZIP-301 connection state, worker authentication and
 account mapping, externally leased nonce namespaces, per-miner share targets
 and vardiff, the assignments advertised to each session, bounded
-current/recent generation admission, and the future accounting projection and
-payout policy. These are policy and bookkeeping responsibilities, not
+current/recent generation admission, the accounting projection, and payout
+policy. These are policy and bookkeeping responsibilities, not
 consensus authority.
 
 Wolf remains the sole authority for Wcash and Zcash template construction,
@@ -61,30 +61,27 @@ evidence; source composition alone is not that evidence.
 
 | Component | Implemented now | Explicitly absent |
 | --- | --- | --- |
-| wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v1 request, response, event, target-endian and identity types; exact candidate, coinbase, parent-header and stable share-ID bindings; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | TCP/TLS listener, worker database, ASIC interoperability certification |
-| wcash-pool-core | In-memory session ordering, immutable worker binding, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, authoritative current/recent lifetime, bounded non-resurrectable generation tombstones, in-flight retirement fences, target policy, and integer vardiff including inactivity easing | Durable nonce-lease orchestration, durable generation-ID history, runtime composition, database persistence, crash recovery, network I/O, consensus validation |
-| wcash-pool-backend-client | Timeout-bounded Unix-socket connection, strict handshake and identity checks, request correlation, job snapshot/event replay, transport-branded lifetime anchors, exact submitted header time, canonical submitted-proof and job-bound receipt checks, live response-watermark flush enforcement, a core-validated share adapter that owns the admission fence through backend I/O, branded share commits, health checks, and bounded unsolicited-event buffering | Service composition, exact private Wcash recipient verification, cross-repository release evidence, and cryptographic peer authentication if transport stops being local |
-| wcash-pool-edge | Finite connection and queue policies, deterministic request limiting, ticket-bound authorization with exact miner-login binding, immutable session assignments, target-before-notify ordering, bounded global job fanout, replay-aware vardiff sampling, cancellation-safe serialized Wolf submissions, a bounded idle health/event pump with a mandatory acknowledged consumer seam, global suspension on terminal backend/event-stream failure, and a loopback-only admitted-TCP driver with strict LF framing, absolute deadlines, bounded writes, clean cancellation, and synthetic 4+28 transcript tests | Public TCP/TLS listener, authorization implementation, durable event-consumer/projector implementation, durable nonce leasing, service composition, certified ASIC transcript |
-| wcash-poold | A machine-readable readiness command that exits not-ready | Serve command, miner/admin/metrics listeners, configuration, database, wallet, payout loop, deployment |
-| Accounting | Protocol receipts and event shapes only | PostgreSQL schema and projector, balances, maturity, fees, rounding, reorg reversal, payouts |
-| Operations | Hermetic source checks and test scaffolding | Container image, manifests, monitoring, backups, runbooks, private soak, public endpoint |
+| wcash-pool-protocol | Bounded four-byte big-endian backend framing; strict backend-v2 request, response, event, target-endian and identity types; exact candidate, coinbase, parent-header and stable share-ID bindings; strict LF-delimited ZIP-301 request and response codec; 4-byte and 8-byte nonce profiles | ASIC interoperability certification |
+| wcash-pool-core | Session ordering, immutable worker binding, externally namespaced nonce allocation, bounded non-resurrectable generation history, retirement fences, target policy, and integer vardiff | Consensus validation, which deliberately remains in Wolf; real-ASIC certification |
+| wcash-pool-backend-client | Timeout-bounded Unix transport, strict protocol-v2 identity/authority handshake, snapshot and replay, canonical proof/receipt validation, response-watermark enforcement, and fail-closed share admission | Cross-repository exact-artifact evidence; cryptographic peer authentication if the transport ever leaves the local Unix boundary |
+| wcash-pool-edge | Source-restricted TCP listener, PostgreSQL worker authentication, durable nonce leases, bounded ZIP-301 actors, request/deadline/backpressure policy, job fanout, event projection, and global suspension | Independent regional failovers and certified real-ASIC evidence |
+| wcash-poold | Testnet-only preflight, migration, backend initialization, projector, composed miner/portal service, and chain-separated automatic payout worker | Mainnet mode and permission to publish Testnet before the live runbook gates pass |
+| Accounting | Deployment-fenced PostgreSQL PPLNS allocation, conserved ledgers, maturity/dematurity/orphan handling, wallet reconciliation, payout batches, and exact-artifact recovery | PPS/PPS+ financing and manual instant withdrawals |
+| Operations | Immutable release renderer, least-authority service roles, systemd dependency fencing, protected credentials, private preflight/start/activation/rollback, health checks, and reproducible Zallet build verification | Completed private soak, restore exercise, public DNS activation, and Mainnet deployment |
 
 ## Wolf backend and remaining integration requirements
 
-The pool-side wire contract is implemented in `wcash-pool-protocol`. Wolf now
-pins the protocol baseline at pool commit
-`adb66440a99a8dba9189ee15849e46e5a8c08441` and contains the matching private
-Unix listener, serialized authority, native retained-job path, and durable
-journal. That source-level match does not make the pair deployable: the pool
-service does not compose it into a public miner path, fixed cross-repository
-release vectors and recovery evidence remain required, and Wolf currently
-refuses a private Wcash collector because it cannot independently prove the
-encrypted recipient. The following remains the release contract for the
-integrated pair.
+The pool-side wire contract is implemented in `wcash-pool-protocol`. Wolf
+commit `e457b08d8db261b226cf7fb3278493d033f458f8` pins pool protocol commit
+`d5a298a47f4d12c2d532617a6eae55b26ec8b050` and contains the matching private
+Unix listener, serialized authority, native retained-job path, durable journal,
+and read-only trial-decryption proof for the exact private Wcash collector. The
+pair is composed in source. Fixed cross-repository artifacts, recovery, payout,
+reorg, HTTPS, and ASIC evidence remain required before publication.
 
 ### Transport and handshake
 
-- Serve backend protocol version 1 over a permission-restricted Unix socket.
+- Serve backend protocol version 2 over a permission-restricted Unix socket.
   The socket directory and inode must reject unauthorized users. A future TCP
   transport would require separate mutually authenticated credentials.
 - Use exactly one four-byte big-endian length followed by at most 64 KiB of
@@ -95,7 +92,7 @@ integrated pair.
   exact Wcash and Zcash genesis hashes; the non-zero Wcash chain ID;
   domain-separated 32-byte commitments to the exact Wcash child and Zcash
   parent block-reward recipients; current journal sequence; and every required
-  version-1 capability exactly once.
+  version-2 capability exactly once.
 - Configure both payout commitments independently of the socket peer and require
   exact equality during Hello. A changed template recipient must therefore stop
   mining instead of silently redirecting either chain's rewards.
@@ -172,10 +169,9 @@ integrated pair.
   generation retained by `SubmissionContext`. Any mismatch poisons the backend
   connection and releases the admission fence without exposing branded success.
 
-These generation-binding and winner-quarantine additions change the pre-Wolf
-backend-v1 wire shape. The version remains 1 only because no Wolf backend-v1
-server or deployed pool consumer exists; once version 1 ships, any further
-incompatible change requires a new negotiated protocol version.
+These generation-binding, authority, and winner-lifecycle additions are frozen
+as backend protocol version 2 for the Testnet release pair. Any further
+incompatible wire change requires a newly negotiated protocol version.
 
 ### Durable replay journal
 

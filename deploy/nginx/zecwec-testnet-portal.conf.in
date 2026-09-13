@@ -29,9 +29,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name @APEX_HOST@;
 
     ssl_certificate @APEX_TLS_CERT@;
@@ -49,9 +48,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name @PORTAL_HOST@;
 
     ssl_certificate @PORTAL_TLS_CERT@;

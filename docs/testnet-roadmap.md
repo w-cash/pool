@@ -38,17 +38,17 @@ committed revision must still pass clean-clone checks.
 
 ## Phase 1 — Freeze the wolf backend API
 
-The pool-side backend-v1 wire types and Unix client exist. Wolf pins the same
+The pool-side protocol-v2 wire types and Unix client exist. Wolf pins the same
 protocol baseline and exposes a permission-restricted listener, serialized
 authority, retained native jobs, and durable journal around its consensus
-coordinator. Phase 1 remains partial until the two services are composed and
-the following cross-repository recovery, compatibility, and private-recipient
-gates are evidenced on exact release revisions.
+coordinator. The services are composed in source. Phase 1 remains unapproved
+until the following cross-repository recovery, compatibility, and
+private-recipient gates are evidenced on exact release revisions.
 
 Required wolf gates:
 
 - permission-restricted Unix transport using the exact bounded four-byte
-  big-endian backend-v1 framing;
+  big-endian backend-v2 framing;
 - Hello-first negotiation of distinct backend session, stable backend
   instance and journal stream, Wcash and Zcash genesis identities, Wcash chain
   ID, exact Wcash and Zcash payout-recipient commitments, and the complete
@@ -119,8 +119,8 @@ the pool cannot bypass wolf's consensus validation.
 
 Deliverables:
 
-- bounded ZIP-301 framing and strict JSON/message validation (codec and
-  loopback accepted-stream integration implemented; public listener pending);
+- bounded ZIP-301 framing and strict JSON/message validation through the
+  source-restricted Testnet TCP listener and TLS termination;
 - TLS, subscription, authorization, worker identity, clean disconnect, and
   backpressure;
 - exact login binding: until aliases are explicitly represented, authentication
@@ -146,14 +146,12 @@ wrong-session, wrong-job, and disconnect races are covered without live nodes.
 
 Current note: deterministic codec, bounded connection/session actors, global
 job fanout and suspension, exact-login policy, replay-aware vardiff, request
-limiting, cancellation-safe submission serialization, a bounded idle
-health/event pump with a mandatory consumer seam, and a loopback-only
-accepted-stream driver cover only the library/test layer. The driver enforces
-strict LF framing, absolute frame/idle/write/auth/submission deadlines, bounded
-backpressure, cancellation cleanup, and the standard 4+28 nonce split. There
-is no durable event-consumer implementation, public socket listener, TLS
-termination, credential implementation, durable nonce lease, service
-composition, or certified ASIC transcript yet.
+limiting, cancellation-safe submission serialization, durable event
+projection, PostgreSQL authentication and nonce leasing, and the
+source-restricted listener are composed for Testnet. Strict LF framing,
+absolute frame/idle/write/auth/submission deadlines, bounded backpressure,
+cancellation cleanup, and the standard 4+28 nonce split are covered. Exact
+release deployment and a certified real-ASIC transcript remain required.
 
 ## Phase 3 — End-to-end job and share lifecycle
 

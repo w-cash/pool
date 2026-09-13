@@ -9,6 +9,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/common.sh"
 
 require_root
+require_command python3
 require_command sha256sum
 require_command systemctl
 
@@ -18,6 +19,7 @@ mode=$1
 settings=$2
 [[ $mode == snapshot || $mode == reconcile ]] || die "credential refresh mode is invalid"
 require_private_regular_file "$settings"
+cidrs=/etc/wcash-pool/miner-cidrs
 
 state_directory=/var/lib/zecwec-cookie-refresh
 state_file="$state_directory/cookie-digests"
@@ -91,6 +93,27 @@ write_snapshot() {
     trap - RETURN
 }
 
+refresh_completed=false
+target_was_active=false
+refresh_failed() {
+    local status=$?
+    trap - ERR
+    trap - EXIT
+    if ! $refresh_completed; then
+        stop_testnet_runtime_after_failure "$settings" "$cidrs"
+    fi
+    exit "$status"
+}
+if [[ $mode == reconcile ]]; then
+    systemctl is-active --quiet zecwec-testnet-pool.target && target_was_active=true
+    # A path-triggered rotation can observe a cookie between unlink and rename.
+    # Close ingress before waiting or parsing any state, and make explicit exits
+    # as well as command failures stop the stale-credential runtime.
+    trap refresh_failed ERR
+    trap refresh_failed EXIT
+    "$script_dir/restrict-mining-firewall.sh" close "$settings" "$cidrs"
+fi
+
 read_current
 if [[ $mode == snapshot ]]; then
     write_snapshot
@@ -119,15 +142,51 @@ validator_changed=false
     || validator_changed=true
 
 if ! $wcash_changed && ! $template_changed && ! $validator_changed; then
+    if $target_was_active; then
+        portal=$(read_setting "$settings" PORTAL_LISTEN)
+        python3 "$script_dir/wait_payout_ready.py" "http://$portal/readyz" 4200
+        "$script_dir/restrict-mining-firewall.sh" apply "$settings" "$cidrs"
+        "$script_dir/enable-nginx-edge.sh" reconcile "$settings" "$cidrs"
+        "$script_dir/health-check.sh" --settings "$settings" --cidrs "$cidrs"
+    fi
+    refresh_completed=true
+    trap - ERR
+    trap - EXIT
     exit 0
 fi
 
-pool_should_run=false
-if systemctl is-active --quiet zecwec-testnet-pool.target \
-    || systemctl is-active --quiet wcash-pool.service; then
+target_should_run=false
+if systemctl is-active --quiet zecwec-testnet-pool.target; then
+    target_should_run=true
+fi
+pool_should_run=$target_should_run
+if systemctl is-active --quiet wcash-pool.service; then
     pool_should_run=true
 fi
-systemctl stop wcash-pool.service >/dev/null 2>&1 || true
+projector_should_run=$target_should_run
+if systemctl is-active --quiet wcash-pool-projector.service; then
+    projector_should_run=true
+fi
+payout_should_run=$target_should_run
+if systemctl is-active --quiet wcash-payout-worker.service; then
+    payout_should_run=true
+fi
+zallet_should_run=$target_should_run
+if systemctl is-active --quiet zecwec-zallet-payout.service; then
+    zallet_should_run=true
+fi
+
+# An active target upholds the payout services. Stop it first so systemd does
+# not race the credential refresh by immediately reviving a stopped worker.
+if $target_should_run || $pool_should_run || $payout_should_run; then
+    "$script_dir/restrict-mining-firewall.sh" close "$settings" "$cidrs"
+fi
+if $target_should_run; then
+    systemctl stop wcash-pool-health.timer >/dev/null 2>&1 || true
+    systemctl stop zecwec-testnet-pool.target >/dev/null 2>&1 || true
+fi
+systemctl stop wcash-payout-worker.service zecwec-zallet-payout.service \
+    wcash-pool.service wcash-pool-projector.service >/dev/null 2>&1 || true
 
 if $wcash_changed || $template_changed || $validator_changed; then
     if systemctl is-active --quiet wcash-pool-backend.service || $pool_should_run; then
@@ -147,21 +206,53 @@ sleep 1
 read_current
 for name in "${cookie_names[@]}"; do
     if [[ ${before_pool[$name]} != "${current[$name]}" ]]; then
-        systemctl stop wcash-pool.service >/dev/null 2>&1 || true
+        stop_testnet_runtime_after_failure "$settings" "$cidrs"
         die "an RPC credential rotated during refresh; the public pool remains stopped"
     fi
 done
 
+if $projector_should_run; then
+    systemctl start wcash-pool-projector.service
+fi
 if $pool_should_run; then
     systemctl start wcash-pool.service
     read_current
     for name in "${cookie_names[@]}"; do
         if [[ ${before_pool[$name]} != "${current[$name]}" ]]; then
-            systemctl stop wcash-pool.service >/dev/null 2>&1 || true
+            stop_testnet_runtime_after_failure "$settings" "$cidrs"
             die "an RPC credential rotated during pool startup; the public pool was stopped"
         fi
     done
 fi
+if $zallet_should_run; then
+    systemctl start zecwec-zallet-payout.service
+fi
+if $payout_should_run; then
+    systemctl start wcash-payout-worker.service
+fi
+if $target_should_run; then
+    systemctl start zecwec-testnet-pool.target
+    portal=$(read_setting "$settings" PORTAL_LISTEN)
+    python3 "$script_dir/wait_payout_ready.py" "http://$portal/readyz" 4200
+    "$script_dir/restrict-mining-firewall.sh" apply "$settings" "$cidrs"
+    "$script_dir/enable-nginx-edge.sh" reconcile "$settings" "$cidrs"
+    "$script_dir/health-check.sh" --settings "$settings" \
+        --cidrs "$cidrs"
+fi
+
+read_current
+for name in "${cookie_names[@]}"; do
+    if [[ ${before_pool[$name]} != "${current[$name]}" ]]; then
+        stop_testnet_runtime_after_failure "$settings" "$cidrs"
+        die "an RPC credential rotated during service startup; public and payout services were stopped"
+    fi
+done
 
 write_snapshot
+if $target_should_run; then
+    systemctl start wcash-pool-health.timer
+fi
+refresh_completed=true
+trap - ERR
+trap - EXIT
 log "refreshed affected systemd credential snapshots without exposing credentials"

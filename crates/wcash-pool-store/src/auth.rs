@@ -12,7 +12,9 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use wcash_pool_core::AuthenticatedWorker;
-use wcash_pool_edge::{AuthenticationError, AuthenticationProvider, AuthenticationTicket};
+use wcash_pool_edge::{
+    AuthenticationError, AuthenticationGrant, AuthenticationProvider, AuthenticationTicket,
+};
 use zeroize::Zeroizing;
 
 const TOKEN_PREFIX: &str = "zw1";
@@ -199,8 +201,43 @@ impl PostgresAuthenticationProvider {
         &self,
         login: &str,
         password: &str,
-    ) -> Result<AuthenticatedWorker, AuthenticationError> {
+    ) -> Result<AuthenticationGrant, AuthenticationError> {
         authenticate_credentials(self, login, password).await
+    }
+
+    /// Revalidates one connected Stratum identity against fresh PostgreSQL
+    /// worker, account, and token state without repeating memory-hard hashing.
+    pub async fn revalidate_worker(
+        &self,
+        grant: &AuthenticationGrant,
+    ) -> Result<(), AuthenticationError> {
+        let worker = grant.worker();
+        let live = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+               SELECT 1 FROM workers w \
+               JOIN accounts a \
+                 ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
+               WHERE w.deployment_id=$1 AND w.id=$2 AND w.account_id=$3 \
+                 AND w.canonical_login=$4 AND w.enabled AND a.enabled \
+                 AND EXISTS (SELECT 1 FROM mining_tokens t \
+                     WHERE t.deployment_id=w.deployment_id AND t.worker_id=w.id AND t.id=$5 \
+                       AND t.revoked_at IS NULL \
+                       AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())) \
+             )",
+        )
+        .bind(self.deployment_id)
+        .bind(worker.worker_id())
+        .bind(worker.account_id())
+        .bind(worker.canonical_login())
+        .bind(grant.credential_id())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| AuthenticationError::Unavailable)?;
+        if live {
+            Ok(())
+        } else {
+            Err(AuthenticationError::Denied)
+        }
     }
 }
 
@@ -208,7 +245,7 @@ async fn authenticate_credentials(
     provider: &PostgresAuthenticationProvider,
     login: &str,
     password: &str,
-) -> Result<AuthenticatedWorker, AuthenticationError> {
+) -> Result<AuthenticationGrant, AuthenticationError> {
     // Every clone shares this semaphore. It fences Argon2's ~19 MiB working
     // set process-wide instead of permitting one allocation per open socket.
     let verification_slot = provider
@@ -223,7 +260,8 @@ async fn authenticate_credentials(
     let row = if valid_login(&login) {
         if let Some(selector) = selector {
             sqlx::query(
-                "SELECT a.id AS account_id, w.id AS worker_id, w.canonical_login, t.verifier \
+                "SELECT a.id AS account_id, w.id AS worker_id, w.canonical_login, \
+                        t.id AS credential_id,t.verifier \
                  FROM mining_tokens t \
                  JOIN workers w ON (w.deployment_id, w.id) = (t.deployment_id, t.worker_id) \
                  JOIN accounts a ON (a.deployment_id, a.id) = (w.deployment_id, w.account_id) \
@@ -245,7 +283,7 @@ async fn authenticate_credentials(
         None
     };
 
-    let (account_id, worker_id, canonical_login, verifier) = match row {
+    let (account_id, worker_id, credential_id, canonical_login, verifier) = match row {
         Some(row) => {
             let account_id = row
                 .try_get::<Uuid, _>("account_id")
@@ -256,12 +294,27 @@ async fn authenticate_credentials(
             let canonical_login = row
                 .try_get::<String, _>("canonical_login")
                 .map_err(|_| AuthenticationError::Unavailable)?;
+            let credential_id = row
+                .try_get::<Uuid, _>("credential_id")
+                .map_err(|_| AuthenticationError::Unavailable)?;
             let verifier = row
                 .try_get::<String, _>("verifier")
                 .map_err(|_| AuthenticationError::Unavailable)?;
-            (Some(account_id), Some(worker_id), canonical_login, verifier)
+            (
+                Some(account_id),
+                Some(worker_id),
+                Some(credential_id),
+                canonical_login,
+                verifier,
+            )
         }
-        None => (None, None, String::new(), provider.dummy_verifier.clone()),
+        None => (
+            None,
+            None,
+            None,
+            String::new(),
+            provider.dummy_verifier.clone(),
+        ),
     };
 
     let verified = tokio::task::spawn_blocking(move || {
@@ -272,10 +325,11 @@ async fn authenticate_credentials(
     })
     .await
     .map_err(|_| AuthenticationError::Unavailable)?;
-    match (verified, account_id, worker_id) {
-        (true, Some(account_id), Some(worker_id)) => {
-            AuthenticatedWorker::new(account_id, worker_id, canonical_login)
-                .map_err(|_| AuthenticationError::Unavailable)
+    match (verified, account_id, worker_id, credential_id) {
+        (true, Some(account_id), Some(worker_id), Some(credential_id)) => {
+            let worker = AuthenticatedWorker::new(account_id, worker_id, canonical_login)
+                .map_err(|_| AuthenticationError::Unavailable)?;
+            AuthenticationGrant::new(worker, credential_id)
         }
         _ => Err(AuthenticationError::Denied),
     }
@@ -285,9 +339,16 @@ impl AuthenticationProvider for PostgresAuthenticationProvider {
     fn authenticate<'a>(
         &'a self,
         ticket: &'a AuthenticationTicket,
-    ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedWorker, AuthenticationError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<AuthenticationGrant, AuthenticationError>> + Send + 'a>>
     {
         Box::pin(self.authenticate_credentials(ticket.worker(), ticket.password()))
+    }
+
+    fn revalidate<'a>(
+        &'a self,
+        grant: &'a AuthenticationGrant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthenticationError>> + Send + 'a>> {
+        Box::pin(self.revalidate_worker(grant))
     }
 }
 

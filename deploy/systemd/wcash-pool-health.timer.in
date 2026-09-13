@@ -8,6 +8,3 @@ RandomizedDelaySec=5s
 AccuracySec=5s
 Persistent=false
 Unit=wcash-pool-health.service
-
-[Install]
-WantedBy=timers.target

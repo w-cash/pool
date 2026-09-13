@@ -699,7 +699,9 @@ impl ZecPcztSigner {
         if request.fund_source != ZecFundSource::Orchard {
             return Err(ZecPayoutError::WrongFundSource);
         }
-        if request.batch.outputs.len() > self.config.max_outputs() {
+        if request.batch.outputs.len() > self.config.max_outputs()
+            || request.batch.maximum_network_fee_zat > self.config.max_fee_zat()
+        {
             return Err(ZecPayoutError::InvalidRequest);
         }
         let output_total_zat = request
@@ -708,7 +710,7 @@ impl ZecPcztSigner {
             .map_err(|_| ZecPayoutError::InvalidRequest)?;
         if output_total_zat > MAX_ZEC_ZAT
             || output_total_zat
-                .checked_add(self.config.max_fee_zat())
+                .checked_add(request.batch.maximum_network_fee_zat)
                 .is_none_or(|total| total > MAX_ZEC_ZAT)
         {
             return Err(ZecPayoutError::InvalidRequest);
@@ -1033,7 +1035,7 @@ impl ZecPcztSigner {
         let fee = declared_value_sum - i128::from(transparent_total);
         let network_fee_zat = u64::try_from(fee)
             .ok()
-            .filter(|fee| *fee > 0 && *fee <= self.config.max_fee_zat())
+            .filter(|fee| *fee > 0 && *fee <= request.batch.maximum_network_fee_zat)
             .ok_or(ZecPayoutError::WalletProtocolViolation)?;
 
         Ok(VerifiedEffects {
@@ -1065,7 +1067,7 @@ impl ZecPcztSigner {
             || u32::from_str_radix(&inspected.consensus_branch_id, 16).ok()
                 != Some(ZCASH_NU6_3_BRANCH_ID)
             || inspected.fee_zat < 0
-            || inspected.fee_zat > i128::from(self.config.max_fee_zat())
+            || inspected.fee_zat > i128::from(request.batch.maximum_network_fee_zat)
             || !inspected.transparent.inputs.is_empty()
             || inspected.sapling.spends != 0
             || !inspected.sapling.outputs.is_empty()

@@ -1,6 +1,8 @@
 //! Validated portal configuration and secret material.
 
 use std::fmt;
+
+use axum::http::Uri;
 use zeroize::Zeroize;
 
 use crate::ChainNetwork;
@@ -16,7 +18,7 @@ pub struct PortalConfig {
     pub session_ttl_secs: u64,
     /// Maximum inactivity before a session expires.
     pub session_idle_secs: u64,
-    /// Safety hold applied to replacement payout destinations.
+    /// Safety hold applied to every initial or replacement payout destination.
     pub payout_change_hold_secs: u64,
     /// Failed logins before a temporary lock.
     pub max_login_attempts: u32,
@@ -46,12 +48,7 @@ impl PortalConfig {
 
     /// Rejects configurations that weaken core browser controls.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.canonical_origin.starts_with("https://")
-            || self.canonical_origin.ends_with('/')
-            || self
-                .canonical_origin
-                .contains(|character: char| character.is_whitespace())
-        {
+        if !is_exact_https_origin(&self.canonical_origin) {
             return Err(ConfigError::CanonicalOrigin);
         }
         if self.session_ttl_secs < 300 || self.session_ttl_secs > 24 * 60 * 60 {
@@ -74,6 +71,21 @@ impl PortalConfig {
         }
         Ok(())
     }
+}
+
+fn is_exact_https_origin(candidate: &str) -> bool {
+    let Ok(uri) = candidate.parse::<Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    uri.scheme_str() == Some("https")
+        && !authority.as_str().contains('@')
+        && !authority.host().is_empty()
+        && uri.path() == "/"
+        && uri.query().is_none()
+        && candidate == format!("https://{authority}")
 }
 
 /// Configuration validation failure.
@@ -156,5 +168,44 @@ impl Drop for PortalSecrets {
     fn drop(&mut self) {
         self.token_pepper.zeroize();
         self.totp_encryption_key.zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_origin_is_one_strict_https_origin() {
+        for accepted in [
+            "https://testnet.zecwec.com",
+            "https://testnet.zecwec.com:8443",
+            "https://[2001:db8::1]:8443",
+        ] {
+            let mut config = PortalConfig::testnet();
+            config.canonical_origin = accepted.to_owned();
+            assert_eq!(config.validate(), Ok(()), "rejected {accepted}");
+        }
+
+        for rejected in [
+            "http://testnet.zecwec.com",
+            "https://testnet.zecwec.com/",
+            "https://testnet.zecwec.com/path",
+            "https://testnet.zecwec.com?query=1",
+            "https://testnet.zecwec.com#fragment",
+            "https://user@testnet.zecwec.com",
+            "https://testnet.zecwec.com@evil.example",
+            "https://testnet.zecwec.com\\@evil.example",
+            "https://",
+            " https://testnet.zecwec.com",
+        ] {
+            let mut config = PortalConfig::testnet();
+            config.canonical_origin = rejected.to_owned();
+            assert_eq!(
+                config.validate(),
+                Err(ConfigError::CanonicalOrigin),
+                "accepted {rejected}"
+            );
+        }
     }
 }

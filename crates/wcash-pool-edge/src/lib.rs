@@ -21,8 +21,9 @@ mod telemetry;
 
 pub use config::{ConnectionLimits, EdgeConfig, EdgeConfigError};
 pub use connection::{
-    AuthenticationError, AuthenticationProvider, AuthenticationTicket, ConnectionAction,
-    ConnectionActor, ConnectionActorError, MiningPolicy, PendingShare, ShareTicket,
+    AuthenticationError, AuthenticationGrant, AuthenticationProvider, AuthenticationTicket,
+    ConnectionAction, ConnectionActor, ConnectionActorError, MiningPolicy, PendingShare,
+    ShareTicket,
 };
 pub use error::{MinerError, MinerErrorCode};
 pub use rate_limit::{ConnectionCapacity, ConnectionPermit, RateLimit, RateLimitError};

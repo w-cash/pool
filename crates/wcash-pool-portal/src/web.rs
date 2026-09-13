@@ -239,6 +239,9 @@ async fn healthz() -> Json<Value> {
 
 async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     state.store.readiness().await?;
+    if !state.store.payout_worker_is_live().await? {
+        return Err(AppError::Unavailable);
+    }
     address_validator_readiness(&state, Asset::Wec).await?;
     address_validator_readiness(&state, Asset::Zec).await?;
     state.payout.readiness_bounded(READINESS_TIMEOUT).await?;
@@ -246,7 +249,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
         "ready": true,
         "component": "miner-portal",
         "network": state.config.network,
-        "payout_execution": state.payout.execution().as_str()
+        "payout_execution": "enabled"
     })))
 }
 
@@ -411,8 +414,11 @@ async fn login(
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
     require_origin(&state, &headers)?;
-    let username = canonical_username(&request.username).unwrap_or_default();
-    let account = state.store.account_by_username(&username).await?;
+    let username = canonical_username(&request.username);
+    let account = match username {
+        Ok(username) => state.store.account_by_username(&username).await?,
+        Err(_) => None,
+    };
     let encoded = account.as_ref().map_or_else(
         || state.dummy_password_hash.clone(),
         |value| value.password_hash.clone(),
@@ -653,6 +659,9 @@ async fn list_payout_settings(
                     threshold_zat: 0,
                     automatic: false,
                     revision: 0,
+                    pending_threshold_zat: None,
+                    pending_automatic: None,
+                    pending_revision: None,
                 }),
         );
     }

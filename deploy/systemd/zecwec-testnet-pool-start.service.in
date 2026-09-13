@@ -1,0 +1,20 @@
+# Managed by the ZecWec Testnet deployment package.
+[Unit]
+Description=Readiness-gated ZecWec Testnet pool startup
+Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+Requires=postgresql.service @WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+After=network-online.target postgresql.service @WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@ @ZCASH_TEMPLATE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/start-testnet-pool.sh /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
+TimeoutStartSec=7200s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

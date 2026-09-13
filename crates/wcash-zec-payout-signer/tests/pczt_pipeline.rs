@@ -843,6 +843,7 @@ fn fixture(root: &TestDirectory) -> (ZecSignerConfig, ZecPayoutRequest, TestPczt
             network: ChainNetwork::Testnet,
             ledger_root: [5; 32],
             reconciliation_id: Uuid::new_v4(),
+            maximum_network_fee_zat: 1_000_000,
             outputs: vec![PayoutOutput {
                 allocation_id: Uuid::new_v4(),
                 canonical_address: pczt.recipient_unified_address.clone(),

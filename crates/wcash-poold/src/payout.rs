@@ -75,6 +75,7 @@ mod tests {
                 network: ChainNetwork::Testnet,
                 ledger_root: [1; 32],
                 reconciliation_id: uuid::Uuid::new_v4(),
+                maximum_network_fee_zat: 1,
                 outputs: Vec::new(),
             };
             assert_eq!(

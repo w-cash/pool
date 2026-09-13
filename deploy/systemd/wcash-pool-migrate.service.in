@@ -8,17 +8,14 @@ ConditionPathExists=/etc/wcash-pool/pool.migrate.toml
 
 [Service]
 Type=oneshot
-User=wcash-pool
-Group=wcash-pool
+User=wcash-pool-migrate
+Group=wcash-pool-migrate
 UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
 LoadCredential=database-url:@DATABASE_MIGRATOR_URL_CREDENTIAL@
-LoadCredential=portal-token-pepper:@PORTAL_TOKEN_PEPPER_CREDENTIAL@
-LoadCredential=portal-totp-key:@PORTAL_TOTP_KEY_CREDENTIAL@
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
-ExecStartPre=@WCASH_RELEASE_ROOT@/wcash-poold config-check --config /etc/wcash-pool/pool.migrate.toml
 ExecStart=@WCASH_RELEASE_ROOT@/wcash-poold migrate --config /etc/wcash-pool/pool.migrate.toml
-ExecStartPost=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url @POSTGRES_RUNTIME_ROLE@
+ExecStartPost=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/grant-runtime.sh /run/credentials/wcash-pool-migrate.service/database-url @POSTGRES_MIGRATOR_ROLE@ @POSTGRES_RUNTIME_ROLE@ @POSTGRES_PROJECTOR_ROLE@ @POSTGRES_PAYOUT_ROLE@
 RemainAfterExit=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
@@ -31,12 +28,14 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
+InaccessiblePaths=-@WEC_SEED_FILE@ -@PAYOUT_STATE_DIR@ -@ZALLET_CONFIG_FILE@ -@ZALLET_PAYOUT_CONFIG_FILE@ -@ZALLET_STATE_DIR@ -@ZALLET_RECOVERY_CONFIG_FILE@ -@ZALLET_RECOVERY_STATE_DIR@ -@ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL@ -@PORTAL_TOKEN_PEPPER_CREDENTIAL@ -@PORTAL_TOTP_KEY_CREDENTIAL@
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+SocketBindDeny=any
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=

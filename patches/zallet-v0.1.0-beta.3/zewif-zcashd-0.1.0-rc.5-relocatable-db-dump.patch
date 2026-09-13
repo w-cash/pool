@@ -1,0 +1,127 @@
+diff --git a/build.rs b/build.rs
+index 7681ae1..ede3ee8 100644
+--- a/build.rs
++++ b/build.rs
+@@ -46,7 +46,7 @@ fn build_berkeley_db() -> Result<(), String> {
+ 
+     // Skip if already built
+     if db_dump_binary.exists() {
+-        println!("cargo:rustc-env=DB_DUMP_PATH={}", db_dump_binary.display());
++        emit_db_dump_path(out_path, &db_dump_binary)?;
+         return Ok(());
+     }
+ 
+@@ -121,11 +121,36 @@ fn build_berkeley_db() -> Result<(), String> {
+     fs::copy(&built_binary, &db_dump_binary)
+         .map_err(|e| format!("Failed to copy db_dump to OUT_DIR: {}", e))?;
+ 
+-    println!("cargo:rustc-env=DB_DUMP_PATH={}", db_dump_binary.display());
++    emit_db_dump_path(out_path, &db_dump_binary)?;
+ 
+     Ok(())
+ }
+ 
++fn emit_db_dump_path(out_path: &Path, db_dump_binary: &Path) -> Result<(), String> {
++    // Cargo places OUT_DIR below `<profile>/build/<unit>/out`, while the
++    // executable is written directly below `<profile>`. Store that stable,
++    // executable-relative suffix rather than an absolute build-host path.
++    let profile_dir = out_path
++        .ancestors()
++        .nth(3)
++        .ok_or_else(|| format!("Unexpected OUT_DIR layout: {}", out_path.display()))?;
++    let relative_path = db_dump_binary.strip_prefix(profile_dir).map_err(|_| {
++        format!(
++            "db_dump escaped Cargo profile directory: {}",
++            db_dump_binary.display()
++        )
++    })?;
++    if relative_path.is_absolute() {
++        return Err(format!(
++            "db_dump path was not made relative: {}",
++            relative_path.display()
++        ));
++    }
++
++    println!("cargo:rustc-env=DB_DUMP_PATH={}", relative_path.display());
++    Ok(())
++}
++
+ fn verify_checksum(tarball_path: &Path) -> Result<(), String> {
+     let output = Command::new("sha256sum")
+         .arg(tarball_path)
+diff --git a/src/bdb_dump.rs b/src/bdb_dump.rs
+index d5b2494..6e508d4 100644
+--- a/src/bdb_dump.rs
++++ b/src/bdb_dump.rs
+@@ -1,5 +1,6 @@
+ use std::{
+     collections::HashMap,
++    env,
+     path::{Path, PathBuf},
+     process::{Command, Stdio},
+ };
+@@ -47,15 +48,27 @@ impl BDBDump {
+     /// Resolves the path to the db_dump utility, preferring the vendored version.
+     fn resolve_db_dump_path() -> PathBuf {
+         if let Some(vendored_path) = option_env!("DB_DUMP_PATH") {
+-            let path = PathBuf::from(vendored_path);
+-            if path.exists() {
+-                return path;
++            if let Ok(executable) = env::current_exe() {
++                if let Some(path) = Self::vendored_db_dump_path(&executable, vendored_path) {
++                    if path.is_file() {
++                        return path;
++                    }
++                }
+             }
+         }
+ 
+         PathBuf::from("db_dump")
+     }
+ 
++    fn vendored_db_dump_path(executable: &Path, vendored_path: &str) -> Option<PathBuf> {
++        let vendored_path = Path::new(vendored_path);
++        if vendored_path.is_absolute() {
++            return None;
++        }
++
++        executable.parent().map(|parent| parent.join(vendored_path))
++    }
++
+     /// Dumps the BDB database at `filepath`, automatically resolving the db_dump binary.
+     ///
+     /// Uses the vendored db_dump if available, falling back to a system-installed version.
+@@ -156,3 +169,33 @@ impl BDBDump {
+         Ok(BDBDump { header_records, data_records })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::BDBDump;
++    use std::path::{Path, PathBuf};
++
++    #[test]
++    fn vendored_db_dump_is_resolved_relative_to_the_executable() {
++        assert_eq!(
++            BDBDump::vendored_db_dump_path(
++                Path::new("/opt/zallet/bin/zallet"),
++                "build/zewif-zcashd/out/db_dump",
++            ),
++            Some(PathBuf::from(
++                "/opt/zallet/bin/build/zewif-zcashd/out/db_dump"
++            )),
++        );
++    }
++
++    #[test]
++    fn absolute_build_host_paths_are_rejected() {
++        assert_eq!(
++            BDBDump::vendored_db_dump_path(
++                Path::new("/opt/zallet/bin/zallet"),
++                "/tmp/build/zewif-zcashd/out/db_dump",
++            ),
++            None,
++        );
++    }
++}

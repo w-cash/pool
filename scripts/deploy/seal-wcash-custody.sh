@@ -27,16 +27,18 @@ for protected in "$settings" "$recovery_init" "$recovery_identity"; do
     require_private_regular_file "$protected"
 done
 require_absolute_path "$authority"
-[[ $authority == /var/lib/wcash-pool/wcash-wallet-authority.json ]] \
+[[ $authority == /var/lib/wcash-payout/wcash-wallet-authority.json ]] \
     || die "wallet authority path does not match the reviewed deployment"
 [[ -f $authority && ! -L $authority ]] || die "frozen wallet authority is unavailable"
 case $(stat -c '%U:%G:%a:%h' -- "$authority") in
-    wcash-pool:wcash-pool:600:1 | root:root:400:1) ;;
+    wcash-payout:wcash-payout:600:1 | root:root:400:1) ;;
     *) die "frozen wallet authority ownership or mode is unsafe" ;;
 esac
 
 stop_custody_units_for_sealing
 require_no_processes_for_user wcash-pool "mining identity"
+require_no_processes_for_user wcash-pool-projector "accounting projector identity"
+require_no_processes_for_user wcash-payout "payout identity"
 
 seed=$(read_setting "$settings" WEC_SEED_FILE)
 [[ $seed == /var/lib/wcash-pool-secrets/wcash-seed ]] \
@@ -61,7 +63,7 @@ chown root:root -- "$attestation"
 chmod 0400 -- "$attestation"
 
 case $(stat -c '%U:%G:%a:%h' -- "$seed") in
-    wcash-pool:wcash-pool:600:1)
+    wcash-payout:wcash-payout:600:1)
         chown root:root -- "$seed"
         chmod 0400 -- "$seed"
         ;;

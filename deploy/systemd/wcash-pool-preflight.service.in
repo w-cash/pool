@@ -1,9 +1,9 @@
 [Unit]
 Description=Validate ZecWec Testnet pool without opening miner or portal listeners
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
-Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-custody-gate.service
-BindsTo=wcash-pool-backend.service @WCASH_NODE_UNIT@ @ZCASH_VALIDATOR_UNIT@
-After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-custody-gate.service zecwec-zallet-recovery.service @WCASH_NODE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+Requires=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-projector.service wcash-pool-custody-gate.service
+BindsTo=wcash-pool-backend.service wcash-pool-projector.service @WCASH_NODE_UNIT@ @ZCASH_VALIDATOR_UNIT@
+After=postgresql.service wcash-pool-migrate.service wcash-pool-backend.service wcash-pool-projector.service wcash-pool-custody-gate.service zecwec-zallet-recovery.service @WCASH_NODE_UNIT@ @ZCASH_VALIDATOR_UNIT@
 Conflicts=zecwec-zallet-recovery.service
 ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/pool.preflight.toml
@@ -43,7 +43,7 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-InaccessiblePaths=-@WEC_SEED_FILE@ -@WCASH_WALLET_DATABASE@ -@WEC_SIGNER_JOURNAL@ -@ZALLET_CONFIG_FILE@ -@ZALLET_STATE_DIR@ -@ZALLET_RECOVERY_CONFIG_FILE@ -@ZALLET_RECOVERY_STATE_DIR@ -@ZEC_SIGNER_JOURNAL@
+InaccessiblePaths=-@WEC_SEED_FILE@ -@PAYOUT_STATE_DIR@ -@ZALLET_CONFIG_FILE@ -@ZALLET_PAYOUT_CONFIG_FILE@ -@ZALLET_STATE_DIR@ -@ZALLET_RECOVERY_CONFIG_FILE@ -@ZALLET_RECOVERY_STATE_DIR@ -@ZALLET_ENCRYPTION_IDENTITY_CREDENTIAL@
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -47,6 +47,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Validate only the isolated payout policy and its database credential.
+    PayoutConfigCheck {
+        /// Absolute path to the protected payout-worker policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Prove one finalized, empty Zcash Testnet collector before backend init.
     ZecAuthorityCheck {
         /// Absolute path to the standalone ZEC authority policy.
@@ -68,6 +74,18 @@ enum Command {
     /// Run the fail-closed Testnet pool until SIGINT or SIGTERM.
     Serve {
         /// Absolute path to the protected Testnet policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run the isolated accounting projector with no public listener.
+    Projector {
+        /// Absolute path to the protected projector policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run the isolated key-bearing Testnet payout worker with no public listener.
+    PayoutWorker {
+        /// Absolute path to the protected payout-worker policy.
         #[arg(long)]
         config: PathBuf,
     },
@@ -123,6 +141,27 @@ async fn main() -> ExitCode {
                 }
                 Err(error) => {
                     eprintln!("configuration rejected: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            }
+        }
+        Command::PayoutConfigCheck { config } => {
+            match config::RuntimeConfig::load(&config).and_then(|runtime| {
+                if runtime.payout_mode != config::PayoutMode::Automatic
+                    || runtime.automatic_payout.is_none()
+                {
+                    return Err(config::ConfigError::InvalidPolicy);
+                }
+                let database = runtime.database_url()?;
+                drop(database);
+                Ok(())
+            }) {
+                Ok(()) => {
+                    println!("{{\"valid\":true,\"network\":\"testnet\",\"scope\":\"payout\"}}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("payout configuration rejected: {error}");
                     ExitCode::from(NOT_READY_EXIT_CODE)
                 }
             }
@@ -196,6 +235,32 @@ async fn main() -> ExitCode {
                 ExitCode::from(NOT_READY_EXIT_CODE)
             }
         },
+        Command::Projector { config } => match config::RuntimeConfig::load(&config) {
+            Ok(runtime) => match service::run_projector(runtime).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("accounting projector stopped: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            },
+            Err(error) => {
+                eprintln!("projector configuration rejected: {error}");
+                ExitCode::from(NOT_READY_EXIT_CODE)
+            }
+        },
+        Command::PayoutWorker { config } => match config::RuntimeConfig::load(&config) {
+            Ok(runtime) => match service::run_payout_worker(runtime).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("payout worker stopped: {error}");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            },
+            Err(error) => {
+                eprintln!("configuration rejected: {error}");
+                ExitCode::from(NOT_READY_EXIT_CODE)
+            }
+        },
     }
 }
 
@@ -213,6 +278,41 @@ mod tests {
                 command: Command::ValidateZecTestnetOrchard
             })
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "wcash-poold",
+                "payout-config-check",
+                "--config",
+                "/tmp/payout.toml"
+            ]),
+            Ok(Cli {
+                command: Command::PayoutConfigCheck { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "wcash-poold",
+                "payout-worker",
+                "--config",
+                "/tmp/payout.toml"
+            ]),
+            Ok(Cli {
+                command: Command::PayoutWorker { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["wcash-poold", "payout-worker"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "wcash-poold",
+                "projector",
+                "--config",
+                "/tmp/projector.toml"
+            ]),
+            Ok(Cli {
+                command: Command::Projector { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["wcash-poold", "projector"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["wcash-poold", "serve", "--config", "/tmp/pool.toml"]),
             Ok(Cli {

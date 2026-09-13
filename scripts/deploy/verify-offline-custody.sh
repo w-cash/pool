@@ -17,12 +17,14 @@ require_command systemctl
 [[ $# -eq 1 ]] || die "usage: verify-offline-custody.sh <settings>"
 settings=$1
 require_private_regular_file "$settings"
-for unit in zecwec-zallet.service zecwec-zallet-recovery.service \
+for unit in zecwec-zallet.service zecwec-zallet-payout.service \
+    zecwec-zallet-recovery.service wcash-payout-worker.service \
     wcash-pool-wallet-init.service \
     wcash-pool-zec-authority-bootstrap.service; do
     require_loaded_unit_fully_inactive "$unit"
 done
 require_no_processes_for_user wcash-pool "mining identity"
+require_no_processes_for_user wcash-payout "payout identity"
 require_no_processes_for_user zecwec-zallet "collector identity"
 require_no_processes_for_user zecwec-zallet-recovery "recovery identity"
 zallet_rpc=$(read_setting "$settings" ZALLET_RPC)
@@ -32,5 +34,5 @@ for port in "${zallet_rpc##*:}" 28242; do
     fi
     [[ -z $listener ]] || die "collector RPC listener remains active"
 done
-require_offline_collector_custody "$settings" "${ZECWEC_RELEASE_PATH:?immutable release path is required}"
-log "offline collector custody gate passed without reading spending authority"
+require_hot_testnet_payout_custody "$settings" "${ZECWEC_RELEASE_PATH:?immutable release path is required}"
+log "isolated hot Testnet payout custody gate passed without reading spending authority"

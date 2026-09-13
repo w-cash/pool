@@ -48,6 +48,13 @@ block. The resulting collector asset is matched by miner liabilities; it is
 not automatically pool profit. Wcash's absence of a consensus developer tax is
 separate from any disclosed pool service fee.
 
+The Testnet launch policy charges a 0% pool service fee. Miners fund only the
+actual network transaction fee for their own payout: each batch reserves a
+published policy-bounded maximum, pays a net output, and returns every unused
+reserved atomic unit after confirmation. The portal publishes both fee caps
+and shows each account's gross amount, reserve, actual charge, refund, and net
+output without exposing another miner's settlement data.
+
 The target collector policy is:
 
 - **WEC:** a pool-owned private Wcash Ironwood coinbase receiver. Wcash hides
@@ -84,14 +91,14 @@ is unavailable or its identity is inconsistent.
 
 | Area | Current private-Testnet candidate state |
 | --- | --- |
-| Wire protocol | Strict, bounded backend-v1 and ZIP-301 codecs; jobs bind the Wcash candidate hash and both chains' coinbase transaction IDs; canonical parent-header and stable share-ID derivations, exact dual-chain reward facts, and reversible winner-lifecycle events—including Wcash witness quarantine and requeue—have deterministic positive and negative tests |
+| Wire protocol | Strict, bounded backend-v2 and ZIP-301 codecs; jobs bind the Wcash candidate hash and both chains' coinbase transaction IDs; canonical parent-header and stable share-ID derivations, exact dual-chain reward facts, and reversible winner-lifecycle events—including Wcash witness quarantine and requeue—have deterministic positive and negative tests |
 | Pool policy | In-memory session ordering with exact authorized-login reuse, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff that excludes idempotently replayed receipts |
 | Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetimes, submitted-header-time preservation, canonical proof/receipt/attribution binding, live response-watermark flush enforcement, bounded all-event sequence and share-identity evidence, and a fenced core-to-backend share path tested against local mock peers |
 | Miner edge | Source-restricted public TCP listener behind nginx TLS, bounded ZIP-301 actors, PostgreSQL worker authentication, durable cross-process nonce leases, strict framing/deadlines/backpressure, and account-scoped process telemetry; real ASIC certification remains a launch gate |
 | Miner portal | Responsive six-page UI; bounded Argon2id work, encrypted TOTP, digest-only sessions, CSRF/origin controls, authoritative address adapters, account-isolated balances/rewards/blocks/payouts, one-time worker tokens, and separate WEC/ZEC settings |
 | Service process | `config-check`, listener-free `preflight`, migration/authority commands, and composed Testnet-only `serve`; readiness fails before wallet, backend, identity, or signer authority can be proven |
 | Persistence and money | Deployment-fenced PostgreSQL PPLNS/ledger projection, maturity/reorg/idempotency handling, durable payout artifacts and recovery, and exact wallet-to-ledger reconciliation for independent WEC and ZEC collectors |
-| Wolf integration | Backend-v1 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling are composed; exact artifact pairing and live recovery evidence remain launch gates |
+| Wolf integration | Backend-v2 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling are composed; exact artifact pairing and live recovery evidence remain launch gates |
 | Operations | Immutable release renderer, protected systemd credentials, private preflight/start/rollback paths, source-restricted Stratum, Cloudflare-AOP portal staging, and explicit publication gates; no public launch is claimed |
 
 The final miner, reward, privacy, account, UI, and deployment decisions are in

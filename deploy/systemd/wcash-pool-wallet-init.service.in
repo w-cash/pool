@@ -4,22 +4,24 @@ Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deploym
 Requires=@WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@
 BindsTo=@WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@
 After=@WCASH_NODE_UNIT@ @WCASH_LIGHTWALLETD_UNIT@
-Before=wcash-pool-preflight.service wcash-pool.service
+Before=wcash-payout-worker.service wcash-pool-projector.service wcash-pool-preflight.service wcash-pool.service
 ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-wallet
 ConditionPathExists=@WEC_SEED_FILE@
 
 [Service]
 Type=oneshot
-User=wcash-pool
-Group=wcash-pool
+User=wcash-payout
+Group=wcash-payout
 UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
 EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env
+Environment=WEC_SEED_FILE=/run/credentials/wcash-pool-wallet-init.service/wcash-seed
+LoadCredential=wcash-seed:@WEC_SEED_FILE@
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-wallet
 ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/initialize-wcash-wallet.sh
 RemainAfterExit=yes
 TimeoutStartSec=1200s
-StateDirectory=wcash-pool
+StateDirectory=wcash-payout
 StateDirectoryMode=0700
 RuntimeDirectory=wcash-wallet-operation
 RuntimeDirectoryMode=0700

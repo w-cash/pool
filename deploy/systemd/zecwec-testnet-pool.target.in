@@ -1,8 +1,7 @@
 [Unit]
 Description=ZecWec WEC/ZEC merged-mining Testnet pool
-Requires=wcash-pool.service
-Wants=wcash-pool-health.timer zecwec-cookie-refresh.path
-After=wcash-pool.service
-
-[Install]
-WantedBy=multi-user.target
+Requires=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
+BindsTo=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
+Wants=zecwec-cookie-refresh.path
+After=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
+Upholds=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service

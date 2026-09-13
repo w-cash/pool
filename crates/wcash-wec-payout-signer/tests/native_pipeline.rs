@@ -374,6 +374,7 @@ fn request(account: Uuid) -> WecPayoutRequest {
             network: ChainNetwork::Testnet,
             ledger_root: [0x11; 32],
             reconciliation_id: Uuid::from_u128(2),
+            maximum_network_fee_zat: 1_000_000,
             outputs: vec![
                 PayoutOutput {
                     allocation_id: Uuid::from_u128(3),
@@ -936,13 +937,15 @@ fn policy_and_call_bounds_reject_unsafe_values() {
 fn wallet_fee_above_the_exact_cap_never_reaches_broadcast() {
     let fixture = Fixture::new();
     let wallet = Arc::new(MockWallet::new(fixture.account));
+    let mut payout = request(fixture.account);
+    payout.batch.maximum_network_fee_zat = 9_999;
     let config = fixture
         .config()
         .with_max_fee_zat(9_999)
         .expect("valid strict fee cap");
     let signer = WecPayoutSigner::new(config, wallet.clone()).expect("signer");
     assert_eq!(
-        signer.execute(&request(fixture.account)).unwrap_err(),
+        signer.execute(&payout).unwrap_err(),
         WecPayoutError::WalletProtocolViolation
     );
     assert_eq!(wallet.counts().3, 0);

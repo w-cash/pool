@@ -3,7 +3,7 @@ Description=Seal the initial-zero Zcash Testnet collector authority
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
 Requires=zecwec-zallet.service @ZCASH_VALIDATOR_UNIT@
 After=zecwec-zallet.service zecwec-zallet-recovery.service @ZCASH_VALIDATOR_UNIT@
-Conflicts=wcash-pool.service zecwec-zallet-recovery.service
+Conflicts=wcash-pool-projector.service wcash-pool.service zecwec-zallet-recovery.service
 ConditionFileIsExecutable=@WCASH_RELEASE_ROOT@/wcash-poold
 ConditionPathExists=/etc/wcash-pool/zec-authority.testnet.toml
 
@@ -11,6 +11,7 @@ ConditionPathExists=/etc/wcash-pool/zec-authority.testnet.toml
 Type=oneshot
 User=wcash-pool-backend
 Group=wcash-pool-socket
+SupplementaryGroups=wcash-pool-backend
 UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
 Environment=ZEC_AUTHORITY_CONFIG=/run/credentials/wcash-pool-zec-authority-bootstrap.service/zec-authority-config

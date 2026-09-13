@@ -199,6 +199,7 @@ def systemd_value(unit: str, field: str) -> str:
 
 def require_services_inactive() -> None:
     units = {
+        "wcash-pool-projector.service": True,
         "wcash-pool.service": True,
         "zecwec-zallet.service": False,
         "zecwec-zallet-recovery.service": False,

@@ -32,10 +32,12 @@ WEC and ZEC destinations are entered separately. Full values are accepted only
 by the mutation endpoint and handed to a chain-specific authoritative parser.
 The parser must verify the complete encoding, checksum, chain, network, and
 supported receiver set. A prefix or regular expression is not an acceptable
-validator. Browser responses contain masked destinations. The initial valid
-destination can become active immediately; a replacement remains pending for
-the configured safety hold while accounting continues against the existing
-destination.
+validator. The launch pool accepts only Ironwood-capable destinations for both
+assets; chain-level transparent coinbase support remains outside this pool's
+payout policy. Browser responses contain masked destinations. Every new or
+replacement destination remains pending for the configured 48-hour safety
+hold. Accounting continues during the hold, but no payout may use either the
+old or pending destination until the new revision becomes active.
 
 ## Browser security
 
@@ -83,6 +85,10 @@ The `/api/v1/balances`, `/api/v1/rewards`, `/api/v1/blocks`, and
 account-scoped PostgreSQL projections. The found-block view starts at the
 backend-validated submitted state rather than waiting for reward allocation;
 its immutable cursor also keeps dual-chain winners independently pageable.
+The overview publishes the 0% service fee and both network-fee reserve caps
+for each asset. Each private payout row separately reports the selected gross
+liability, maximum fee reserve, net transaction output, and—after
+confirmation—the miner's actual fee contribution and returned reserve.
 The `/api/v1/telemetry` route reads only the authenticated account's bounded
 in-process counters. Empty arrays mean a proven empty account dataset;
 repository failure remains an explicit unavailable response.

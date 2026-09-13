@@ -81,6 +81,128 @@ jobs:
       - name: Run deterministic workspace tests
         run: cargo test --locked --workspace --all-targets --all-features
 
+  postgres-runtime:
+    name: PostgreSQL runtime and security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16.10-bookworm@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
+        env:
+          POSTGRES_DB: wcash_pool_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d wcash_pool_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.91.0
+          cache-shared-key: pool-rust-1.91.0
+          cache-on-failure: true
+          cache-save-if: false
+
+      - name: Run required PostgreSQL runtime and authority regressions
+        run: >-
+          cargo test --locked -p wcash-pool-store --test postgres_runtime
+          durable_runtime_is_chain_scoped_conserved_and_revocable -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
+      - name: Run required confirmed-payout rotation regression
+        run: >-
+          cargo test --locked -p wcash-pool-store --test payout_watch_rotation
+          confirmed_watches_rotate_across_restart_without_broadcast_starvation
+          -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
+  deployment-package:
+    name: Deployment package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.91.0
+          cache-shared-key: pool-rust-1.91.0
+          cache-on-failure: true
+          cache-save-if: false
+
+      - name: Install deployment lint dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - name: Validate the deployable package
+        run: bash scripts/test-deployment-package.sh
+
+  zallet-release:
+    name: Reproducible pinned Zallet release
+    # Release builders use the Ubuntu 22.04 native ABI/toolchain family. Keep
+    # the required compile gate on that same runner generation.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zallet Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+          cache: false
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential clang cmake libclang-dev pkg-config
+
+      - name: Build the first exact locked patched Zallet release
+        run: bash scripts/build-zallet-testnet.sh "$RUNNER_TEMP/zallet-release-a"
+
+      - name: Build the second clean exact Zallet release
+        run: bash scripts/build-zallet-testnet.sh "$RUNNER_TEMP/zallet-release-b"
+
+      - name: Compare and verify both Zallet builds
+        run: |
+          for candidate in zallet-release-a zallet-release-b; do
+            cd "$RUNNER_TEMP/$candidate"
+            sha256sum --strict --check ZALLET_SHA256SUM
+            cd "$GITHUB_WORKSPACE"
+            python3 scripts/verify-zallet-build.py \
+              "$RUNNER_TEMP/$candidate" \
+              patches/zallet-v0.1.0-beta.3
+          done
+          cmp --silent \
+            "$RUNNER_TEMP/zallet-release-a/ZALLET_SHA256SUM" \
+            "$RUNNER_TEMP/zallet-release-b/ZALLET_SHA256SUM"
+          cd "$GITHUB_WORKSPACE"
+          test "$(sha256sum "$RUNNER_TEMP/zallet-release-a/zallet" | cut -d' ' -f1)" = \
+            "$(sha256sum "$RUNNER_TEMP/zallet-release-b/zallet" | cut -d' ' -f1)"
+
   supply-chain:
     name: Dependency policy
     runs-on: ubuntu-24.04
