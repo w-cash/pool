@@ -70,6 +70,26 @@ grep -Fq 'config.timeouts.wait = Some(WALLET_POOL_WAIT_TIMEOUT);' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
 grep -Fq '.runtime(deadpool::Runtime::Tokio1)' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
+grep -Fq 'denied_build_constants.extend([CARGO_MANIFEST_DIR, CARGO_TREE]);' \
+    "$repo_root/patches/zallet-v0.1.0-beta.3/0003-remove-nonreproducible-shadow-paths.patch"
+grep -Fq 'generated shadow metadata contains its build path' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'for patch in "${patches[@]}"; do' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+if grep -Fq 'glob("*.patch")' "$repo_root/scripts/build-zallet-testnet.sh"; then
+    printf 'deployment-package-test: Zallet provenance glob is not the applied patch set\n' >&2
+    exit 1
+fi
+# shellcheck disable=SC2016
+grep -Fq 'staging=$(mktemp -d "$output_parent/.zallet-build.XXXXXX")' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'trap '\''rm -rf -- "$temporary" "$staging"'\'' EXIT' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'mv -T -- "$staging" "$output"' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fx -- '    --deadline 1080' \
     "$repo_root/scripts/deploy/wait-zallet-ready.sh" >/dev/null
 # shellcheck disable=SC2016
