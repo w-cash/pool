@@ -105,6 +105,7 @@ impl RouterState {
             | BackendEvent::WinnerOrphaned { .. }
             | BackendEvent::WinnerQuarantined { .. }
             | BackendEvent::WinnerRequeued { .. }
+            | BackendEvent::WinnerSideChain { .. }
             | BackendEvent::WinnerMatured { .. } => None,
         })
     }

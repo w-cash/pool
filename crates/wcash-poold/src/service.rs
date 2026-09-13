@@ -8,7 +8,7 @@ use std::{ffi::OsStr, os::unix::net::UnixDatagram, path::Path};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time};
 use wcash_pool_address::{TestnetAddressValidator, WcashCommandValidator};
 use wcash_pool_backend_client::BackendClient;
-use wcash_pool_edge::{BackendEventConsumer, JobRouter, ShareRouterError};
+use wcash_pool_edge::{JobRouter, ShareRouterError};
 use wcash_pool_portal::{
     serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
     MinerTelemetrySource, PoolDataSource, PoolOverview, PortalApp, PortalBuildError, PortalConfig,
@@ -243,7 +243,7 @@ async fn drain_projector_events(
         if event.connection_binding() != &binding {
             return Err(ServiceError::ProjectorConnectionMismatch);
         }
-        events.push(event);
+        events.push(event.event().clone());
     }
     if events.is_empty() {
         return Ok(());
@@ -251,12 +251,13 @@ async fn drain_projector_events(
 
     match time::timeout(
         PROJECTOR_BATCH_TIMEOUT,
-        projector.consume(binding.authority(), &events),
+        projector.project_replay_page(binding.authority(), &events),
     )
     .await
     {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(ServiceError::ProjectorUnavailable),
+        Ok(Err(error)) => Err(ServiceError::ProjectorRejected(error)),
+        Err(_) => Err(ServiceError::ProjectorBatchTimeout),
     }
 }
 
@@ -1878,9 +1879,12 @@ pub enum ServiceError {
     /// The projector's backend stream was not the connection that produced its snapshot.
     #[error("accounting projector backend connection binding changed")]
     ProjectorConnectionMismatch,
-    /// PostgreSQL did not durably accept an exact journal batch in time.
-    #[error("accounting projector could not durably project the backend journal")]
-    ProjectorUnavailable,
+    /// A typed accounting rejection must remain visible in private service logs.
+    #[error("accounting projector rejected a backend event: {0}")]
+    ProjectorRejected(#[source] StoreError),
+    /// A bounded journal batch exceeded its execution deadline.
+    #[error("accounting projector exceeded its 20-second batch deadline")]
+    ProjectorBatchTimeout,
     /// Wolf reported that accepting or projecting current work is unsafe.
     #[error("accounting projector stopped because the backend is unhealthy")]
     ProjectorBackendUnhealthy,

@@ -250,7 +250,7 @@ filter = "info"
         for height in range(first_height, args.blocks + 1):
             started = time.monotonic()
             selected_worker = secondary_worker if height == 2 else worker
-            self.mine_winner(f'zip301-mine-{height:04}', args.miner, selected_worker)
+            self.mine_winner(f'zip301-mine-{height:04}', args.miner, selected_worker, {'wec': height, 'zec': height})
             self.until('Wcash chain win', lambda: self.rpc('wec', 'getblockcount') >= height)
             self.until('Zcash chain win', lambda: self.rpc('zec', 'getblockcount') >= height)
             if height == 1 or height % 10 == 0 or height == args.blocks:
@@ -282,11 +282,13 @@ filter = "info"
         return {'account': account, 'password': password, 'worker': worker,
                 'cookies': self.cookies.copy(), 'csrf': self.csrf}
 
-    def mine_winner(self, label, miner, worker):
+    def mine_winner(self, label, miner, worker, minimum_heights=None):
         env = os.environ.copy()
         env['WCASH_STRATUM_PASSWORD'] = worker['token']
+        run_id = time.time_ns()
         for attempt in range(1, 6):
-            attempt_label = f'{label}-attempt-{attempt}'
+            attempt_label = f'{label}-run-{run_id}-attempt-{attempt}'
+            started = time.monotonic()
             try:
                 proof = self.command(attempt_label, [miner, 'zip301-mine',
                     '127.0.0.1:18237', worker['mining_username'], '256', '0'], env=env, timeout=900)
@@ -301,10 +303,46 @@ filter = "info"
                 self.alive()
                 time.sleep(1)
                 continue
-            if json.loads(proof).get('result') != 'accepted':
+            result = json.loads(proof)
+            if result.get('result') != 'accepted':
                 raise RuntimeError('real ZIP-301 submission was not accepted')
-            private(self.root / (label + '.stdout'), proof)
-            return
+            elapsed = time.monotonic() - started
+            advanced = minimum_heights is None or self.proof_advances_chains(result, minimum_heights)
+            private(self.root / (attempt_label + '.metrics.json'), json.dumps({
+                'elapsed_seconds': elapsed, 'nonce_runs': result['attempted_nonce_runs'],
+                'accepted': True, 'required_heights_reached': advanced,
+            }))
+            if advanced:
+                private(self.root / (label + '.stdout'), proof)
+                return
+            # A second valid parent proof for a retained Wcash candidate can
+            # enter a Zcash side chain. Its accepted share remains in the
+            # journal; only a fresh proof can advance the requested chain tips.
+            self.alive()
+            time.sleep(1)
+        raise RuntimeError('bounded accepted proof attempts did not advance both real chains')
+
+    def proof_advances_chains(self, proof, minimum_heights):
+        parent_hash = proof.get('parent_block_hash')
+        if (not isinstance(parent_hash, str) or len(parent_hash) != 64
+                or any(c not in '0123456789abcdefABCDEF' for c in parent_hash)):
+            raise RuntimeError('accepted proof lacks exact parent block identity')
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            self.alive()
+            if all(self.rpc(name, 'getblockcount') >= height for name, height in minimum_heights.items()):
+                return True
+            status = self.rpc('zec', 'getblockstatus', [parent_hash])
+            if not isinstance(status, dict) or status.get('state') not in ('best_chain', 'side_chain', 'unknown'):
+                raise RuntimeError('unexpected committed parent membership response')
+            if status['state'] != 'unknown':
+                if (status.get('hash', '').lower() != parent_hash.lower()
+                        or type(status.get('height')) is not int or status['height'] <= 0):
+                    raise RuntimeError('committed parent membership changed proof identity')
+                if status['state'] == 'side_chain' or status['height'] < minimum_heights['zec']:
+                    return False
+            time.sleep(0.25)
+        raise RuntimeError('accepted proof did not resolve into real chain progress or known side chain')
 
     def two_chain_blocks(self):
         result = self.portal('/api/v1/blocks')

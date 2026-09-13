@@ -156,6 +156,7 @@ GRANT SELECT ON TABLE
     jobs,
     shares,
     winners,
+    winner_proofs,
     winner_allocations,
     ledger_transactions,
     ledger_entries,
@@ -166,13 +167,15 @@ GRANT INSERT ON TABLE
     jobs,
     shares,
     winners,
+    winner_proofs,
     winner_allocations,
     ledger_transactions,
     ledger_entries
 TO :"projector_role";
 GRANT UPDATE (last_event_seq, updated_at) ON TABLE backend_cursors TO :"projector_role";
-GRANT UPDATE (state, active_observation_event_seq, active_maturity_event_seq)
+GRANT UPDATE (state, active_observation_event_seq, active_maturity_event_seq, active_proof_share_id)
 ON TABLE winners TO :"projector_role";
+GRANT UPDATE (state) ON TABLE winner_proofs TO :"projector_role";
 GRANT UPDATE (sealed_at, sealed_entry_count)
 ON TABLE ledger_transactions TO :"projector_role";
 GRANT EXECUTE ON FUNCTION public.ensure_projected_worker_v1(UUID,UUID,UUID,TEXT)

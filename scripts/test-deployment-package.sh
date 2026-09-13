@@ -5,7 +5,10 @@ set +x
 export PYTHONDONTWRITEBYTECODE=1
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-temporary=$(mktemp -d)
+# The real config loader rejects writable or untrusted ancestors. Keep these
+# credential fixtures under the user's home, just like an actual protected
+# runtime, rather than a shared temporary directory.
+temporary=$(mktemp -d "$HOME/.wcash-pool-package-test.XXXXXXXX")
 temporary=$(CDPATH='' cd -- "$temporary" && pwd -P)
 trap 'rm -rf -- "$temporary"' EXIT
 
@@ -1652,12 +1655,26 @@ PY
 
 PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/grant-runtime.sh" <<'PY'
 import pathlib
+import re
 import sys
 
 grants = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES" not in grants
 assert "GRANT UPDATE (last_event_seq, updated_at) ON TABLE backend_cursors" in grants
-assert "GRANT UPDATE (state, active_observation_event_seq, active_maturity_event_seq)" in grants
+assert "GRANT UPDATE (state, active_observation_event_seq, active_maturity_event_seq, active_proof_share_id)" in grants
+assert 'GRANT UPDATE (state) ON TABLE winner_proofs TO :"projector_role";' in grants
+proof_grants = [
+    (privileges.strip(), role)
+    for privileges, tables, role in re.findall(
+        r'GRANT ([^;]+?) ON TABLE\s+([^;]+?)\s+TO :"([a-z_]+)";', grants
+    )
+    if re.search(r'\bwinner_proofs\b', tables)
+]
+assert sorted(proof_grants) == sorted([
+    ('SELECT', 'projector_role'),
+    ('INSERT', 'projector_role'),
+    ('UPDATE (state)', 'projector_role'),
+]), proof_grants
 assert "GRANT UPDATE (sealed_at, sealed_entry_count)" in grants
 assert "public.configure_payout_destination_v1(" in grants
 assert "public.activate_due_payout_destinations_v1(UUID,TEXT)" in grants
@@ -2659,7 +2676,7 @@ output.chmod(0o600)
 PY
 "$repo_root/target/debug/wcash-poold" config-check \
     --config "$temporary/config-check.toml" \
-    | grep -Fqx '{"valid":true,"network":"testnet"}' \
+    | python3 -c 'import json, sys; sys.exit(json.load(sys.stdin) != {"valid": True, "network": "testnet"})' \
     || {
         printf 'deployment-package-test: real Rust config-check rejected rendered policy\n' >&2
         exit 1

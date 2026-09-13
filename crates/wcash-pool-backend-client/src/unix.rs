@@ -2208,6 +2208,7 @@ mod tests {
             BackendCapability::EventReplayV1,
             BackendCapability::DualTargetV1,
             BackendCapability::WinnerLifecycleV1,
+            BackendCapability::WinnerSideChainV1,
         ]
     }
 

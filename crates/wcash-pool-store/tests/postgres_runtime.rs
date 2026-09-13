@@ -804,13 +804,14 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
          GRANT EXECUTE ON FUNCTION public.configure_payout_destination_v1( \
              UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN) TO {public_role}; \
          GRANT SELECT ON deployments,backend_cursors,backend_events,chain_policies, \
-             chain_safety_state,jobs,shares,winners,winner_allocations,ledger_transactions, \
+             chain_safety_state,jobs,shares,winners,winner_proofs,winner_allocations,ledger_transactions, \
              ledger_entries,payout_batches TO {projector_role}; \
-         GRANT INSERT ON backend_events,jobs,shares,winners,winner_allocations, \
+         GRANT INSERT ON backend_events,jobs,shares,winners,winner_proofs,winner_allocations, \
              ledger_transactions,ledger_entries TO {projector_role}; \
          GRANT UPDATE(last_event_seq,updated_at) ON backend_cursors TO {projector_role}; \
-         GRANT UPDATE(state,active_observation_event_seq,active_maturity_event_seq) \
+         GRANT UPDATE(state,active_observation_event_seq,active_maturity_event_seq,active_proof_share_id) \
              ON winners TO {projector_role}; \
+         GRANT UPDATE(state) ON winner_proofs TO {projector_role}; \
          GRANT UPDATE(sealed_at,sealed_entry_count) ON ledger_transactions TO {projector_role}; \
          GRANT EXECUTE ON FUNCTION public.ensure_projected_worker_v1(UUID,UUID,UUID,TEXT) \
              TO {projector_role}; \
@@ -900,6 +901,10 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (&public_role, "jobs", "INSERT", false),
         (&public_role, "shares", "INSERT", false),
         (&public_role, "winners", "UPDATE", false),
+        (&public_role, "winner_proofs", "SELECT", false),
+        (&public_role, "winner_proofs", "INSERT", false),
+        (&public_role, "winner_proofs", "UPDATE", false),
+        (&public_role, "winner_proofs", "DELETE", false),
         (&public_role, "winner_allocations", "INSERT", false),
         (&public_role, "ledger_transactions", "INSERT", false),
         (&public_role, "ledger_entries", "INSERT", false),
@@ -916,6 +921,10 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (&public_role, "payout_watch_cursors", "UPDATE", false),
         (&public_role, "payout_worker_leases", "UPDATE", false),
         (&projector_role, "backend_events", "INSERT", true),
+        (&projector_role, "winner_proofs", "SELECT", true),
+        (&projector_role, "winner_proofs", "INSERT", true),
+        (&projector_role, "winner_proofs", "UPDATE", false),
+        (&projector_role, "winner_proofs", "DELETE", false),
         (&projector_role, "ledger_entries", "INSERT", true),
         (&projector_role, "accounts", "INSERT", false),
         (&projector_role, "workers", "INSERT", false),
@@ -931,6 +940,10 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (&payout_role, "chain_safety_state", "UPDATE", false),
         (&payout_role, "payout_destinations", "UPDATE", false),
         (&payout_role, "backend_events", "SELECT", false),
+        (&payout_role, "winner_proofs", "SELECT", false),
+        (&payout_role, "winner_proofs", "INSERT", false),
+        (&payout_role, "winner_proofs", "UPDATE", false),
+        (&payout_role, "winner_proofs", "DELETE", false),
         (&payout_role, "payout_watch_cursors", "SELECT", true),
         (&payout_role, "payout_watch_cursors", "INSERT", false),
         (&payout_role, "payout_watch_cursors", "UPDATE", false),
@@ -973,6 +986,46 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (&public_role, "mining_tokens", "revoked_at", "UPDATE", true),
         (&public_role, "mining_tokens", "worker_id", "UPDATE", false),
         (&public_role, "mining_tokens", "verifier", "UPDATE", false),
+        (&projector_role, "winner_proofs", "state", "UPDATE", true),
+        (
+            &projector_role,
+            "winner_proofs",
+            "share_id",
+            "UPDATE",
+            false,
+        ),
+        (&projector_role, "winner_proofs", "job_id", "UPDATE", false),
+        (
+            &projector_role,
+            "winner_proofs",
+            "block_hash_le",
+            "UPDATE",
+            false,
+        ),
+        (
+            &projector_role,
+            "winners",
+            "active_proof_share_id",
+            "UPDATE",
+            true,
+        ),
+        (&projector_role, "winners", "share_id", "UPDATE", false),
+        (&public_role, "winner_proofs", "state", "UPDATE", false),
+        (&payout_role, "winner_proofs", "state", "UPDATE", false),
+        (
+            &public_role,
+            "winners",
+            "active_proof_share_id",
+            "UPDATE",
+            false,
+        ),
+        (
+            &payout_role,
+            "winners",
+            "active_proof_share_id",
+            "UPDATE",
+            false,
+        ),
         (&payout_role, "payout_batches", "state", "UPDATE", true),
         (&payout_role, "payout_batches", "chain", "UPDATE", false),
         (

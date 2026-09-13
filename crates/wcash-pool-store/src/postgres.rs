@@ -23,8 +23,8 @@ use wcash_pool_protocol::{
 
 use crate::auth::validate_argon2id_verifier;
 use crate::{
-    allocate_pplns, generate_mining_token, hash_mining_token, target_work, MiningToken,
-    MiningTokenError, PplnsError, WeightedShare,
+    allocate_pplns, generate_mining_token, hash_mining_token, target_work, AccountAllocation,
+    AllocationPlan, MiningToken, MiningTokenError, PplnsError, WeightedShare,
 };
 
 const MAX_DATABASE_CONNECTIONS: u32 = 64;
@@ -4228,6 +4228,47 @@ async fn project_one(
                 insert_winner(&mut transaction, identity.id, receipt, job_id, winner).await?;
             }
         }
+        BackendEvent::WinnerSideChain {
+            share_id,
+            job_id,
+            winner,
+            ..
+        } => {
+            let row = load_winner(
+                &mut transaction,
+                identity.id,
+                share_id.as_bytes(),
+                job_id.as_bytes(),
+                winner,
+            )
+            .await?;
+            if winner.chain != MergedChain::Zcash
+                || row.proof_state != "submitted"
+                || row.state != "submitted"
+                || row.observation_event_seq.is_some()
+                || row.maturity_event_seq.is_some()
+                || row.active_proof_share_id.is_some()
+            {
+                return Err(StoreError::InvalidWinnerTransition);
+            }
+            update_winner_proof_state(
+                &mut transaction,
+                identity.id,
+                winner,
+                share_id.as_bytes(),
+                "side_chain",
+            )
+            .await?;
+            update_winner_state(
+                &mut transaction,
+                identity.id,
+                winner,
+                "side_chain",
+                None,
+                None,
+            )
+            .await?;
+        }
         BackendEvent::WinnerObserved {
             share_id,
             job_id,
@@ -4325,18 +4366,28 @@ async fn project_one(
                 winner,
             )
             .await?;
-            if row.state != "quarantined" || row.observation_event_seq.is_some() {
+            if row.proof_state != "quarantined" {
                 return Err(StoreError::InvalidWinnerTransition);
             }
-            update_winner_state(
+            update_winner_proof_state(
                 &mut transaction,
                 identity.id,
                 winner,
+                share_id.as_bytes(),
                 "requeued",
-                None,
-                None,
             )
             .await?;
+            if row.active_proof_share_id.is_none() && row.state == "quarantined" {
+                update_winner_state(
+                    &mut transaction,
+                    identity.id,
+                    winner,
+                    "requeued",
+                    None,
+                    None,
+                )
+                .await?;
+            }
         }
         BackendEvent::JobInvalidated { .. } | BackendEvent::GenerationClosed { .. } => {}
     }
@@ -4360,6 +4411,7 @@ const fn event_kind(event: &BackendEvent) -> &'static str {
         BackendEvent::JobInvalidated { .. } => "job_invalidated",
         BackendEvent::GenerationClosed { .. } => "generation_closed",
         BackendEvent::ShareCommitted { .. } => "share_committed",
+        BackendEvent::WinnerSideChain { .. } => "winner_side_chain",
         BackendEvent::WinnerObserved { .. } => "winner_observed",
         BackendEvent::WinnerOrphaned { .. } => "winner_orphaned",
         BackendEvent::WinnerQuarantined { .. } => "winner_quarantined",
@@ -4423,27 +4475,71 @@ async fn insert_winner(
     job_id: &wcash_pool_protocol::Hex32,
     winner: &WinnerDescriptor,
 ) -> Result<(), StoreError> {
+    let existing = sqlx::query(
+        "SELECT share_id,height,coinbase_txid_le,reward_zat,maturity_confirmations \
+         FROM winners WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3 FOR UPDATE",
+    )
+    .bind(deployment_id)
+    .bind(Chain::from(winner.chain).as_str())
+    .bind(winner.block_hash_le.as_bytes().as_slice())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(row) = existing {
+        // A Wcash block ID excludes its AuxPoW witness. Each distinct committed
+        // proof remains accountable, but the candidate reward and original
+        // winning share/PPLNS cutoff belong to exactly one economic winner.
+        if winner.chain != MergedChain::Wcash || !winner_facts_match(&row, winner)? {
+            return Err(StoreError::WinnerFactConflict);
+        }
+    } else {
+        sqlx::query(
+            "INSERT INTO winners \
+             (deployment_id,chain,block_hash_le,share_id,job_id,height,coinbase_txid_le,reward_zat, \
+              maturity_confirmations,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'submitted')",
+        )
+        .bind(deployment_id)
+        .bind(Chain::from(winner.chain).as_str())
+        .bind(winner.block_hash_le.as_bytes().as_slice())
+        .bind(receipt.share_id.as_bytes().as_slice())
+        .bind(job_id.as_bytes().as_slice())
+        .bind(i64::from(winner.height))
+        .bind(winner.coinbase_txid_le.as_bytes().as_slice())
+        .bind(i64::try_from(winner.reward_zat).map_err(|_| StoreError::MoneyOverflow)?)
+        .bind(i32::try_from(winner.maturity_confirmations).map_err(|_| StoreError::MoneyOverflow)?)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    // The caller has already validated this exact receipt against its own
+    // immutable job descriptor and inserted its share in this transaction.
     sqlx::query(
-        "INSERT INTO winners \
-         (deployment_id,chain,block_hash_le,share_id,job_id,height,coinbase_txid_le,reward_zat, \
-          maturity_confirmations,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'submitted')",
+        "INSERT INTO winner_proofs \
+         (deployment_id,chain,block_hash_le,share_id,job_id,state) \
+         VALUES ($1,$2,$3,$4,$5,'submitted')",
     )
     .bind(deployment_id)
     .bind(Chain::from(winner.chain).as_str())
     .bind(winner.block_hash_le.as_bytes().as_slice())
     .bind(receipt.share_id.as_bytes().as_slice())
     .bind(job_id.as_bytes().as_slice())
-    .bind(i64::from(winner.height))
-    .bind(winner.coinbase_txid_le.as_bytes().as_slice())
-    .bind(i64::try_from(winner.reward_zat).map_err(|_| StoreError::MoneyOverflow)?)
-    .bind(i32::try_from(winner.maturity_confirmations).map_err(|_| StoreError::MoneyOverflow)?)
     .execute(&mut **transaction)
     .await?;
     Ok(())
 }
 
+fn winner_facts_match(row: &PgRow, winner: &WinnerDescriptor) -> Result<bool, StoreError> {
+    Ok(row.try_get::<i64, _>("height")? == i64::from(winner.height)
+        && row.try_get::<Vec<u8>, _>("coinbase_txid_le")? == winner.coinbase_txid_le.as_bytes()
+        && row.try_get::<i64, _>("reward_zat")?
+            == i64::try_from(winner.reward_zat).map_err(|_| StoreError::MoneyOverflow)?
+        && row.try_get::<i32, _>("maturity_confirmations")?
+            == i32::try_from(winner.maturity_confirmations)
+                .map_err(|_| StoreError::MoneyOverflow)?)
+}
+
 struct WinnerRow {
     state: String,
+    proof_state: String,
+    active_proof_share_id: Option<Vec<u8>>,
     observation_event_seq: Option<i64>,
     maturity_event_seq: Option<i64>,
     share_event_seq: i64,
@@ -4457,36 +4553,78 @@ async fn load_winner(
     winner: &WinnerDescriptor,
 ) -> Result<WinnerRow, StoreError> {
     let row = sqlx::query(
-        "SELECT w.share_id,w.job_id,w.height,w.coinbase_txid_le,w.reward_zat,w.maturity_confirmations, \
-                w.state,w.active_observation_event_seq,w.active_maturity_event_seq,s.event_seq AS share_event_seq \
+        "SELECT p.job_id,w.height,w.coinbase_txid_le,w.reward_zat,w.maturity_confirmations, \
+                w.state,p.state AS proof_state,w.active_proof_share_id, \
+                w.active_observation_event_seq,w.active_maturity_event_seq, \
+                s.event_seq AS share_event_seq \
          FROM winners w JOIN shares s \
            ON (s.deployment_id,s.share_id)=(w.deployment_id,w.share_id) \
-         WHERE w.deployment_id=$1 AND w.chain=$2 AND w.block_hash_le=$3 FOR UPDATE OF w",
+         JOIN winner_proofs p \
+           ON (p.deployment_id,p.chain,p.block_hash_le)=(w.deployment_id,w.chain,w.block_hash_le) \
+         WHERE w.deployment_id=$1 AND w.chain=$2 AND w.block_hash_le=$3 AND p.share_id=$4 \
+         FOR UPDATE OF w,p",
     )
     .bind(deployment_id)
     .bind(Chain::from(winner.chain).as_str())
     .bind(winner.block_hash_le.as_bytes().as_slice())
+    .bind(share_id.as_slice())
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(StoreError::UnknownWinner)?;
-    let matches = row.try_get::<Vec<u8>, _>("share_id")? == share_id
-        && row.try_get::<Vec<u8>, _>("job_id")? == job_id
-        && row.try_get::<i64, _>("height")? == i64::from(winner.height)
-        && row.try_get::<Vec<u8>, _>("coinbase_txid_le")? == winner.coinbase_txid_le.as_bytes()
-        && row.try_get::<i64, _>("reward_zat")?
-            == i64::try_from(winner.reward_zat).map_err(|_| StoreError::MoneyOverflow)?
-        && row.try_get::<i32, _>("maturity_confirmations")?
-            == i32::try_from(winner.maturity_confirmations)
-                .map_err(|_| StoreError::MoneyOverflow)?;
-    if !matches {
+    if row.try_get::<Vec<u8>, _>("job_id")? != job_id || !winner_facts_match(&row, winner)? {
         return Err(StoreError::WinnerFactConflict);
     }
     Ok(WinnerRow {
         state: row.try_get("state")?,
+        proof_state: row.try_get("proof_state")?,
+        active_proof_share_id: row.try_get("active_proof_share_id")?,
         observation_event_seq: row.try_get("active_observation_event_seq")?,
         maturity_event_seq: row.try_get("active_maturity_event_seq")?,
         share_event_seq: row.try_get("share_event_seq")?,
     })
+}
+
+async fn update_winner_proof_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    winner: &WinnerDescriptor,
+    share_id: &[u8; 32],
+    state: &'static str,
+) -> Result<(), StoreError> {
+    let result = sqlx::query(
+        "UPDATE winner_proofs SET state=$5 \
+         WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3 AND share_id=$4",
+    )
+    .bind(deployment_id)
+    .bind(Chain::from(winner.chain).as_str())
+    .bind(winner.block_hash_le.as_bytes().as_slice())
+    .bind(share_id.as_slice())
+    .bind(state)
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(StoreError::UnknownWinner);
+    }
+    Ok(())
+}
+
+async fn select_winner_proof(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    winner: &WinnerDescriptor,
+    share_id: &[u8; 32],
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE winners SET active_proof_share_id=$4 \
+         WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3",
+    )
+    .bind(deployment_id)
+    .bind(Chain::from(winner.chain).as_str())
+    .bind(winner.block_hash_le.as_bytes().as_slice())
+    .bind(share_id.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn observe_winner(
@@ -4499,10 +4637,32 @@ async fn observe_winner(
     confirmations: u32,
 ) -> Result<(), StoreError> {
     let row = load_winner(transaction, deployment_id, share_id, job_id, winner).await?;
-    if confirmations == 0 {
+    if confirmations == 0
+        || (row.proof_state == "matured" && confirmations >= winner.maturity_confirmations)
+    {
         return Err(StoreError::InvalidWinnerTransition);
     }
+    observe_economic_winner(
+        transaction,
+        deployment_id,
+        event_seq,
+        winner,
+        confirmations,
+        &row,
+    )
+    .await?;
+    update_winner_proof_state(transaction, deployment_id, winner, share_id, "observed").await?;
+    select_winner_proof(transaction, deployment_id, winner, share_id).await
+}
 
+async fn observe_economic_winner(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    event_seq: i64,
+    winner: &WinnerDescriptor,
+    confirmations: u32,
+    row: &WinnerRow,
+) -> Result<(), StoreError> {
     // Wolf emits an observation whenever an immature canonical winner's tip
     // changes. PPLNS allocation and its ledger entry are immutable at the
     // first observation, so later observations are accounting no-ops.
@@ -4523,64 +4683,28 @@ async fn observe_winner(
     {
         let required = required_winner_confirmations(transaction, deployment_id, winner).await?;
         if confirmations >= required {
-            return Err(StoreError::InvalidWinnerTransition);
+            return Ok(());
         }
-        return demature_winner(transaction, deployment_id, event_seq, winner, &row).await;
+        return demature_winner(transaction, deployment_id, event_seq, winner, row).await;
     }
 
     if !matches!(
         row.state.as_str(),
-        "submitted" | "requeued" | "orphaned" | "quarantined"
+        "submitted" | "side_chain" | "requeued" | "orphaned" | "quarantined"
     ) || row.observation_event_seq.is_some()
         || row.maturity_event_seq.is_some()
     {
         return Err(StoreError::InvalidWinnerTransition);
     }
     let chain = Chain::from(winner.chain);
-    let policy = sqlx::query(
-        "SELECT pplns_window_work::TEXT AS window_work,fee_bps,policy_version \
-         FROM chain_policies WHERE deployment_id=$1 AND chain=$2",
+    let (plan, policy_version) = winner_allocation_plan(
+        transaction,
+        deployment_id,
+        chain,
+        winner,
+        row.share_event_seq,
     )
-    .bind(deployment_id)
-    .bind(chain.as_str())
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(StoreError::MissingChainPolicy(chain))?;
-    let window_work = BigUint::from_str(&policy.try_get::<String, _>("window_work")?)
-        .map_err(|_| StoreError::CorruptDatabaseState("PPLNS work window"))?;
-    let fee_bps = u16::try_from(policy.try_get::<i32, _>("fee_bps")?)
-        .map_err(|_| StoreError::CorruptDatabaseState("pool fee"))?;
-    let policy_version = policy.try_get::<i64, _>("policy_version")?;
-
-    let rows = sqlx::query(
-        "SELECT share_id,account_id,work::TEXT AS work FROM shares \
-         WHERE deployment_id=$1 AND event_seq <= $2 ORDER BY event_seq DESC LIMIT $3",
-    )
-    .bind(deployment_id)
-    .bind(row.share_event_seq)
-    .bind(MAX_PPLNS_SHARES)
-    .fetch_all(&mut **transaction)
     .await?;
-    let mut shares = Vec::with_capacity(rows.len());
-    let mut available_work = BigUint::default();
-    for row in &rows {
-        let share_bytes = row.try_get::<Vec<u8>, _>("share_id")?;
-        let share_id: [u8; 32] = share_bytes
-            .try_into()
-            .map_err(|_| StoreError::CorruptDatabaseState("share ID"))?;
-        let work = BigUint::from_str(&row.try_get::<String, _>("work")?)
-            .map_err(|_| StoreError::CorruptDatabaseState("share work"))?;
-        available_work += &work;
-        shares.push(WeightedShare {
-            share_id,
-            account_id: row.try_get("account_id")?,
-            work,
-        });
-    }
-    if i64::try_from(rows.len()).ok() == Some(MAX_PPLNS_SHARES) && available_work < window_work {
-        return Err(StoreError::PplnsWindowTooLarge);
-    }
-    let plan = allocate_pplns(&shares, &window_work, winner.reward_zat, fee_bps)?;
     for allocation in &plan.accounts {
         sqlx::query(
             "INSERT INTO winner_allocations \
@@ -4633,6 +4757,106 @@ async fn observe_winner(
     .await
 }
 
+async fn winner_allocation_plan(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    chain: Chain,
+    winner: &WinnerDescriptor,
+    share_event_seq: i64,
+) -> Result<(AllocationPlan, i64), StoreError> {
+    let original = sqlx::query(
+        "SELECT policy_version,account_id,selected_work::TEXT AS work,amount_zat \
+         FROM winner_allocations WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3 \
+           AND observation_event_seq=(SELECT MIN(observation_event_seq) FROM winner_allocations \
+             WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3) ORDER BY account_id",
+    )
+    .bind(deployment_id)
+    .bind(chain.as_str())
+    .bind(winner.block_hash_le.as_bytes().as_slice())
+    .fetch_all(&mut **transaction)
+    .await?;
+    if let Some(first) = original.first() {
+        let policy_version = first.try_get::<i64, _>("policy_version")?;
+        let mut accounts = Vec::with_capacity(original.len());
+        let mut selected_work = BigUint::default();
+        let mut miner_total = 0u64;
+        for row in original {
+            if row.try_get::<i64, _>("policy_version")? != policy_version {
+                return Err(StoreError::CorruptDatabaseState("winner allocation policy"));
+            }
+            let work = BigUint::from_str(&row.try_get::<String, _>("work")?)
+                .map_err(|_| StoreError::CorruptDatabaseState("winner allocation work"))?;
+            let amount_zat = u64::try_from(row.try_get::<i64, _>("amount_zat")?)
+                .map_err(|_| StoreError::MoneyOverflow)?;
+            selected_work += &work;
+            miner_total = miner_total
+                .checked_add(amount_zat)
+                .ok_or(StoreError::MoneyOverflow)?;
+            accounts.push(AccountAllocation {
+                account_id: row.try_get("account_id")?,
+                work,
+                amount_zat,
+            });
+        }
+        return Ok((
+            AllocationPlan {
+                selected_work,
+                pool_fee_zat: winner
+                    .reward_zat
+                    .checked_sub(miner_total)
+                    .ok_or(StoreError::MoneyOverflow)?,
+                accounts,
+            },
+            policy_version,
+        ));
+    }
+    let policy = sqlx::query(
+        "SELECT pplns_window_work::TEXT AS window_work,fee_bps,policy_version \
+         FROM chain_policies WHERE deployment_id=$1 AND chain=$2",
+    )
+    .bind(deployment_id)
+    .bind(chain.as_str())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(StoreError::MissingChainPolicy(chain))?;
+    let window_work = BigUint::from_str(&policy.try_get::<String, _>("window_work")?)
+        .map_err(|_| StoreError::CorruptDatabaseState("PPLNS work window"))?;
+    let fee_bps = u16::try_from(policy.try_get::<i32, _>("fee_bps")?)
+        .map_err(|_| StoreError::CorruptDatabaseState("pool fee"))?;
+    let policy_version = policy.try_get::<i64, _>("policy_version")?;
+
+    let rows = sqlx::query(
+        "SELECT share_id,account_id,work::TEXT AS work FROM shares \
+         WHERE deployment_id=$1 AND event_seq <= $2 ORDER BY event_seq DESC LIMIT $3",
+    )
+    .bind(deployment_id)
+    .bind(share_event_seq)
+    .bind(MAX_PPLNS_SHARES)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut shares = Vec::with_capacity(rows.len());
+    let mut available_work = BigUint::default();
+    for row in &rows {
+        let share_bytes = row.try_get::<Vec<u8>, _>("share_id")?;
+        let share_id: [u8; 32] = share_bytes
+            .try_into()
+            .map_err(|_| StoreError::CorruptDatabaseState("share ID"))?;
+        let work = BigUint::from_str(&row.try_get::<String, _>("work")?)
+            .map_err(|_| StoreError::CorruptDatabaseState("share work"))?;
+        available_work += &work;
+        shares.push(WeightedShare {
+            share_id,
+            account_id: row.try_get("account_id")?,
+            work,
+        });
+    }
+    if i64::try_from(rows.len()).ok() == Some(MAX_PPLNS_SHARES) && available_work < window_work {
+        return Err(StoreError::PplnsWindowTooLarge);
+    }
+    let plan = allocate_pplns(&shares, &window_work, winner.reward_zat, fee_bps)?;
+    Ok((plan, policy_version))
+}
+
 async fn demature_winner(
     transaction: &mut Transaction<'_, Postgres>,
     deployment_id: Uuid,
@@ -4676,7 +4900,7 @@ async fn demature_winner(
         "SELECT e.account_id,e.ledger_account,e.amount_zat \
          FROM ledger_entries e JOIN ledger_transactions t \
            ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
-         WHERE t.deployment_id=$1 AND t.backend_event_seq=$2 \
+         WHERE t.deployment_id=$1 AND t.backend_event_seq=$2 AND t.kind='winner_matured' \
          ORDER BY e.line_no",
     )
     .bind(deployment_id)
@@ -4730,12 +4954,12 @@ async fn mature_winner(
     winner: &WinnerDescriptor,
     confirmations: u32,
 ) -> Result<(), StoreError> {
-    let row = load_winner(transaction, deployment_id, share_id, job_id, winner).await?;
-    let observation = row
-        .observation_event_seq
-        .filter(|_| row.state == "observed" && row.maturity_event_seq.is_none())
-        .ok_or(StoreError::InvalidWinnerTransition)?;
-    let chain = Chain::from(winner.chain);
+    let mut row = load_winner(transaction, deployment_id, share_id, job_id, winner).await?;
+    // The backend journal requires an observation of this exact proof before
+    // maturity. A different proof may already have matured the economic block.
+    if row.proof_state != "observed" {
+        return Err(StoreError::InvalidWinnerTransition);
+    }
     let required = required_winner_confirmations(transaction, deployment_id, winner).await?;
     if confirmations < required {
         return Err(StoreError::PrematureWinner {
@@ -4743,6 +4967,44 @@ async fn mature_winner(
             actual: confirmations,
         });
     }
+    if !matches!(row.state.as_str(), "observed" | "matured") {
+        // A fresh positive proof may restore a block invalidated by another
+        // witness. Restoration and maturity are distinct conserving ledger
+        // kinds within this one atomic backend-event projection.
+        observe_economic_winner(
+            transaction,
+            deployment_id,
+            event_seq,
+            winner,
+            confirmations,
+            &row,
+        )
+        .await?;
+        row = load_winner(transaction, deployment_id, share_id, job_id, winner).await?;
+    }
+    mature_economic_winner(transaction, deployment_id, event_seq, winner, &row).await?;
+    update_winner_proof_state(transaction, deployment_id, winner, share_id, "matured").await?;
+    select_winner_proof(transaction, deployment_id, winner, share_id).await
+}
+
+async fn mature_economic_winner(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    event_seq: i64,
+    winner: &WinnerDescriptor,
+    row: &WinnerRow,
+) -> Result<(), StoreError> {
+    if row.state == "matured"
+        && row.observation_event_seq.is_some()
+        && row.maturity_event_seq.is_some()
+    {
+        return Ok(());
+    }
+    let observation = row
+        .observation_event_seq
+        .filter(|_| row.state == "observed" && row.maturity_event_seq.is_none())
+        .ok_or(StoreError::InvalidWinnerTransition)?;
+    let chain = Chain::from(winner.chain);
     let allocations = sqlx::query(
         "SELECT account_id,amount_zat FROM winner_allocations \
          WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3 AND observation_event_seq=$4 \
@@ -4856,21 +5118,45 @@ async fn reverse_winner(
         winner,
     )
     .await?;
-    if !matches!(row.state.as_str(), "observed" | "matured") {
-        if reversal.next_state == "quarantined"
-            && matches!(row.state.as_str(), "submitted" | "requeued" | "orphaned")
-        {
-            return update_winner_state(
-                transaction,
-                deployment_id,
-                winner,
-                reversal.next_state,
-                None,
-                None,
-            )
-            .await;
-        }
+    let valid = match reversal.next_state {
+        "orphaned" => matches!(row.proof_state.as_str(), "observed" | "matured"),
+        "quarantined" => row.proof_state != "quarantined",
+        _ => false,
+    };
+    if !valid {
         return Err(StoreError::InvalidWinnerTransition);
+    }
+    update_winner_proof_state(
+        transaction,
+        deployment_id,
+        winner,
+        reference.share_id,
+        reversal.next_state,
+    )
+    .await?;
+    if reversal.next_state == "quarantined"
+        && row
+            .active_proof_share_id
+            .as_deref()
+            .is_some_and(|active| active != reference.share_id)
+    {
+        // Another exact proof is still the selected positive observation.
+        // This witness conflict says nothing about that proof's spendability.
+        return Ok(());
+    }
+    if !matches!(row.state.as_str(), "observed" | "matured") {
+        if row.observation_event_seq.is_some() || row.maturity_event_seq.is_some() {
+            return Err(StoreError::CorruptDatabaseState("inactive winner ledger"));
+        }
+        return update_winner_state(
+            transaction,
+            deployment_id,
+            winner,
+            reversal.next_state,
+            None,
+            None,
+        )
+        .await;
     }
     let chain = Chain::from(winner.chain);
     if row.maturity_event_seq.is_some() {
@@ -4898,25 +5184,21 @@ async fn reverse_winner(
             .await?;
         }
     }
-    let mut source_events = Vec::with_capacity(2);
-    if let Some(maturity) = row.maturity_event_seq {
-        source_events.push(maturity);
-    }
-    if let Some(observation) = row.observation_event_seq {
-        source_events.push(observation);
-    }
-    if source_events.is_empty() {
+    if row.observation_event_seq.is_none() {
         return Err(StoreError::CorruptDatabaseState("active winner ledger"));
     }
     let rows = sqlx::query(
         "SELECT e.account_id,e.ledger_account,e.amount_zat \
          FROM ledger_entries e JOIN ledger_transactions t \
            ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
-         WHERE t.deployment_id=$1 AND t.backend_event_seq = ANY($2) \
-         ORDER BY t.backend_event_seq,e.line_no",
+         WHERE t.deployment_id=$1 \
+           AND ((t.backend_event_seq=$2 AND t.kind='winner_observed') \
+             OR (t.backend_event_seq=$3 AND t.kind='winner_matured')) \
+         ORDER BY t.ledger_sequence,e.line_no",
     )
     .bind(deployment_id)
-    .bind(&source_events)
+    .bind(row.observation_event_seq)
+    .bind(row.maturity_event_seq)
     .fetch_all(&mut **transaction)
     .await?;
     if rows.is_empty() {
@@ -4968,7 +5250,9 @@ async fn update_winner_state(
     maturity_event_seq: Option<i64>,
 ) -> Result<(), StoreError> {
     let result = sqlx::query(
-        "UPDATE winners SET state=$4,active_observation_event_seq=$5,active_maturity_event_seq=$6 \
+        "UPDATE winners SET state=$4,active_observation_event_seq=$5,active_maturity_event_seq=$6, \
+                active_proof_share_id=CASE WHEN $4 IN ('observed','matured') \
+                    THEN active_proof_share_id ELSE NULL END \
          WHERE deployment_id=$1 AND chain=$2 AND block_hash_le=$3",
     )
     .bind(deployment_id)

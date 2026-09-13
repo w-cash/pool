@@ -200,6 +200,18 @@ protocol v2 has
 no pool-controlled retirement capability, so documentation and code must not
 invent one.
 
+Proof identity and economic block identity are separate for Wcash. Alternative
+AuxPoW witnesses must neither duplicate a block reward nor redirect its original
+PPLNS allocation. Quarantine applies to the exact proof; fresh canonical evidence
+selects the proof backing the single reward. An authoritative orphan observation
+reverses that reward even when another proof has older positive history.
+
+A Zcash proof committed to a noncanonical side chain has no reward. Only exact
+committed evidence from every pinned parent node can establish `WinnerSideChain`.
+Its durable state permits status-only monitoring after a node prunes that fork,
+without treating an unknown first submission as accepted. RPC failures remain
+fail-closed. A new canonical observation is required before any reward credit.
+
 Soak tests must exceed cache capacity with unsolved and parent-only rotations,
 cover late child winners, and inject transport loss at every retirement and
 submission boundary.

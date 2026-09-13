@@ -50,11 +50,19 @@ service flow. Pending evidence must remain labeled pending.
 
 | Gate | Status |
 | --- | --- |
-| Integrated Rust release checks | Pending |
-| Complete local regtest mining and accounting | Pending |
+| Integrated Rust release checks | Component suites passed; final proof-lifecycle correction under verification |
+| Miner portal on the real local services | Passed: 42 browser checks, including account, worker revocation and both Zcash destination profiles |
+| Complete local regtest mining and accounting | Pending: preserved chains at height 23 exposed duplicate Wcash economic-block insertion; recovery under verification |
 | Real Zcash transparent and shielded payments | Pending |
 | Real Wcash payment and restart reconciliation | Pending |
 | Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
 | Remote preflight and public endpoint acceptance | Pending |
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
+
+At pool revision `1e9650956ef1928df2dc64e6ccc5f8d9b5866523`, dependency policy
+checks passed and a production-default static x86_64 Linux pool binary built
+successfully with Rust 1.91 and cargo-zigbuild. That binary ran on Ubuntu 22.04;
+115 cross-compiled component tests also passed there. These platform checks do
+not approve that revision for deployment: the real height-23 accounting failure
+requires the subsequent proof-lifecycle correction and a new exact release.

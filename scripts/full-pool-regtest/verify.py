@@ -66,10 +66,10 @@ class Verifier:
         require(result.returncode == 0, 'live PostgreSQL query failed')
         return json.loads(result.stdout)
 
-    def rpc(self, chain, method, params):
+    def rpc(self, chain, method, params, *, timeout=30):
         key = {'wcash': 'wec', 'zcash': 'zec'}[chain]
         cookie = (self.runtime / key / '.cookie').read_text().strip()
-        conn = http.client.HTTPConnection('127.0.0.1', {'wcash': 28232, 'zcash': 18232}[chain], timeout=30)
+        conn = http.client.HTTPConnection('127.0.0.1', {'wcash': 28232, 'zcash': 18232}[chain], timeout=timeout)
         try:
             conn.request('POST', '/', json.dumps({'jsonrpc': '2.0', 'id': 'verify-regtest',
                                                  'method': method, 'params': params}),

@@ -1170,6 +1170,42 @@ fn wcash_witness_quarantine_has_an_explicit_requeue_transition() {
 }
 
 #[test]
+fn side_chain_evidence_requires_zcash_and_distinct_valid_identity() -> TestResult {
+    let valid = BackendEvent::WinnerSideChain {
+        event_seq: 1,
+        share_id: fixed(0x51),
+        job_id: fixed(0x52),
+        winner: winner(MergedChain::Zcash, 0x61),
+        tip: ChainTip {
+            block_hash_le: fixed(0x72),
+            height: 11,
+        },
+    };
+    valid.validate()?;
+    let encoded = serde_json::to_value(&valid)?;
+    for (pointer, value) in [
+        ("/winner/chain", serde_json::json!("wcash")),
+        ("/tip/block_hash_le", serde_json::json!("61".repeat(32))),
+        ("/share_id", serde_json::json!("00".repeat(32))),
+        ("/job_id", serde_json::json!("00".repeat(32))),
+        ("/event_seq", serde_json::json!(0)),
+    ] {
+        let mut invalid = encoded.clone();
+        *invalid.pointer_mut(pointer).expect("existing wire field") = value;
+        let invalid: BackendEvent = serde_json::from_value(invalid)?;
+        assert!(
+            invalid.validate().is_err(),
+            "invalid field accepted: {pointer}"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(BackendCapability::WinnerSideChainV1)?,
+        "winner_side_chain_v1"
+    );
+    Ok(())
+}
+
+#[test]
 fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult {
     let wcash = winner(MergedChain::Wcash, 0x61);
     let events = [
@@ -1225,6 +1261,16 @@ fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult
             },
             confirmations: 100,
         },
+        BackendEvent::WinnerSideChain {
+            event_seq: 6,
+            share_id: fixed(0x51),
+            job_id: fixed(0x52),
+            winner: winner(MergedChain::Zcash, 0x62),
+            tip: ChainTip {
+                block_hash_le: fixed(0x73),
+                height: 11,
+            },
+        },
     ];
     for (event, expected_tag) in events.into_iter().zip([
         "winner_observed",
@@ -1232,6 +1278,7 @@ fn winner_lifecycle_wire_shapes_round_trip_and_reject_extensions() -> TestResult
         "winner_quarantined",
         "winner_requeued",
         "winner_matured",
+        "winner_side_chain",
     ]) {
         let message = BackendMessage::Event {
             version: BACKEND_PROTOCOL_VERSION,

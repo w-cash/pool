@@ -242,11 +242,21 @@ incompatible wire change requires a newly negotiated protocol version.
   best-chain tip and a confirmation count equal to
   `tip_height - winner_height + 1`; maturity additionally meets the winner's
   advertised chain-specific threshold. An orphan event binds the replacement
-  best-chain tip. A Wcash witness conflict emits `WinnerQuarantined`; reward
-  progression stops until exact-witness observation or `WinnerRequeued` records
-  authoritative absence and releases the exact retained bytes for backend-only
-  resubmission. Both transitions bind the sampled best-chain tip and are invalid
-  for Zcash. The conflicting and retained block bytes stay in wolf's private
+  best-chain tip. Wcash may have several exact AuxPoW proofs for one block ID;
+  `winner_proofs` tracks each lifecycle while `winners` retains one economic
+  reward and the original winning share and PPLNS allocation. A conflict on
+  another proof cannot reverse the currently selected positive proof's reward.
+  Quarantining the selected proof or orphaning the block reverses its active
+  credit; only fresh positive evidence can restore that original allocation.
+  `WinnerRequeued` records authoritative absence and releases quarantined Wcash
+  bytes for backend-only resubmission. These witness transitions are invalid for
+  Zcash. A never-canonical Zcash proof verified as committed on a side chain by
+  every pinned parent node emits `WinnerSideChain`, with no reward or allocation.
+  Durable status-only monitoring then survives node eviction and backend restart;
+  a later canonical observation follows the ordinary reward lifecycle. The
+  required `winner_side_chain_v1` capability rejects incompatible binaries during
+  startup without changing the version-2 journal identity. The conflicting and
+  retained block bytes stay in wolf's private
   durable journal rather than crossing the pool protocol. `GenerationClosed`
   closes share admission only and is never block acceptance, reward maturity,
   or payout evidence.

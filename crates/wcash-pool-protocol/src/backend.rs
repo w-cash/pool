@@ -362,15 +362,18 @@ pub enum BackendCapability {
     DualTargetV1,
     /// Winning shares and reversible reward lifecycle changes are journaled.
     WinnerLifecycleV1,
+    /// Valid noncanonical Zcash proofs are durably monitored without reward credit.
+    WinnerSideChainV1,
 }
 
 /// Capabilities every current-protocol backend must advertise exactly once.
-pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 5] = [
+pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 6] = [
     BackendCapability::JobStreamV1,
     BackendCapability::DurableShareReceiptsV1,
     BackendCapability::EventReplayV1,
     BackendCapability::DualTargetV1,
     BackendCapability::WinnerLifecycleV1,
+    BackendCapability::WinnerSideChainV1,
 ];
 
 /// One of the independently submitted merged-mining chains.
@@ -614,6 +617,22 @@ pub enum BackendEvent {
         /// Confirmation count computed from the same state snapshot as `tip`.
         confirmations: u32,
     },
+    /// An exact Zcash proof was committed on a noncanonical chain by every
+    /// pinned parent node. It has never been observed on the best chain and
+    /// creates no reward credit. The durable record permits status-only
+    /// monitoring after the nodes evict the side branch or the backend restarts.
+    WinnerSideChain {
+        /// Monotonic backend journal sequence.
+        event_seq: u64,
+        /// Share whose proof created this candidate.
+        share_id: Hex32,
+        /// Generation that produced the candidate.
+        job_id: Hex32,
+        /// Immutable candidate-block and potential reward facts.
+        winner: WinnerDescriptor,
+        /// Stable best-chain tip sampled around exact side-chain verification.
+        tip: ChainTip,
+    },
     /// A previously observed winner left one chain's current best chain.
     WinnerOrphaned {
         /// Monotonic backend journal sequence.
@@ -732,6 +751,20 @@ impl fmt::Debug for BackendEvent {
                 .field("tip", tip)
                 .field("confirmations", confirmations)
                 .finish(),
+            Self::WinnerSideChain {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            } => formatter
+                .debug_struct("WinnerSideChain")
+                .field("event_seq", event_seq)
+                .field("share_id", share_id)
+                .field("job_id", job_id)
+                .field("winner", winner)
+                .field("tip", tip)
+                .finish(),
             Self::WinnerOrphaned {
                 event_seq,
                 share_id,
@@ -802,6 +835,7 @@ impl BackendEvent {
             | Self::JobInvalidated { event_seq, .. }
             | Self::GenerationClosed { event_seq, .. }
             | Self::WinnerObserved { event_seq, .. }
+            | Self::WinnerSideChain { event_seq, .. }
             | Self::WinnerOrphaned { event_seq, .. }
             | Self::WinnerQuarantined { event_seq, .. }
             | Self::WinnerRequeued { event_seq, .. }
@@ -882,6 +916,13 @@ impl BackendEvent {
                 confirmations,
                 ..
             } => validate_winner_observation(share_id, job_id, winner, tip, *confirmations, false),
+            Self::WinnerSideChain {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => validate_zcash_winner_side_chain(share_id, job_id, winner, tip),
             Self::WinnerOrphaned {
                 share_id,
                 job_id,
@@ -1882,6 +1923,29 @@ fn validate_winner_observation(
         return Err(invalid(
             "winner_event.confirmations",
             "matured winner has not reached its immutable confirmation requirement",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zcash_winner_side_chain(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+    tip: &ChainTip,
+) -> Result<(), ProtocolError> {
+    validate_winner_reference(share_id, job_id, winner)?;
+    tip.validate()?;
+    if winner.chain != MergedChain::Zcash {
+        return Err(invalid(
+            "winner_event.chain",
+            "side-chain monitoring requires Zcash",
+        ));
+    }
+    if tip.block_hash_le == winner.block_hash_le {
+        return Err(invalid(
+            "winner_event.tip",
+            "side-chain tip must not be the candidate block",
         ));
     }
     Ok(())

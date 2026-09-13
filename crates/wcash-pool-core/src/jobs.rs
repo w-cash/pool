@@ -785,6 +785,7 @@ impl GenerationRegistry {
             | BackendEvent::WinnerOrphaned { .. }
             | BackendEvent::WinnerQuarantined { .. }
             | BackendEvent::WinnerRequeued { .. }
+            | BackendEvent::WinnerSideChain { .. }
             | BackendEvent::WinnerMatured { .. } => {}
         }
         // A valid event can spend time queued behind a bounded backend exchange.

@@ -1218,7 +1218,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn revoked_authorization_closes_an_existing_session_promptly() -> TestResult {
         let (mut client, server) = tcp_pair().await?;
         let config = edge_config(
@@ -1252,6 +1252,10 @@ mod tests {
             let _ = read_line(&mut client).await?;
         }
 
+        // Complete real socket I/O before pausing the clock: automatic virtual
+        // advancement can otherwise expire a handshake while the OS is waking
+        // its reader. Revocation itself still uses the exact virtual deadline.
+        time::pause();
         authentication.live.store(false, Ordering::SeqCst);
         time::advance(AUTHORIZATION_REVALIDATION_INTERVAL).await;
         tokio::task::yield_now().await;

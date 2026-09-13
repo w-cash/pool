@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import time
 from types import SimpleNamespace
+import sys
+sys.dont_write_bytecode = True
 from run import Harness, private
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -20,7 +22,8 @@ worker = session['worker']
 for index in range(args.blocks):
     previous = {name: h.rpc(name, 'getblockcount') for name in ('wec', 'zec')}
     started = time.monotonic()
-    h.mine_winner(f'continuation-proof-{previous["wec"]+1:04}', args.miner, worker)
+    h.mine_winner(f'continuation-proof-{previous["wec"]+1:04}', args.miner, worker,
+                  {name: height + 1 for name, height in previous.items()})
     for name in ('wec', 'zec'):
         h.until(name + ' chain advancement', lambda n=name: h.rpc(n, 'getblockcount') > previous[n])
     if index == 0 or (index + 1) % 10 == 0 or index + 1 == args.blocks:

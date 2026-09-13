@@ -1,5 +1,7 @@
 """Replay helper boundary fixtures; these are not real mining acceptance."""
 import io
+import copy
+import itertools
 import json
 from pathlib import Path
 import socket
@@ -11,7 +13,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from replay import LedgerCheck, ReplayExchange, ReplayVerifier, encode, private_file, proxy
+from replay import GENESIS, LedgerCheck, ReplayExchange, ReplayVerifier, encode, private_file, proxy, retained_side_chain_is_idle
 
 
 SUBMIT = {'id': 4, 'method': 'mining.submit',
@@ -19,7 +21,98 @@ SUBMIT = {'id': 4, 'method': 'mining.submit',
 ACCEPTED = {'id': 4, 'result': True, 'error': None}
 
 
+def side_chain_fixture():
+    winner = {'chain': 'zcash', 'block_hash_le': 'ab' * 32, 'height': 11,
+              'coinbase_txid_le': 'bc' * 32, 'reward_zat': 100, 'maturity_confirmations': 100}
+    share, job = 'cd' * 32, 'de' * 32
+    row = {'chain': 'zcash', 'block': winner['block_hash_le'], 'height': 11,
+           'coinbase': winner['coinbase_txid_le'], 'reward': 100, 'maturity': 100,
+           'share': share, 'job': job, 'inactive': True, 'allocations': 0, 'credit': 0,
+           'proofs': [{'share': share, 'job': job, 'state': 'side_chain'}], 'committed_seq': 2,
+           'committed': {'event': 'share_committed', 'job_id': job, 'receipt': {
+               'event_seq': 2, 'share_id': share, 'job_id': job,
+               'parent_hash_le': winner['block_hash_le'], 'winners': [winner]}},
+           'event': {'event': 'winner_side_chain', 'event_seq': 3, 'share_id': share,
+                     'job_id': job, 'winner': winner,
+                     'tip': {'block_hash_le': 'ef' * 32, 'height': 12}}}
+    return row, {'state': 'side_chain', 'hash': 'ab' * 32, 'height': 11}
+
+
 class ReplayBoundaryTests(unittest.TestCase):
+    def test_retained_side_chain_requires_durable_exact_uncredited_evidence(self):
+        row, status = side_chain_fixture()
+        self.assertTrue(retained_side_chain_is_idle(row, status))
+        self.assertTrue(retained_side_chain_is_idle(row, {'state': 'unknown'}))
+        self.assertFalse(retained_side_chain_is_idle(row, {**status, 'state': 'best_chain', 'confirmations': 2}))
+        for field, value in [('inactive', False), ('credit', 1), ('allocations', 1),
+                             ('event', None), ('proofs', []), ('committed', {})]:
+            with self.subTest(field=field):
+                bad = {**row, field: value}
+                with self.assertRaises(RuntimeError):
+                    retained_side_chain_is_idle(bad, {'state': 'unknown'})
+
+    def test_side_chain_node_or_committed_identity_mismatch_is_rejected(self):
+        row, status = side_chain_fixture()
+        for bad in ({**status, 'hash': 'aa' * 32}, {**status, 'height': 12},
+                    {'state': 'unknown', 'hash': status['hash']}, {'state': 'pending'}):
+            with self.subTest(status=bad):
+                with self.assertRaises(RuntimeError):
+                    retained_side_chain_is_idle(row, bad)
+        for part in ('event', 'committed'):
+            bad = copy.deepcopy(row)
+            if part == 'event':
+                bad['event']['winner']['reward_zat'] += 1
+            else:
+                bad['committed']['receipt']['winners'] = []
+            with self.subTest(part=part), self.assertRaises(RuntimeError):
+                retained_side_chain_is_idle(bad, {'state': 'unknown'})
+
+    def idle_ledger(self, row=None):
+        ledger = object.__new__(LedgerCheck)
+        ledger.before = {'total': 23, 'worker': 22}
+        ledger.idle_snapshot = lambda: {**ledger.before, 'pending': 0, 'winners': 'stable'}
+        ledger.side_chains = lambda: [] if row is None else [row]
+        def rpc(chain, method, params):
+            if method == 'getblockhash':
+                return GENESIS[chain]
+            if method == 'getbestblockhash':
+                return 'aa' * 32
+            if method == 'getblockstatus':
+                return {'state': 'unknown'}
+            self.fail('unexpected RPC')
+        ledger.verifier = SimpleNamespace(rpc=rpc, query_deadline=None)
+        return ledger
+
+    def test_idle_accepts_durable_pruned_side_chain_without_claiming_credit(self):
+        row, _ = side_chain_fixture()
+        ledger = self.idle_ledger(row)
+        with patch('replay.time.sleep'):
+            ledger.require_idle()
+        self.assertEqual(ledger.retained_side_chain_count, 1)
+        self.assertIsNone(ledger.verifier.query_deadline)
+
+    def test_idle_keeps_generic_submitted_pending_and_has_bounded_deadline(self):
+        ledger = self.idle_ledger()
+        ledger.idle_snapshot = lambda: {**ledger.before, 'pending': 1, 'winners': 'submitted'}
+        with patch('replay.IDLE_DEADLINE_SECONDS', 1), patch('replay.time.sleep'), \
+                patch('replay.time.monotonic', side_effect=itertools.count(0, .1)):
+            with self.assertRaisesRegex(RuntimeError, 'did not become idle'):
+                ledger.require_idle()
+        self.assertIsNone(ledger.verifier.query_deadline)
+
+    def test_idle_rejects_other_mining_and_changing_economic_state(self):
+        ledger = self.idle_ledger()
+        ledger.idle_snapshot = lambda: {'total': 24, 'worker': 23, 'pending': 0}
+        with self.assertRaisesRegex(RuntimeError, 'other mining is active'):
+            ledger.require_idle()
+        ledger = self.idle_ledger()
+        changes = itertools.count()
+        ledger.idle_snapshot = lambda: {**ledger.before, 'pending': 0, 'winners': next(changes)}
+        with patch('replay.IDLE_DEADLINE_SECONDS', 1), patch('replay.time.sleep'), \
+                patch('replay.time.monotonic', side_effect=itertools.count(0, .1)):
+            with self.assertRaisesRegex(RuntimeError, 'did not become idle'):
+                ledger.require_idle()
+
     def test_postgres_uri_is_decoded_into_private_environment_not_argv(self):
         with tempfile.TemporaryDirectory() as directory:
             connection_file = Path(directory) / 'database-url'

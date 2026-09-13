@@ -18,14 +18,20 @@ import sys
 import time
 import uuid
 
-from verify import Verifier, require
+from verify import GENESIS, Verifier, display_block, require
 
 MAX_LINE = 262144
+IDLE_DEADLINE_SECONDS = 20
 
 
 class ReplayVerifier(Verifier):
     """Keep live SQL inside the native client's short response deadline."""
     query_deadline = None
+
+    def rpc(self, chain, method, params):
+        timeout = 2 if self.query_deadline is None else min(2, self.query_deadline - time.monotonic())
+        require(timeout > 0, 'node preflight deadline reached before replay')
+        return super().rpc(chain, method, params, timeout=timeout)
 
     def query(self, select):
         timeout = 2 if self.query_deadline is None else min(2, self.query_deadline - time.monotonic())
@@ -43,6 +49,51 @@ def private_file(path):
 
 def encode(message):
     return (json.dumps(message, separators=(',', ':')) + '\n').encode()
+
+
+def retained_side_chain_is_idle(row, status):
+    """Unknown is usable only after exact durable side-chain evidence, never alone."""
+    winner = {'chain': row['chain'], 'block_hash_le': row['block'], 'height': row['height'],
+              'coinbase_txid_le': row['coinbase'], 'reward_zat': row['reward'],
+              'maturity_confirmations': row['maturity']}
+    require(row['chain'] == 'zcash' and row['inactive'] is True
+            and row['allocations'] == 0 and row['credit'] == 0,
+            'retained side-chain candidate has active economic state')
+    require(row['proofs'] == [{'share': row['share'], 'job': row['job'], 'state': 'side_chain'}],
+            'retained side-chain candidate lacks its exact proof state')
+    event, committed = row['event'], row['committed']
+    require(isinstance(event, dict) and event.get('event') == 'winner_side_chain'
+            and event.get('share_id') == row['share'] and event.get('job_id') == row['job']
+            and event.get('winner') == winner
+            and type(event.get('event_seq')) is int and event['event_seq'] > row['committed_seq'],
+            'retained side-chain candidate lacks matching durable classification')
+    tip = event.get('tip', {})
+    require(isinstance(tip, dict) and type(tip.get('height')) is int and tip['height'] >= 0
+            and isinstance(tip.get('block_hash_le'), str) and len(tip['block_hash_le']) == 64
+            and tip['block_hash_le'] != row['block'], 'durable side-chain tip evidence is invalid')
+    require(len(bytes.fromhex(tip['block_hash_le'])) == 32, 'invalid durable side-chain tip hash')
+    require(isinstance(committed, dict) and committed.get('event') == 'share_committed'
+            and committed.get('job_id') == row['job'], 'side-chain committed job evidence differs')
+    receipt = committed.get('receipt', {})
+    require(receipt.get('share_id') == row['share'] and receipt.get('job_id') == row['job']
+            and receipt.get('event_seq') == row['committed_seq']
+            and receipt.get('parent_hash_le') == row['block']
+            and winner in receipt.get('winners', []), 'side-chain committed receipt evidence differs')
+    require(isinstance(status, dict), 'invalid exact side-chain node status')
+    if status == {'state': 'unknown'}:
+        # The native node may prune a previously classified noncanonical fork.
+        # The earlier exact durable event, not Unknown, supplies the evidence.
+        return True
+    require(status.get('hash') == display_block(row['block'])
+            and status.get('height') == row['height'], 'side-chain node identity differs')
+    if status.get('state') == 'best_chain':
+        require(set(status) == {'state', 'hash', 'height', 'confirmations'}
+                and type(status['confirmations']) is int and status['confirmations'] > 0,
+                'invalid exact canonical node status')
+        return False  # Await the actual positive projection, never fabricate it.
+    require(set(status) == {'state', 'hash', 'height'} and status.get('state') == 'side_chain',
+            'invalid exact side-chain node classification')
+    return True
 
 
 class ReplayExchange:
@@ -104,11 +155,71 @@ class LedgerCheck:
         self.original_facts = None
 
     def require_idle(self):
-        pending = self.verifier.query(f'''SELECT count(*) AS count FROM winners
-            WHERE deployment_id={self.dep} AND state IN ('submitted','requeued')''')
-        require(pending == [{'count': 0}], 'wait for existing winner projections before replay')
-        time.sleep(0.5)
-        require(self.counts() == self.before, 'other mining is active; wait before replay')
+        deadline = time.monotonic() + IDLE_DEADLINE_SECONDS
+        self.verifier.query_deadline = deadline
+        try:
+            for chain, genesis in GENESIS.items():
+                require(self.verifier.rpc(chain, 'getblockhash', [0]) == genesis,
+                        'replay preflight node is not the exact Regtest chain')
+            while time.monotonic() < deadline:
+                before = self.idle_snapshot()
+                require(before['total'] == self.before['total'] and before['worker'] == self.before['worker'],
+                        'other mining is active; wait before replay')
+                if before['pending']:
+                    time.sleep(0.25)
+                    continue
+                tips = self.node_tips()
+                rows = self.side_chains()
+                classified = all(retained_side_chain_is_idle(row, self.verifier.rpc(
+                    row['chain'], 'getblockstatus', [display_block(row['block'])])) for row in rows)
+                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+                after = self.idle_snapshot()
+                if classified and before == after and tips == self.node_tips():
+                    self.retained_side_chain_count = len(rows)
+                    return
+            raise RuntimeError('winner projections or independent node tips did not become idle before replay')
+        finally:
+            self.verifier.query_deadline = None
+
+    def node_tips(self):
+        tips = {chain: self.verifier.rpc(chain, 'getbestblockhash', []) for chain in GENESIS}
+        require(all(isinstance(tip, str) and len(tip) == 64 and len(bytes.fromhex(tip)) == 32
+                    for tip in tips.values()), 'invalid independent node tip')
+        return tips
+
+    def idle_snapshot(self):
+        rows = self.verifier.query(f'''SELECT
+            (SELECT count(*) FROM shares WHERE deployment_id={self.dep}) AS total,
+            (SELECT count(*) FROM shares WHERE deployment_id={self.dep} AND worker_id={self.worker}) AS worker,
+            (SELECT count(*) FROM winners WHERE deployment_id={self.dep} AND state IN ('submitted','requeued')) AS pending,
+            (SELECT md5(COALESCE(jsonb_agg(to_jsonb(w) ORDER BY w.chain,w.block_hash_le)::TEXT,''))
+             FROM winners w WHERE w.deployment_id={self.dep}) AS winners,
+            (SELECT md5(COALESCE(jsonb_agg(to_jsonb(p) ORDER BY p.chain,p.block_hash_le,p.share_id)::TEXT,''))
+             FROM winner_proofs p WHERE p.deployment_id={self.dep}) AS proofs,
+            (SELECT md5(COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.chain,a.block_hash_le,a.observation_event_seq,a.account_id)::TEXT,''))
+             FROM winner_allocations a WHERE a.deployment_id={self.dep}) AS allocations,
+            (SELECT md5(COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.id)::TEXT,''))
+             FROM ledger_transactions t WHERE t.deployment_id={self.dep} AND t.kind LIKE 'winner_%') AS credit''')
+        require(len(rows) == 1, 'invalid idle snapshot query')
+        return rows[0]
+
+    def side_chains(self):
+        return self.verifier.query(f'''SELECT w.chain,w.height,encode(w.block_hash_le,'hex') AS block,
+            encode(w.share_id,'hex') AS share,encode(w.job_id,'hex') AS job,
+            encode(w.coinbase_txid_le,'hex') AS coinbase,w.reward_zat AS reward,w.maturity_confirmations AS maturity,
+            (w.active_proof_share_id IS NULL AND w.active_observation_event_seq IS NULL AND w.active_maturity_event_seq IS NULL) AS inactive,
+            (SELECT count(*) FROM winner_allocations a WHERE (a.deployment_id,a.chain,a.block_hash_le)=(w.deployment_id,w.chain,w.block_hash_le)) AS allocations,
+            (SELECT count(*) FROM ledger_transactions t WHERE t.deployment_id=w.deployment_id AND t.chain=w.chain
+             AND t.reference=w.chain || ':' || encode(w.block_hash_le,'hex')) AS credit,
+            (SELECT jsonb_agg(jsonb_build_object('share',encode(p.share_id,'hex'),'job',encode(p.job_id,'hex'),'state',p.state) ORDER BY p.share_id)
+             FROM winner_proofs p WHERE (p.deployment_id,p.chain,p.block_hash_le)=(w.deployment_id,w.chain,w.block_hash_le)) AS proofs,
+            c.event_seq AS committed_seq,c.payload AS committed,
+            (SELECT e.payload FROM backend_events e WHERE e.deployment_id=w.deployment_id AND e.event_kind='winner_side_chain'
+             AND e.payload->>'share_id'=encode(w.share_id,'hex') AND e.payload->>'job_id'=encode(w.job_id,'hex')
+             AND e.payload->'winner'->>'block_hash_le'=encode(w.block_hash_le,'hex') ORDER BY e.event_seq DESC LIMIT 1) AS event
+            FROM winners w JOIN shares s ON (s.deployment_id,s.share_id)=(w.deployment_id,w.share_id)
+            JOIN backend_events c ON (c.deployment_id,c.event_seq)=(s.deployment_id,s.event_seq)
+            WHERE w.deployment_id={self.dep} AND w.state='side_chain' ORDER BY w.chain,w.block_hash_le''')
 
     def counts(self):
         rows = self.verifier.query(f'''SELECT count(*) AS total,
@@ -285,6 +396,7 @@ def run(args):
               'original_winners_per_chain': 1, 'winner_allocations_unchanged': True,
               'original_winner_ledger_entries_unchanged': True,
               'unchanged_observation_seconds': args.observe_seconds,
+              'retained_uncredited_side_chain_candidates': ledger.retained_side_chain_count,
               'scope': 'same-session replay only; restart/recovery is separate evidence'}
     with private_file(evidence / 'result.json') as output:
         output.write(json.dumps(report, indent=2).encode())
