@@ -16,7 +16,9 @@ import signal
 import socket
 import subprocess
 import time
+import tomllib
 import uuid
+from urllib.parse import urlsplit, unquote
 
 WEC_GENESIS = '70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c'
 ZEC_GENESIS = '029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327'
@@ -38,6 +40,9 @@ class Harness:
         self.root = args.runtime.resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
+        for ancestor in (self.root, *self.root.parents):
+            if ancestor.stat().st_mode & 0o022:
+                raise RuntimeError('runtime and all ancestors must reject group/other writes')
         self.processes = []
         self.cookies = {}
         self.csrf = None
@@ -45,7 +50,7 @@ class Harness:
 
     def command(self, label, command, *, env=None, stdin=None, timeout=300):
         result = subprocess.run([str(x) for x in command], input=stdin, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=self.root)
         private(self.root / (label + '.stdout'), result.stdout)
         private(self.root / (label + '.stderr'), result.stderr)
         if result.returncode:
@@ -56,7 +61,7 @@ class Harness:
         log = open(self.root / (label + '.log'), 'wb')
         os.chmod(log.name, 0o600)
         proc = subprocess.Popen([str(x) for x in command], stdout=log, stderr=subprocess.STDOUT,
-                                env=env, start_new_session=True)
+                                env=env, start_new_session=True, cwd=self.root)
         log.close()
         self.processes.append((label, proc))
         private(self.root / 'processes.json', json.dumps({name: p.pid for name, p in self.processes}))
@@ -159,7 +164,10 @@ filter = "info"
     def run(self):
         args = self.args
         pg_env = os.environ.copy()
-        pg_env['PGDATABASE'] = args.database_url_file.read_text().strip()
+        database = urlsplit(args.database_url_file.read_text().strip())
+        pg_env.update({'PGHOST': database.hostname or '', 'PGPORT': str(database.port or 5432),
+                       'PGUSER': unquote(database.username or ''), 'PGPASSWORD': unquote(database.password or ''),
+                       'PGDATABASE': unquote(database.path.lstrip('/'))})
         version = int(self.command('postgres-version', ['psql', '-Atqc', 'SHOW server_version_num'], env=pg_env))
         if version // 10000 != 16:
             raise RuntimeError('full composition requires PostgreSQL 16')
@@ -186,14 +194,21 @@ filter = "info"
                     'WCASH_POOL_BACKEND_IDENTITY': str(self.root / 'backend.identity'),
                     'WCASH_POOL_BACKEND_JOURNAL': str(self.root / 'backend.journal'),
                     'WCASH_POOL_BACKEND_SOCKET': str(self.root / 'backend.sock'),
+                    'WCASH_SHARE_JOURNAL': str(self.root / '.wcash-share-journal-v2.jsonl'),
                     'WCASH_POOL_BACKEND_SUBMIT_UID': str(os.getuid()),
                     'WCASH_POOL_BACKEND_PROJECTOR_UID': str(os.getuid() + 1),
                     'WCASH_POOL_BACKEND_PAYOUT_UID': str(os.getuid() + 2),
-                    'WCASH_POOL_BACKEND_SOCKET_GID': str(os.getgid()), 'WCASH_SHARE_TARGET': TARGET})
+                    'WCASH_POOL_BACKEND_SOCKET_GID': str(self.root.stat().st_gid), 'WCASH_SHARE_TARGET': TARGET})
         for name, prefix in [('wec', 'WCASH_RPC'), ('zec', 'ZCASH_TEMPLATE_RPC'), ('validator', 'ZCASH_VALIDATOR_RPC')]:
             user, password = (self.root / name / '.cookie').read_text().strip().split(':', 1)
             env[prefix + '_USERNAME'], env[prefix + '_PASSWORD'] = user, password
         urls = ['http://127.0.0.1:28232', 'http://127.0.0.1:18232', 'http://127.0.0.1:18242', '-']
+        native = json.loads(self.command('native-job-preflight', [args.miner, 'native-job', *urls], env=env))
+        child_target = native['wcash']['child_target']
+        parent_target = native['zcash']['parent_target']
+        if child_target != parent_target:
+            raise RuntimeError('this merged-winner harness requires equal actual Regtest targets')
+        self.network_target = parent_target
         authority = json.loads(self.command('backend-init', [args.miner, 'pool-backend-init', *urls], env=env))
         self.spawn('backend', [args.miner, 'native-pool-backend', *urls], env=env)
         self.until('backend socket', lambda: (self.root / 'backend.sock').exists())
@@ -201,6 +216,9 @@ filter = "info"
         self.command('pool-config', [args.poold, 'config-check', '--config', config])
         self.command('pool-migrate', [args.poold, 'migrate', '--config', config])
         self.spawn('projector', [args.poold, 'projector', '--config', config])
+        # A listening backend socket precedes its first proved coinbase/job.
+        # Use the same bounded readiness gate as the service deployment.
+        self.command('pool-preflight', [args.poold, 'preflight', '--config', config])
         self.spawn('poold', [args.poold, 'serve', '--config', config])
         self.until('portal', lambda: self.portal('/healthz'))
         password = secrets.token_urlsafe(32)
@@ -258,7 +276,8 @@ filter = "info"
     def write_pool_config(self, authority):
         network_target = self.rpc('zec', 'getblocktemplate')['target']
         if (not isinstance(network_target, str) or len(network_target) != 64
-                or not 0 < int(network_target, 16) <= int(TARGET, 16)):
+                or not 0 < int(network_target, 16) <= int(TARGET, 16)
+                or network_target != self.network_target):
             raise RuntimeError('invalid regtest network target')
         for name in ('pepper', 'totp'):
             if not (self.root / name).exists():
@@ -280,6 +299,15 @@ filter = "info"
                   # the actual fixed Regtest network target for this winner test.
                   'initial_share_target_be': network_target, 'easiest_share_target_be': TARGET}
         path = self.root / 'pool.toml'
+        if path.exists():
+            existing = tomllib.loads(path.read_text())
+            for key in ('network', 'backend_instance', 'journal_stream', 'chain_id',
+                        'wcash_genesis', 'zcash_genesis', 'wcash_payout_commitment',
+                        'zcash_payout_commitment', 'database_url_file'):
+                if existing.get(key) != values[key]:
+                    raise RuntimeError('existing runtime belongs to a different backend or database')
+            for key in ('deployment_id', 'pool_instance'):
+                values[key] = str(uuid.UUID(existing[key]))
         text = '\n'.join(key + ' = ' + json.dumps(value) for key, value in values.items()) + '\n'
         for asset in ('wcash', 'zcash'):
             text += f'''\n[{asset}_policy]
@@ -319,6 +347,8 @@ def main():
     parser.add_argument('--blocks', type=int, default=102, help='Real merged blocks; 102 matures the first reward for both test accounts')
     parser.add_argument('--keep-running', action='store_true')
     args = parser.parse_args()
+    for name in ("runtime", "database_url_file", "zec_collector_file", "wallet", "miner", "wcash_node", "zcash_node", "poold"):
+        setattr(args, name, getattr(args, name).resolve())
     if not 1 <= args.blocks <= 1000:
         parser.error('--blocks must be in 1..1000')
     harness = Harness(args)
