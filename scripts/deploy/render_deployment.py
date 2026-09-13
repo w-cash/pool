@@ -200,6 +200,9 @@ WALLET_BOOTSTRAP_TEMPLATES = {
 
 DEPLOYMENT_TEMPLATES = {
     **WALLET_BOOTSTRAP_TEMPLATES,
+    # Custody finalization validates the isolated payout runtime before a
+    # backend authority exists, so this policy must be present at bootstrap.
+    "deploy/config/zallet-payout.testnet.toml.in": "zallet-payout.toml",
     "deploy/config/zec-authority.testnet.toml.in": "zec-authority.testnet.toml",
     "deploy/config/backend.env.in": "backend.env",
     "deploy/systemd/wcash-pool-zec-authority-bootstrap.service.in": "systemd/wcash-pool-zec-authority-bootstrap.service",
@@ -698,12 +701,6 @@ def main() -> None:
             args.output / "pool.payout.toml",
             payout_values,
         )
-        render(
-            args.source_root / "deploy/config/zallet-payout.testnet.toml.in",
-            args.output / "zallet-payout.toml",
-            values,
-        )
-
     release_policy = args.output / "release.env"
     release_policy.write_text(
         f"ZECWEC_RELEASE_PATH={release_root}\nZECWEC_DEPLOYMENT_SCHEMA=2\n",

@@ -130,6 +130,8 @@ if [[ $phase != wallet-bootstrap ]]; then
     install -o root -g wcash-pool-backend -m 0640 "$staging/backend.env" "$ZECWEC_CONFIG_DIR/backend.env"
     install -o root -g wcash-pool-backend -m 0640 "$staging/zec-authority.testnet.toml" \
         "$ZECWEC_CONFIG_DIR/zec-authority.testnet.toml"
+    install -o root -g zecwec-zallet -m 0640 "$staging/zallet-payout.toml" \
+        "$ZECWEC_CONFIG_DIR/zallet-payout.toml"
 fi
 
 if [[ $phase == finalize ]]; then
@@ -141,8 +143,6 @@ if [[ $phase == finalize ]]; then
         "$ZECWEC_CONFIG_DIR/pool.projector.toml"
     install -o root -g wcash-payout -m 0640 "$staging/pool.payout.toml" \
         "$ZECWEC_CONFIG_DIR/pool.payout.toml"
-    install -o root -g zecwec-zallet -m 0640 "$staging/zallet-payout.toml" \
-        "$ZECWEC_CONFIG_DIR/zallet-payout.toml"
 fi
 install -o root -g root -m 0644 "$staging/release.env" "$ZECWEC_CONFIG_DIR/release.env"
 

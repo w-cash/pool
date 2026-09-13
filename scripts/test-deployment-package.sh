@@ -1733,6 +1733,20 @@ grep -Fq 'install -o root -g zecwec-zallet -m 0640 "$staging/zallet-payout.toml"
     "$repo_root/scripts/deploy/render-deployment.sh"
 grep -Fq 'systemctl disable zecwec-testnet-pool-start.service' \
     "$repo_root/scripts/deploy/render-deployment.sh"
+python3 - "$repo_root/scripts/deploy/render-deployment.sh" <<'PY'
+import pathlib
+import sys
+
+renderer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+bootstrap_policy = renderer.index('if [[ $phase != wallet-bootstrap ]]; then')
+payout_install = renderer.index(
+    'install -o root -g zecwec-zallet -m 0640 "$staging/zallet-payout.toml"'
+)
+finalize_policy = renderer.index(
+    'if [[ $phase == finalize ]]; then', bootstrap_policy
+)
+assert bootstrap_policy < payout_install < finalize_policy
+PY
 grep -Fq 'root:zecwec-zallet:640:1' "$repo_root/scripts/deploy/common.sh"
 # shellcheck disable=SC2016
 grep -Fq 'runuser --user zecwec-zallet -- /usr/bin/test -r "$zallet_config"' \
@@ -2608,6 +2622,7 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" wallet-bootstrap \
     --payout-uid 12346
 [[ ! -e $temporary/wallet-bootstrap-output/backend.env \
     && ! -e $temporary/wallet-bootstrap-output/zec-authority.testnet.toml \
+    && ! -e $temporary/wallet-bootstrap-output/zallet-payout.toml \
     && ! -e $temporary/wallet-bootstrap-output/pool.runtime.toml \
     && ! -e $temporary/wallet-bootstrap-output/systemd/wcash-pool.service \
     && ! -e $temporary/wallet-bootstrap-output/systemd/wcash-pool-zec-authority-bootstrap.service ]] \
@@ -2963,6 +2978,23 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --output "$temporary/ironwood-output" \
     --pool-uid 12345 \
     --payout-uid 12346
+[[ -f $temporary/ironwood-output/zallet-payout.toml ]] \
+    || {
+        printf 'deployment-package-test: bootstrap omitted payout Zallet policy\n' >&2
+        exit 1
+    }
+cmp --silent \
+    "$temporary/ironwood-output/zallet-payout.toml" \
+    "$temporary/output/zallet-payout.toml" \
+    || {
+        printf 'deployment-package-test: bootstrap and finalize rendered different payout Zallet policies\n' >&2
+        exit 1
+    }
+[[ ! -e $temporary/ironwood-output/pool.payout.toml ]] \
+    || {
+        printf 'deployment-package-test: bootstrap rendered an authority-bound payout policy\n' >&2
+        exit 1
+    }
 grep -Fq 'LoadCredential=wcash-payout-ivk:' \
     "$temporary/ironwood-output/systemd/wcash-pool-backend.service" \
     || {
