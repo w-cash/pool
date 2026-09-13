@@ -1214,10 +1214,11 @@ assert "Group=wcash-pool-socket\n" in backend_unit
 assert "SupplementaryGroups=wcash-pool-backend\n" in backend_unit
 assert "LoadCredential=wcash-payout-ivk:" in backend_unit
 assert "LoadCredential=wcash-wallet-authority:/var/lib/wcash-payout/wcash-wallet-authority.json" in backend_unit
-assert "LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml" in backend_unit
-assert "LoadCredential=zec-initial-zero-result:/var/lib/zecwec-custody/zec-collector-initial-zero.json" in backend_unit
-assert "LoadCredential=zec-initial-zero-attestation:/var/lib/zecwec-custody/zec-collector-initial-zero.attestation" in backend_unit
-assert "zec-authority-bootstrap.sh verify" in backend_unit
+assert "LoadCredential=zec-authority-config:" not in backend_unit
+assert "LoadCredential=zec-initial-zero-result:" not in backend_unit
+assert "LoadCredential=zec-initial-zero-attestation:" not in backend_unit
+assert "ExecStartPre=+" in backend_unit
+assert "zec-authority-bootstrap.sh verify-sealed" in backend_unit
 
 preflight_unit = (root / "systemd/wcash-pool-preflight.service").read_text(encoding="utf-8")
 zallet_unit = (root / "systemd/zecwec-zallet.service").read_text(encoding="utf-8")
@@ -1230,6 +1231,24 @@ assert (
 )
 assert "ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock" in health_unit
 assert "SupplementaryGroups=wcash-pool-backend\n" in backend_init_unit
+for authority_consumer in (pool_unit, preflight_unit, backend_unit, backend_init_unit):
+    assert (
+        "Environment=ZEC_AUTHORITY_CONFIG="
+        "/etc/wcash-pool/zec-authority.testnet.toml"
+    ) in authority_consumer
+    assert (
+        "Environment=ZEC_AUTHORITY_RESULT="
+        "/var/lib/zecwec-custody/zec-collector-initial-zero.json"
+    ) in authority_consumer
+    assert (
+        "Environment=ZEC_AUTHORITY_ATTESTATION="
+        "/var/lib/zecwec-custody/zec-collector-initial-zero.attestation"
+    ) in authority_consumer
+    assert "LoadCredential=zec-authority-config:" not in authority_consumer
+    assert "LoadCredential=zec-initial-zero-result:" not in authority_consumer
+    assert "LoadCredential=zec-initial-zero-attestation:" not in authority_consumer
+    assert "ExecStartPre=+" in authority_consumer
+    assert "zec-authority-bootstrap.sh verify-sealed" in authority_consumer
 executable_condition_units = {
     "wcash-pool-backend-init.service",
     "wcash-pool-backend.service",
@@ -1503,6 +1522,10 @@ assert "SupplementaryGroups=wcash-pool-backend\n" in zec_authority_unit
 assert "Before=wcash-pool-backend-init.service" not in zec_authority_unit
 assert "wcash-poold zec-authority-check" not in zec_authority_unit
 assert "zec-authority-bootstrap.sh reconcile" in zec_authority_unit
+assert (
+    "Environment=ZEC_AUTHORITY_CONFIG=/etc/wcash-pool/zec-authority.testnet.toml"
+) in zec_authority_unit
+assert "LoadCredential=zec-authority-config:" not in zec_authority_unit
 assert "BindsTo=zecwec-zallet.service" not in zec_authority_unit
 assert (
     "Conflicts=wcash-pool-projector.service wcash-pool.service "

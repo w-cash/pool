@@ -13,9 +13,9 @@ Group=wcash-pool-socket
 SupplementaryGroups=wcash-pool-backend
 UMask=0077
 EnvironmentFile=/etc/wcash-pool/backend.env
-Environment=ZEC_AUTHORITY_CONFIG=/run/credentials/wcash-pool-backend-init.service/zec-authority-config
-Environment=ZEC_AUTHORITY_RESULT=/run/credentials/wcash-pool-backend-init.service/zec-initial-zero-result
-Environment=ZEC_AUTHORITY_ATTESTATION=/run/credentials/wcash-pool-backend-init.service/zec-initial-zero-attestation
+Environment=ZEC_AUTHORITY_CONFIG=/etc/wcash-pool/zec-authority.testnet.toml
+Environment=ZEC_AUTHORITY_RESULT=/var/lib/zecwec-custody/zec-collector-initial-zero.json
+Environment=ZEC_AUTHORITY_ATTESTATION=/var/lib/zecwec-custody/zec-collector-initial-zero.attestation
 LoadCredential=wcash-rpc-cookie:@WCASH_RPC_COOKIE_SOURCE@
 LoadCredential=zcash-template-rpc-cookie:@ZCASH_TEMPLATE_COOKIE_SOURCE@
 LoadCredential=zcash-validator-rpc-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
@@ -23,11 +23,8 @@ LoadCredential=wcash-payout-address:@WCASH_PAYOUT_ADDRESS_CREDENTIAL@
 @WCASH_IVK_LOAD_CREDENTIAL@
 LoadCredential=zcash-payout-address:@ZCASH_PAYOUT_ADDRESS_CREDENTIAL@
 LoadCredential=wcash-wallet-authority:@WCASH_WALLET_AUTHORITY@
-LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml
-LoadCredential=zec-initial-zero-result:@ZCASH_INITIAL_ZERO_RESULT@
-LoadCredential=zec-initial-zero-attestation:@ZCASH_INITIAL_ZERO_ATTESTATION@
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-merge-miner
-ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/zec-authority-bootstrap.sh verify
+ExecStartPre=+@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/zec-authority-bootstrap.sh verify-sealed
 ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/backend-entrypoint.sh init
 RemainAfterExit=yes
 StateDirectory=wcash-pool-backend

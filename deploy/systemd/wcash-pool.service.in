@@ -18,20 +18,17 @@ Group=wcash-pool
 SupplementaryGroups=wcash-pool-socket
 UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
-Environment=ZEC_AUTHORITY_CONFIG=/run/credentials/wcash-pool.service/zec-authority-config
-Environment=ZEC_AUTHORITY_RESULT=/run/credentials/wcash-pool.service/zec-initial-zero-result
-Environment=ZEC_AUTHORITY_ATTESTATION=/run/credentials/wcash-pool.service/zec-initial-zero-attestation
+Environment=ZEC_AUTHORITY_CONFIG=/etc/wcash-pool/zec-authority.testnet.toml
+Environment=ZEC_AUTHORITY_RESULT=/var/lib/zecwec-custody/zec-collector-initial-zero.json
+Environment=ZEC_AUTHORITY_ATTESTATION=/var/lib/zecwec-custody/zec-collector-initial-zero.attestation
 LoadCredential=database-url:@DATABASE_RUNTIME_URL_CREDENTIAL@
 LoadCredential=portal-token-pepper:@PORTAL_TOKEN_PEPPER_CREDENTIAL@
 LoadCredential=portal-totp-key:@PORTAL_TOTP_KEY_CREDENTIAL@
 LoadCredential=wcash-node-cookie:@WCASH_RPC_COOKIE_SOURCE@
 LoadCredential=zcash-node-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
-LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml
-LoadCredential=zec-initial-zero-result:@ZCASH_INITIAL_ZERO_RESULT@
-LoadCredential=zec-initial-zero-attestation:@ZCASH_INITIAL_ZERO_ATTESTATION@
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-wallet
-ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/zec-authority-bootstrap.sh verify
+ExecStartPre=+@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/zec-authority-bootstrap.sh verify-sealed
 ExecStartPre=@WCASH_RELEASE_ROOT@/wcash-poold config-check --config /etc/wcash-pool/pool.runtime.toml
 ExecStartPre=@WCASH_RELEASE_ROOT@/wcash-poold preflight --config /etc/wcash-pool/pool.runtime.toml
 ExecStart=@WCASH_RELEASE_ROOT@/wcash-poold serve --config /etc/wcash-pool/pool.runtime.toml
