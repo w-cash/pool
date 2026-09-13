@@ -25,6 +25,50 @@ def option(tokens: list[str], name: str) -> str | None:
     return tokens[index + 1]
 
 
+def exact_accept_rule(
+    tokens: list[str], expected_chain: str, any_source: str
+) -> tuple[str, int] | None:
+    """Return the source/port for an exact inert UFW TCP ACCEPT rule."""
+
+    if len(tokens) < 8 or tokens[:2] != ["-A", expected_chain]:
+        return None
+    values: dict[str, str] = {}
+    modules: set[str] = set()
+    index = 2
+    while index < len(tokens):
+        name = tokens[index]
+        if name == "-m":
+            if index + 1 >= len(tokens):
+                fail("managed ACCEPT rule has a module without a value")
+            module = tokens[index + 1]
+            if module not in {"tcp", "comment"} or module in modules:
+                fail("managed ACCEPT rule has an unsupported match module")
+            modules.add(module)
+            index += 2
+            continue
+        if name not in {"-s", "-d", "-p", "--dport", "--comment", "-j"}:
+            fail("managed ACCEPT rule has an unsupported predicate")
+        if name in values or index + 1 >= len(tokens):
+            fail("managed ACCEPT rule has an ambiguous option")
+        values[name] = tokens[index + 1]
+        index += 2
+
+    required = {"-p", "--dport", "-j"}
+    if not required.issubset(values) or values["-p"] != "tcp" or values["-j"] != "ACCEPT":
+        fail("managed ACCEPT rule is not exact TCP ACCEPT")
+    if "tcp" not in modules:
+        fail("managed ACCEPT rule is missing the TCP match module")
+    if ("comment" in modules) != ("--comment" in values):
+        fail("managed ACCEPT rule has an inconsistent comment match")
+    if values.get("-d", any_source) != any_source:
+        fail("managed ACCEPT rule has a narrowed destination")
+    try:
+        port = int(values["--dport"])
+    except ValueError:
+        fail("managed ACCEPT rule has a non-numeric destination port")
+    return values.get("-s", any_source), port
+
+
 def covered_ports(specification: str | None, managed: set[int]) -> set[int]:
     if specification is None:
         return set(managed)
@@ -307,7 +351,12 @@ def main() -> None:
         port = next(iter(covered))
         if destination_spec != str(port) or port == legacy_port:
             fail("a range, alias, or legacy ACCEPT rule covers mining")
-        raw_source = option(tokens, "-s") or any_source
+        exact = exact_accept_rule(tokens, expected_chain, any_source)
+        if exact is None:
+            fail("managed ACCEPT rule is not exact")
+        raw_source, exact_port = exact
+        if exact_port != port:
+            fail("managed ACCEPT rule destination is ambiguous")
         try:
             source = str(ipaddress.ip_network(raw_source, strict=False))
         except ValueError:
