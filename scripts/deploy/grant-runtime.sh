@@ -3,6 +3,8 @@
 set -Eeuo pipefail
 set +x
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 die() {
     printf 'grant-runtime: %s\n' "$*" >&2
     exit 1
@@ -16,6 +18,7 @@ public_role=$3
 projector_role=$4
 payout_role=$5
 [[ $url_file == /* && -f $url_file && ! -L $url_file ]] || die "migrator URL is unavailable"
+command -v python3 >/dev/null 2>&1 || die "python3 is unavailable"
 for role in "$migrator_role" "$public_role" "$projector_role" "$payout_role"; do
     [[ $role =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "database role is unsafe"
 done
@@ -25,12 +28,8 @@ done
     && $projector_role != "$payout_role" ]] \
     || die "migrator, public, projector, and payout roles must be distinct"
 
-IFS= read -r PGDATABASE <"$url_file" || [[ -n ${PGDATABASE:-} ]] || die "migrator URL is empty"
-[[ -n $PGDATABASE && $PGDATABASE != *[$'\r\n\t']* ]] || die "migrator URL is invalid"
-export PGDATABASE
-trap 'unset PGDATABASE' EXIT
-
-psql --no-psqlrc --set=ON_ERROR_STOP=1 \
+python3 "$script_dir/psql-with-url-file.py" "$url_file" \
+    --no-psqlrc --set=ON_ERROR_STOP=1 \
     --set="migrator_role=$migrator_role" --set="public_role=$public_role" \
     --set="projector_role=$projector_role" \
     --set="payout_role=$payout_role" <<'SQL'

@@ -30,6 +30,7 @@ shellcheck "$repo_root"/scripts/deploy/*.sh \
     "$repo_root/scripts/test-deployment-package.sh"
 python3 "$repo_root/scripts/deploy/test_wait_payout_ready.py"
 python3 "$repo_root/scripts/deploy/test_verify_mining_firewall.py"
+python3 "$repo_root/scripts/test-psql-with-url-file.py"
 
 mkdir -p "$temporary/fake-bin"
 for supported_postgres_version in 160000 160015 170000; do
