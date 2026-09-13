@@ -903,7 +903,15 @@ enabled portal link and reloads nginx. The authorized operator can now run the
 complete browser flow at the canonical HTTPS hostname with real cookie and
 origin semantics while the portal remains unavailable to the public.
 
-Before telling an operator to point an ASIC, prove all of the following:
+Before changing the remote deployment, run the complete pool against local
+Wcash and Zcash regtest nodes. Use the real portal, edge, PostgreSQL projection,
+wallet construction and node broadcast paths. Record the exact source pair and
+exercise independent winners, accounting conservation, both Zcash destination
+types, Wcash payouts and restart recovery. Unit tests with substituted wallet
+or node responses do not complete this gate.
+
+Before inviting the first controlled ASIC, prove all of the following on the
+selected remote release:
 
 - both Wcash nodes agree on canonical tip and genesis;
 - both Zcash Testnet nodes agree on canonical tip and genesis;
@@ -918,15 +926,23 @@ Before telling an operator to point an ASIC, prove all of the following:
   forced projector stop also closes public miner intake;
 - registration, login, TOTP, worker creation/revocation, and both payout
   destination flows work through HTTPS;
-- accepted/rejected/duplicate/stale shares update the correct worker metrics;
-- WEC-only, ZEC-only, and dual winner paths conserve accounting;
-- restart/reorganization handling neither loses nor duplicates mining
-  liabilities;
-- one actual ASIC share is accepted through the policy-controlled endpoint;
+- external ZIP-301 clients receive jobs on both TCP and hostname-verified TLS;
+- invalid worker credentials fail closed and legacy ports remain closed;
+- local evidence covers accepted/rejected/duplicate/stale work, independent
+  winner accounting and restart/reorganization recovery;
 - payout execution reports `enabled` only from a fresh exact-owner DB heartbeat;
-- a matured Testnet payout can be constructed, journaled, broadcast through
-  the independent node path, confirmed, and recovered idempotently after a
-  forced restart.
+- the real regtest payout path constructs, journals and broadcasts transactions
+  accepted by each chain, then confirms and recovers them idempotently.
+
+The controlled ASIC can now connect. Record its first actual accepted share and
+subsequent job rotation. A public Testnet block must be discovered and satisfy
+the chain's confirmation rules before its mined reward can be paid. Record that
+later payout separately; neither a physical ASIC share nor an already matured
+public block can be a prerequisite for allowing the first ASIC to connect.
+
+For Wcash chain readiness, compare actual canonical tips, genesis identities,
+known peers and validated current templates. A wall-clock `estimatedheight`
+alone is not evidence of missing blocks on a chain awaiting miners.
 
 After every gate above has evidence recorded, remove the Cloudflare Access
 application, confirm the zone still uses Full (strict) and Authenticated Origin

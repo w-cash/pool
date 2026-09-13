@@ -71,13 +71,19 @@ evidence; source composition alone is not that evidence.
 
 ## Wolf backend and remaining integration requirements
 
-The pool-side wire contract is implemented in `wcash-pool-protocol`. Wolf
-commit `e457b08d8db261b226cf7fb3278493d033f458f8` pins pool protocol commit
-`d5a298a47f4d12c2d532617a6eae55b26ec8b050` and contains the matching private
-Unix listener, serialized authority, native retained-job path, durable journal,
-and read-only trial-decryption proof for the exact private Wcash collector. The
-pair is composed in source. Fixed cross-repository artifacts, recovery, payout,
-reorg, HTTPS, and ASIC evidence remain required before publication.
+The pool-side wire contract is implemented in `wcash-pool-protocol`. The
+delivery baseline is Wolf `b2b0bd425dd82561bb107262e166597fd6cd1493` and pool
+`ab2e3c70418aad9319832877b1d2dec0b21b9441`. This supersedes the historical,
+rebased commit pair previously listed here. It includes the matching private
+Unix listener, isolated peer roles, serialized authority, native retained-job
+path, durable journal and read-only trial-decryption proof for the exact private
+Wcash collector. The deployed release must record its actual newer pool
+revision and artifact digests after delivery fixes. Composition in source is
+not evidence that that release passed regtest or external acceptance.
+
+The owned Testnet pool uses one Rust implementation. Delivery does not include
+a second S-NOMP runtime or require an external pool integration. See the
+[delivery scope and acceptance record](testnet-delivery.md).
 
 ### Transport and handshake
 

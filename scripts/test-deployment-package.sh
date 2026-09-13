@@ -1628,6 +1628,8 @@ assert '\"POST:/api/v1/workers\" $http_cf_connecting_ip;' in portal
 assert "return 444;" in portal
 assert "location ^~ /api/v1/ {" in portal
 assert "location = /readyz {" in portal
+assert "location ~ ^/(?:assets/(?:app[.](?:css|js)|forms[.]css))?$ {" in portal
+assert "limit_except GET { deny all; }" in portal
 assert "location / {\n        return 404;\n    }" in portal
 assert "location / {\n        limit_req" not in portal
 PY

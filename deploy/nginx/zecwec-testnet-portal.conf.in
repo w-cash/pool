@@ -69,9 +69,20 @@ server {
     proxy_send_timeout 30s;
     limit_req_status 429;
 
-    # The production edge is API-only. A separately reviewed frontend can be
-    # served on this origin later, but the pool release never exposes its
-    # bundled diagnostic UI or static assets through nginx.
+    # Serve the reviewed miner UI from the same origin as its session API.
+    # Only these bundled assets are public; other paths still fail closed.
+    location ~ ^/(?:assets/(?:app[.](?:css|js)|forms[.]css))?$ {
+        limit_except GET { deny all; }
+        limit_req zone=zecwec_portal_requests burst=40 nodelay;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $http_cf_connecting_ip;
+        proxy_set_header X-Forwarded-For $http_cf_connecting_ip;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://zecwec_testnet_portal;
+    }
+
     location ^~ /api/v1/ {
         limit_req zone=zecwec_portal_requests burst=40 nodelay;
         limit_req zone=zecwec_portal_credentials burst=4 nodelay;
