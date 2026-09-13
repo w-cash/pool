@@ -12,6 +12,10 @@ zewif_zcashd_sha256=b67252cc55aad73afc6d608f29d14711d86e2b06bffcb76585aba31ee631
 zewif_zcashd_patch_sha256=0cd00a61194c9cf1d45554d35dd5954333709355adcef1c2939c20a48a41f91e
 zewif_zcashd_url="https://static.crates.io/crates/zewif-zcashd/zewif-zcashd-${zewif_zcashd_version}.crate"
 zewif_zcashd_patch="$patch_dir/zewif-zcashd-${zewif_zcashd_version}-relocatable-db-dump.patch"
+librustzcash_revision=1f6bb2072e7fcb142b0d90ff7b267a8699a84818
+librustzcash_upstream=https://github.com/zcash/librustzcash.git
+librustzcash_patch_sha256=48f058795862c30a7ccec03a7cfb9d15244c1a9451a0e159c7116644536bd9b0
+librustzcash_patch="$patch_dir/librustzcash-1f6bb207-recovery-tip-gate.patch"
 
 for command in curl git install python3 sha256sum; do
     command -v "$command" >/dev/null 2>&1 || {
@@ -27,6 +31,7 @@ source_dir="$temporary/source"
 zewif_zcashd_archive="$temporary/zewif-zcashd-${zewif_zcashd_version}.crate"
 zewif_zcashd_extract_root="$temporary/dependency"
 zewif_zcashd_source="$zewif_zcashd_extract_root/zewif-zcashd-${zewif_zcashd_version}"
+librustzcash_source="$temporary/librustzcash"
 
 git init --quiet "$source_dir"
 git -C "$source_dir" remote add origin "$upstream"
@@ -69,7 +74,10 @@ grep -Fq 'build_root=/tmp/zecwec-zallet-v0.1.0-beta.3-build' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq "flock \"\$build_lock_fd\"" \
     "$repo_root/scripts/build-zallet-testnet.sh"
-python3 - "$source_dir/backends/zaino/Cargo.lock" "$zewif_zcashd_sha256" <<'PY'
+python3 - \
+    "$source_dir/backends/zaino/Cargo.lock" \
+    "$zewif_zcashd_sha256" \
+    "$librustzcash_revision" <<'PY'
 import pathlib
 import re
 import sys
@@ -84,6 +92,19 @@ matches = re.findall(
 )
 if matches != [expected_checksum]:
     raise SystemExit("zallet-patch-test: locked zewif-zcashd registry identity changed")
+
+revision = sys.argv[3]
+source = (
+    "git+https://github.com/zcash/librustzcash.git"
+    f"?rev={revision}#{revision}"
+)
+package = re.findall(
+    r'\[\[package\]\]\nname = "zcash_client_sqlite"\nversion = "0\.22\.0"\n'
+    r'source = "([^"]+)"',
+    lock,
+)
+if package != [source]:
+    raise SystemExit("zallet-patch-test: locked librustzcash identity changed")
 PY
 
 printf '%s  %s\n' "$zewif_zcashd_patch_sha256" "$zewif_zcashd_patch" \
@@ -138,4 +159,20 @@ grep -Fq 'vendored_db_dump_is_resolved_relative_to_the_executable' \
     "$zewif_zcashd_source/src/bdb_dump.rs"
 grep -Fq 'absolute_build_host_paths_are_rejected' \
     "$zewif_zcashd_source/src/bdb_dump.rs"
+
+printf '%s  %s\n' "$librustzcash_patch_sha256" "$librustzcash_patch" \
+    | sha256sum --check --status
+git init --quiet "$librustzcash_source"
+git -C "$librustzcash_source" remote add origin "$librustzcash_upstream"
+git -C "$librustzcash_source" fetch --quiet --depth 1 origin "$librustzcash_revision"
+git -C "$librustzcash_source" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+[[ $(git -C "$librustzcash_source" rev-parse HEAD) == "$librustzcash_revision" ]]
+[[ -z $(git -C "$librustzcash_source" status --porcelain) ]]
+git -C "$librustzcash_source" apply --check "$librustzcash_patch"
+git -C "$librustzcash_source" apply "$librustzcash_patch"
+git -C "$librustzcash_source" diff --check
+grep -Fq 'if new_tip < birthday {' \
+    "$librustzcash_source/zcash_client_sqlite/src/wallet/scanning.rs"
+grep -Fq 'update_chain_tip_below_wallet_birthday_preserves_scan_queue' \
+    "$librustzcash_source/zcash_client_sqlite/src/wallet/scanning.rs"
 printf 'zallet-patch-test: exact beta.3 patch set applies cleanly\n'

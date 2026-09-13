@@ -32,6 +32,14 @@ The ordered patch set is deliberately small:
    ownership and return contract. This is the local deterministic signal/barrier
    resolution described as option 1 in issue #766; it is not the reload-polling
    workaround proposed by the still-open pull request #768.
+5. Patch `zcash_client_sqlite` at the already-locked librustzcash revision
+   `1f6bb2072e7fcb142b0d90ff7b267a8699a84818` so a temporarily regressed
+   backend tip below the wallet birthday preserves the existing scan queue.
+   Constructing a range below the birthday is unsafe because the wallet has no
+   guaranteed tree state there; the previous code instead attempted a reversed
+   `ChainTip` or `Historic` range and panicked. The focused regression reproduces
+   that state and proves queued recovery work remains unchanged until the
+   backend catches up.
 
 The capacity patch is not a substitute for upstream's broader RPC
 resource-ordering work in pull request #716. ZecWec serializes collector
@@ -58,3 +66,9 @@ retaining the crate's locked registry identity. Because Cargo hashes canonical
 workspace paths before rustc remapping, compilation is serialized in one fixed,
 ownership-checked build root on every host. The final gate rejects a binary that
 still embeds that build root.
+The build also resolves `zcash_client_sqlite` from the exact git source and
+revision recorded in the unchanged Zaino lock, confirms the checkout remains
+inside its private Cargo home, and applies the recorded librustzcash patch
+without a path override. It runs the focused upstream regression before
+compiling the release binary. Both dependency identities and every patch digest
+are included in `PROVENANCE.json`.

@@ -28,6 +28,7 @@ expected_zallet_patch_entries=$(printf '%s\n' \
     0003-remove-nonreproducible-shadow-paths.patch \
     0004-observe-batch-decryptor-shutdown.patch \
     README.md \
+    librustzcash-1f6bb207-recovery-tip-gate.patch \
     zewif-zcashd-0.1.0-rc.5-relocatable-db-dump.patch | LC_ALL=C sort)
 zallet_patch_source="$source_root/patches/zallet-v0.1.0-beta.3"
 require_exact_immediate_entries \

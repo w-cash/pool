@@ -22,12 +22,15 @@ ZEWIF_ARCHIVE = (
 ZEWIF_ARCHIVE_SHA256 = (
     "b67252cc55aad73afc6d608f29d14711d86e2b06bffcb76585aba31ee6310901"
 )
+LIBRUSTZCASH_REPOSITORY = "https://github.com/zcash/librustzcash.git"
+LIBRUSTZCASH_REVISION = "1f6bb2072e7fcb142b0d90ff7b267a8699a84818"
 PATCH_NAMES = [
     "0001-reserve-wallet-database-capacity.patch",
     "0002-signal-data-requests-after-chain-writes.patch",
     "0003-remove-nonreproducible-shadow-paths.patch",
     "0004-observe-batch-decryptor-shutdown.patch",
     "zewif-zcashd-0.1.0-rc.5-relocatable-db-dump.patch",
+    "librustzcash-1f6bb207-recovery-tip-gate.patch",
 ]
 PATCH_DIRECTORY_ENTRIES = set(PATCH_NAMES) | {"README.md"}
 RECORD_KEYS = {
@@ -147,9 +150,15 @@ def main() -> None:
             "archive_sha256": ZEWIF_ARCHIVE_SHA256,
             "name": "zewif-zcashd",
             "version": ZEWIF_VERSION,
-        }
+        },
+        {
+            "name": "librustzcash",
+            "patched_package": "zcash_client_sqlite",
+            "repository": LIBRUSTZCASH_REPOSITORY,
+            "revision": LIBRUSTZCASH_REVISION,
+        },
     ]:
-        fail("provenance does not identify the pinned zewif-zcashd archive")
+        fail("provenance does not identify the pinned patched dependencies")
 
     patches = record.get("patches")
     if not isinstance(patches, list) or len(patches) != len(PATCH_NAMES):
