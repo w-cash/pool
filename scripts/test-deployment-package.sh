@@ -1268,10 +1268,15 @@ wallet_init_unit = (root / "systemd/wcash-pool-wallet-init.service").read_text(e
 assert "User=wcash-payout\n" in wallet_init_unit
 assert "LoadCredential=wcash-seed:" in wallet_init_unit
 assert "EnvironmentFile=/etc/wcash-pool/wcash-wallet-bootstrap.env" in wallet_init_unit
+assert (
+    "Environment=WEC_SEED_FILE=/run/credentials/"
+    "wcash-pool-wallet-init.service/wcash-seed"
+) in wallet_init_unit
 assert "TimeoutStartSec=1200s" in wallet_init_unit
 wallet_bootstrap = (root / "wcash-wallet-bootstrap.env").read_text(encoding="utf-8")
 assert "WCASH_WALLET_BIRTHDAY=1" in wallet_bootstrap
 assert "WCASH_WALLET_AUTHORITY=/var/lib/wcash-payout/wcash-wallet-authority.json" in wallet_bootstrap
+assert "WEC_SEED_FILE=" not in wallet_bootstrap
 payout_unit = (root / "systemd/wcash-payout-worker.service").read_text(encoding="utf-8")
 assert "Type=notify\n" in payout_unit
 assert "NotifyAccess=main\n" in payout_unit
