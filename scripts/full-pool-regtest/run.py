@@ -162,7 +162,7 @@ filter = "info"
         pg_env['PGDATABASE'] = args.database_url_file.read_text().strip()
         version = int(self.command('postgres-version', ['psql', '-Atqc', 'SHOW server_version_num'], env=pg_env))
         if version // 10000 != 16:
-            raise RuntimeError('full composition requires PostgreSQL16')
+            raise RuntimeError('full composition requires PostgreSQL 16')
         collector = args.zec_collector_file.read_text().strip()
         if not collector:
             raise RuntimeError('a wallet-owned ZEC collector address is required')
@@ -207,15 +207,28 @@ filter = "info"
         account = self.portal('/api/v1/auth/register', {'username': 'regtest_team', 'password': password})
         login = self.portal('/api/v1/auth/login', {'username': 'regtest_team', 'password': password})
         self.csrf = login['csrf_token']
-        worker = self.portal('/api/v1/workers', {'label': 'asic_1'})['worker']
-        private(self.root / 'portal-session.json', json.dumps({'account': account, 'password': password,
-                'worker': worker, 'cookies': self.cookies, 'csrf': self.csrf}))
+        worker = self.portal('/api/v1/workers', {'label': 'asic-1'})['worker']
+        primary = {'account': account, 'password': password, 'worker': worker,
+                   'cookies': self.cookies.copy(), 'csrf': self.csrf}
+        self.cookies, self.csrf = {}, None
+        secondary_password = secrets.token_urlsafe(32)
+        secondary_account = self.portal('/api/v1/auth/register',
+            {'username': 'regtest_shielded', 'password': secondary_password})
+        secondary_login = self.portal('/api/v1/auth/login',
+            {'username': 'regtest_shielded', 'password': secondary_password})
+        self.csrf = secondary_login['csrf_token']
+        secondary_worker = self.portal('/api/v1/workers', {'label': 'asic-2'})['worker']
+        secondary = {'account': secondary_account, 'password': secondary_password,
+                     'worker': secondary_worker, 'cookies': self.cookies.copy(), 'csrf': self.csrf}
+        self.cookies, self.csrf = primary['cookies'], primary['csrf']
+        private(self.root / 'portal-session.json', json.dumps({**primary, 'secondary': secondary}))
         miner_env = os.environ.copy()
-        miner_env['WCASH_STRATUM_PASSWORD'] = worker['token']
         for height in range(1, args.blocks + 1):
             started = time.monotonic()
+            selected_worker = secondary_worker if height == 2 else worker
+            miner_env['WCASH_STRATUM_PASSWORD'] = selected_worker['token']
             proof = self.command(f'zip301-mine-{height:04}', [args.miner, 'zip301-mine',
-                                '127.0.0.1:18237', worker['mining_username'], '256', '0'],
+                                '127.0.0.1:18237', selected_worker['mining_username'], '256', '0'],
                                 env=miner_env, timeout=900)
             if json.loads(proof).get('result') != 'accepted':
                 raise RuntimeError('real ZIP-301 submission was not accepted')
@@ -303,11 +316,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('runtime', 'database-url-file', 'zec-collector-file', 'wallet', 'miner', 'wcash-node', 'zcash-node', 'poold'):
         parser.add_argument('--' + name, type=Path, required=True)
-    parser.add_argument('--blocks', type=int, default=101, help='Real merged blocks; 101 preserves the100-confirmation maturity policy')
+    parser.add_argument('--blocks', type=int, default=102, help='Real merged blocks; 102 matures the first reward for both test accounts')
     parser.add_argument('--keep-running', action='store_true')
     args = parser.parse_args()
     if not 1 <= args.blocks <= 1000:
-        parser.error('--blocks must be in1..1000')
+        parser.error('--blocks must be in 1..1000')
     harness = Harness(args)
     try:
         harness.run()
