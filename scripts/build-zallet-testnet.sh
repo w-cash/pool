@@ -68,6 +68,7 @@ patches=(
     "$patch_dir/0001-reserve-wallet-database-capacity.patch"
     "$patch_dir/0002-signal-data-requests-after-chain-writes.patch"
     "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch"
+    "$patch_dir/0004-deflake-batch-decryptor-shutdown-test.patch"
 )
 applied_patch_list=$temporary/applied-patches
 printf '%s\n' "${patches[@]}" >"$applied_patch_list"
@@ -99,6 +100,16 @@ grep -Fx "libprotoc $protoc_version" "$temporary/protoc-version" >/dev/null
     cd "$source_dir"
     cargo "+$toolchain" fmt --all -- --check
     cargo "+$toolchain" test --locked --package zallet-core pool_config_tests
+    # beta.3's original assertion raced a reload request against Tokio's
+    # asynchronous task abort. The audited upstream #766 backport observes
+    # eventual shutdown with its own 30-second bound; repeat it to exercise the
+    # scheduling boundary before accepting the full sync suite.
+    for _stress_iteration in {1..100}; do
+        timeout --signal=TERM --kill-after=10s 40s \
+            cargo "+$toolchain" test --locked --package zallet-core \
+            components::sync::tests::wallet_sync_error_shuts_down_the_spawned_batch_decryptor \
+            -- --exact --test-threads=1
+    done
     # These Tokio cancellation tests share global tracing/i18n state and can
     # deadlock each other when the Rust harness runs them concurrently.  They
     # complete in seconds serially; keep an outer bound so a regression cannot

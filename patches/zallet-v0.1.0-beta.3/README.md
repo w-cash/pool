@@ -21,6 +21,11 @@ The ordered patch set is deliberately small:
    generated build metadata. Both can contain the ephemeral source path; they
    are unused by Zallet at runtime and make otherwise identical binaries
    non-reproducible.
+4. Backport upstream commit
+   `b2d15011dc28a7284222f95e843880e53c4efe94`, which fixes issue #766 by
+   observing the batch decryptor's asynchronous abort with a bounded retry.
+   The original beta.3 test raced a single reload request against cancellation
+   and could fail even though the task was shutting down.
 
 The capacity patch is not a substitute for upstream's broader RPC
 resource-ordering work in pull request #716. ZecWec serializes collector
