@@ -174,7 +174,8 @@ if ! systemctl reload nginx.service; then
     $created_stream && rm -f -- "$stream_link"
     die "nginx reload failed; newly created links were removed"
 fi
-if ! require_public_tls_listener "$mining_host" "$mining_tls_port" 127.0.0.1; then
+if ! require_public_tls_listener \
+    "$mining_host" "$mining_tls_port" 127.0.0.1 "$mining_certificate"; then
     if [[ $effective_mode != stratum-only ]]; then
         disable_managed_portal
     fi

@@ -32,5 +32,8 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+# The authority parent is deliberately 0700 and owned by wcash-payout. This
+# read-only capability lets the root gate traverse and verify that sealed file
+# without granting any write bypass.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
 AmbientCapabilities=

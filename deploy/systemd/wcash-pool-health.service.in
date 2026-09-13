@@ -11,5 +11,7 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+# Health re-verifies the sealed authority below a wcash-payout-owned 0700
+# directory. Keep the bypass read-only; CAP_DAC_OVERRIDE is intentionally absent.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
 AmbientCapabilities=

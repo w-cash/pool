@@ -35,6 +35,37 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
 }
 
+require_readonly_systemd_credential() {
+    local credential=$1
+    local expected_name=$2
+    local service_uid=${3:-$(id -u)}
+    local metadata owner mode links
+
+    [[ -n ${CREDENTIALS_DIRECTORY:-} \
+        && $CREDENTIALS_DIRECTORY == /* \
+        && -d $CREDENTIALS_DIRECTORY \
+        && ! -L $CREDENTIALS_DIRECTORY ]] \
+        || die "systemd credential directory is unavailable"
+    [[ $credential == "$CREDENTIALS_DIRECTORY/$expected_name" \
+        && -f $credential \
+        && ! -L $credential ]] \
+        || die "protected credential is unavailable"
+    [[ -r $credential ]] \
+        || die "protected credential is not readable by the service"
+
+    metadata=$(stat -c '%u:%a:%h' -- "$credential") \
+        || die "protected credential metadata is unavailable"
+    IFS=: read -r owner mode links <<<"$metadata"
+    [[ ($owner == 0 || $owner == "$service_uid") \
+        && ($mode == 400 || $mode == 440) \
+        && $links == 1 ]] \
+        || die "protected credential ownership, mode, or link count is invalid"
+    if ((service_uid != 0)); then
+        [[ ! -w $credential ]] \
+            || die "protected credential is writable by the service"
+    fi
+}
+
 require_supported_postgres_server() {
     local version_num
     require_command runuser
@@ -328,6 +359,7 @@ require_public_tls_listener() (
     local hostname=${1:?TLS hostname is required}
     local port=${2:?TLS port is required}
     local address=${3:-127.0.0.1}
+    local expected_certificate=${4:?expected TLS certificate path is required}
     [[ $hostname =~ ^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$ \
         && $hostname == *.* && $hostname != *..* ]] \
         || die "TLS listener hostname is invalid"
@@ -336,18 +368,39 @@ require_public_tls_listener() (
     [[ $address =~ ^[0-9a-fA-F:.]+$ ]] \
         || die "TLS listener address is invalid"
     require_command openssl
+    require_command cmp
+    require_command mktemp
     require_command timeout
     [[ -d /etc/ssl/certs && ! -L /etc/ssl/certs ]] \
         || die "system TLS trust store is unavailable"
+    local scratch handshake expected_der served_der served_leaf
+    scratch=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf -- $(printf '%q' "$scratch")" EXIT
+    handshake=$scratch/handshake.pem
+    expected_der=$scratch/expected.der
+    served_der=$scratch/served.der
+    served_leaf=$scratch/served-leaf.pem
     timeout --signal=TERM --kill-after=2s 15s \
         openssl s_client \
         -connect "$address:$port" \
         -servername "$hostname" \
+        -showcerts \
         -verify_hostname "$hostname" \
         -verify_return_error \
         -CApath /etc/ssl/certs \
-        </dev/null >/dev/null 2>&1 \
+        </dev/null >"$handshake" 2>/dev/null \
         || die "TLS listener did not present a publicly trusted certificate for the configured hostname"
+    openssl x509 -in "$handshake" -out "$served_leaf" \
+        || die "TLS listener response did not contain a certificate"
+    openssl x509 -in "$served_leaf" -noout -checkend 604800 >/dev/null \
+        || die "live mining TLS certificate expires in less than seven days"
+    openssl x509 -in "$expected_certificate" -outform DER -out "$expected_der" \
+        || die "configured mining TLS certificate could not be encoded"
+    openssl x509 -in "$served_leaf" -outform DER -out "$served_der" \
+        || die "live mining TLS certificate could not be encoded"
+    cmp -s -- "$expected_der" "$served_der" \
+        || die "TLS listener did not present the configured mining certificate"
 )
 
 require_cleanup_trees_safe() {
