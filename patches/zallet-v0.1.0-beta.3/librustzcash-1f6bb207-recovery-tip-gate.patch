@@ -1,0 +1,53 @@
+diff --git a/zcash_client_sqlite/src/wallet/scanning.rs b/zcash_client_sqlite/src/wallet/scanning.rs
+index ac6a2312..5a4051e8 100644
+--- a/zcash_client_sqlite/src/wallet/scanning.rs
++++ b/zcash_client_sqlite/src/wallet/scanning.rs
+@@ -603,6 +603,21 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
+     // Read the wallet birthday (if known).
+     let wallet_birthday = wallet_birthday(conn)?;
+ 
++    // A chain backend can briefly report a tip below the wallet birthday while its
++    // view is being replaced or rewound. There is no safe scan range to construct in
++    // that state: account creation guarantees tree state only from the birthday
++    // onward. Preserve the existing queue until the backend catches back up.
++    if let Some(birthday) = wallet_birthday {
++        if new_tip < birthday {
++            debug!(
++                ?new_tip,
++                ?birthday,
++                "Chain tip is below the wallet birthday; preserving existing scan ranges"
++            );
++            return Ok(());
++        }
++    }
++
+     // If the chain tip is below the prior max scanned height, then the caller has caught
+     // the chain in the middle of a reorg. Do nothing; the caller will continue using the
+     // old scan ranges and either:
+@@ -1147,6 +1162,26 @@ pub(crate) mod tests {
+         assert_eq!(actual, expected);
+     }
+ 
++    #[test]
++    fn update_chain_tip_below_wallet_birthday_preserves_scan_queue() {
++        let (mut st, _, birthday, _) = test_with_nu5_birthday_offset::<SaplingPoolTester>(
++            50,
++            26,
++            BlockHash([0; 32]),
++            true,
++        );
++        let ranges_before = suggest_scan_ranges(st.wallet().conn(), Ignored).unwrap();
++
++        // Simulate a temporarily regressed backend snapshot. This must neither panic
++        // while constructing a reversed range nor discard the recovery work already
++        // queued from the wallet birthday.
++        let stale_tip = birthday.height().saturating_sub(VERIFY_LOOKAHEAD);
++        st.wallet_mut().update_chain_tip(stale_tip).unwrap();
++
++        let ranges_after = suggest_scan_ranges(st.wallet().conn(), Ignored).unwrap();
++        assert_eq!(ranges_after, ranges_before);
++    }
++
+     #[test]
+     fn update_chain_tip_before_create_account() {
+         let mut st = TestBuilder::new()

@@ -14,6 +14,9 @@ protoc_url="https://github.com/protocolbuffers/protobuf/releases/download/v${pro
 zewif_zcashd_version=0.1.0-rc.5
 zewif_zcashd_sha256=b67252cc55aad73afc6d608f29d14711d86e2b06bffcb76585aba31ee6310901
 zewif_zcashd_url="https://static.crates.io/crates/zewif-zcashd/zewif-zcashd-${zewif_zcashd_version}.crate"
+librustzcash_revision=1f6bb2072e7fcb142b0d90ff7b267a8699a84818
+librustzcash_upstream=https://github.com/zcash/librustzcash.git
+librustzcash_source_id="git+${librustzcash_upstream}?rev=${librustzcash_revision}#${librustzcash_revision}"
 build_root=/tmp/zecwec-zallet-v0.1.0-beta.3-build
 build_lock=/tmp/zecwec-zallet-v0.1.0-beta.3-build.lock.d
 
@@ -113,11 +116,15 @@ patches=(
     "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch"
     "$patch_dir/0004-observe-batch-decryptor-shutdown.patch"
 )
-dependency_patches=(
+zewif_zcashd_patches=(
     "$patch_dir/zewif-zcashd-0.1.0-rc.5-relocatable-db-dump.patch"
 )
+librustzcash_patches=(
+    "$patch_dir/librustzcash-1f6bb207-recovery-tip-gate.patch"
+)
 applied_patch_list=$temporary/applied-patches
-printf '%s\n' "${patches[@]}" "${dependency_patches[@]}" >"$applied_patch_list"
+printf '%s\n' "${patches[@]}" "${zewif_zcashd_patches[@]}" \
+    "${librustzcash_patches[@]}" >"$applied_patch_list"
 for patch in "${patches[@]}"; do
     git -C "$source_dir" apply --check "$patch"
     git -C "$source_dir" apply "$patch"
@@ -197,6 +204,51 @@ cargo "+$toolchain" metadata --locked --format-version 1 \
     printf 'build-zallet-testnet: Cargo.lock changed during pristine resolution\n' >&2
     exit 1
 }
+
+# Resolve and validate the exact locked librustzcash checkout before changing
+# its private Cargo source. Editing the checkout retains the lockfile's git
+# identity; a path override would make the release depend on the build root.
+librustzcash_source=$(python3 - \
+    "$temporary/cargo-metadata-pristine.json" \
+    "$cargo_home" \
+    "$librustzcash_source_id" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+cargo_home = pathlib.Path(sys.argv[2]).resolve()
+expected_source_id = sys.argv[3]
+packages = [
+    package
+    for package in metadata["packages"]
+    if package["name"] == "zcash_client_sqlite"
+    and package["version"] == "0.22.0"
+]
+if len(packages) != 1:
+    raise SystemExit(
+        f"build-zallet-testnet: expected one zcash_client_sqlite package, found {len(packages)}"
+    )
+package = packages[0]
+if package["source"] != expected_source_id:
+    raise SystemExit(
+        f"build-zallet-testnet: unexpected librustzcash source: {package['source']}"
+    )
+source = pathlib.Path(package["manifest_path"]).resolve().parent.parent
+checkouts = (cargo_home / "git" / "checkouts").resolve()
+try:
+    source.relative_to(checkouts)
+except ValueError as error:
+    raise SystemExit(
+        "build-zallet-testnet: librustzcash escaped the private Cargo checkout"
+    ) from error
+print(source)
+PY
+)
+[[ -d $librustzcash_source && ! -L $librustzcash_source ]]
+[[ $(git -C "$librustzcash_source" rev-parse HEAD) == "$librustzcash_revision" ]]
+[[ $(git -C "$librustzcash_source" rev-parse --show-toplevel) == "$librustzcash_source" ]]
+[[ -z $(git -C "$librustzcash_source" status --porcelain --untracked-files=no) ]]
 
 zewif_zcashd_registry_sources=()
 shopt -s nullglob
@@ -285,7 +337,7 @@ for relative, expected in expected_files.items():
         )
 PY
 
-for patch in "${dependency_patches[@]}"; do
+for patch in "${zewif_zcashd_patches[@]}"; do
     (
         cd "$zewif_zcashd_registry_source"
         git apply --check "$patch"
@@ -296,6 +348,16 @@ grep -Fq 'emit_db_dump_path(out_path, &db_dump_binary)?;' \
     "$zewif_zcashd_registry_source/build.rs"
 grep -Fq 'vendored_db_dump_path(&executable, vendored_path)' \
     "$zewif_zcashd_registry_source/src/bdb_dump.rs"
+
+for patch in "${librustzcash_patches[@]}"; do
+    git -C "$librustzcash_source" apply --check "$patch"
+    git -C "$librustzcash_source" apply "$patch"
+done
+git -C "$librustzcash_source" diff --check
+grep -Fq 'if new_tip < birthday {' \
+    "$librustzcash_source/zcash_client_sqlite/src/wallet/scanning.rs"
+grep -Fq 'update_chain_tip_below_wallet_birthday_preserves_scan_queue' \
+    "$librustzcash_source/zcash_client_sqlite/src/wallet/scanning.rs"
 
 # Re-resolve after patching and prove that the locked package is still the
 # crates.io registry package, not a root-dependent path dependency.
@@ -310,7 +372,9 @@ cargo "+$toolchain" metadata --locked --format-version 1 \
 python3 - \
     "$temporary/cargo-metadata-patched.json" \
     "$zewif_zcashd_registry_source" \
-    "$zewif_zcashd_version" <<'PY'
+    "$zewif_zcashd_version" \
+    "$librustzcash_source" \
+    "$librustzcash_source_id" <<'PY'
 import json
 import pathlib
 import sys
@@ -337,7 +401,36 @@ if manifest_source != expected_source:
     raise SystemExit(
         "build-zallet-testnet: metadata resolved an unexpected zewif-zcashd source"
     )
+
+librustzcash_source = pathlib.Path(sys.argv[4]).resolve()
+librustzcash_source_id = sys.argv[5]
+librustzcash_packages = [
+    package
+    for package in metadata["packages"]
+    if package["name"] == "zcash_client_sqlite"
+    and package["version"] == "0.22.0"
+]
+if len(librustzcash_packages) != 1:
+    raise SystemExit(
+        "build-zallet-testnet: patched metadata lost zcash_client_sqlite"
+    )
+librustzcash_package = librustzcash_packages[0]
+if librustzcash_package["source"] != librustzcash_source_id:
+    raise SystemExit(
+        "build-zallet-testnet: librustzcash lost its locked git identity"
+    )
+manifest_source = pathlib.Path(librustzcash_package["manifest_path"]).resolve().parent.parent
+if manifest_source != librustzcash_source:
+    raise SystemExit(
+        "build-zallet-testnet: metadata resolved an unexpected librustzcash checkout"
+    )
 PY
+(
+    cd "$librustzcash_source"
+    cargo "+$toolchain" test --locked --package zcash_client_sqlite \
+        wallet::scanning::tests::update_chain_tip_below_wallet_birthday_preserves_scan_queue \
+        -- --exact --test-threads=1
+)
 (
     cd "$source_dir"
     cargo "+$toolchain" fmt --all -- --check
@@ -424,7 +517,9 @@ python3 - \
     "$zewif_zcashd_version" \
     "$zewif_zcashd_url" \
     "$zewif_zcashd_sha256" \
-    "$zaino_lock_sha256" <<'PY'
+    "$zaino_lock_sha256" \
+    "$librustzcash_revision" \
+    "$librustzcash_upstream" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -473,6 +568,12 @@ record = {
             "version": sys.argv[12],
             "archive": sys.argv[13],
             "archive_sha256": sys.argv[14],
+        },
+        {
+            "name": "librustzcash",
+            "repository": sys.argv[17],
+            "revision": sys.argv[16],
+            "patched_package": "zcash_client_sqlite",
         }
     ],
     "patches": [

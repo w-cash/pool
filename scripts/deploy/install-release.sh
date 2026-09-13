@@ -72,6 +72,7 @@ expected_zallet_patch_entries=$(printf '%s\n' \
     0003-remove-nonreproducible-shadow-paths.patch \
     0004-observe-batch-decryptor-shutdown.patch \
     README.md \
+    librustzcash-1f6bb207-recovery-tip-gate.patch \
     zewif-zcashd-0.1.0-rc.5-relocatable-db-dump.patch | LC_ALL=C sort)
 [[ -d $zallet_patch_source && ! -L $zallet_patch_source ]] \
     || die "pinned Zallet patch source is unavailable"
