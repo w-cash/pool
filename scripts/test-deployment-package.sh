@@ -504,6 +504,8 @@ grep -Fq 'root:root:400:1)' \
     "$repo_root/scripts/deploy/provision-host.sh"
 grep -Fq -- '--ack-independent-offline-backup-recovery' \
     "$repo_root/scripts/deploy/seal-wcash-custody.sh"
+grep -Fq 'stop_custody_units_for_sealing' \
+    "$repo_root/scripts/deploy/seal-wcash-custody.sh"
 grep -Fq 'runuser --user' \
     "$repo_root/scripts/deploy/common.sh"
 grep -Fq 'usermod --gid wcash-pool --groups wcash-pool-socket wcash-pool' \
@@ -525,6 +527,90 @@ if grep -Eq 'systemctl (start|restart) zecwec-zallet' \
     printf 'deployment-package-test: deferred lifecycle can start Zallet\n' >&2
     exit 1
 fi
+
+custody_systemctl_test="$temporary/custody-systemctl-test"
+mkdir -p "$custody_systemctl_test/bin"
+cat >"$custody_systemctl_test/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+
+case $1 in
+    show)
+        property=${2#--property=}
+        unit=$4
+        case "$SYSTEMCTL_SCENARIO:$unit:$property" in
+            expected:wcash-pool.service:LoadState) printf 'not-found\n' ;;
+            expected:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
+            missing-wallet:wcash-pool.service:LoadState) printf 'not-found\n' ;;
+            missing-wallet:wcash-pool-wallet-init.service:LoadState) printf 'not-found\n' ;;
+            masked-pool:wcash-pool.service:LoadState) printf 'masked\n' ;;
+            masked-pool:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
+            stop-failure:wcash-pool.service:LoadState) printf 'not-found\n' ;;
+            stop-failure:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
+            nonzero-pid:wcash-pool.service:LoadState) printf 'not-found\n' ;;
+            nonzero-pid:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
+            *:wcash-pool.service:ActiveState | *:wcash-pool-wallet-init.service:ActiveState)
+                printf 'inactive\n'
+                ;;
+            *:wcash-pool.service:SubState | *:wcash-pool-wallet-init.service:SubState)
+                printf 'dead\n'
+                ;;
+            nonzero-pid:wcash-pool-wallet-init.service:MainPID) printf '17\n' ;;
+            *:wcash-pool.service:MainPID | *:wcash-pool-wallet-init.service:MainPID)
+                printf '0\n'
+                ;;
+            *:wcash-pool.service:ControlPID | *:wcash-pool-wallet-init.service:ControlPID)
+                printf '0\n'
+                ;;
+            *) exit 2 ;;
+        esac
+        ;;
+    stop)
+        [[ $SYSTEMCTL_SCENARIO != stop-failure ]] || exit 1
+        printf '%s\n' "$2" >>"$SYSTEMCTL_STOP_LOG"
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0755 "$custody_systemctl_test/bin/systemctl"
+
+run_custody_systemctl_scenario() {
+    local scenario=$1
+    local expected=$2
+    local stop_log="$custody_systemctl_test/$scenario.stops"
+    : >"$stop_log"
+    if PATH="$custody_systemctl_test/bin:$PATH" \
+        SYSTEMCTL_SCENARIO=$scenario \
+        SYSTEMCTL_STOP_LOG=$stop_log \
+        bash -c \
+            'source "$1"; source "$2"; stop_custody_units_for_sealing' \
+            bash \
+            "$repo_root/scripts/deploy/common.sh" \
+            "$repo_root/scripts/deploy/custody-unit-state.sh" \
+            >/dev/null 2>&1; then
+        [[ $expected == pass ]] || {
+            printf 'deployment-package-test: custody systemd scenario %s passed unexpectedly\n' \
+                "$scenario" >&2
+            exit 1
+        }
+    else
+        [[ $expected == fail ]] || {
+            printf 'deployment-package-test: custody systemd scenario %s failed unexpectedly\n' \
+                "$scenario" >&2
+            exit 1
+        }
+    fi
+}
+
+run_custody_systemctl_scenario expected pass
+[[ $(cat "$custody_systemctl_test/expected.stops") == wcash-pool-wallet-init.service ]] \
+    || {
+        printf 'deployment-package-test: custody seal did not stop exactly the loaded wallet unit\n' >&2
+        exit 1
+    }
+for scenario in missing-wallet masked-pool stop-failure nonzero-pid; do
+    run_custody_systemctl_scenario "$scenario" fail
+done
 
 mkdir -p "$temporary/config-check-credentials"
 chmod 0700 "$temporary/config-check-credentials"
