@@ -198,6 +198,42 @@ if CREDENTIALS_DIRECTORY="$credential_test/run/credentials/test.service" \
     printf 'deployment-package-test: credential gate accepted the wrong credential name\n' >&2
     exit 1
 fi
+absence_test="$temporary/absence-test"
+mkdir -p "$absence_test"
+absence_paths=()
+for absence_name in \
+    backend.env \
+    pool.runtime.toml \
+    pool.projector.toml \
+    pool.preflight.toml \
+    pool.migrate.toml \
+    wcash-wallet.sqlite \
+    wcash-wallet-authority.json \
+    wec-payout-journal \
+    zec-payout-journal \
+    share-journal-v2.jsonl; do
+    absence_paths+=("$absence_test/$absence_name")
+done
+require_absence_test() {
+    bash -c 'source "$1"; shift; require_paths_absent "test absence gate" "$@"' \
+        bash "$repo_root/scripts/deploy/common.sh" "$@"
+}
+require_absence_test "${absence_paths[@]}"
+for rejected_absence_path in "${absence_paths[@]}"; do
+    touch "$rejected_absence_path"
+    if require_absence_test "${absence_paths[@]}" >/dev/null 2>&1; then
+        printf 'deployment-package-test: absence gate accepted %s\n' \
+            "$(basename -- "$rejected_absence_path")" >&2
+        exit 1
+    fi
+    rm -f -- "$rejected_absence_path"
+done
+ln -s missing-target "$absence_test/wcash-wallet.sqlite"
+if require_absence_test "${absence_paths[@]}" >/dev/null 2>&1; then
+    printf 'deployment-package-test: absence gate accepted a dangling legacy path\n' >&2
+    exit 1
+fi
+rm -f -- "$absence_test/wcash-wallet.sqlite"
 cat >"$temporary/fake-bin/ss" <<'SH'
 #!/bin/sh
 if [ "${SS_TEST_STATUS:-0}" -ne 0 ]; then exit "$SS_TEST_STATUS"; fi
@@ -1390,6 +1426,41 @@ for owner in owners - {"root"}:
     assert f"id -u {owner} " in provisioner, f"renderer owner is not provisioned: {owner}"
 for group in groups - {"root"}:
     assert f"getent group {group} " in provisioner, f"renderer group is not provisioned: {group}"
+PY
+
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/render-deployment.sh" \
+    "$repo_root/docs/zecwec-testnet-deployment.md" <<'PY'
+import pathlib
+import sys
+
+renderer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+runbook = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+normalized_runbook = " ".join(runbook.split())
+legacy_paths = (
+    "/etc/wcash-pool/backend.env",
+    "/etc/wcash-pool/pool.runtime.toml",
+    "/etc/wcash-pool/pool.projector.toml",
+    "/etc/wcash-pool/pool.preflight.toml",
+    "/etc/wcash-pool/pool.migrate.toml",
+    "/var/lib/wcash-pool/wcash-wallet.sqlite",
+    "/var/lib/wcash-pool/wcash-wallet-authority.json",
+    "/var/lib/wcash-pool/wec-payout-journal",
+    "/var/lib/wcash-pool/zec-payout-journal",
+    "/var/lib/wcash-pool/share-journal-v2.jsonl",
+)
+gate = renderer.index("require_paths_absent")
+for legacy_path in legacy_paths:
+    assert legacy_path in renderer[gate:]
+for mutation in ("staging=$(mktemp", "python3 ", "install -", "systemctl daemon-reload"):
+    assert gate < renderer.index(mutation, gate)
+assert (
+    "not an in-place upgrade for a finalized, funded, or running epoch-1 pool"
+    in normalized_runbook
+)
+assert "no automatic state-continuity claim" in normalized_runbook
+assert "move every legacy wallet database" in normalized_runbook
+assert "Do not delete it." in normalized_runbook
 PY
 
 # shellcheck disable=SC2016

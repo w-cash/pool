@@ -66,6 +66,17 @@ require_readonly_systemd_credential() {
     fi
 }
 
+require_paths_absent() {
+    local label=${1:?absence-check label is required}
+    shift
+    (($# > 0)) || die "$label requires at least one path"
+    local path
+    for path in "$@"; do
+        [[ ! -e $path && ! -L $path ]] \
+            || die "$label: $path"
+    done
+}
+
 require_supported_postgres_server() {
     local version_num
     require_command runuser

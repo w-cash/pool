@@ -76,15 +76,18 @@ fi
 systemctl stop wcash-pool-backend-init.service wcash-pool-zec-authority-bootstrap.service \
     wcash-pool-wallet-init.service >/dev/null 2>&1 || true
 if [[ $phase == wallet-bootstrap ]]; then
-    for stale in \
+    require_paths_absent \
+        "wallet-bootstrap refuses existing epoch-1 policy or durable state" \
         /etc/wcash-pool/backend.env \
         /etc/wcash-pool/pool.runtime.toml \
         /etc/wcash-pool/pool.projector.toml \
         /etc/wcash-pool/pool.preflight.toml \
-        /etc/wcash-pool/pool.migrate.toml; do
-        [[ ! -e $stale && ! -L $stale ]] \
-            || die "wallet-bootstrap refuses existing authority or runtime policy: $stale"
-    done
+        /etc/wcash-pool/pool.migrate.toml \
+        /var/lib/wcash-pool/wcash-wallet.sqlite \
+        /var/lib/wcash-pool/wcash-wallet-authority.json \
+        /var/lib/wcash-pool/wec-payout-journal \
+        /var/lib/wcash-pool/zec-payout-journal \
+        /var/lib/wcash-pool/share-journal-v2.jsonl
 fi
 managed_unit=/etc/systemd/system/wcash-pool.service
 if [[ -e $managed_unit || -L $managed_unit ]]; then
