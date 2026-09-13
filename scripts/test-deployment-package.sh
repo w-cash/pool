@@ -79,7 +79,27 @@ if grep -Fq '/usr/local/libexec' "$repo_root/scripts/deploy/wait-zallet-ready.sh
     printf 'deployment-package-test: Zallet readiness escaped its immutable release\n' >&2
     exit 1
 fi
-PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile "$repo_root"/scripts/deploy/*.py
+PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile \
+    "$repo_root"/scripts/deploy/*.py \
+    "$repo_root/scripts/test-zec-wallet-recovery.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-zec-wallet-recovery.py" >/dev/null
+[[ -x $repo_root/scripts/deploy/verify-zec-wallet-recovery.py ]] || {
+    printf 'deployment-package-test: ZEC wallet recovery verifier is not executable\n' >&2
+    exit 1
+}
+grep -Fq 'capture-original' "$repo_root/scripts/deploy/verify-zec-wallet-recovery.py"
+grep -Fq 'capture-recovered' "$repo_root/scripts/deploy/verify-zec-wallet-recovery.py"
+grep -Fq -- '--ack-fresh-isolated-mnemonic-recovery' \
+    "$repo_root/scripts/deploy/verify-zec-wallet-recovery.py"
+grep -Fq 'operator_acknowledged_fresh_isolated_mnemonic_recovery' \
+    "$repo_root/scripts/deploy/verify-zec-wallet-recovery.py"
+grep -Fq 'validate-zec-testnet-orchard' \
+    "$repo_root/scripts/deploy/verify-zec-wallet-recovery.py"
+if grep -Fq 'fresh_isolated_mnemonic_recovery_verified' \
+    "$repo_root/scripts/deploy/verify-zec-wallet-recovery.py"; then
+    printf 'deployment-package-test: ZEC recovery overclaims machine verification\n' >&2
+    exit 1
+fi
 PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/zallet_rpc_health.py" <<'PY'
 import http.client
 import importlib.util
@@ -422,6 +442,8 @@ custody_gate_unit = (root / "systemd/wcash-pool-custody-gate.service").read_text
 )
 assert "User=root\n" in custody_gate_unit
 assert "verify-offline-custody.sh /etc/wcash-pool/deployment.env" in custody_gate_unit
+assert "verify-release.sh wcash-poold" in custody_gate_unit
+assert "verify-release.sh deployment-package" in custody_gate_unit
 assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID" in custody_gate_unit
 assert "Conflicts=zecwec-zallet.service" in custody_gate_unit
 assert (
@@ -500,6 +522,15 @@ grep -Fq 'require_offline_collector_custody' \
     "$repo_root/scripts/deploy/preflight.sh"
 grep -Fq 'require_offline_collector_custody' \
     "$repo_root/scripts/deploy/health-check.sh"
+grep -Fq 'zec-wallet-original.rpc.json' "$repo_root/scripts/deploy/common.sh"
+grep -Fq 'zec-wallet-recovered.rpc.json' "$repo_root/scripts/deploy/common.sh"
+grep -Fq 'zec-wallet-recovery.attestation.json' "$repo_root/scripts/deploy/common.sh"
+# shellcheck disable=SC2016
+grep -Fq 'python3 "$zec_recovery_verifier" verify' \
+    "$repo_root/scripts/deploy/common.sh"
+# shellcheck disable=SC2016
+grep -Fq 'native_validator=$release_root/wcash-poold' \
+    "$repo_root/scripts/deploy/common.sh"
 grep -Fq 'root:root:400:1)' \
     "$repo_root/scripts/deploy/provision-host.sh"
 grep -Fq -- '--ack-independent-offline-backup-recovery' \

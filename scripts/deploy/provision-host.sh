@@ -46,6 +46,7 @@ install -d -o root -g root -m 0700 "$ZECWEC_CREDENTIAL_DIR"
 install -d -o root -g root -m 0755 "$ZECWEC_CONFIG_DIR/tls"
 install -d -o wcash-pool -g wcash-pool -m 0700 /var/lib/wcash-pool
 install -d -o wcash-pool-backend -g wcash-pool-socket -m 0700 /var/lib/wcash-pool-backend
+install -d -o root -g root -m 0700 /var/lib/zecwec-custody
 wcash_seed=/var/lib/wcash-pool-secrets/wcash-seed
 if [[ -e $wcash_seed || -L $wcash_seed ]]; then
     [[ -f $wcash_seed && ! -L $wcash_seed ]] \

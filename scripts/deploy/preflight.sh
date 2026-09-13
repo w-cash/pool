@@ -50,7 +50,12 @@ if systemctl is-active --quiet zecwec-zallet.service \
     die "deferred-payout mining requires the Zallet wallet and RPC listener to remain offline"
 fi
 
-require_offline_collector_custody "$settings"
+release_policy=/etc/wcash-pool/release.env
+[[ -f $release_policy && ! -L $release_policy \
+    && $(stat -c '%u:%a:%h' -- "$release_policy") == 0:644:1 ]] \
+    || die "rendered release policy is unavailable or unsafe"
+release_root=$(resolve_release_root "$(read_setting "$release_policy" ZECWEC_RELEASE_PATH)")
+require_offline_collector_custody "$settings" "$release_root"
 
 systemctl stop wcash-pool-backend.service >/dev/null 2>&1 || true
 systemctl restart wcash-pool-backend-init.service

@@ -19,7 +19,7 @@ pub mod wcash_observation;
 mod wec_wallet_transport;
 mod zec_authority_check;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{io::Read, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 
@@ -38,6 +38,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate an Orchard-only Zcash Testnet collector address from standard input.
+    #[command(hide = true)]
+    ValidateZecTestnetOrchard,
     /// Validate immutable policy and protected credential files without connecting.
     ConfigCheck {
         /// Absolute path to the protected Testnet policy.
@@ -73,6 +76,35 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
+        Command::ValidateZecTestnetOrchard => {
+            let mut encoded = String::new();
+            let read_result = std::io::stdin().take(514).read_to_string(&mut encoded);
+            let candidate = encoded.strip_suffix('\n');
+            if read_result.is_err()
+                || encoded.len() > 513
+                || candidate.is_none()
+                || candidate.is_some_and(|value| {
+                    value
+                        .chars()
+                        .any(|character| matches!(character, '\r' | '\n'))
+                })
+            {
+                eprintln!("collector address input is invalid");
+                return ExitCode::from(NOT_READY_EXIT_CODE);
+            }
+            match wcash_pool_address::validate_zcash_testnet_orchard_only(
+                candidate.unwrap_or_default(),
+            ) {
+                Ok(()) => {
+                    println!("{{\"valid\":true,\"network\":\"testnet\",\"receiver\":\"orchard\"}}");
+                    ExitCode::SUCCESS
+                }
+                Err(_) => {
+                    eprintln!("collector address is not a valid Orchard-only Zcash Testnet UA");
+                    ExitCode::from(NOT_READY_EXIT_CODE)
+                }
+            }
+        }
         Command::ConfigCheck { config } => {
             match config::RuntimeConfig::load(&config).and_then(|runtime| {
                 let database = runtime.database_url()?;
@@ -175,6 +207,12 @@ mod tests {
 
     #[test]
     fn exposes_explicit_testnet_service_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["wcash-poold", "validate-zec-testnet-orchard"]),
+            Ok(Cli {
+                command: Command::ValidateZecTestnetOrchard
+            })
+        ));
         assert!(matches!(
             Cli::try_parse_from(["wcash-poold", "serve", "--config", "/tmp/pool.toml"]),
             Ok(Cli {

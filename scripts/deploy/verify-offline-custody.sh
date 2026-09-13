@@ -26,5 +26,5 @@ for unit in zecwec-zallet.service wcash-pool-wallet-init.service \
 done
 require_no_processes_for_user wcash-pool "mining identity"
 require_no_processes_for_user zecwec-zallet "collector identity"
-require_offline_collector_custody "$settings"
+require_offline_collector_custody "$settings" "${ZECWEC_RELEASE_PATH:?immutable release path is required}"
 log "offline collector custody gate passed without reading spending authority"

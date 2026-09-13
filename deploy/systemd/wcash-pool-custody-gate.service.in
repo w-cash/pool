@@ -11,6 +11,8 @@ User=root
 Group=root
 UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
+ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh deployment-package
 ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-offline-custody.sh /etc/wcash-pool/deployment.env
 NoNewPrivileges=yes
 PrivateDevices=yes

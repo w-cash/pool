@@ -51,7 +51,7 @@ zallet_port=${zallet_rpc##*:}
 if ss -H -ltn "sport = :$zallet_port" | grep -q .; then
     die "deferred-payout mining exposed a Zallet RPC listener"
 fi
-require_offline_collector_custody "$settings"
+require_offline_collector_custody "$settings" "$release_root"
 
 socket=$(read_setting "$settings" BACKEND_SOCKET)
 [[ -S $socket && ! -L $socket ]] || die "backend socket is unavailable"
