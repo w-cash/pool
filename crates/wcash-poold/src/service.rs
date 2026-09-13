@@ -1321,16 +1321,8 @@ async fn build_payout_services(
         zcash_wallet
     };
     let zcash_wallet = Arc::new(zcash_wallet);
-    let wcash_authority = NodePayoutAuthority::new(
-        Chain::Wcash,
-        wcash_rpc,
-        config.wcash_genesis,
-    )?;
-    let zcash_authority = NodePayoutAuthority::new(
-        Chain::Zcash,
-        zcash_rpc,
-        config.zcash_genesis,
-    )?;
+    let wcash_authority = NodePayoutAuthority::new(Chain::Wcash, wcash_rpc, config.wcash_genesis)?;
+    let zcash_authority = NodePayoutAuthority::new(Chain::Zcash, zcash_rpc, config.zcash_genesis)?;
     #[cfg(feature = "regtest")]
     let (wcash_authority, zcash_authority) = if config.network == ChainNetwork::Regtest {
         (

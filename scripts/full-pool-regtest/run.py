@@ -221,27 +221,19 @@ filter = "info"
         self.command('pool-preflight', [args.poold, 'preflight', '--config', config])
         self.spawn('poold', [args.poold, 'serve', '--config', config])
         self.until('portal', lambda: self.portal('/healthz'))
-        password = secrets.token_urlsafe(32)
-        account = self.portal('/api/v1/auth/register', {'username': 'regtest_team', 'password': password})
-        login = self.portal('/api/v1/auth/login', {'username': 'regtest_team', 'password': password})
-        self.csrf = login['csrf_token']
-        worker = self.portal('/api/v1/workers', {'label': 'asic-1'})['worker']
-        primary = {'account': account, 'password': password, 'worker': worker,
-                   'cookies': self.cookies.copy(), 'csrf': self.csrf}
+        session_path = self.root / 'portal-session.json'
+        saved = json.loads(session_path.read_text()) if session_path.exists() else {}
+        primary = self.miner_account('regtest_team', 'asic-1', saved)
+        private(session_path, json.dumps({**primary, **({'secondary': saved['secondary']} if 'secondary' in saved else {})}))
         self.cookies, self.csrf = {}, None
-        secondary_password = secrets.token_urlsafe(32)
-        secondary_account = self.portal('/api/v1/auth/register',
-            {'username': 'regtest_shielded', 'password': secondary_password})
-        secondary_login = self.portal('/api/v1/auth/login',
-            {'username': 'regtest_shielded', 'password': secondary_password})
-        self.csrf = secondary_login['csrf_token']
-        secondary_worker = self.portal('/api/v1/workers', {'label': 'asic-2'})['worker']
-        secondary = {'account': secondary_account, 'password': secondary_password,
-                     'worker': secondary_worker, 'cookies': self.cookies.copy(), 'csrf': self.csrf}
+        secondary = self.miner_account('regtest_shielded', 'asic-2', saved.get('secondary', {}))
         self.cookies, self.csrf = primary['cookies'], primary['csrf']
-        private(self.root / 'portal-session.json', json.dumps({**primary, 'secondary': secondary}))
+        private(session_path, json.dumps({**primary, 'secondary': secondary}))
+        worker, secondary_worker = primary['worker'], secondary['worker']
         miner_env = os.environ.copy()
-        for height in range(1, args.blocks + 1):
+        first_height = self.rpc('wec', 'getblockcount') + 1
+        self.until('equal resumed chain tips', lambda: self.rpc('zec', 'getblockcount') == first_height - 1)
+        for height in range(first_height, args.blocks + 1):
             started = time.monotonic()
             selected_worker = secondary_worker if height == 2 else worker
             miner_env['WCASH_STRATUM_PASSWORD'] = selected_worker['token']
@@ -267,6 +259,19 @@ filter = "info"
             while True:
                 self.alive()
                 time.sleep(1)
+
+    def miner_account(self, username, label, saved):
+        password = saved.get('password') or secrets.token_urlsafe(32)
+        account = saved.get('account')
+        if account is None:
+            account = self.portal('/api/v1/auth/register', {'username': username, 'password': password})['account']
+        elif 'account' in account:
+            account = account['account']  # Read the first harness session format.
+        login = self.portal('/api/v1/auth/login', {'username': username, 'password': password})
+        self.csrf = login['csrf_token']
+        worker = saved.get('worker') or self.portal('/api/v1/workers', {'label': label})['worker']
+        return {'account': account, 'password': password, 'worker': worker,
+                'cookies': self.cookies.copy(), 'csrf': self.csrf}
 
     def two_chain_blocks(self):
         result = self.portal('/api/v1/blocks')
