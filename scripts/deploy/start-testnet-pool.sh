@@ -19,6 +19,7 @@ require_private_regular_file "$cidrs"
 # Keep every mining ingress closed until the isolated payout worker has proved
 # a fresh lease. This also closes rules persisted by UFW across a reboot.
 "$script_dir/restrict-mining-firewall.sh" close "$settings" "$cidrs"
+start_nginx_for_closed_ingress
 "$script_dir/preflight.sh" "$settings"
 
 if ! systemctl start zecwec-testnet-pool.target; then
