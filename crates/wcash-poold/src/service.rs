@@ -71,6 +71,7 @@ const PAYOUT_MAXIMUM_CONSECUTIVE_FAILURES: u32 = 20;
 const PAYOUT_MAXIMUM_CONFIRMATION_WATCHES: u32 = 8;
 const PAYOUT_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PROJECTOR_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const PROJECTOR_BACKEND_UNHEALTHY_GRACE: Duration = Duration::from_secs(30);
 const PROJECTOR_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
 const PAYOUT_WORKER_LEASE_DURATION: Duration = Duration::from_secs(35 * 60);
 const PAYOUT_WORKER_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -140,6 +141,34 @@ pub async fn run_projector(config: RuntimeConfig) -> Result<(), ServiceError> {
     combine_service_and_cleanup(service_result, cleanup_result)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectorBackendHealth {
+    Healthy,
+    TransientlyUnhealthy,
+    GraceExpired,
+}
+
+#[derive(Debug, Default)]
+struct ProjectorBackendHealthWindow {
+    unhealthy_since: Option<time::Instant>,
+}
+
+impl ProjectorBackendHealthWindow {
+    fn observe(&mut self, healthy: bool, now: time::Instant) -> ProjectorBackendHealth {
+        if healthy {
+            self.unhealthy_since = None;
+            return ProjectorBackendHealth::Healthy;
+        }
+
+        let unhealthy_since = *self.unhealthy_since.get_or_insert(now);
+        if now.duration_since(unhealthy_since) >= PROJECTOR_BACKEND_UNHEALTHY_GRACE {
+            ProjectorBackendHealth::GraceExpired
+        } else {
+            ProjectorBackendHealth::TransientlyUnhealthy
+        }
+    }
+}
+
 async fn run_projector_loop<S>(
     client: &mut BackendClient,
     projector: &PostgresEventProjector,
@@ -150,6 +179,7 @@ where
 {
     let mut heartbeat = time::interval(PROJECTOR_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut backend_health = ProjectorBackendHealthWindow::default();
     tokio::pin!(shutdown);
 
     loop {
@@ -167,7 +197,10 @@ where
             .map_err(BootstrapError::from)
             .map_err(ServiceError::from);
         drain_projector_events(client, projector).await?;
-        if !health?.healthy {
+        let health = health?;
+        if backend_health.observe(health.healthy, time::Instant::now())
+            == ProjectorBackendHealth::GraceExpired
+        {
             return Err(ServiceError::ProjectorBackendUnhealthy);
         }
     }
@@ -1836,9 +1869,10 @@ mod tests {
         retain_first_error, validate_probe_only_payout_configuration, validate_projector_authority,
         verify_startup_signer_readiness, wait_for_payout_worker_lease,
         wait_for_projector_heartbeat, with_payout_worker_lease, AuthorityTip, PreflightProbe,
-        ServiceError, VerifiedWalletAuthority, MAX_WEC_IN_FLIGHT_PASS_SECS,
-        PAYOUT_MAXIMUM_CONFIRMATION_WATCHES, PAYOUT_WORKER_LEASE_ACQUIRE_WAIT,
-        PAYOUT_WORKER_LEASE_DURATION, PAYOUT_WORKER_LEASE_RETRY_INTERVAL,
+        ProjectorBackendHealth, ProjectorBackendHealthWindow, ServiceError,
+        VerifiedWalletAuthority, MAX_WEC_IN_FLIGHT_PASS_SECS, PAYOUT_MAXIMUM_CONFIRMATION_WATCHES,
+        PAYOUT_WORKER_LEASE_ACQUIRE_WAIT, PAYOUT_WORKER_LEASE_DURATION,
+        PAYOUT_WORKER_LEASE_RETRY_INTERVAL, PROJECTOR_BACKEND_UNHEALTHY_GRACE,
         REQUIRED_PAYOUT_READINESS_TIMEOUT, REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT,
         SERVICE_DRAIN_TIMEOUT, SIGNER_READINESS_TIMEOUT,
     };
@@ -1915,6 +1949,38 @@ mod tests {
             wait_for_projector_heartbeat(&mut heartbeat, shutdown.as_mut())
                 .await
                 .expect("initial heartbeat succeeds")
+        );
+    }
+
+    #[test]
+    fn projector_tolerates_bounded_startup_and_rotation_health_gaps() {
+        let start = tokio::time::Instant::now();
+        let mut window = ProjectorBackendHealthWindow::default();
+
+        assert_eq!(
+            window.observe(false, start),
+            ProjectorBackendHealth::TransientlyUnhealthy
+        );
+        assert_eq!(
+            window.observe(
+                false,
+                start + PROJECTOR_BACKEND_UNHEALTHY_GRACE - Duration::from_nanos(1)
+            ),
+            ProjectorBackendHealth::TransientlyUnhealthy
+        );
+        assert_eq!(
+            window.observe(true, start + PROJECTOR_BACKEND_UNHEALTHY_GRACE),
+            ProjectorBackendHealth::Healthy
+        );
+
+        let rotation = start + PROJECTOR_BACKEND_UNHEALTHY_GRACE + Duration::from_secs(1);
+        assert_eq!(
+            window.observe(false, rotation),
+            ProjectorBackendHealth::TransientlyUnhealthy
+        );
+        assert_eq!(
+            window.observe(false, rotation + PROJECTOR_BACKEND_UNHEALTHY_GRACE),
+            ProjectorBackendHealth::GraceExpired
         );
     }
 
