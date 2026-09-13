@@ -21,7 +21,10 @@ No maturity, proof, wallet identity, payout amount, or ledger effect is mocked.
 
 Required inputs:
 
-- A fresh owner-private runtime directory and disposable PostgreSQL 16 database.
+- A fresh owner-private runtime directory beneath owner-controlled ancestors
+  (for example `$HOME/.wcash-regtest`) and disposable PostgreSQL 16 database.
+  `/tmp` and `/private/tmp` are unsuitable: the pool deliberately rejects their
+  world-writable ancestor even when the leaf directory is mode 0700.
   Supply its connection URL through a mode 0600 file, never a command-line value.
 - Wcash and Zcash consensus binaries from the pinned node revision (or a documented
   source-identical cached build), the native backend/ZIP-301 miner, and the Wcash
