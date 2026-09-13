@@ -104,8 +104,11 @@ raise SystemExit(0 if value == expected else 1)
 ss -H -ltn "sport = :$plain_port" | grep -q . || die "plaintext Stratum listener is unavailable"
 systemctl is-active --quiet nginx.service || die "nginx TLS edge is not active"
 ss -H -ltn "sport = :$tls_port" | grep -q . || die "TLS Stratum listener is unavailable"
+mining_certificate=$(read_setting "$settings" MINING_TLS_CERT)
+require_trusted_etc_file "$mining_certificate" false
 require_public_tls_listener \
-    "$(read_setting "$settings" MINING_HOST)" "$tls_port" 127.0.0.1
+    "$(read_setting "$settings" MINING_HOST)" "$tls_port" 127.0.0.1 \
+    "$mining_certificate"
 
 "$script_dir/restrict-mining-firewall.sh" check "$settings" "$cidrs" >/dev/null
 trap - EXIT

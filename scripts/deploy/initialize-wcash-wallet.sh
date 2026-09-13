@@ -4,6 +4,10 @@ set -Eeuo pipefail
 set +x
 umask 077
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/deploy/common.sh
+source "$script_dir/common.sh"
+
 die() {
     printf 'initialize-wcash-wallet: %s\n' "$*" >&2
     exit 1
@@ -23,6 +27,7 @@ required_environment=(
     WCASH_EXPECTED_SIGNER_ACCOUNT
     WCASH_EXPECTED_PAYOUT_COMMITMENT
     WCASH_WALLET_AUTHORITY
+    CREDENTIALS_DIRECTORY
     RUNTIME_DIRECTORY
 )
 for variable in "${required_environment[@]}"; do
@@ -56,7 +61,9 @@ payout_state=$(systemctl show --property=ActiveState --value wcash-payout-worker
     || die "wallet database path does not match the reviewed deployment"
 [[ $WCASH_WALLET_AUTHORITY == /var/lib/wcash-payout/wcash-wallet-authority.json ]] \
     || die "wallet authority path does not match the reviewed deployment"
-[[ $WEC_SEED_FILE == /run/credentials/wcash-pool-wallet-init.service/wcash-seed ]] \
+[[ $CREDENTIALS_DIRECTORY == /run/credentials/wcash-pool-wallet-init.service ]] \
+    || die "credential directory does not match the wallet initializer"
+[[ $WEC_SEED_FILE == "$CREDENTIALS_DIRECTORY/wcash-seed" ]] \
     || die "seed path is not the private systemd credential mount"
 [[ $WCASH_LIGHTWALLETD_ENDPOINT =~ ^http://127\.0\.0\.1:[0-9]{1,5}$ ]] \
     || die "compact-block endpoint must be literal IPv4 loopback"
@@ -86,9 +93,7 @@ fi
 
 service_uid=$(id -u)
 [[ $service_uid != 0 ]] || die "wallet initialization must not run as root"
-[[ -f $WEC_SEED_FILE && ! -L $WEC_SEED_FILE ]] || die "protected seed is unavailable"
-[[ $(stat -c '%u:%a:%h' -- "$WEC_SEED_FILE") == "$service_uid:600:1" ]] \
-    || die "protected seed ownership, mode, or link count is invalid"
+require_readonly_systemd_credential "$WEC_SEED_FILE" wcash-seed "$service_uid"
 seed_size=$(stat -c '%s' -- "$WEC_SEED_FILE")
 ((seed_size >= 64 && seed_size <= 505)) || die "protected seed size is invalid"
 

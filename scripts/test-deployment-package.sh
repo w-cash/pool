@@ -135,6 +135,69 @@ for duplicate_service_id in uid gid; do
         exit 1
     fi
 done
+credential_test="$temporary/systemd-credential-test"
+mkdir -p "$credential_test/bin" "$credential_test/run/credentials/test.service"
+credential_file="$credential_test/run/credentials/test.service/wcash-seed"
+printf 'test credential\n' >"$credential_file"
+chmod 0400 "$credential_file"
+cat >"$credential_test/bin/stat" <<'SH'
+#!/bin/sh
+case "$*" in
+    *%u:%a:%h*) printf '%s\n' "${CREDENTIAL_TEST_METADATA:?}" ;;
+    *) exec /usr/bin/stat "$@" ;;
+esac
+SH
+chmod 0555 "$credential_test/bin/stat"
+for accepted_metadata in "$(id -u):400:1" "$(id -u):440:1"; do
+    CREDENTIALS_DIRECTORY="$credential_test/run/credentials/test.service" \
+        CREDENTIAL_TEST_METADATA=$accepted_metadata \
+        PATH="$credential_test/bin:$PATH" \
+        bash -c 'source "$1"; require_readonly_systemd_credential "$2" wcash-seed' \
+        bash "$repo_root/scripts/deploy/common.sh" "$credential_file"
+done
+CREDENTIALS_DIRECTORY="$credential_test/run/credentials/test.service" \
+    CREDENTIAL_TEST_METADATA=0:440:1 \
+    PATH="$credential_test/bin:$PATH" \
+    bash -c 'source "$1"; require_readonly_systemd_credential "$2" wcash-seed 123456' \
+    bash "$repo_root/scripts/deploy/common.sh" "$credential_file"
+for rejected_metadata in \
+    "$(id -u):600:1" \
+    "$(id -u):404:1" \
+    "$(id -u):400:2" \
+    "987654:400:1"; do
+    if CREDENTIALS_DIRECTORY="$credential_test/run/credentials/test.service" \
+        CREDENTIAL_TEST_METADATA=$rejected_metadata \
+        PATH="$credential_test/bin:$PATH" \
+        bash -c 'source "$1"; require_readonly_systemd_credential "$2" wcash-seed' \
+        bash "$repo_root/scripts/deploy/common.sh" "$credential_file" \
+        >/dev/null 2>&1; then
+        printf 'deployment-package-test: credential gate accepted metadata %s\n' \
+            "$rejected_metadata" >&2
+        exit 1
+    fi
+done
+chmod 0600 "$credential_file"
+if [[ $(id -u) != 0 ]]; then
+    if CREDENTIALS_DIRECTORY="$credential_test/run/credentials/test.service" \
+        CREDENTIAL_TEST_METADATA="$(id -u):400:1" \
+        PATH="$credential_test/bin:$PATH" \
+        bash -c 'source "$1"; require_readonly_systemd_credential "$2" wcash-seed' \
+        bash "$repo_root/scripts/deploy/common.sh" "$credential_file" \
+        >/dev/null 2>&1; then
+        printf 'deployment-package-test: credential gate accepted a service-writable file\n' >&2
+        exit 1
+    fi
+fi
+chmod 0400 "$credential_file"
+if CREDENTIALS_DIRECTORY="$credential_test/run/credentials/test.service" \
+    CREDENTIAL_TEST_METADATA="$(id -u):400:1" \
+    PATH="$credential_test/bin:$PATH" \
+    bash -c 'source "$1"; require_readonly_systemd_credential "$2" wrong-name' \
+    bash "$repo_root/scripts/deploy/common.sh" "$credential_file" \
+    >/dev/null 2>&1; then
+    printf 'deployment-package-test: credential gate accepted the wrong credential name\n' >&2
+    exit 1
+fi
 cat >"$temporary/fake-bin/ss" <<'SH'
 #!/bin/sh
 if [ "${SS_TEST_STATUS:-0}" -ne 0 ]; then exit "$SS_TEST_STATUS"; fi
@@ -951,7 +1014,10 @@ zallet_unit = (root / "systemd/zecwec-zallet.service").read_text(encoding="utf-8
 backend_init_unit = (root / "systemd/wcash-pool-backend-init.service").read_text(encoding="utf-8")
 health_unit = (root / "systemd/wcash-pool-health.service").read_text(encoding="utf-8")
 assert "User=root\n" in health_unit
-assert "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID" in health_unit
+assert (
+    "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH"
+    in health_unit
+)
 assert "ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock" in health_unit
 assert "SupplementaryGroups=wcash-pool-backend\n" in backend_init_unit
 executable_condition_units = {
@@ -1042,7 +1108,15 @@ assert "User=root\n" in custody_gate_unit
 assert "verify-offline-custody.sh /etc/wcash-pool/deployment.env" in custody_gate_unit
 assert "verify-release.sh wcash-poold" in custody_gate_unit
 assert "verify-release.sh deployment-package" in custody_gate_unit
-assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID" in custody_gate_unit
+assert (
+    "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH"
+    in custody_gate_unit
+)
+assert all(
+    "CAP_DAC_OVERRIDE" not in line
+    for line in custody_gate_unit.splitlines()
+    if line.startswith("CapabilityBoundingSet=")
+)
 assert "Conflicts=zecwec-zallet.service" in custody_gate_unit
 assert (
     "After=zecwec-zallet.service zecwec-zallet-recovery.service "
@@ -1118,6 +1192,16 @@ startup_unit = (root / "systemd/zecwec-testnet-pool-start.service").read_text(
     encoding="utf-8"
 )
 health_timer = (root / "systemd/wcash-pool-health.timer").read_text(encoding="utf-8")
+health_service = (root / "systemd/wcash-pool-health.service").read_text(encoding="utf-8")
+assert (
+    "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH"
+    in health_service
+)
+assert all(
+    "CAP_DAC_OVERRIDE" not in line
+    for line in health_service.splitlines()
+    if line.startswith("CapabilityBoundingSet=")
+)
 cookie_refresh_path = (root / "systemd/zecwec-cookie-refresh.path").read_text(
     encoding="utf-8"
 )
@@ -1131,6 +1215,9 @@ assert "WantedBy=timers.target" not in health_timer
 assert "PartOf=zecwec-testnet-pool.target" in cookie_refresh_path
 assert "Type=oneshot" in startup_unit
 assert "User=root\n" in startup_unit
+assert "After=network-online.target nginx.service postgresql.service" in startup_unit
+assert "Wants=network-online.target nginx.service" in startup_unit
+assert "Requires=nginx.service" not in startup_unit
 assert "start-testnet-pool.sh /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs" in startup_unit
 assert "TimeoutStartSec=7200s" in startup_unit
 assert "WantedBy=multi-user.target" in startup_unit
@@ -1430,11 +1517,14 @@ command_name=${1:-}
 shift || true
 case "$command_name" in
     x509)
+        input=
         output=
         operation=copy
         while (($#)); do
             case "$1" in
+                -in) input=$2; shift 2 ;;
                 -out) output=$2; shift 2 ;;
+                -outform) shift 2 ;;
                 -checkhost) operation=host; shift 2 ;;
                 -checkend) operation=expiry; shift 2 ;;
                 -pubkey) operation=public-key; shift ;;
@@ -1442,7 +1532,14 @@ case "$command_name" in
             esac
         done
         case "$operation" in
-            copy) printf '%s\n' leaf >"$output" ;;
+            copy)
+                value=leaf
+                if [[ ${TLS_TEST_LIVE_MISMATCH:-0} == 1 \
+                    && $input == *served-leaf.pem ]]; then
+                    value=different-leaf
+                fi
+                printf '%s\n' "$value" >"$output"
+                ;;
             host) exit "${TLS_TEST_HOST_STATUS:-0}" ;;
             expiry) exit "${TLS_TEST_EXPIRY_STATUS:-0}" ;;
             public-key) printf '%s\n' public-key ;;
@@ -1455,6 +1552,7 @@ case "$command_name" in
         exit "${TLS_TEST_VERIFY_STATUS:-0}"
         ;;
     s_client)
+        printf '%s\n' handshake
         exit "${TLS_TEST_LISTENER_STATUS:-0}"
         ;;
     *) exit 64 ;;
@@ -1482,9 +1580,9 @@ PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
     bash "$repo_root/scripts/deploy/common.sh" \
     "$tls_test_cert" "$tls_test_key" testnet-mine.zecwec.com
 PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
-    bash -c 'source "$1"; require_public_tls_listener "$2" "$3" "$4"' \
+    bash -c 'source "$1"; require_public_tls_listener "$2" "$3" "$4" "$5"' \
     bash "$repo_root/scripts/deploy/common.sh" \
-    testnet-mine.zecwec.com 3443 127.0.0.1
+    testnet-mine.zecwec.com 3443 127.0.0.1 "$tls_test_cert"
 for rejected_tls_gate in wrong-host expiring mismatched-key untrusted-chain; do
     host_status=0
     expiry_status=0
@@ -1510,20 +1608,34 @@ for rejected_tls_gate in wrong-host expiring mismatched-key untrusted-chain; do
         exit 1
     fi
 done
-if PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
-    TLS_TEST_LISTENER_STATUS=1 \
-    bash -c 'source "$1"; require_public_tls_listener "$2" "$3" "$4"' \
-    bash "$repo_root/scripts/deploy/common.sh" \
-    testnet-mine.zecwec.com 3443 127.0.0.1 >/dev/null 2>&1; then
-    printf 'deployment-package-test: mining TLS gate accepted a failed listener\n' >&2
-    exit 1
-fi
+for rejected_listener in failed expiring mismatched-certificate; do
+    listener_status=0
+    expiry_status=0
+    live_mismatch=0
+    case "$rejected_listener" in
+        failed) listener_status=1 ;;
+        expiring) expiry_status=1 ;;
+        mismatched-certificate) live_mismatch=1 ;;
+    esac
+    if PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
+        TLS_TEST_LISTENER_STATUS=$listener_status \
+        TLS_TEST_EXPIRY_STATUS=$expiry_status \
+        TLS_TEST_LIVE_MISMATCH=$live_mismatch \
+        bash -c 'source "$1"; require_public_tls_listener "$2" "$3" "$4" "$5"' \
+        bash "$repo_root/scripts/deploy/common.sh" \
+        testnet-mine.zecwec.com 3443 127.0.0.1 "$tls_test_cert" \
+        >/dev/null 2>&1; then
+        printf 'deployment-package-test: mining TLS gate accepted %s live endpoint\n' \
+            "$rejected_listener" >&2
+        exit 1
+    fi
+done
 grep -Fq 'x509 -in' "$tls_test_log"
 grep -Fq -- '-checkhost testnet-mine.zecwec.com' "$tls_test_log"
 grep -Fq -- '-checkend 604800' "$tls_test_log"
 grep -Fq -- '-verify_hostname testnet-mine.zecwec.com -CApath /etc/ssl/certs' \
     "$tls_test_log"
-grep -Fq -- 's_client -connect 127.0.0.1:3443 -servername testnet-mine.zecwec.com' \
+grep -Fq -- 's_client -connect 127.0.0.1:3443 -servername testnet-mine.zecwec.com -showcerts' \
     "$tls_test_log"
 
 PYTHONDONTWRITEBYTECODE=1 python3 - \
@@ -1536,7 +1648,7 @@ edge, health = (pathlib.Path(path).read_text(encoding="utf-8") for path in sys.a
 certificate_gate = edge.index("require_public_tls_certificate")
 stream_enable = edge.index('ln -s -- "$stream_source" "$stream_link"')
 nginx_reload = edge.index("if ! systemctl reload nginx.service", stream_enable)
-listener_gate = edge.index('require_public_tls_listener "$mining_host"')
+listener_gate = edge.index("if ! require_public_tls_listener")
 assert certificate_gate < stream_enable < nginx_reload < listener_gate
 assert 'rm -f -- "$stream_link"' in edge[listener_gate:]
 assert "require_public_tls_listener" in health

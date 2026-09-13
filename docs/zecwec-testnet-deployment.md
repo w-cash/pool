@@ -794,7 +794,8 @@ failure stops every public/key-bearing pool component and closes mining ingress.
 
 The command enables `zecwec-testnet-pool-start.service` as the sole boot entry
 point. The raw target and health timer are deliberately not enabled: on every
-boot the one-shot entry point closes persisted UFW rules, repeats preflight,
+boot the one-shot is ordered after a requested nginx start, closes persisted
+UFW rules even if nginx failed to start, repeats preflight,
 starts the target, waits for payout readiness, restores only the previously
 acknowledged edge mode, proves full health, and only then starts the minute
 health timer. The root-owned portal mode is persisted before its nginx link;
