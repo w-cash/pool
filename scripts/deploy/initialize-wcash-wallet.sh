@@ -103,9 +103,12 @@ if [[ -e $WCASH_WALLET_DATABASE || -L $WCASH_WALLET_DATABASE ]]; then
         || die "existing wallet database ownership or link count is unsafe"
 fi
 if [[ -e $WCASH_WALLET_AUTHORITY || -L $WCASH_WALLET_AUTHORITY ]]; then
-    [[ -f $WCASH_WALLET_AUTHORITY && ! -L $WCASH_WALLET_AUTHORITY \
-        && $(stat -c '%u:%a:%h' -- "$WCASH_WALLET_AUTHORITY") == "$service_uid:600:1" ]] \
-        || die "existing wallet authority ownership, mode, or link count is unsafe"
+    [[ -f $WCASH_WALLET_AUTHORITY && ! -L $WCASH_WALLET_AUTHORITY ]] \
+        || die "existing wallet authority is unsafe"
+    case $(stat -c '%U:%G:%a:%h' -- "$WCASH_WALLET_AUTHORITY") in
+        wcash-payout:wcash-payout:600:1 | root:wcash-payout:440:1) ;;
+        *) die "existing wallet authority ownership, mode, or link count is unsafe" ;;
+    esac
 fi
 
 lock_file="$RUNTIME_DIRECTORY/wcash-wallet.lock"

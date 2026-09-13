@@ -31,7 +31,7 @@ require_absolute_path "$authority"
     || die "wallet authority path does not match the reviewed deployment"
 [[ -f $authority && ! -L $authority ]] || die "frozen wallet authority is unavailable"
 case $(stat -c '%U:%G:%a:%h' -- "$authority") in
-    wcash-payout:wcash-payout:600:1 | root:root:400:1) ;;
+    wcash-payout:wcash-payout:600:1 | root:wcash-payout:440:1) ;;
     *) die "frozen wallet authority ownership or mode is unsafe" ;;
 esac
 
@@ -57,8 +57,12 @@ verifier="$script_dir/verify-wcash-wallet-recovery.py"
 [[ -f $verifier && ! -L $verifier ]] || die "wallet recovery verifier is unavailable"
 python3 "$verifier" seal \
     "$authority" "$recovery_init" "$recovery_identity" "$attestation"
-chown root:root -- "$authority"
-chmod 0400 -- "$authority"
+# Root freezes the authority, while the payout group retains read-only access
+# so the documented post-seal wallet initializer can verify the exact binding.
+# The source remains outside every mining/backend identity; backend services
+# receive only a private systemd credential snapshot.
+chown root:wcash-payout -- "$authority"
+chmod 0440 -- "$authority"
 chown root:root -- "$attestation"
 chmod 0400 -- "$attestation"
 

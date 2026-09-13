@@ -77,6 +77,27 @@ for rejected_pgrep_status in 0 2 3; do
         exit 1
     fi
 done
+mkdir -p "$temporary/authority-parent"
+PATH="$temporary/fake-bin:$PATH" bash -c '
+    source "$1"
+    runuser() { printf untraversable; }
+    require_untraversable_by_user "$2" wcash-pool "test authority parent"
+' sh "$repo_root/scripts/deploy/common.sh" "$temporary/authority-parent"
+for traversal_probe in traversable failed; do
+    if TRAVERSAL_PROBE=$traversal_probe bash -c '
+        source "$1"
+        runuser() {
+            if [ "$TRAVERSAL_PROBE" = failed ]; then return 1; fi
+            printf traversable
+        }
+        require_untraversable_by_user "$2" wcash-pool "test authority parent"
+    ' sh "$repo_root/scripts/deploy/common.sh" "$temporary/authority-parent" \
+        >/dev/null 2>&1; then
+        printf 'deployment-package-test: authority traversal gate accepted %s probe\n' \
+            "$traversal_probe" >&2
+        exit 1
+    fi
+done
 cat >"$temporary/fake-bin/id" <<'SH'
 #!/bin/sh
 case "$1:$2" in
@@ -1537,6 +1558,25 @@ grep -Fq 'native_validator=$release_root/wcash-poold' \
     "$repo_root/scripts/deploy/common.sh"
 grep -Fq 'root:root:400:1)' \
     "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq 'wcash-payout:wcash-payout:600:1 | root:wcash-payout:440:1)' \
+    "$repo_root/scripts/deploy/initialize-wcash-wallet.sh"
+grep -Fq 'wcash-payout:wcash-payout:600:1 | root:wcash-payout:440:1)' \
+    "$repo_root/scripts/deploy/seal-wcash-custody.sh"
+# shellcheck disable=SC2016
+grep -Fq 'chown root:wcash-payout -- "$authority"' \
+    "$repo_root/scripts/deploy/seal-wcash-custody.sh"
+# shellcheck disable=SC2016
+grep -Fq 'chmod 0440 -- "$authority"' \
+    "$repo_root/scripts/deploy/seal-wcash-custody.sh"
+grep -Fq 'root:wcash-payout:440:1' \
+    "$repo_root/scripts/deploy/common.sh"
+grep -Fq 'wcash-payout:wcash-payout:700' \
+    "$repo_root/scripts/deploy/common.sh"
+grep -Fq 'for isolated_identity in wcash-pool wcash-pool-projector wcash-pool-backend' \
+    "$repo_root/scripts/deploy/common.sh"
+# shellcheck disable=SC2016
+grep -Fq 'require_untraversable_by_user "$authority_parent" "$isolated_identity"' \
+    "$repo_root/scripts/deploy/common.sh"
 grep -Fq -- '--ack-independent-offline-backup-recovery' \
     "$repo_root/scripts/deploy/seal-wcash-custody.sh"
 grep -Fq 'stop_custody_units_for_sealing' \
