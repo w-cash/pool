@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).resolve().parent / "deploy" / "verify-zec-wallet-recovery.py"
@@ -336,6 +337,147 @@ class RecoveryVerifierTest(unittest.TestCase):
             server.server_close()
         self.assertEqual(state.authenticated_calls, 0)
         self.assertEqual(stale.read_text(encoding="utf-8"), "{}\n")
+
+    def test_capture_refuses_stale_intent_before_any_rpc(self) -> None:
+        output = self.root / "stale-intent.rpc.json"
+        intent = self.root / "stale-intent.rpc.json.mutation-intent"
+        intent.write_text("tainted\n", encoding="utf-8")
+        intent.chmod(0o400)
+        server, thread, state = self.server(False)
+        try:
+            with self.assertRaises(SystemExit):
+                MODULE.capture_original(
+                    os.fspath(self.settings),
+                    f"127.0.0.1:{server.server_port}",
+                    os.fspath(self.cookie),
+                    os.fspath(output),
+                    os.fspath(self.native),
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+        self.assertEqual(state.authenticated_calls, 0)
+        self.assertFalse(output.exists())
+        self.assertEqual(intent.read_text(encoding="utf-8"), "tainted\n")
+
+    def test_intent_is_durable_before_each_mutation_and_cleared_on_success(self) -> None:
+        original_server, original_thread, _state = self.server(False)
+        original = self.root / "timed-original.rpc.json"
+        original_intent = original.parent / MODULE.mutation_intent_name(
+            os.fspath(original)
+        )
+        observations: list[dict[str, object]] = []
+        real_rpc_call = MODULE.rpc_call
+
+        def observe_original(*args: object, **kwargs: object) -> dict:
+            method = args[5]
+            if method == "z_getnewaccount":
+                self.assertTrue(original_intent.exists())
+                self.assertEqual(stat.S_IMODE(original_intent.stat().st_mode), 0o400)
+                observations.append(json.loads(original_intent.read_text(encoding="utf-8")))
+            return real_rpc_call(*args, **kwargs)
+
+        try:
+            with mock.patch.object(MODULE, "rpc_call", side_effect=observe_original):
+                MODULE.capture_original(
+                    os.fspath(self.settings),
+                    f"127.0.0.1:{original_server.server_port}",
+                    os.fspath(self.cookie),
+                    os.fspath(original),
+                    os.fspath(self.native),
+                )
+        finally:
+            original_server.shutdown()
+            original_thread.join()
+            original_server.server_close()
+        self.assertEqual(observations[0]["operation"], "z_getnewaccount")
+        self.assertFalse(original_intent.exists())
+
+        recovered_server, recovered_thread, _state = self.server(True)
+        recovered = self.root / "timed-recovered.rpc.json"
+        recovered_intent = recovered.parent / MODULE.mutation_intent_name(
+            os.fspath(recovered)
+        )
+
+        def observe_recovered(*args: object, **kwargs: object) -> dict:
+            method = args[5]
+            if method == "z_recoveraccounts":
+                self.assertTrue(recovered_intent.exists())
+                self.assertEqual(stat.S_IMODE(recovered_intent.stat().st_mode), 0o400)
+                observations.append(json.loads(recovered_intent.read_text(encoding="utf-8")))
+            return real_rpc_call(*args, **kwargs)
+
+        try:
+            with mock.patch.object(MODULE, "rpc_call", side_effect=observe_recovered):
+                MODULE.capture_recovered(
+                    os.fspath(self.settings),
+                    os.fspath(original),
+                    f"127.0.0.1:{recovered_server.server_port}",
+                    os.fspath(self.cookie),
+                    os.fspath(recovered),
+                    os.fspath(self.native),
+                    True,
+                )
+        finally:
+            recovered_server.shutdown()
+            recovered_thread.join()
+            recovered_server.server_close()
+        self.assertEqual(observations[1]["operation"], "z_recoveraccounts")
+        self.assertFalse(recovered_intent.exists())
+
+    def test_mutation_and_post_mutation_failures_retain_intent(self) -> None:
+        real_rpc_call = MODULE.rpc_call
+        scenarios = ("rpc", "validation", "write")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                server, thread, _state = self.server(False)
+                output = self.root / f"failed-{scenario}.rpc.json"
+                intent = output.parent / MODULE.mutation_intent_name(
+                    os.fspath(output)
+                )
+
+                def fail_at_requested_stage(*args: object, **kwargs: object) -> dict:
+                    method = args[5]
+                    if method == "z_getnewaccount" and scenario == "rpc":
+                        raise SystemExit("simulated RPC failure")
+                    result = real_rpc_call(*args, **kwargs)
+                    if method == "z_getnewaccount" and scenario == "validation":
+                        result["response"]["result"] = {}
+                    return result
+
+                patches = [mock.patch.object(MODULE, "rpc_call", side_effect=fail_at_requested_stage)]
+                if scenario == "write":
+                    patches.append(
+                        mock.patch.object(
+                            MODULE,
+                            "write_once",
+                            side_effect=SystemExit("simulated durable-write failure"),
+                        )
+                    )
+                try:
+                    with patches[0]:
+                        if len(patches) == 2:
+                            patches[1].start()
+                        try:
+                            with self.assertRaises(SystemExit):
+                                MODULE.capture_original(
+                                    os.fspath(self.settings),
+                                    f"127.0.0.1:{server.server_port}",
+                                    os.fspath(self.cookie),
+                                    os.fspath(output),
+                                    os.fspath(self.native),
+                                )
+                        finally:
+                            if len(patches) == 2:
+                                patches[1].stop()
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+                self.assertFalse(output.exists())
+                self.assertTrue(intent.exists())
+                self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o400)
 
     def test_bool_aliases_are_rejected_in_recovery_transcript(self) -> None:
         original, recovered = self.capture_pair()

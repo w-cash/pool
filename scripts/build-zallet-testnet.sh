@@ -31,7 +31,7 @@ output_parent=$(dirname -- "$output")
     exit 1
 }
 
-for command in cargo curl git install python3 rustc rustup sha256sum unzip; do
+for command in cargo curl git install python3 rustc rustup sha256sum timeout unzip; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'build-zallet-testnet: missing command: %s\n' "$command" >&2
         exit 1
@@ -99,7 +99,13 @@ grep -Fx "libprotoc $protoc_version" "$temporary/protoc-version" >/dev/null
     cd "$source_dir"
     cargo "+$toolchain" fmt --all -- --check
     cargo "+$toolchain" test --locked --package zallet-core pool_config_tests
-    cargo "+$toolchain" test --locked --package zallet-core components::sync::tests
+    # These Tokio cancellation tests share global tracing/i18n state and can
+    # deadlock each other when the Rust harness runs them concurrently.  They
+    # complete in seconds serially; keep an outer bound so a regression cannot
+    # hold an isolated release build indefinitely.
+    timeout --signal=TERM --kill-after=10s 300s \
+        cargo "+$toolchain" test --locked --package zallet-core \
+        components::sync::tests -- --test-threads=1
     cargo "+$toolchain" build --locked --release \
         --manifest-path backends/zaino/Cargo.toml \
         --features rpc-cli,zcashd-import \

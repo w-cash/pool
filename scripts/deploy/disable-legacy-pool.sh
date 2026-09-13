@@ -13,11 +13,17 @@ require_command systemctl
 [[ $# -eq 1 ]] || die "usage: disable-legacy-pool.sh <legacy-systemd-unit>"
 unit=$1
 [[ $unit =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "legacy unit name is unsafe"
-systemctl cat "$unit" >/dev/null 2>&1 || {
-    log "legacy unit does not exist: $unit"
-    exit 0
-}
-if systemctl cat "$unit" | grep -Fq '# Managed by the ZecWec Testnet deployment package.'; then
+if ! unit_definition=$(systemctl cat "$unit" 2>/dev/null); then
+    load_state=$(systemctl_value_strict "$unit" LoadState)
+    if [[ $load_state == not-found ]]; then
+        log "legacy unit does not exist: $unit"
+        exit 0
+    fi
+    die "legacy unit definition cannot be inspected"
+fi
+[[ -n $unit_definition ]] || die "legacy unit definition is empty"
+if grep -Fq '# Managed by the ZecWec Testnet deployment package.' \
+    <<<"$unit_definition"; then
     die "refusing to archive the managed ZecWec Testnet pool unit"
 fi
 
@@ -26,7 +32,7 @@ install -d -o root -g root -m 0700 "$backup_dir"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="$backup_dir/${unit}.${stamp}.unit"
 umask 077
-systemctl cat "$unit" >"$backup"
+printf '%s\n' "$unit_definition" >"$backup"
 chmod 0600 "$backup"
 systemctl disable --now "$unit"
 systemctl is-active --quiet "$unit" && die "legacy pool unit remained active"

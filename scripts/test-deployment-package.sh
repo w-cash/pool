@@ -12,6 +12,12 @@ command -v shellcheck >/dev/null 2>&1 || {
     printf 'deployment-package-test: shellcheck is required\n' >&2
     exit 1
 }
+if find "$repo_root/deploy" "$repo_root/scripts" "$repo_root/docs" \
+    \( -type d -name __pycache__ -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
+    -print -quit | grep -q .; then
+    printf 'deployment-package-test: Python bytecode or cache directory would enter release\n' >&2
+    exit 1
+fi
 
 bash -n "$repo_root"/scripts/deploy/*.sh \
     "$repo_root/scripts/build-zallet-testnet.sh" \
@@ -39,7 +45,134 @@ for rejected_pgrep_status in 0 2 3; do
         exit 1
     fi
 done
+cat >"$temporary/fake-bin/id" <<'SH'
+#!/bin/sh
+case "$1:$2" in
+    -u:wcash-pool) printf '1101\n' ;;
+    -g:wcash-pool) printf '1201\n' ;;
+    -u:wcash-pool-backend) printf '1102\n' ;;
+    -g:wcash-pool-backend) printf '1202\n' ;;
+    -u:zecwec-zallet) printf '1103\n' ;;
+    -g:zecwec-zallet) printf '1203\n' ;;
+    -u:zecwec-zallet-recovery)
+        if [ "${DUPLICATE_SERVICE_ID:-}" = uid ]; then printf '1103\n'; else printf '1104\n'; fi
+        ;;
+    -g:zecwec-zallet-recovery)
+        if [ "${DUPLICATE_SERVICE_ID:-}" = gid ]; then printf '1203\n'; else printf '1204\n'; fi
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0555 "$temporary/fake-bin/id"
+PATH="$temporary/fake-bin:$PATH" bash -c \
+    'source "$1"; require_distinct_service_identities' \
+    sh "$repo_root/scripts/deploy/common.sh"
+for duplicate_service_id in uid gid; do
+    if PATH="$temporary/fake-bin:$PATH" DUPLICATE_SERVICE_ID=$duplicate_service_id \
+        bash -c 'source "$1"; require_distinct_service_identities' \
+        sh "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        printf 'deployment-package-test: duplicate service %s passed identity gate\n' \
+            "$duplicate_service_id" >&2
+        exit 1
+    fi
+done
+cat >"$temporary/fake-bin/ss" <<'SH'
+#!/bin/sh
+if [ "${SS_TEST_STATUS:-0}" -ne 0 ]; then exit "$SS_TEST_STATUS"; fi
+[ -z "${SS_TEST_OUTPUT:-}" ] || printf '%s\n' "$SS_TEST_OUTPUT"
+SH
+chmod 0555 "$temporary/fake-bin/ss"
+PATH="$temporary/fake-bin:$PATH" bash -c \
+    'source "$1"; require_tcp_listener_absent 28242 "test listener"' \
+    sh "$repo_root/scripts/deploy/common.sh"
+for listener_case in inspection-error present; do
+    ss_status=0
+    ss_output=
+    if [[ $listener_case == inspection-error ]]; then
+        ss_status=2
+    else
+        ss_output='LISTEN test fixture'
+    fi
+    if PATH="$temporary/fake-bin:$PATH" SS_TEST_STATUS=$ss_status SS_TEST_OUTPUT=$ss_output \
+        bash -c 'source "$1"; require_tcp_listener_absent 28242 "test listener"' \
+        sh "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        printf 'deployment-package-test: listener gate accepted %s\n' \
+            "$listener_case" >&2
+        exit 1
+    fi
+done
+mkdir -p "$temporary/source-tree/deploy" "$temporary/source-tree/scripts" \
+    "$temporary/source-tree/docs" "$temporary/cleanup-a" "$temporary/cleanup-b" \
+    "$temporary/exact-staging"
+touch "$temporary/exact-staging/mnemonic.age" "$temporary/exact-staging/mnemonic.txt"
+exact_staging_entries=$(printf '%s\n' mnemonic.age mnemonic.txt | LC_ALL=C sort)
+bash -c 'source "$1"; require_exact_immediate_entries "$2" "$3" "test staging"' \
+    sh "$repo_root/scripts/deploy/common.sh" "$temporary/exact-staging" \
+    "$exact_staging_entries"
+for unexpected_staging_entry in extra-file nested-directory; do
+    if [[ $unexpected_staging_entry == extra-file ]]; then
+        touch "$temporary/exact-staging/extra"
+    else
+        mkdir "$temporary/exact-staging/nested"
+    fi
+    if bash -c \
+        'source "$1"; require_exact_immediate_entries "$2" "$3" "test staging"' \
+        sh "$repo_root/scripts/deploy/common.sh" "$temporary/exact-staging" \
+        "$exact_staging_entries" >/dev/null 2>&1; then
+        printf 'deployment-package-test: exact staging accepted %s\n' \
+            "$unexpected_staging_entry" >&2
+        exit 1
+    fi
+    rm -f -- "$temporary/exact-staging/extra"
+    rmdir -- "$temporary/exact-staging/nested" 2>/dev/null || true
+done
+cat >"$temporary/fake-bin/find" <<'SH'
+#!/bin/sh
+if [ "${FIND_TEST_STATUS:-0}" -ne 0 ]; then exit "$FIND_TEST_STATUS"; fi
+[ -z "${FIND_TEST_OUTPUT:-}" ] || printf '%s\n' "$FIND_TEST_OUTPUT"
+SH
+chmod 0555 "$temporary/fake-bin/find"
+PATH="$temporary/fake-bin:$PATH" bash -c \
+    'source "$1"; require_deployment_source_tree_safe "$2"; require_cleanup_trees_safe "$3" "$4"' \
+    sh "$repo_root/scripts/deploy/common.sh" "$temporary/source-tree" \
+    "$temporary/cleanup-a" "$temporary/cleanup-b"
+for find_gate in \
+    require_deployment_source_tree_safe \
+    require_cleanup_trees_safe \
+    require_exact_immediate_entries; do
+    if PATH="$temporary/fake-bin:$PATH" FIND_TEST_STATUS=2 bash -c \
+        'source "$1"; shift; "$@"' sh "$repo_root/scripts/deploy/common.sh" \
+        "$find_gate" "$temporary/source-tree" >/dev/null 2>&1; then
+        printf 'deployment-package-test: %s accepted a find traversal error\n' \
+            "$find_gate" >&2
+        exit 1
+    fi
+done
 "$repo_root/scripts/test-zallet-patches.sh" >/dev/null
+# shellcheck disable=SC2016
+[[ $(grep -Fc 'require_tcp_listener_absent "$listener"' \
+    "$repo_root/scripts/deploy/preflight.sh") -eq 2 ]] || {
+    printf 'deployment-package-test: preflight listener checks are not fail-closed\n' >&2
+    exit 1
+}
+# shellcheck disable=SC2016
+grep -Fq 'require_cleanup_trees_safe "$staging" "$recovery_state"' \
+    "$repo_root/scripts/deploy/finalize-zec-offline-custody.sh"
+# shellcheck disable=SC2016
+grep -Fq 'require_exact_immediate_entries "$staging" "$expected_staging_entries"' \
+    "$repo_root/scripts/deploy/finalize-zec-offline-custody.sh"
+# shellcheck disable=SC2016
+grep -Fq 'require_deployment_source_tree_safe "$deployment_source"' \
+    "$repo_root/scripts/deploy/install-release.sh"
+# shellcheck disable=SC2016
+grep -Fq 'require_deployment_source_tree_safe "$source_root"' \
+    "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq 'deployment package file inventory cannot be inspected' \
+    "$repo_root/scripts/deploy/verify-release.sh"
+if grep -Fq '<(find ' "$repo_root/scripts/deploy/verify-release.sh"; then
+    printf 'deployment-package-test: release verification ignores a find producer status\n' >&2
+    exit 1
+fi
 grep -Fq 'base_commit=987382f67e622915228686e9f956c6a9c9a7514c' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'toolchain=1.95.0' "$repo_root/scripts/build-zallet-testnet.sh"
@@ -63,6 +196,10 @@ grep -Fq -- '--manifest-path backends/zaino/Cargo.toml' \
 grep -Fq 'export CXXFLAGS="-include cstdint $CFLAGS"' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq -- '--features rpc-cli,zcashd-import' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'timeout --signal=TERM --kill-after=10s 300s' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'components::sync::tests -- --test-threads=1' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'const MIN_WALLET_POOL_SIZE: usize = 8;' \
     "$repo_root/patches/zallet-v0.1.0-beta.3/0001-reserve-wallet-database-capacity.patch"
@@ -103,6 +240,19 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile \
     "$repo_root"/scripts/deploy/*.py \
     "$repo_root/scripts/test-zec-wallet-recovery.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-zec-wallet-recovery.py" >/dev/null
+PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-import-zallet-mnemonic.py" >/dev/null
+PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test-zec-import-completion.py" >/dev/null
+for helper in \
+    finalize-zec-offline-custody.sh \
+    import-zallet-mnemonic.py \
+    seal-zec-initial-zero.sh \
+    verify-zec-import-completion.py; do
+    [[ -x $repo_root/scripts/deploy/$helper ]] || {
+        printf 'deployment-package-test: required ceremony helper is not executable: %s\n' \
+            "$helper" >&2
+        exit 1
+    }
+done
 [[ -x $repo_root/scripts/deploy/verify-zec-wallet-recovery.py ]] || {
     printf 'deployment-package-test: ZEC wallet recovery verifier is not executable\n' >&2
     exit 1
@@ -337,6 +487,9 @@ runtime = tomllib.loads((root / "pool.runtime.toml").read_text(encoding="utf-8")
 migrate = tomllib.loads((root / "pool.migrate.toml").read_text(encoding="utf-8"))
 preflight = tomllib.loads((root / "pool.preflight.toml").read_text(encoding="utf-8"))
 zallet = tomllib.loads((root / "zallet.toml").read_text(encoding="utf-8"))
+zallet_recovery = tomllib.loads(
+    (root / "zallet-recovery.toml").read_text(encoding="utf-8")
+)
 manifest = json.loads((root / "render-manifest.json").read_text(encoding="utf-8"))
 
 assert runtime["network"] == "testnet"
@@ -376,6 +529,13 @@ assert zallet["builder"] == {"limits": {}}
 assert zallet["external"]["broadcast"] is False
 assert zallet["features"]["as_of_version"] == "0.1.0-beta.3"
 assert zallet["rpc"]["bind"] == ["127.0.0.1:28232"]
+assert zallet_recovery["consensus"]["network"] == "test"
+assert zallet_recovery["external"]["broadcast"] is False
+assert zallet_recovery["features"]["as_of_version"] == "0.1.0-beta.3"
+assert zallet_recovery["rpc"]["bind"] == ["127.0.0.1:28242"]
+assert zallet_recovery["indexer"]["validator_cookie_path"] == (
+    "/run/credentials/zecwec-zallet-recovery.service/validator-cookie"
+)
 assert manifest["network"] == "testnet"
 assert manifest["release_root"] == str(root.parent / "release")
 assert manifest["deployment_schema"] == 1
@@ -395,13 +555,15 @@ assert "LoadCredential=database-url:" in pool_unit
 assert "LoadCredential=wcash-node-cookie:" in pool_unit
 assert "LoadCredential=zallet-" not in pool_unit
 assert (
-    "Conflicts=zecwec-zallet.service wcash-pool-wallet-init.service "
+    "Conflicts=zecwec-zallet.service zecwec-zallet-recovery.service "
+    "wcash-pool-wallet-init.service "
     "wcash-pool-zec-authority-bootstrap.service"
 ) in pool_unit
 assert (
     "After=network-online.target postgresql.service wcash-pool-migrate.service "
     "wcash-pool-backend.service wcash-pool-custody-gate.service "
-    "zecwec-zallet.service wcash-pool-wallet-init.service "
+    "zecwec-zallet.service zecwec-zallet-recovery.service "
+    "wcash-pool-wallet-init.service "
     "wcash-pool-zec-authority-bootstrap.service"
 ) in pool_unit
 assert "Requires=" in pool_unit and "wcash-pool-custody-gate.service" in pool_unit
@@ -415,8 +577,8 @@ assert "Group=wcash-pool-socket\n" in backend_unit
 assert "LoadCredential=wcash-payout-ivk:" in backend_unit
 assert "LoadCredential=wcash-wallet-authority:/var/lib/wcash-pool/wcash-wallet-authority.json" in backend_unit
 assert "LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml" in backend_unit
-assert "LoadCredential=zec-initial-zero-result:/var/lib/wcash-pool-backend/zec-collector-initial-zero.json" in backend_unit
-assert "LoadCredential=zec-initial-zero-attestation:/var/lib/wcash-pool-backend/zec-collector-initial-zero.attestation" in backend_unit
+assert "LoadCredential=zec-initial-zero-result:/var/lib/zecwec-custody/zec-collector-initial-zero.json" in backend_unit
+assert "LoadCredential=zec-initial-zero-attestation:/var/lib/zecwec-custody/zec-collector-initial-zero.attestation" in backend_unit
 assert "zec-authority-bootstrap.sh verify" in backend_unit
 
 preflight_unit = (root / "systemd/wcash-pool-preflight.service").read_text(encoding="utf-8")
@@ -467,7 +629,8 @@ assert "verify-release.sh deployment-package" in custody_gate_unit
 assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID" in custody_gate_unit
 assert "Conflicts=zecwec-zallet.service" in custody_gate_unit
 assert (
-    "After=zecwec-zallet.service wcash-pool-wallet-init.service "
+    "After=zecwec-zallet.service zecwec-zallet-recovery.service "
+    "wcash-pool-wallet-init.service "
     "wcash-pool-zec-authority-bootstrap.service"
 ) in custody_gate_unit
 assert "ConditionPathExists=" not in custody_gate_unit
@@ -499,10 +662,11 @@ assert zec_authority["required_confirmations"] == 100
 assert zec_authority["zallet_cookie_file"] == "/run/credentials/wcash-pool-zec-authority-bootstrap.service/zallet-cookie"
 assert zec_authority["zcash_node_cookie_file"] == "/run/credentials/wcash-pool-zec-authority-bootstrap.service/zcash-node-cookie"
 zec_authority_unit = (root / "systemd/wcash-pool-zec-authority-bootstrap.service").read_text(encoding="utf-8")
-assert "Before=wcash-pool-backend-init.service" in zec_authority_unit
+assert "Before=wcash-pool-backend-init.service" not in zec_authority_unit
 assert "wcash-poold zec-authority-check" not in zec_authority_unit
 assert "zec-authority-bootstrap.sh reconcile" in zec_authority_unit
 assert "BindsTo=zecwec-zallet.service" not in zec_authority_unit
+assert "Conflicts=wcash-pool.service zecwec-zallet-recovery.service" in zec_authority_unit
 
 backend_environment = (root / "backend.env").read_text(encoding="utf-8")
 assert "WCASH_SHARE_TARGET=" + bytes(range(129, 161)).hex() in backend_environment
@@ -563,6 +727,8 @@ grep -Fq 'usermod --gid wcash-pool --groups wcash-pool-socket wcash-pool' \
     "$repo_root/scripts/deploy/provision-host.sh"
 grep -Fq "usermod --gid zecwec-zallet --groups '' zecwec-zallet" \
     "$repo_root/scripts/deploy/provision-host.sh"
+grep -Fq 'require_distinct_service_identities' \
+    "$repo_root/scripts/deploy/provision-host.sh"
 if grep -Fq 'ZALLET_COOKIE' "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"; then
     printf 'deployment-package-test: deferred credential refresh retained Zallet coupling\n' >&2
     exit 1
@@ -578,6 +744,23 @@ if grep -Eq 'systemctl (start|restart) zecwec-zallet' \
     printf 'deployment-package-test: deferred lifecycle can start Zallet\n' >&2
     exit 1
 fi
+for documented_step in \
+    import-zallet-mnemonic.py \
+    zecwec-zallet-recovery.service \
+    seal-zec-initial-zero.sh \
+    finalize-zec-offline-custody.sh \
+    ack-testnet-off-host-backup-and-recovery; do
+    grep -Fq "$documented_step" \
+        "$repo_root/docs/zecwec-testnet-deployment.md" || {
+        printf 'deployment-package-test: runbook omits ceremony step %s\n' \
+            "$documented_step" >&2
+        exit 1
+    }
+done
+grep -Fq 'irreversible removal' "$repo_root/deploy/README.md" || {
+    printf 'deployment-package-test: runbook omits irreversible cleanup warning\n' >&2
+    exit 1
+}
 
 custody_systemctl_test="$temporary/custody-systemctl-test"
 mkdir -p "$custody_systemctl_test/bin"
@@ -661,6 +844,132 @@ run_custody_systemctl_scenario expected pass
     }
 for scenario in missing-wallet masked-pool stop-failure nonzero-pid; do
     run_custody_systemctl_scenario "$scenario" fail
+done
+
+zec_seal_systemctl_test="$temporary/zec-seal-systemctl-test"
+mkdir -p "$zec_seal_systemctl_test/bin"
+cat >"$zec_seal_systemctl_test/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+
+case $1 in
+    stop)
+        printf '%s\n' "$2" >>"$SYSTEMCTL_STOP_LOG"
+        ;;
+    show)
+        property=${2#--property=}
+        unit=$4
+        case "$SYSTEMCTL_SCENARIO:$unit:$property" in
+            active-backend:wcash-pool-backend.service:MainPID) printf '17\n' ;;
+            *:*:LoadState) printf 'loaded\n' ;;
+            *:*:ActiveState) printf 'inactive\n' ;;
+            *:*:SubState) printf 'dead\n' ;;
+            *:*:MainPID | *:*:ControlPID) printf '0\n' ;;
+            *) exit 2 ;;
+        esac
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0755 "$zec_seal_systemctl_test/bin/systemctl"
+cat >"$zec_seal_systemctl_test/bin/id" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [[ ${1:-} == -u && ${2:-} == wcash-pool-backend ]]; then
+    printf '12345\n'
+else
+    exec /usr/bin/id "$@"
+fi
+SH
+chmod 0755 "$zec_seal_systemctl_test/bin/id"
+
+run_zec_seal_systemctl_scenario() {
+    local scenario=$1
+    local expected=$2
+    local stop_log="$zec_seal_systemctl_test/$scenario.stops"
+    : >"$stop_log"
+    if PATH="$zec_seal_systemctl_test/bin:$temporary/fake-bin:$PATH" \
+        SYSTEMCTL_SCENARIO=$scenario \
+        SYSTEMCTL_STOP_LOG=$stop_log \
+        PGREP_TEST_STATUS=1 \
+        bash -c 'source "$1"; stop_backend_units_for_zec_sealing' \
+        bash "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+        [[ $expected == pass ]] || {
+            printf 'deployment-package-test: ZEC seal systemd scenario %s passed unexpectedly\n' \
+                "$scenario" >&2
+            exit 1
+        }
+    else
+        [[ $expected == fail ]] || {
+            printf 'deployment-package-test: ZEC seal systemd scenario %s failed unexpectedly\n' \
+                "$scenario" >&2
+            exit 1
+        }
+    fi
+}
+
+run_zec_seal_systemctl_scenario expected pass
+zec_stopped_units=$(wc -l <"$zec_seal_systemctl_test/expected.stops")
+((zec_stopped_units == 5)) || {
+    printf 'deployment-package-test: ZEC seal stopped %s backend-capable units, expected 5\n' \
+        "$zec_stopped_units" >&2
+    exit 1
+}
+run_zec_seal_systemctl_scenario active-backend fail
+if PATH="$zec_seal_systemctl_test/bin:$temporary/fake-bin:$PATH" \
+    SYSTEMCTL_SCENARIO=expected \
+    SYSTEMCTL_STOP_LOG="$zec_seal_systemctl_test/rogue.stops" \
+    PGREP_TEST_STATUS=0 \
+    bash -c 'source "$1"; stop_backend_units_for_zec_sealing' \
+    bash "$repo_root/scripts/deploy/common.sh" >/dev/null 2>&1; then
+    printf 'deployment-package-test: ZEC seal accepted a rogue backend-UID process\n' >&2
+    exit 1
+fi
+
+unit_state_test="$temporary/unit-state-test"
+mkdir -p "$unit_state_test/bin"
+cat >"$unit_state_test/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[[ $1 == show ]] || exit 2
+[[ ${UNIT_STATE_SCENARIO:-} != error ]] || exit 2
+property=${2#--property=}
+case "$UNIT_STATE_SCENARIO:$property" in
+    missing:LoadState) printf 'not-found\n' ;;
+    masked:LoadState) printf 'masked\n' ;;
+    *:LoadState) printf 'loaded\n' ;;
+    activating:ActiveState) printf 'activating\n' ;;
+    *:ActiveState) printf 'inactive\n' ;;
+    *:SubState) printf 'dead\n' ;;
+    nonzero-pid:MainPID) printf '17\n' ;;
+    *:MainPID | *:ControlPID) printf '0\n' ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0755 "$unit_state_test/bin/systemctl"
+run_unit_state_scenario() {
+    local scenario=$1
+    local expected=$2
+    if PATH="$unit_state_test/bin:$PATH" UNIT_STATE_SCENARIO=$scenario \
+        bash -c 'source "$1"; require_loaded_unit_fully_inactive "$2"' \
+        bash "$repo_root/scripts/deploy/common.sh" zecwec-zallet.service \
+        >/dev/null 2>&1; then
+        [[ $expected == pass ]] || {
+            printf 'deployment-package-test: unit state scenario %s passed unexpectedly\n' \
+                "$scenario" >&2
+            exit 1
+        }
+    else
+        [[ $expected == fail ]] || {
+            printf 'deployment-package-test: unit state scenario %s failed unexpectedly\n' \
+                "$scenario" >&2
+            exit 1
+        }
+    fi
+}
+run_unit_state_scenario expected pass
+for scenario in missing masked error activating nonzero-pid; do
+    run_unit_state_scenario "$scenario" fail
 done
 
 mkdir -p "$temporary/config-check-credentials"

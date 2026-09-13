@@ -44,13 +44,16 @@ for service in postgresql.service wcash-pool-backend.service \
     wcash-pool.service zecwec-cookie-refresh.path; do
     systemctl is-active --quiet "$service" || die "service is not active: $service"
 done
-systemctl is-active --quiet zecwec-zallet.service \
-    && die "deferred-payout mining must not keep Zallet online"
+for unit in zecwec-zallet.service zecwec-zallet-recovery.service; do
+    require_loaded_unit_fully_inactive "$unit"
+done
+require_no_processes_for_user zecwec-zallet "collector identity"
+require_no_processes_for_user zecwec-zallet-recovery "recovery identity"
 zallet_rpc=$(read_setting "$settings" ZALLET_RPC)
 zallet_port=${zallet_rpc##*:}
-if ss -H -ltn "sport = :$zallet_port" | grep -q .; then
-    die "deferred-payout mining exposed a Zallet RPC listener"
-fi
+for wallet_port in "$zallet_port" 28242; do
+    require_tcp_listener_absent "$wallet_port" "deferred-payout Zallet RPC"
+done
 require_offline_collector_custody "$settings" "$release_root"
 
 socket=$(read_setting "$settings" BACKEND_SOCKET)

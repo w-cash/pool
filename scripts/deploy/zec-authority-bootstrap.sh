@@ -9,11 +9,11 @@ die() {
     exit 1
 }
 
-[[ $# -eq 1 ]] || die "usage: zec-authority-bootstrap.sh <reconcile|verify>"
+[[ $# -eq 1 ]] || die "usage: zec-authority-bootstrap.sh <reconcile|verify|verify-sealed>"
 mode=$1
-[[ $mode == reconcile || $mode == verify ]] || die "mode must be reconcile or verify"
+[[ $mode == reconcile || $mode == verify || $mode == verify-sealed ]] \
+    || die "mode must be reconcile, verify, or verify-sealed"
 
-: "${CREDENTIALS_DIRECTORY:?systemd credential directory is required}"
 : "${ZECWEC_RELEASE_PATH:?immutable release path is required}"
 : "${ZEC_AUTHORITY_CONFIG:?ZEC authority configuration is required}"
 : "${ZEC_AUTHORITY_RESULT:?initial-zero result path is required}"
@@ -45,6 +45,10 @@ verify_artifact() {
         [[ $result_metadata =~ ^(0|$trusted_uid):(400|600):1$ \
             && $attestation_metadata =~ ^(0|$trusted_uid):(400|600):1$ ]] \
             || die "initial-zero ZEC authority credential metadata is unsafe"
+    elif [[ $transport == sealed ]]; then
+        [[ $result_metadata == 0:400:1 \
+            && $attestation_metadata == 0:400:1 ]] \
+            || die "sealed initial-zero ZEC authority metadata is unsafe"
     else
         die "artifact transport is invalid"
     fi
@@ -108,7 +112,17 @@ PY
         || die "initial-zero ZEC authority result digest is invalid"
 }
 
-if [[ $mode == verify ]]; then
+if [[ $mode == verify || $mode == verify-sealed ]]; then
+    if [[ $mode == verify-sealed ]]; then
+        [[ ${EUID} -eq 0 ]] || die "sealed authority verification must run as root"
+        [[ $ZEC_AUTHORITY_CONFIG == /etc/wcash-pool/zec-authority.testnet.toml \
+            && $ZEC_AUTHORITY_RESULT == /var/lib/zecwec-custody/zec-collector-initial-zero.json \
+            && $ZEC_AUTHORITY_ATTESTATION == /var/lib/zecwec-custody/zec-collector-initial-zero.attestation ]] \
+            || die "sealed authority inputs differ from the reviewed root namespace"
+        verify_artifact sealed
+        exit 0
+    fi
+    : "${CREDENTIALS_DIRECTORY:?systemd credential directory is required}"
     [[ $ZEC_AUTHORITY_CONFIG == "$CREDENTIALS_DIRECTORY/zec-authority-config" \
         && $ZEC_AUTHORITY_RESULT == "$CREDENTIALS_DIRECTORY/zec-initial-zero-result" \
         && $ZEC_AUTHORITY_ATTESTATION == "$CREDENTIALS_DIRECTORY/zec-initial-zero-attestation" ]] \
@@ -116,6 +130,8 @@ if [[ $mode == verify ]]; then
     verify_artifact credential
     exit 0
 fi
+
+: "${CREDENTIALS_DIRECTORY:?systemd credential directory is required}"
 
 : "${STATE_DIRECTORY:?systemd state directory is required}"
 : "${BACKEND_AUTHORITY:?backend authority path is required}"

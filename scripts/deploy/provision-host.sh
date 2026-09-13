@@ -13,20 +13,19 @@ require_command groupadd
 require_command useradd
 require_command usermod
 require_command openssl
+require_command python3
 
 [[ $# -eq 1 ]] || die "usage: provision-host.sh <deployment-source-root>"
 source_root=$1
 require_absolute_path "$source_root"
 [[ -d $source_root/deploy && -d $source_root/scripts/deploy && -d $source_root/docs ]] \
     || die "deployment source root is incomplete"
-if find "$source_root/deploy" "$source_root/scripts/deploy" "$source_root/docs" \
-    -type l -print -quit | grep -q .; then
-    die "deployment source trees must not contain symbolic links"
-fi
+require_deployment_source_tree_safe "$source_root"
 
 getent group wcash-pool-socket >/dev/null || groupadd --system wcash-pool-socket
 getent group wcash-pool >/dev/null || groupadd --system wcash-pool
 getent group zecwec-zallet >/dev/null || groupadd --system zecwec-zallet
+getent group zecwec-zallet-recovery >/dev/null || groupadd --system zecwec-zallet-recovery
 
 id -u wcash-pool >/dev/null 2>&1 \
     || useradd --system --gid wcash-pool --home-dir /var/lib/wcash-pool --shell /usr/sbin/nologin wcash-pool
@@ -34,10 +33,27 @@ id -u wcash-pool-backend >/dev/null 2>&1 \
     || useradd --system --gid wcash-pool-socket --home-dir /var/lib/wcash-pool-backend --shell /usr/sbin/nologin wcash-pool-backend
 id -u zecwec-zallet >/dev/null 2>&1 \
     || useradd --system --gid zecwec-zallet --home-dir /var/lib/zecwec-zallet --shell /usr/sbin/nologin zecwec-zallet
+id -u zecwec-zallet-recovery >/dev/null 2>&1 \
+    || useradd --system --gid zecwec-zallet-recovery \
+        --home-dir /var/lib/zecwec-zallet-recovery --shell /usr/sbin/nologin \
+        zecwec-zallet-recovery
 
 usermod --gid wcash-pool --groups wcash-pool-socket wcash-pool
 usermod --gid wcash-pool-socket --groups '' wcash-pool-backend
 usermod --gid zecwec-zallet --groups '' zecwec-zallet
+usermod --gid zecwec-zallet-recovery --groups '' zecwec-zallet-recovery
+require_distinct_service_identities
+
+python3 - <<'PY'
+import pexpect
+
+try:
+    version = tuple(int(part) for part in pexpect.__version__.split("."))
+except (AttributeError, ValueError):
+    raise SystemExit("provision-host: pexpect version is invalid")
+if version < (4, 8):
+    raise SystemExit("provision-host: pexpect 4.8 or newer is required")
+PY
 
 install -d -o root -g root -m 0755 /opt/wcash /opt/wcash/releases
 install -d -o root -g root -m 0755 /usr/local/share/zecwec-deploy "$ZECWEC_LIBEXEC"

@@ -25,8 +25,10 @@ legacy_share_journal=/var/lib/wcash-pool/share-journal-v2.jsonl
 
 trap 'systemctl stop wcash-pool.service >/dev/null 2>&1 || true' ERR
 systemctl stop zecwec-cookie-refresh.path >/dev/null 2>&1 || true
-systemctl disable zecwec-zallet.service >/dev/null 2>&1 || true
-systemctl stop zecwec-zallet.service wcash-pool-wallet-init.service \
+systemctl disable zecwec-zallet.service zecwec-zallet-recovery.service \
+    >/dev/null 2>&1 || true
+systemctl stop zecwec-zallet.service zecwec-zallet-recovery.service \
+    wcash-pool-wallet-init.service \
     wcash-pool-zec-authority-bootstrap.service >/dev/null 2>&1 || true
 
 if systemctl is-active --quiet wcash-pool.service; then
@@ -38,17 +40,19 @@ port=${stratum##*:}
 portal=$(read_setting "$settings" PORTAL_LISTEN)
 portal_port=${portal##*:}
 for listener in "$port" "$portal_port"; do
-    if ss -H -ltn "sport = :$listener" | grep -q .; then
-        die "preflight found a public-service listener open before validation"
-    fi
+    require_tcp_listener_absent "$listener" "preflight public-service"
 done
 
 zallet_rpc=$(read_setting "$settings" ZALLET_RPC)
 zallet_port=${zallet_rpc##*:}
-if systemctl is-active --quiet zecwec-zallet.service \
-    || ss -H -ltn "sport = :$zallet_port" | grep -q .; then
-    die "deferred-payout mining requires the Zallet wallet and RPC listener to remain offline"
-fi
+for unit in zecwec-zallet.service zecwec-zallet-recovery.service; do
+    require_loaded_unit_fully_inactive "$unit"
+done
+require_no_processes_for_user zecwec-zallet "collector identity"
+require_no_processes_for_user zecwec-zallet-recovery "recovery identity"
+for wallet_port in "$zallet_port" 28242; do
+    require_tcp_listener_absent "$wallet_port" "deferred-payout Zallet RPC"
+done
 
 release_policy=/etc/wcash-pool/release.env
 [[ -f $release_policy && ! -L $release_policy \
@@ -63,15 +67,16 @@ systemctl restart wcash-pool-backend.service
 systemctl restart wcash-pool-migrate.service
 systemctl restart wcash-pool-preflight.service
 
-systemctl is-active --quiet zecwec-zallet.service \
-    && die "Zallet became active during deferred-payout preflight"
+for unit in zecwec-zallet.service zecwec-zallet-recovery.service; do
+    require_loaded_unit_fully_inactive "$unit"
+done
+require_no_processes_for_user zecwec-zallet "collector identity"
+require_no_processes_for_user zecwec-zallet-recovery "recovery identity"
 systemctl is-active --quiet wcash-pool-backend.service || die "backend is not active"
 systemctl is-active --quiet postgresql.service || die "PostgreSQL is not active"
 
 for listener in "$port" "$portal_port"; do
-    if ss -H -ltn "sport = :$listener" | grep -q .; then
-        die "preflight unexpectedly opened a public-service listener"
-    fi
+    require_tcp_listener_absent "$listener" "post-validation public-service"
 done
 
 "$script_dir/refresh-runtime-credentials.sh" snapshot "$settings"

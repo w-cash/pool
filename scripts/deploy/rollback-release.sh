@@ -31,9 +31,11 @@ ZECWEC_RELEASE_PATH=$target \
     "$target/deployment/scripts/deploy/verify-release.sh" deployment-package
 
 systemctl stop zecwec-cookie-refresh.path wcash-pool.service \
-    wcash-pool-backend.service zecwec-zallet.service wcash-pool-wallet-init.service \
+    wcash-pool-backend.service zecwec-zallet.service \
+    zecwec-zallet-recovery.service wcash-pool-wallet-init.service \
     wcash-pool-zec-authority-bootstrap.service
-systemctl disable zecwec-zallet.service >/dev/null 2>&1 || true
+systemctl disable zecwec-zallet.service zecwec-zallet-recovery.service \
+    >/dev/null 2>&1 || true
 ZECWEC_RELEASE_PATH=$target \
     "$target/deployment/scripts/deploy/render-deployment.sh" finalize "$settings" "$authority"
 temporary=/opt/wcash/.current.rollback.$$

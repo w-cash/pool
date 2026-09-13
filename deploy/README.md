@@ -12,6 +12,9 @@ The package intentionally separates four authorities:
   serves the loopback portal without receiving either collector spending key;
 - `zecwec-zallet`: is a manual bootstrap and later payout tool. It creates and
   proves the Zcash collector, then remains stopped while mining is live;
+- `zecwec-zallet-recovery`: is a distinct manual-only Testnet identity used
+  once to prove mnemonic restoration in a fresh isolated datadir. It cannot
+  read the original wallet or broadcast and is destroyed before mining;
 - PostgreSQL: uses a schema-owning migration role and a non-DDL runtime role.
 
 The backend socket is `0660`, owned by the backend user and the
@@ -50,12 +53,19 @@ service is the only expected non-backend member of that group.
    removes host-DAC access to the seed from the mining identity. Then stop and
    disable both wallet bootstrap services. Use
    `verify-zec-wallet-recovery.py` to make authenticated loopback RPC captures
-   of the original account creation and the independent mnemonic recovery. Its
+   of the original account creation and independent mnemonic recovery. Import
+   the temporary Testnet phrase only through `import-zallet-mnemonic.py`, start
+   the manual recovery unit on `127.0.0.1:28242`, and bind its exact completion
+   marker to both captures. Its
    root-only mode-`0400` attestation binds those raw envelopes, the exact ZIP-32
    account index and birthday, and the natively validated Orchard-only address
    commitment without requiring database-local account UUIDs to match. This
-   attestation is a mandatory pool-start custody gate. Archive any incompatible
-   legacy share journal first.
+   attestation is a mandatory pool-start custody gate. Run the live initial-zero
+   check and root-seal it with `seal-zec-initial-zero.sh`. Only after an
+   independently verified off-host backup and restore, use
+   `finalize-zec-offline-custody.sh` for irreversible removal of the temporary
+   plaintext, identities, and recovery datadir. Archive any incompatible legacy
+   share journal first.
 8. Run `render-deployment.sh finalize`; inspect both generated pool policies,
    run `wcash-pool-migrate.service`, and run `preflight.sh`.
 9. Apply `restrict-mining-firewall.sh` with explicit ASIC source CIDRs. It
