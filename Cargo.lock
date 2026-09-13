@@ -3280,6 +3280,7 @@ dependencies = [
 name = "wcash-pool-address"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "orchard",
  "serde",
  "serde_json",
  "sha2 0.10.9",

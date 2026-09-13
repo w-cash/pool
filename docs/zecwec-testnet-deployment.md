@@ -304,18 +304,83 @@ before an account exists; the later native authority gate requires it after the
 dedicated collector is frozen. A readiness failure after the full interval is
 a hard deployment gate.
 
-Zallet account creation and mnemonic backup are deliberately reviewed manual
-bootstrap steps. Record the new account's canonical UUID, ZIP-32 index, and
-canonical Ironwood Unified Address from Zallet without copying its seed into a
-shell argument, environment variable, log, or deployment file. If a restored
-Zallet has multiple accounts, select the new dedicated zero-balance account
-explicitly; the deployment never guesses. Compute the parent payout
-commitment as lowercase SHA-256 over the exact byte string
-`Wcash/Zcash parent payout address/v1\0` followed immediately by the canonical
-UA bytes. Independently compare that value with the reviewed source constant
-before freezing policy. Independently restore the mnemonic into a fresh
-isolated Zallet datadir and require the same account, address, and commitment;
-an address alone is not custody evidence.
+Before creating an account, export the generated mnemonic with the pinned
+Zallet `export-mnemonic` command, decrypt and record it on durable offline
+media, separately preserve its age identity and passphrase, and complete the
+interactive pinned `zallet confirm-backup` command against this exact datadir.
+Zallet Testnet intentionally refuses `z_getnewaccount` until that confirmation
+succeeds. Do not keep a plaintext phrase on this host.
+
+Account creation is not a hand-authored JSON step. Create a private root-owned
+ceremony directory, make a root-owned mode-`0400` snapshot of the active Zallet
+cookie, ensure the capture output path does not already exist, and let the
+immutable release capture the authenticated RPC operation itself:
+
+```bash
+sudo install -d -o root -g root -m 0700 /var/lib/zecwec-custody
+sudo install -o root -g root -m 0400 \
+  /var/lib/zecwec-zallet/.cookie /var/lib/zecwec-custody/original.cookie
+sudo /opt/wcash/releases/RELEASE/deployment/scripts/deploy/verify-zec-wallet-recovery.py \
+  capture-original /etc/wcash-pool/deployment.env 127.0.0.1:RPC_PORT \
+  /var/lib/zecwec-custody/original.cookie \
+  /var/lib/zecwec-custody/zec-wallet-original.rpc.json \
+  /opt/wcash/releases/RELEASE/wcash-poold
+```
+
+The command requires an unlocked, fully synchronized wallet with zero accounts.
+Over authenticated loopback RPC it captures that empty state, performs the
+single `z_getnewaccount`, derives exactly one Orchard receiver at diversifier
+index zero, and captures the internally consistent account and synchronized
+post-state. The account birthday is derived from the exact pre-creation common
+node/wallet tip. It never reads or emits the mnemonic.
+
+After the capture, make a protected offline backup of the original database.
+Stop it, import the already confirmed mnemonic into a genuinely fresh isolated
+Zallet datadir, and start that isolated instance on a separate loopback
+endpoint. After human review of that boundary, ensure the recovered capture
+output path does not exist, snapshot its cookie, and run:
+
+```bash
+sudo /opt/wcash/releases/RELEASE/deployment/scripts/deploy/verify-zec-wallet-recovery.py \
+  capture-recovered /etc/wcash-pool/deployment.env \
+  /var/lib/zecwec-custody/zec-wallet-original.rpc.json \
+  127.0.0.1:RECOVERY_RPC_PORT /var/lib/zecwec-custody/recovery.cookie \
+  /var/lib/zecwec-custody/zec-wallet-recovered.rpc.json \
+  /opt/wcash/releases/RELEASE/wcash-poold \
+  --ack-fresh-isolated-mnemonic-import
+```
+
+This command first proves the restored wallet has zero accounts, submits the
+actual `z_recoveraccounts` request using the original RPC-derived seed
+fingerprint, index, and birthday, derives index zero again, and captures every
+raw JSON-RPC request/response envelope. The operator acknowledgement describes
+the reviewed fresh-datadir and mnemonic-import ceremony; the software does not
+mislabel that physical fact as machine-verified. Zallet account UUIDs are
+database-local and are required to be internally consistent, but are never
+compared across the two databases.
+
+Replace the final deployment discovery values with the original capture's UUID,
+index, and the domain-separated payout commitment. Then seal and immediately
+re-verify the immutable evidence:
+
+```bash
+sudo /opt/wcash/releases/RELEASE/deployment/scripts/deploy/verify-zec-wallet-recovery.py \
+  seal /etc/wcash-pool/deployment.env \
+  /var/lib/zecwec-custody/zec-wallet-original.rpc.json \
+  /var/lib/zecwec-custody/zec-wallet-recovered.rpc.json \
+  /var/lib/zecwec-custody/zec-wallet-recovery.attestation.json \
+  /opt/wcash/releases/RELEASE/wcash-poold \
+  --ack-fresh-isolated-mnemonic-recovery
+```
+
+All inputs and outputs are root-owned, private, regular, single-link files.
+The verifier binds both authenticated RPC captures, recomputes the payout
+commitment, and delegates raw Orchard receiver validation to the pinned Rust
+`orchard` consensus crate inside `wcash-poold`. The root custody gate reruns
+the same verification before every pool start and during health checks. An
+address, a caller-authored provenance boolean, or an attestation without its
+two exact captures is not custody evidence. Securely remove the two temporary
+cookie snapshots after the captures have been sealed.
 
 Replace all five discovery sentinels with the reviewed canonical Wcash/Zcash
 account UUIDs, both commitments, and the Zallet ZIP-32 index. Install the

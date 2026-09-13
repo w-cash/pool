@@ -48,8 +48,14 @@ service is the only expected non-backend member of that group.
    backups. Verify the recovered Wcash public identity and run
    `seal-wcash-custody.sh`; this records a root-only recovery attestation and
    removes host-DAC access to the seed from the mining identity. Then stop and
-   disable both wallet bootstrap services. Archive any incompatible legacy
-   share journal first.
+   disable both wallet bootstrap services. Use
+   `verify-zec-wallet-recovery.py` to make authenticated loopback RPC captures
+   of the original account creation and the independent mnemonic recovery. Its
+   root-only mode-`0400` attestation binds those raw envelopes, the exact ZIP-32
+   account index and birthday, and the natively validated Orchard-only address
+   commitment without requiring database-local account UUIDs to match. This
+   attestation is a mandatory pool-start custody gate. Archive any incompatible
+   legacy share journal first.
 8. Run `render-deployment.sh finalize`; inspect both generated pool policies,
    run `wcash-pool-migrate.service`, and run `preflight.sh`.
 9. Apply `restrict-mining-firewall.sh` with explicit ASIC source CIDRs. It

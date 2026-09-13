@@ -101,8 +101,14 @@ require_sealed_wcash_custody() {
 
 require_offline_collector_custody() {
     local settings=${1:?settings path is required}
+    local release_root=${2:-${ZECWEC_RELEASE_PATH:-}}
     local wcash_seed wcash_authority wcash_recovery_attestation
-    local zallet_state zallet_config
+    local zallet_state zallet_config zec_custody zec_original zec_recovered
+    local zec_recovery_attestation zec_recovery_verifier native_validator
+    [[ $release_root == /opt/wcash/releases/* \
+        && -d $release_root && ! -L $release_root \
+        && $(realpath -e -- "$release_root") == "$release_root" ]] \
+        || die "offline custody gate requires one immutable release root"
     require_exact_user_groups wcash-pool wcash-pool,wcash-pool-socket
     require_exact_user_groups wcash-pool-backend wcash-pool-socket
     require_exact_user_groups zecwec-zallet zecwec-zallet
@@ -122,6 +128,30 @@ require_offline_collector_custody() {
         || die "offline Zallet configuration is unsafe"
     require_unreadable_by_user "$zallet_state" wcash-pool "offline Zallet state"
     require_unreadable_by_user "$zallet_config" wcash-pool "offline Zallet configuration"
+
+    zec_custody=/var/lib/zecwec-custody
+    zec_original=$zec_custody/zec-wallet-original.rpc.json
+    zec_recovered=$zec_custody/zec-wallet-recovered.rpc.json
+    zec_recovery_attestation=$zec_custody/zec-wallet-recovery.attestation.json
+    zec_recovery_verifier=$release_root/deployment/scripts/deploy/verify-zec-wallet-recovery.py
+    native_validator=$release_root/wcash-poold
+    [[ -d $zec_custody && ! -L $zec_custody \
+        && $(stat -c '%U:%G:%a' -- "$zec_custody") == root:root:700 ]] \
+        || die "Zcash recovery custody directory is unsafe"
+    local evidence
+    for evidence in "$zec_original" "$zec_recovered" "$zec_recovery_attestation"; do
+        [[ -f $evidence && ! -L $evidence \
+            && $(stat -c '%U:%G:%a:%h' -- "$evidence") == root:root:400:1 ]] \
+            || die "Zcash recovery evidence is unavailable or unsafe"
+    done
+    [[ -x $zec_recovery_verifier && ! -L $zec_recovery_verifier \
+        && -x $native_validator && ! -L $native_validator ]] \
+        || die "immutable Zcash recovery authority is unavailable"
+    require_unreadable_by_user "$zec_custody" wcash-pool \
+        "Zcash recovery custody directory"
+    python3 "$zec_recovery_verifier" verify \
+        "$settings" "$zec_original" "$zec_recovered" \
+        "$zec_recovery_attestation" "$native_validator"
 }
 
 require_absolute_path() {

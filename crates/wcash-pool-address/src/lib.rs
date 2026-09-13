@@ -23,7 +23,10 @@ use wcash_pool_portal::{
     AddressValidationError, AddressValidator, Asset, ChainNetwork, ReceiverKind,
     ValidatedDestination,
 };
-use zcash_address::{unified, ConversionError, TryFromAddress, ZcashAddress};
+use zcash_address::{
+    unified::{self, Container},
+    ConversionError, TryFromAddress, ZcashAddress,
+};
 use zcash_protocol::{consensus::NetworkType, PoolType};
 
 const MAX_ADDRESS_BYTES: usize = 512;
@@ -340,7 +343,16 @@ impl TryFromAddress for ZcashReceiverClass {
         _network: NetworkType,
         address: unified::Address,
     ) -> Result<Self, ConversionError<Self::Error>> {
-        if address.has_receiver_of_type(PoolType::ORCHARD) {
+        let items = address.items();
+        let orchard_is_valid = items.iter().any(|receiver| {
+            if let unified::Receiver::Orchard(raw) = receiver {
+                Option::<orchard::Address>::from(orchard::Address::from_raw_address_bytes(raw))
+                    .is_some()
+            } else {
+                false
+            }
+        });
+        if address.has_receiver_of_type(PoolType::ORCHARD) && orchard_is_valid {
             Ok(Self::Ironwood)
         } else {
             Err(UnsupportedZcashReceiver.into())
@@ -365,6 +377,53 @@ impl TryFromAddress for ZcashReceiverClass {
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("unsupported Zcash payout receiver")]
 struct UnsupportedZcashReceiver;
+
+struct OrchardOnly;
+
+impl TryFromAddress for OrchardOnly {
+    type Error = UnsupportedZcashReceiver;
+
+    fn try_from_unified(
+        _network: NetworkType,
+        address: unified::Address,
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        let items = address.items();
+        match items.as_slice() {
+            [unified::Receiver::Orchard(raw)]
+                if Option::<orchard::Address>::from(orchard::Address::from_raw_address_bytes(
+                    raw,
+                ))
+                .is_some() =>
+            {
+                Ok(Self)
+            }
+            _ => Err(UnsupportedZcashReceiver.into()),
+        }
+    }
+}
+
+/// Validates one canonical Orchard-only Zcash Testnet Unified Address.
+///
+/// Besides ZIP-316 framing, this checks the embedded receiver with the
+/// consensus Orchard implementation. The offline collector recovery ceremony
+/// uses this authority before it seals an address commitment.
+pub fn validate_zcash_testnet_orchard_only(candidate: &str) -> Result<(), AddressValidationError> {
+    validate_candidate_shape(candidate)?;
+    let parsed =
+        ZcashAddress::try_from_encoded(candidate).map_err(|_| AddressValidationError::Malformed)?;
+    if parsed.encode() != candidate {
+        return Err(AddressValidationError::Malformed);
+    }
+    parsed
+        .convert_if_network::<OrchardOnly>(NetworkType::Test)
+        .map(|_| ())
+        .map_err(|error| match error {
+            ConversionError::IncorrectNetwork { .. } => AddressValidationError::WrongNetwork,
+            ConversionError::Unsupported(_) | ConversionError::User(_) => {
+                AddressValidationError::UnsupportedReceiver
+            }
+        })
+}
 
 fn parse_supported_zcash(
     candidate: &str,
@@ -526,9 +585,7 @@ mod tests {
     }
 
     fn testnet_ironwood() -> String {
-        let unified = unified::Address::try_from_items(vec![unified::Receiver::Orchard([9; 43])])
-            .expect("fixture unified address is valid");
-        ZcashAddress::from_unified(NetworkType::Test, unified).encode()
+        "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp".to_owned()
     }
 
     #[test]
@@ -553,6 +610,32 @@ mod tests {
         let tex = ZcashAddress::from_tex(NetworkType::Test, [12; 20]).encode();
         assert_eq!(
             parse_supported_zcash(&tex, NetworkType::Test),
+            Err(AddressValidationError::UnsupportedReceiver)
+        );
+    }
+
+    #[test]
+    fn collector_validator_requires_a_native_orchard_receiver() {
+        assert_eq!(
+            validate_zcash_testnet_orchard_only(&testnet_ironwood()),
+            Ok(())
+        );
+
+        let invalid_receiver =
+            unified::Address::try_from_items(vec![unified::Receiver::Orchard([0xff; 43])])
+                .expect("ZIP-316 accepts opaque Orchard receiver bytes");
+        let invalid_receiver =
+            ZcashAddress::from_unified(NetworkType::Test, invalid_receiver).encode();
+        assert_eq!(
+            validate_zcash_testnet_orchard_only(&invalid_receiver),
+            Err(AddressValidationError::UnsupportedReceiver)
+        );
+        assert_eq!(
+            parse_supported_zcash(&invalid_receiver, NetworkType::Test),
+            Err(AddressValidationError::UnsupportedReceiver)
+        );
+        assert_eq!(
+            validate_zcash_testnet_orchard_only(&testnet_transparent()),
             Err(AddressValidationError::UnsupportedReceiver)
         );
     }
