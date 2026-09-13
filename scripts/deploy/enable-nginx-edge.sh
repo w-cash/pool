@@ -112,6 +112,12 @@ for key in "${certificate_keys[@]}"; do
     [[ $key == *_KEY ]] && private=true
     require_trusted_etc_file "$path" "$private"
 done
+mining_certificate=$(read_setting "$settings" MINING_TLS_CERT)
+mining_private_key=$(read_setting "$settings" MINING_TLS_KEY)
+mining_host=$(read_setting "$settings" MINING_HOST)
+mining_tls_port=$(read_setting "$settings" STRATUM_TLS_PORT)
+require_public_tls_certificate \
+    "$mining_certificate" "$mining_private_key" "$mining_host"
 
 [[ -f $portal_source && ! -L $portal_source ]] || die "rendered portal nginx config is missing"
 [[ -f $stream_source && ! -L $stream_source ]] || die "rendered Stratum nginx config is missing"
@@ -167,6 +173,16 @@ if ! systemctl reload nginx.service; then
     fi
     $created_stream && rm -f -- "$stream_link"
     die "nginx reload failed; newly created links were removed"
+fi
+if ! require_public_tls_listener "$mining_host" "$mining_tls_port" 127.0.0.1; then
+    if [[ $effective_mode != stratum-only ]]; then
+        disable_managed_portal
+    fi
+    rm -f -- "$stream_link"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx.service >/dev/null 2>&1 \
+        || systemctl stop nginx.service >/dev/null 2>&1 \
+        || true
+    die "the mining TLS edge failed its public-trust identity probe"
 fi
 if [[ $effective_mode != stratum-only ]]; then
     portal_host=$(read_setting "$settings" PORTAL_HOST)

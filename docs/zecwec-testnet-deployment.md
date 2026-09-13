@@ -164,6 +164,30 @@ only an operator selection marker: rendered services and policies contain the
 resolved immutable version directory. An existing release is accepted only if
 both its binary and deployment-package manifests verify exactly.
 
+### First security-epoch-2 bootstrap
+
+When upgrading a host whose `current` selector still names an epoch-1 release,
+do not switch that link by hand and do not let a pre-authority command resolve
+the selector implicitly. The epoch-2 authority does not exist yet, so normal
+forward activation cannot run. Pin the newly installed immutable release for
+every wallet-bootstrap, credential-installation, bootstrap, and custody command
+until the backend authority has been created and the final policy rendered:
+
+```bash
+ZECWEC_BOOTSTRAP_RELEASE=/opt/wcash/releases/<epoch-2-release-id>
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_RELEASE/deployment/scripts/deploy/render-deployment.sh" \
+  wallet-bootstrap /etc/wcash-pool/deployment.env
+```
+
+Use the same `sudo env ZECWEC_RELEASE_PATH=...` prefix and the same release's
+snapshotted script for the remaining pre-authority steps below. Verify the
+literal path is one installed, root-owned, immutable release; never substitute
+`/opt/wcash/current`. After `backend-authority-protocol-v2.json` exists, use
+`activate-release.sh` once to perform the fail-closed selector transition,
+migration, preflight, start, and health gate. This is the only supported first
+epoch-1-to-epoch-2 transition.
+
 For every later forward rollout, first install and independently review schema
 compatibility, then activate the staged version explicitly:
 
@@ -687,17 +711,26 @@ sudo scripts/deploy/restrict-mining-firewall.sh \
 Do not open the allowlist manually for launch. The readiness-gated start command
 does that only after the payout worker proves a fresh lease.
 
-Install the reviewed certificates, but do not publish the web origin or mining
-DNS before this firewall gate. Install Cloudflare's current official
-Authenticated Origin Pull CA at the exact configured root-owned path, enable
-Authenticated Origin Pulls for the `zecwec.com` zone, set SSL/TLS mode to Full
-(strict), and configure the edge to redirect HTTP to HTTPS. Do not substitute
-an arbitrary client CA. nginx snippets are staged in `sites-available` and
-`streams-available`. The start command enables only the source-restricted TLS
-mining edge and deliberately leaves the portal site disabled. An SSH tunnel may be
-used for service diagnostics, but it is not browser E2E evidence: it does not
-exercise the canonical HTTPS origin, `Secure`/`__Host-` cookies, or Cloudflare
-Authenticated Origin Pulls.
+Install the publicly trusted mining certificate and matching private key before
+starting the pool, but do not publish mining DNS yet. The edge gate proves the
+certificate covers `testnet-mine.zecwec.com`, has at least seven days remaining,
+matches its private key, chains to the host's public trust store, and is the
+certificate actually served by nginx on port 3443. A file-presence or listening-
+port check alone is not accepted.
+
+The apex and portal certificates, Cloudflare Authenticated Origin Pull CA,
+proxied web DNS, Full (strict) zone setting, and Access application are not
+prerequisites for this Stratum-only start. Configure them immediately before
+`stage-portal`; that command requires both the apex and Testnet portal
+certificate/key pairs because nginx loads both web virtual hosts. Install
+Cloudflare's current official Authenticated Origin Pull CA at the exact
+configured root-owned path and do not substitute an arbitrary client CA. nginx
+snippets are staged in `sites-available` and `streams-available`. The start
+command enables only the source-restricted TLS mining edge and deliberately
+leaves the portal site disabled. An SSH tunnel may be used for service
+diagnostics, but it is not browser E2E evidence: it does not exercise the
+canonical HTTPS origin, `Secure`/`__Host-` cookies, or Cloudflare Authenticated
+Origin Pulls.
 
 If an older pool uses a different unit name but still occupies either mining
 port, archive and disable that unit before continuing. The listener-free
