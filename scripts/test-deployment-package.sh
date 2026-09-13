@@ -43,6 +43,18 @@ done
 grep -Fq 'base_commit=987382f67e622915228686e9f956c6a9c9a7514c' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'toolchain=1.95.0' "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'protoc_version=25.9' "$repo_root/scripts/build-zallet-testnet.sh"
+grep -Fq 'protoc_sha256=88f2d0c78a1072c4f84c59e9f9785b74849953e882a573188bc2d0518915b03e' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'export PROTOC="$protoc_root/bin/protoc"' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'export PROTOC_INCLUDE="$protoc_root/include"' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq '"$PROTOC" --version >"$temporary/protoc-version"' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
 # shellcheck disable=SC2016
 grep -Fq 'cd "$source_dir"' "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq -- '--manifest-path backends/zaino/Cargo.toml' \

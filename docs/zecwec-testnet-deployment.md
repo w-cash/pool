@@ -259,7 +259,7 @@ creating authority or payout state. The authority file's `schema_version: 1`
 is an independent on-disk schema, and the wallet CLI's version-1 error envelope
 is an independent failure-only protocol. Neither is accepted as a successful
 wallet response. Before the first mining job, restore the protected seed into
-a fresh isolated wallet and prove it reproduces the frozen account and payout
+a fresh isolated wallet and prove it reproduces the frozen seed-derived payout
 commitment; an IVK proves receipt capability but not spendability.
 
 Keep the fresh isolated wallet's `init` and `payout-identity` JSON outputs in
@@ -275,14 +275,17 @@ sudo scripts/deploy/seal-wcash-custody.sh \
   --ack-independent-offline-backup-recovery
 ```
 
-The verifier requires a newly created isolated database and exact equality of
-network, genesis, branch ID, account, both derived addresses, and payout
-commitment. It writes only a deterministic root-only attestation, changes the
-seed and its parent to `root:root` mode `0400`/`0700`, and proves with a
-dropped-privilege access check that `wcash-pool` cannot read it. Securely erase
-the temporary recovery output files after review. Re-running host provisioning
-preserves this sealed state. Reopening custody later is a separate, explicit
-payout ceremony; it must never overlap the mining service.
+The verifier requires a newly created isolated database, a canonical and
+internally consistent database-local account UUID, and exact equality of
+network, genesis, branch ID, both seed-derived addresses, birthday, and payout
+commitment. The UUID itself is deliberately not compared with the live wallet:
+`zcash_client_sqlite` assigns a new random database-local UUID on each fresh
+restore. The verifier writes only a deterministic root-only attestation,
+changes the seed and its parent to `root:root` mode `0400`/`0700`, and proves
+with a dropped-privilege access check that `wcash-pool` cannot read it. Securely
+erase the temporary recovery output files after review. Re-running host
+provisioning preserves this sealed state. Reopening custody later is a
+separate, explicit payout ceremony; it must never overlap the mining service.
 
 Start only the persistent Zallet wallet and verify its authenticated Testnet
 status:
