@@ -21,7 +21,7 @@ destinations in the private web portal.
 | Reward method | Chain-specific PPLNS based on accepted work, not raw share count |
 | WEC collector | Direct private Wcash Ironwood coinbase, gated by exact read-only recipient verification |
 | ZEC collector | Direct Zcash Ironwood coinbase; receipt remains publicly recoverable under ZIP-213 |
-| Miner destinations | Separate Wcash and Zcash Ironwood-capable addresses; no transparent fallback in the launch pool |
+| Miner destinations | Wcash Ironwood-capable address; Zcash transparent P2PKH/P2SH or Ironwood-capable address, chosen by the miner |
 | Custody | Separate collectors, wallets, keys, ledgers, maturity rules, and payout batches for WEC and ZEC |
 | Testnet/Mainnet | Separate deployments and security domains; Mainnet stays unavailable until a later audited release |
 | Initial settlement | PPLNS and automatic threshold payouts; no PPS/PPS+ balance-sheet risk at launch |
@@ -269,10 +269,11 @@ chain reorganizations, and orphaned blocks.
   a promise of daily ZEC income.
 - Version 1 uses automatic payouts only. Manual instant withdrawals add an
   unnecessary hot-wallet and account-takeover surface.
-- The launch pool accepts only Ironwood-capable miner payout destinations on
-  both chains. Wolf still permits a solo miner or a separately operated pool
-  to select transparent coinbase, but ZecWec never silently downgrades a
-  shielded payout batch to transparent output.
+- Wcash miner payouts require an Ironwood-capable destination. Zcash miners
+  choose a transparent P2PKH/P2SH destination or an Ironwood-capable Unified
+  Address. The signer verifies the exact requested receiver and amount;
+  a shielded request is never changed to a transparent output. Collector
+  coinbase policy remains separate from the miner's payout address choice.
 
 Changing a Mainnet payout destination requires strong reauthentication, sends
 an immediate security notification, and places that asset's payouts on a
