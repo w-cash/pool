@@ -50,6 +50,9 @@ pub enum DeploymentNetwork {
     Testnet,
     /// Value-bearing production networks.
     Mainnet,
+    /// Isolated local chain used only by explicitly enabled integration builds.
+    #[cfg(feature = "regtest")]
+    Regtest,
 }
 
 impl DeploymentNetwork {
@@ -58,6 +61,8 @@ impl DeploymentNetwork {
         match self {
             Self::Testnet => "testnet",
             Self::Mainnet => "mainnet",
+            #[cfg(feature = "regtest")]
+            Self::Regtest => "regtest",
         }
     }
 }
@@ -3519,6 +3524,8 @@ const fn network_for_deployment(network: DeploymentNetwork) -> ChainNetwork {
     match network {
         DeploymentNetwork::Testnet => ChainNetwork::Testnet,
         DeploymentNetwork::Mainnet => ChainNetwork::Mainnet,
+        #[cfg(feature = "regtest")]
+        DeploymentNetwork::Regtest => ChainNetwork::Regtest,
     }
 }
 

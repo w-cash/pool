@@ -10,6 +10,11 @@ repository.workspace = true
 publish = false
 readme = "README.md"
 
+[features]
+default = []
+# Isolated local chain integration only; never enabled in deployment builds.
+regtest = ["wcash-pool-portal/regtest"]
+
 [dependencies]
 argon2.workspace = true
 futures-util.workspace = true

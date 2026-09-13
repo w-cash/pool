@@ -108,6 +108,8 @@ impl PayoutBatchRequest {
         hasher.update([match self.network {
             ChainNetwork::Testnet => 1,
             ChainNetwork::Mainnet => 2,
+            #[cfg(feature = "regtest")]
+            ChainNetwork::Regtest => 3,
         }]);
         hasher.update(self.ledger_root);
         hasher.update(self.reconciliation_id.as_bytes());
@@ -215,6 +217,7 @@ pub struct TestnetPayoutBoundary {
     signer: Arc<dyn IsolatedPayoutSigner>,
     readiness_slots: Arc<Semaphore>,
     execution: PayoutExecution,
+    network: ChainNetwork,
 }
 
 /// Public operational state of the payout execution boundary.
@@ -243,6 +246,7 @@ impl TestnetPayoutBoundary {
             signer,
             readiness_slots: Arc::new(Semaphore::new(1)),
             execution: PayoutExecution::Enabled,
+            network: ChainNetwork::Testnet,
         }
     }
 
@@ -252,7 +256,15 @@ impl TestnetPayoutBoundary {
             signer: Arc::new(DisabledPayoutSigner),
             readiness_slots: Arc::new(Semaphore::new(1)),
             execution: PayoutExecution::Deferred,
+            network: ChainNetwork::Testnet,
         }
+    }
+
+    /// Selects the isolated integration network without weakening default boundaries.
+    #[cfg(feature = "regtest")]
+    pub fn with_regtest_network(mut self) -> Self {
+        self.network = ChainNetwork::Regtest;
+        self
     }
 
     /// Returns the immutable execution policy for health and operator status.
@@ -292,7 +304,7 @@ impl TestnetPayoutBoundary {
         if self.execution == PayoutExecution::Deferred {
             return Err(SignerError::NotConfigured);
         }
-        if request.network != ChainNetwork::Testnet {
+        if request.network != self.network {
             return Err(SignerError::WrongNetwork);
         }
         let expected_total = request.validate()?;

@@ -143,7 +143,7 @@ impl PortalApp {
     ) -> Result<Self, PortalBuildError> {
         config.validate()?;
         secrets.validate()?;
-        if config.network != crate::ChainNetwork::Testnet {
+        if config.network == crate::ChainNetwork::Mainnet {
             return Err(PortalBuildError::MainnetDisabled);
         }
         let dummy_password_hash = hash_password("dummy credential never authenticates")?;

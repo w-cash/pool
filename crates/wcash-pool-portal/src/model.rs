@@ -45,6 +45,9 @@ pub enum ChainNetwork {
     Testnet,
     /// Monetary production network.
     Mainnet,
+    /// Isolated local chain used only by explicitly enabled integration builds.
+    #[cfg(feature = "regtest")]
+    Regtest,
 }
 
 impl ChainNetwork {
@@ -53,6 +56,8 @@ impl ChainNetwork {
         match self {
             Self::Testnet => "testnet",
             Self::Mainnet => "mainnet",
+            #[cfg(feature = "regtest")]
+            Self::Regtest => "regtest",
         }
     }
 }
@@ -64,6 +69,8 @@ impl FromStr for ChainNetwork {
         match value {
             "testnet" => Ok(Self::Testnet),
             "mainnet" => Ok(Self::Mainnet),
+            #[cfg(feature = "regtest")]
+            "regtest" => Ok(Self::Regtest),
             _ => Err(()),
         }
     }

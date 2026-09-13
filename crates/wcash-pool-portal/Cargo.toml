@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+# Isolated local chain integration only; never enabled in deployment builds.
+regtest = []
+
 [dependencies]
 argon2.workspace = true
 axum.workspace = true

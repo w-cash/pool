@@ -518,7 +518,8 @@ async fn configure_payout(
     if change.account_id.is_nil()
         || change.threshold_zat == 0
         || change.threshold_zat > MAXIMUM_MONEY_ZAT
-        || change.replacement_hold_secs != PAYOUT_CONFIGURATION_HOLD_SECS
+        || change.replacement_hold_secs
+            != payout_configuration_hold_secs(change.network)
         || change.address_digest.iter().all(|byte| *byte == 0)
     {
         return Err(RepositoryError::InvalidState);
@@ -1203,11 +1204,7 @@ where
 }
 
 fn require_network(store: &PostgresStore, network: ChainNetwork) -> Result<(), RepositoryError> {
-    let matches = matches!(
-        (store.identity.network, network),
-        (DeploymentNetwork::Testnet, ChainNetwork::Testnet)
-            | (DeploymentNetwork::Mainnet, ChainNetwork::Mainnet)
-    );
+    let matches = store.identity.network.as_str() == network.as_str();
     if matches {
         Ok(())
     } else {
@@ -1303,4 +1300,13 @@ mod tests {
         drop(recovered);
         Ok(())
     }
+}
+
+fn payout_configuration_hold_secs(network: ChainNetwork) -> u64 {
+    #[cfg(feature = "regtest")]
+    if network == ChainNetwork::Regtest {
+        return 1;
+    }
+    let _ = network;
+    PAYOUT_CONFIGURATION_HOLD_SECS
 }
