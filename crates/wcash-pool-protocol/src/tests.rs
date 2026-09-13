@@ -1191,7 +1191,7 @@ fn side_chain_evidence_requires_zcash_and_distinct_valid_identity() -> TestResul
         ("/event_seq", serde_json::json!(0)),
     ] {
         let mut invalid = encoded.clone();
-        *invalid.pointer_mut(pointer).expect("existing wire field") = value;
+        *invalid.pointer_mut(pointer).ok_or("missing test wire field")? = value;
         let invalid: BackendEvent = serde_json::from_value(invalid)?;
         assert!(
             invalid.validate().is_err(),
