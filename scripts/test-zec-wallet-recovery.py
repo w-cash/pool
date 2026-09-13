@@ -54,7 +54,14 @@ class RpcState:
 
     def result(self, method: str, params: object) -> object:
         if method == "getwalletstatus":
-            result = {"node_tip": self.tip, "wallet_tip": self.tip, "locked": False}
+            result = {
+                "node_tip": self.tip,
+                "wallet_tip": self.tip,
+                # Pinned Zallet beta.3 cannot derive a fully-scanned height
+                # before an account exists, so its synchronization lock stays
+                # set in this otherwise terminal bootstrap state.
+                "locked": not self.created,
+            }
             if self.created:
                 result["fully_synced_height"] = self.tip["height"]
             return result
@@ -250,6 +257,57 @@ class RecoveryVerifierTest(unittest.TestCase):
         self.assertEqual(
             MODULE.read_object(os.fspath(attestation), "attestation"), expected
         )
+
+    def test_pre_account_lock_exception_is_exact_and_accountless(self) -> None:
+        locked = {
+            "node_tip": ORIGINAL_TIP,
+            "wallet_tip": ORIGINAL_TIP,
+            "locked": True,
+        }
+        self.assertEqual(
+            MODULE.validate_status(locked, "pre-account status", False),
+            ORIGINAL_TIP["height"],
+        )
+
+        for mutation in (
+            {"sync_work_remaining": None},
+            {"fully_synced_height": ORIGINAL_TIP["height"]},
+            {"locked": 1},
+            {"wallet_tip": {"height": ORIGINAL_TIP["height"] - 1, "blockhash": "56" * 32}},
+        ):
+            invalid = dict(locked)
+            invalid.update(mutation)
+            with self.assertRaises(SystemExit):
+                MODULE.validate_status(invalid, "pre-account status", False)
+
+        with self.assertRaises(SystemExit):
+            MODULE.validate_status(locked, "post-account status", True)
+
+        server, thread, state = self.server(False)
+        original_result = state.result
+
+        def nonempty_pre_accounts(method: str, params: object) -> object:
+            if method == "z_listaccounts" and not state.created:
+                return [{"unexpected": "account"}]
+            return original_result(method, params)
+
+        state.result = nonempty_pre_accounts  # type: ignore[method-assign]
+        output = self.root / "nonempty-pre-accounts.rpc.json"
+        try:
+            with self.assertRaises(SystemExit):
+                MODULE.capture_original(
+                    os.fspath(self.settings),
+                    f"127.0.0.1:{server.server_port}",
+                    os.fspath(self.cookie),
+                    os.fspath(output),
+                    os.fspath(self.native),
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+        self.assertFalse(output.exists())
+        self.assertFalse((self.root / f"{output.name}.mutation-intent").exists())
 
     def test_rejects_mutated_or_hand_authored_transcript(self) -> None:
         original, recovered = self.capture_pair()

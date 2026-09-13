@@ -56,18 +56,63 @@ def wallet_status_is_ready(result: object) -> bool:
         return False
     if "sync_work_remaining" in result:
         return False
-    # Zallet omits this field until an account exists. The native authority gate
-    # later requires it to equal the common tip for the frozen collector account.
+    # Ordinary readiness is only valid after an account exists and Zallet can
+    # prove that account has been fully scanned to the common tip. The one
+    # accountless bootstrap state is handled separately and requires a second
+    # authenticated account-list query.
     if "fully_synced_height" not in result:
-        return True
+        return False
     fully_synced_height = result["fully_synced_height"]
     return type(fully_synced_height) is int and fully_synced_height == wallet_height
 
 
-def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
-    encoded = base64.b64encode(cookie.encode("ascii")).decode("ascii")
+def accountless_status_needs_confirmation(result: object) -> bool:
+    """Recognize Zallet beta.3's terminal zero-account synchronization state.
+
+    Zallet cannot publish a fully-scanned height before an account exists, so
+    its synchronization lock remains set even after its wallet and node tips
+    match. This narrow state is usable only after a second authenticated RPC
+    proves that the wallet really has no accounts.
+    """
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"node_tip", "wallet_tip", "locked"}
+        or result["locked"] is not True
+    ):
+        return False
+    node_tip = result["node_tip"]
+    wallet_tip = result["wallet_tip"]
+    if (
+        not isinstance(node_tip, dict)
+        or not isinstance(wallet_tip, dict)
+        or set(node_tip) != {"height", "blockhash"}
+        or set(wallet_tip) != {"height", "blockhash"}
+    ):
+        return False
+    node_height = node_tip.get("height")
+    node_hash = node_tip.get("blockhash")
+    return (
+        type(node_height) is int
+        and 0 < node_height <= 0xFFFFFFFF
+        and isinstance(node_hash, str)
+        and len(node_hash) == 64
+        and node_hash != "0" * 64
+        and all(char in "0123456789abcdef" for char in node_hash)
+        and wallet_tip == node_tip
+    )
+
+
+def rpc_result(
+    host: str,
+    port: int,
+    encoded_cookie: str,
+    request_id: str,
+    method: str,
+    params: object,
+    timeout: float,
+) -> object:
     body = json.dumps(
-        {"jsonrpc": "2.0", "id": "zecwec-readiness", "method": "getwalletstatus", "params": []},
+        {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
         separators=(",", ":"),
     )
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -77,7 +122,7 @@ def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
             "/",
             body=body,
             headers={
-                "Authorization": f"Basic {encoded}",
+                "Authorization": f"Basic {encoded_cookie}",
                 "Content-Type": "application/json",
                 "Connection": "close",
             },
@@ -85,18 +130,52 @@ def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
         response = connection.getresponse()
         payload = response.read(1024 * 1024)
         if response.status != 200:
-            return False
+            raise ValueError("unexpected RPC status")
         decoded = json.loads(payload)
-        return (
-            isinstance(decoded, dict)
-            and decoded.get("id") == "zecwec-readiness"
-            and decoded.get("error") is None
-            and wallet_status_is_ready(decoded.get("result"))
-        )
-    except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
-        return False
+        if (
+            not isinstance(decoded, dict)
+            or set(decoded) != {"jsonrpc", "id", "result"}
+            or decoded["jsonrpc"] != "2.0"
+            or decoded["id"] != request_id
+        ):
+            raise ValueError("invalid RPC envelope")
+        return decoded["result"]
     finally:
         connection.close()
+
+
+def probe(host: str, port: int, cookie: str, timeout: float) -> bool:
+    encoded = base64.b64encode(cookie.encode("ascii")).decode("ascii")
+    deadline = time.monotonic() + timeout
+    try:
+        status = rpc_result(
+            host,
+            port,
+            encoded,
+            "zecwec-readiness",
+            "getwalletstatus",
+            [],
+            timeout,
+        )
+        if wallet_status_is_ready(status):
+            return True
+        if not accountless_status_needs_confirmation(status):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        accounts = rpc_result(
+            host,
+            port,
+            encoded,
+            "zecwec-readiness-accounts",
+            "z_listaccounts",
+            [False],
+            remaining,
+        )
+        return accounts == []
+    except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
+        return False
 
 
 def main() -> None:

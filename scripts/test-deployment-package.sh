@@ -695,7 +695,10 @@ ready = {
 assert module.wallet_status_is_ready(ready) is True
 accountless = dict(ready)
 accountless.pop("fully_synced_height")
-assert module.wallet_status_is_ready(accountless) is True
+assert module.wallet_status_is_ready(accountless) is False
+locked_accountless = dict(accountless)
+locked_accountless["locked"] = True
+assert module.accountless_status_needs_confirmation(locked_accountless) is True
 for field, value in [
     ("locked", True),
     ("sync_work_remaining", {"unscanned_blocks": 1}),
@@ -735,34 +738,130 @@ class StaticRpcResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 class StaticRpcConnection:
-    payload = None
+    payloads = []
+    requests = []
 
     def __init__(self, *_args, **_kwargs):
         pass
 
-    def request(self, *_args, **_kwargs):
-        pass
+    def request(self, _method, _path, body, **_kwargs):
+        self.requests.append(json.loads(body))
 
     def getresponse(self):
-        return StaticRpcResponse(self.payload)
+        return StaticRpcResponse(self.payloads.pop(0))
 
     def close(self):
         pass
 
 module.http.client.HTTPConnection = StaticRpcConnection
-StaticRpcConnection.payload = {
+StaticRpcConnection.payloads = [{
+    "jsonrpc": "2.0",
     "id": "zecwec-readiness",
-    "error": None,
     "result": ready,
-}
+}]
 assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is True
 for malformed in [
     [],
-    {"id": "wrong-id", "error": None, "result": ready},
-    {"id": "zecwec-readiness", "error": {"code": -1}, "result": ready},
+    {"jsonrpc": "2.0", "id": "wrong-id", "result": ready},
+    {"jsonrpc": "2.0", "id": "zecwec-readiness", "error": None, "result": ready},
 ]:
-    StaticRpcConnection.payload = malformed
+    StaticRpcConnection.payloads = [malformed]
     assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is False
+
+StaticRpcConnection.requests = []
+StaticRpcConnection.payloads = [
+    {
+        "jsonrpc": "2.0",
+        "id": "zecwec-readiness",
+        "result": locked_accountless,
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": "zecwec-readiness-accounts",
+        "result": [],
+    },
+]
+assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is True
+assert [request["method"] for request in StaticRpcConnection.requests] == [
+    "getwalletstatus",
+    "z_listaccounts",
+]
+assert StaticRpcConnection.requests[1]["params"] == [False]
+
+for accounts in [None, {}, ["existing-account"]]:
+    StaticRpcConnection.payloads = [
+        {
+            "jsonrpc": "2.0",
+            "id": "zecwec-readiness",
+            "result": locked_accountless,
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "zecwec-readiness-accounts",
+            "result": accounts,
+        },
+    ]
+    assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is False
+
+for malformed_accounts in [
+    {
+        "jsonrpc": "2.0",
+        "id": "zecwec-readiness",
+        "result": [],
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": "zecwec-readiness-accounts",
+        "error": {"code": -1},
+        "result": [],
+    },
+    {
+        "id": "zecwec-readiness-accounts",
+        "result": [],
+    },
+    {
+        "jsonrpc": "1.0",
+        "id": "zecwec-readiness-accounts",
+        "result": [],
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": "zecwec-readiness-accounts",
+        "result": [],
+        "extra": None,
+    },
+]:
+    StaticRpcConnection.payloads = [
+        {
+            "jsonrpc": "2.0",
+            "id": "zecwec-readiness",
+            "result": locked_accountless,
+        },
+        malformed_accounts,
+    ]
+    assert module.probe("127.0.0.1", 28232, "user:test-value", 0.1) is False
+
+for mutation in [
+    {"sync_work_remaining": None},
+    {"fully_synced_height": tip["height"]},
+    {"locked": 1},
+    {"wallet_tip": {"blockhash": "11" * 32, "height": tip["height"]}},
+    {
+        "node_tip": {
+            "blockhash": tip["blockhash"],
+            "height": tip["height"],
+            "extra": None,
+        },
+        "wallet_tip": {
+            "blockhash": tip["blockhash"],
+            "height": tip["height"],
+            "extra": None,
+        },
+    },
+]:
+    invalid = dict(locked_accountless)
+    invalid.update(mutation)
+    assert module.accountless_status_needs_confirmation(invalid) is False
 PY
 cargo build --locked --quiet --manifest-path "$repo_root/Cargo.toml" \
     --package wcash-poold --bin wcash-poold
