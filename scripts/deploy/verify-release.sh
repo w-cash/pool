@@ -34,28 +34,43 @@ if [[ $binary == deployment-package ]]; then
     [[ -f $package/DEPLOYMENT-SCHEMA \
         && $(cat -- "$package/DEPLOYMENT-SCHEMA") == 1 ]] \
         || die "deployment package schema is unsupported"
-    if find "$package" -type l -o ! -type d ! -type f | grep -q .; then
-        die "deployment package contains an unsupported file type"
+    audit=$(mktemp -d) || die "cannot create deployment verification workspace"
+    chmod 0700 -- "$audit" || die "cannot protect deployment verification workspace"
+    trap 'rm -rf -- "$audit"' EXIT
+    if ! find "$package" \( -type l -o ! -type d ! -type f \) \
+        -print >"$audit/unsupported"; then
+        die "deployment package file types cannot be inspected"
     fi
-    if find "$package" \( ! -user root -o -perm /022 \) -print -quit | grep -q .; then
-        die "deployment package ownership or mode is unsafe"
+    [[ ! -s $audit/unsupported ]] \
+        || die "deployment package contains an unsupported file type"
+    if ! find "$package" \( ! -user root -o -perm /022 \) \
+        -print >"$audit/unsafe-metadata"; then
+        die "deployment package ownership and modes cannot be inspected"
     fi
+    [[ ! -s $audit/unsafe-metadata ]] \
+        || die "deployment package ownership or mode is unsafe"
     if awk 'NF != 2 || $1 !~ /^[0-9a-f]{64}$/ || $2 !~ /^deployment\/[A-Za-z0-9._\/-]+$/ || $2 ~ /(^|\/)\.\.?(\/|$)/ { exit 1 }' \
         "$manifest"; then
         :
     else
         die "deployment package manifest syntax is invalid"
     fi
-    manifest_count=$(wc -l <"$manifest")
-    file_count=$(find "$package" -type f | wc -l)
+    if ! (cd -- "$release_root" && find deployment -type f -print) \
+        >"$audit/files.unsorted"; then
+        die "deployment package file inventory cannot be inspected"
+    fi
+    LC_ALL=C sort -- "$audit/files.unsorted" >"$audit/files" \
+        || die "deployment package file inventory cannot be sorted"
+    if ! awk '{print $2}' "$manifest" >"$audit/manifest.unsorted"; then
+        die "deployment package manifest paths cannot be read"
+    fi
+    LC_ALL=C sort -- "$audit/manifest.unsorted" >"$audit/manifest" \
+        || die "deployment package manifest paths cannot be sorted"
+    manifest_count=$(wc -l <"$audit/manifest")
+    file_count=$(wc -l <"$audit/files")
     [[ $manifest_count -eq $file_count ]] \
         || die "deployment package manifest does not cover every file"
-    if ! (
-        cd -- "$release_root"
-        cmp --silent \
-            <(find deployment -type f -print | LC_ALL=C sort) \
-            <(awk '{print $2}' DEPLOYMENT-SHA256SUMS | LC_ALL=C sort)
-    ); then
+    if ! cmp --silent "$audit/files" "$audit/manifest"; then
         die "deployment package manifest path set is incomplete or duplicated"
     fi
     (
