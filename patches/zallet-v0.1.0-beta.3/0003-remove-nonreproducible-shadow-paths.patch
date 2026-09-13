@@ -1,0 +1,26 @@
+diff --git a/zallet-core/build.rs b/zallet-core/build.rs
+index 2a4426c..b05f711 100644
+--- a/zallet-core/build.rs
++++ b/zallet-core/build.rs
+@@ -9,7 +9,7 @@ use clap_complete::{Shell, generate_to};
+ use clap_mangen::Man;
+ use flate2::{Compression, write::GzEncoder};
+ use i18n_embed::unic_langid::LanguageIdentifier;
+-use shadow_rs::ShadowBuilder;
++use shadow_rs::{CARGO_MANIFEST_DIR, CARGO_TREE, ShadowBuilder, default_deny};
+ 
+ const JSON_RPC_METHODS_RS: &str = "src/components/json_rpc/methods.rs";
+ 
+@@ -60,7 +60,11 @@ fn main() -> Result<(), Box<dyn Error>> {
+         .to_path_buf();
+ 
+     // Collect build-time information.
+-    ShadowBuilder::builder().build()?;
++    let mut denied_build_constants = default_deny();
++    denied_build_constants.extend([CARGO_MANIFEST_DIR, CARGO_TREE]);
++    ShadowBuilder::builder()
++        .deny_const(denied_build_constants)
++        .build()?;
+ 
+     // TODO: Improve the build script so this works with non-wallet Zallet builds.
+     #[cfg(not(zallet_build = "merchant_terminal"))]

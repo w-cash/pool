@@ -17,6 +17,10 @@ The ordered patch set is deliberately small:
    `1d5a012931675caeed01c29aef30dcea829788ae`, which signals the data-request
    worker only after chain writes are stored. This closes upstream issue #817
    without taking unrelated unreleased changes.
+3. Exclude `shadow-rs`'s `CARGO_MANIFEST_DIR` and `CARGO_TREE` constants from
+   generated build metadata. Both can contain the ephemeral source path; they
+   are unused by Zallet at runtime and make otherwise identical binaries
+   non-reproducible.
 
 The capacity patch is not a substitute for upstream's broader RPC
 resource-ordering work in pull request #716. ZecWec serializes collector
@@ -24,10 +28,10 @@ mutations through one process-wide signer mutex and an exclusive journal lock,
 retains bounded RPC deadlines, and keeps the pool private while that work
 remains unreleased. The deployment must not add another independent Zallet
 mutation client. A future Zallet upgrade must re-audit and either drop or rebase
-both patches.
+all patches.
 
 Build the pinned backend with `scripts/build-zallet-testnet.sh`. The script
-fetches only the exact base commit, checks both patches before applying them,
+fetches only the exact base commit, checks all patches before applying them,
 runs the low-core capacity regressions and sync tests, builds with both
 `rpc-cli` and `zcashd-import`, and writes a non-secret provenance record beside
 the output binary. One successful build is a private Testnet candidate only.

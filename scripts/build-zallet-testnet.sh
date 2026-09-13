@@ -21,6 +21,15 @@ output=$1
     printf 'build-zallet-testnet: output directory must be absolute\n' >&2
     exit 1
 }
+[[ ! -e $output && ! -L $output ]] || {
+    printf 'build-zallet-testnet: output directory already exists\n' >&2
+    exit 1
+}
+output_parent=$(dirname -- "$output")
+[[ -d $output_parent && ! -L $output_parent ]] || {
+    printf 'build-zallet-testnet: output parent must be a real directory\n' >&2
+    exit 1
+}
 
 for command in cargo curl git install python3 rustc rustup sha256sum unzip; do
     command -v "$command" >/dev/null 2>&1 || {
@@ -31,7 +40,8 @@ done
 
 temporary=$(mktemp -d)
 temporary=$(CDPATH='' cd -- "$temporary" && pwd -P)
-trap 'rm -rf -- "$temporary"' EXIT
+staging=$(mktemp -d "$output_parent/.zallet-build.XXXXXX")
+trap 'rm -rf -- "$temporary" "$staging"' EXIT
 source_dir="$temporary/source"
 target_dir="$temporary/target"
 cargo_home="$temporary/cargo-home"
@@ -54,9 +64,14 @@ git -C "$source_dir" -c advice.detachedHead=false checkout --quiet --detach FETC
 [[ $(git -C "$source_dir" rev-parse HEAD) == "$base_commit" ]]
 [[ -z $(git -C "$source_dir" status --porcelain) ]]
 
-for patch in \
-    "$patch_dir/0001-reserve-wallet-database-capacity.patch" \
-    "$patch_dir/0002-signal-data-requests-after-chain-writes.patch"; do
+patches=(
+    "$patch_dir/0001-reserve-wallet-database-capacity.patch"
+    "$patch_dir/0002-signal-data-requests-after-chain-writes.patch"
+    "$patch_dir/0003-remove-nonreproducible-shadow-paths.patch"
+)
+applied_patch_list=$temporary/applied-patches
+printf '%s\n' "${patches[@]}" >"$applied_patch_list"
+for patch in "${patches[@]}"; do
     git -C "$source_dir" apply --check "$patch"
     git -C "$source_dir" apply "$patch"
 done
@@ -91,21 +106,37 @@ grep -Fx "libprotoc $protoc_version" "$temporary/protoc-version" >/dev/null
         --bin zallet-zaino
 )
 
-install -d -m 0755 "$output"
-install -m 0555 "$target_dir/release/zallet-zaino" "$output/zallet"
+python3 - "$target_dir" "$temporary" <<'PY'
+import pathlib
+import sys
+
+target_dir = pathlib.Path(sys.argv[1])
+temporary = sys.argv[2].encode("utf-8")
+shadow_files = sorted(target_dir.glob("**/build/zallet-core-*/out/shadow.rs"))
+if not shadow_files:
+    raise SystemExit("build-zallet-testnet: generated shadow metadata is missing")
+for shadow_file in shadow_files:
+    content = shadow_file.read_bytes()
+    if b"pub const CARGO_MANIFEST_DIR" in content or b"pub const CARGO_TREE" in content:
+        raise SystemExit("build-zallet-testnet: non-reproducible shadow metadata was generated")
+    if temporary in content:
+        raise SystemExit("build-zallet-testnet: generated shadow metadata contains its build path")
+PY
+
+install -m 0555 "$target_dir/release/zallet-zaino" "$staging/zallet"
 (
-    cd "$output"
+    cd "$staging"
     sha256sum zallet >ZALLET_SHA256SUM
 )
 python3 - \
-    "$output/PROVENANCE.json" \
+    "$staging/PROVENANCE.json" \
     "$base_commit" \
-    "$patch_dir" \
+    "$applied_patch_list" \
     "$temporary/rustc-version" \
     "$temporary/cargo-version" \
     "$temporary/protoc-version" \
     "$source_dir" \
-    "$output/zallet" \
+    "$staging/zallet" \
     "$temporary" \
     "$protoc_version" \
     "$protoc_sha256" <<'PY'
@@ -116,7 +147,12 @@ import subprocess
 import sys
 
 output = pathlib.Path(sys.argv[1])
-patches = sorted(pathlib.Path(sys.argv[3]).glob("*.patch"))
+patches = [
+    pathlib.Path(line)
+    for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines()
+]
+if not patches or len(patches) != len(set(patches)):
+    raise SystemExit("build-zallet-testnet: applied patch list is invalid")
 source_dir = pathlib.Path(sys.argv[7])
 binary = pathlib.Path(sys.argv[8])
 temporary = sys.argv[9].encode("utf-8")
@@ -152,5 +188,15 @@ record = {
 }
 output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
-chmod 0444 "$output/ZALLET_SHA256SUM" "$output/PROVENANCE.json"
+chmod 0444 "$staging/ZALLET_SHA256SUM" "$staging/PROVENANCE.json"
+(
+    cd "$staging"
+    sha256sum --strict --check --status ZALLET_SHA256SUM
+)
+[[ ! -e $output && ! -L $output ]] || {
+    printf 'build-zallet-testnet: output directory appeared during the build\n' >&2
+    exit 1
+}
+mv -T -- "$staging" "$output"
+trap 'rm -rf -- "$temporary"' EXIT
 printf 'build-zallet-testnet: verified patched binary written to %s\n' "$output"
