@@ -1240,6 +1240,15 @@ fn portal_receiver_from_name(value: &str) -> Result<PortalReceiverKind, Reposito
     }
 }
 
+fn payout_configuration_hold_secs(network: ChainNetwork) -> u64 {
+    #[cfg(feature = "regtest")]
+    if network == ChainNetwork::Regtest {
+        return 1;
+    }
+    let _ = network;
+    PAYOUT_CONFIGURATION_HOLD_SECS
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1299,13 +1308,4 @@ mod tests {
         drop(recovered);
         Ok(())
     }
-}
-
-fn payout_configuration_hold_secs(network: ChainNetwork) -> u64 {
-    #[cfg(feature = "regtest")]
-    if network == ChainNetwork::Regtest {
-        return 1;
-    }
-    let _ = network;
-    PAYOUT_CONFIGURATION_HOLD_SECS
 }
