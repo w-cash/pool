@@ -1130,7 +1130,7 @@ impl ZecPcztSigner {
             return Err(ZecPayoutError::WalletProtocolViolation);
         }
 
-        let expected_ironwood: Vec<(&str, u64)> = request
+        let mut expected_ironwood: Vec<(&str, u64)> = request
             .batch
             .outputs
             .iter()
@@ -1144,7 +1144,12 @@ impl ZecPcztSigner {
             .filter(|output| output.user_address.is_some())
             .map(|output| Some((output.user_address.as_deref()?, output.value_zat?)))
             .collect();
-        if actual_ironwood.as_deref() != Some(expected_ironwood.as_slice()) {
+        let mut actual_ironwood = actual_ironwood.ok_or(ZecPayoutError::WalletProtocolViolation)?;
+        // Shielded action order is randomized by the consensus builder. Match
+        // the exact recipient multiset, preserving duplicate/count checks.
+        expected_ironwood.sort_unstable();
+        actual_ironwood.sort_unstable();
+        if actual_ironwood != expected_ironwood {
             return Err(ZecPayoutError::WalletProtocolViolation);
         }
 

@@ -105,6 +105,7 @@ struct TestPczt {
     recipient_unified_address: String,
     recipient_kind: ReceiverKind,
     fee_zat: u64,
+    extra_recipient: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -282,6 +283,22 @@ fn build_destination_pczt(
     payout_zat: u64,
     transparent: Option<TransparentAddress>,
 ) -> (String, TestPcztIdentity) {
+    build_outputs_pczt(
+        expiry_height,
+        recipient_seed,
+        payout_zat,
+        transparent,
+        false,
+    )
+}
+
+fn build_outputs_pczt(
+    expiry_height: u32,
+    recipient_seed: &[u8; 32],
+    payout_zat: u64,
+    transparent: Option<TransparentAddress>,
+    extra_output: bool,
+) -> (String, TestPcztIdentity) {
     let account_index = AccountId::ZERO;
     let source_usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &SOURCE_SEED, account_index)
         .expect("source test key derives");
@@ -304,9 +321,16 @@ fn build_destination_pczt(
         .orchard()
         .expect("recipient contains Orchard receiver");
 
+    let extra_usk =
+        UnifiedSpendingKey::from_seed(&TEST_NETWORK, &[0x66; 32], account_index).unwrap();
+    let (extra_address, _) = extra_usk
+        .to_unified_full_viewing_key()
+        .default_address(UnifiedAddressRequest::ORCHARD)
+        .unwrap();
+    let fee_zat = if extra_output { 15_000 } else { FEE_ZAT };
     let source_note = valid_ironwood_note(
         source_address.orchard().copied().unwrap(),
-        payout_zat + FEE_ZAT,
+        payout_zat * if extra_output { 2 } else { 1 } + fee_zat,
     );
     let source_commitment: ExtractedNoteCommitment = source_note.commitment().into();
     let merkle_path = MerklePath::from_parts(
@@ -344,6 +368,16 @@ fn build_destination_pczt(
             )
             .expect("valid Ironwood payout");
     }
+    if extra_output {
+        builder
+            .add_ironwood_output::<zip317::FeeError>(
+                None,
+                *extra_address.orchard().unwrap(),
+                Zatoshis::const_from_u64(payout_zat),
+                MemoBytes::empty(),
+            )
+            .expect("second valid shielded payout");
+    }
     let build = builder
         .build_for_pczt(DeterministicRng(0x5ec0_1a7e), &zip317::FeeRule::standard())
         .expect("balanced PCZT fixture");
@@ -352,6 +386,7 @@ fn build_destination_pczt(
         .spend_action_index(0)
         .expect("source spend action exists");
     let output_index = build.ironwood_meta.output_action_index(0);
+    let extra_index = build.ironwood_meta.output_action_index(1);
     let pczt = Creator::build_from_parts(build.pczt_parts).expect("V6 PCZT parts");
     let pczt = IoFinalizer::new(pczt)
         .finalize_io()
@@ -407,6 +442,12 @@ fn build_destination_pczt(
                     Ok(())
                 })?;
             }
+            if let Some(extra_index) = extra_index {
+                bundle.update_action_with(extra_index, |mut action| {
+                    action.set_output_user_address(extra_address.encode(&TEST_NETWORK));
+                    Ok(())
+                })?;
+            }
             Ok(())
         })
         .expect("Ironwood metadata updates")
@@ -433,6 +474,7 @@ fn build_destination_pczt(
             source_ufvk: source_ufvk.encode(&TEST_NETWORK),
             recipient_unified_address: recipient_encoded,
             spend_action_index: spend_index,
+            extra_recipient: extra_output.then(|| extra_address.encode(&TEST_NETWORK)),
         },
     )
 }
@@ -443,6 +485,7 @@ struct TestPcztIdentity {
     source_ufvk: String,
     recipient_unified_address: String,
     spend_action_index: usize,
+    extra_recipient: Option<String>,
 }
 
 fn test_pczt() -> TestPczt {
@@ -487,6 +530,7 @@ fn test_pczt() -> TestPczt {
                 recipient_unified_address: identity.recipient_unified_address,
                 recipient_kind: ReceiverKind::Ironwood,
                 fee_zat: FEE_ZAT,
+                extra_recipient: None,
             }
         })
         .clone()
@@ -519,6 +563,28 @@ fn transparent_test_pczt(script_hash: bool) -> TestPczt {
                 recipient_unified_address: identity.recipient_unified_address,
                 recipient_kind: ReceiverKind::Transparent,
                 fee_zat: FEE_ZAT,
+                ..test_pczt()
+            }
+        })
+        .clone()
+}
+
+fn multiple_recipient_pczt() -> TestPczt {
+    static FIXTURE: OnceLock<TestPczt> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let (created, identity) =
+                build_outputs_pczt(EXPIRY_HEIGHT, &RECIPIENT_SEED, PAYOUT_ZAT, None, true);
+            let (proved, signed) = prove_and_sign(&created, identity.spend_action_index);
+            let (raw_transaction, transaction_id) = extract_transaction(&signed);
+            TestPczt {
+                created,
+                proved,
+                signed,
+                raw_transaction,
+                transaction_id,
+                extra_recipient: identity.extra_recipient,
+                fee_zat: 15_000,
                 ..test_pczt()
             }
         })
@@ -599,6 +665,7 @@ struct CapturedCall {
 enum Tamper {
     None,
     WeakPrivacyPolicy,
+    DuplicateInspectionRecipient,
     EmptyCreatedEffects,
     CreatedRecipientEffects,
     CreatedValueEffects,
@@ -717,6 +784,21 @@ impl HappyZallet {
             inspection["ironwood"]["actions"] = json!(1);
             inspection["ironwood"]["signed_actions"] = json!(usize::from(ordinal > 1));
             inspection["ironwood"]["value_balance_zat"] = json!(PAYOUT_ZAT + self.pczt.fee_zat);
+        }
+        if let Some(extra) = self.pczt.extra_recipient.as_ref() {
+            // The wallet's action order is deliberately opposite to request order.
+            let extra = if matches!(self.tamper, Tamper::DuplicateInspectionRecipient) {
+                &self.pczt.recipient_unified_address
+            } else {
+                extra
+            };
+            inspection["ironwood"]["outputs"] = json!([
+                {"value_zat": PAYOUT_ZAT, "user_address": extra},
+                {"value_zat": 0, "user_address": null},
+                {"value_zat": ironwood_amount, "user_address": ironwood_address}
+            ]);
+            inspection["ironwood"]["actions"] = json!(3);
+            inspection["ironwood"]["signed_actions"] = json!(if ordinal > 1 { 3 } else { 2 });
         }
         inspection
     }
@@ -943,7 +1025,7 @@ fn fixture_for(
         wcash_zec_payout_signer::parent_payout_address_commitment(&pczt.source_unified_address),
     )
     .expect("valid test signer configuration");
-    let request = ZecPayoutRequest {
+    let mut request = ZecPayoutRequest {
         batch: PayoutBatchRequest {
             batch_id: Uuid::new_v4(),
             asset: Asset::Zec,
@@ -961,6 +1043,14 @@ fn fixture_for(
         source_account: account,
         fund_source: ZecFundSource::Orchard,
     };
+    if let Some(extra) = pczt.extra_recipient.as_ref() {
+        request.batch.outputs.push(PayoutOutput {
+            allocation_id: Uuid::new_v4(),
+            canonical_address: extra.clone(),
+            receiver_kind: ReceiverKind::Ironwood,
+            amount_zat: PAYOUT_ZAT,
+        });
+    }
     (config, request, pczt)
 }
 
@@ -1125,6 +1215,30 @@ fn weak_wallet_privacy_response_is_rejected_before_proving_or_signing() {
             .iter()
             .any(|call| matches!(call.method, "pczt_prove" | "pczt_sign")));
         assert!(zebra.calls().is_empty());
+    }
+}
+
+#[test]
+fn multiple_shielded_recipients_allow_shuffled_actions_but_reject_duplicate_recipients() {
+    for tamper in [Tamper::None, Tamper::DuplicateInspectionRecipient] {
+        let root = TestDirectory::new();
+        let (config, request, pczt) = fixture_for(&root, multiple_recipient_pczt());
+        let zallet = Arc::new(HappyZallet::tampered(pczt, tamper));
+        let zebra = Arc::new(ScriptedZebra::new([ZebraStep::Accepted]));
+        let signer = ZecPcztSigner::new(config, zallet.clone(), zebra.clone()).unwrap();
+        let result = signer.execute(&request);
+        if matches!(tamper, Tamper::None) {
+            let receipt = result.expect("valid shuffled multi-recipient payout");
+            assert_eq!(receipt.output_total_zat, 2 * PAYOUT_ZAT);
+            assert_eq!(receipt.network_fee_zat, 15_000);
+        } else {
+            assert_eq!(result, Err(ZecPayoutError::WalletProtocolViolation));
+            assert!(!zallet
+                .calls()
+                .iter()
+                .any(|call| call.method == "pczt_prove"));
+            assert!(zebra.calls().is_empty());
+        }
     }
 }
 
