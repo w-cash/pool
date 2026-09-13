@@ -7,6 +7,8 @@ umask 077
 script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$script_dir/common.sh"
+# shellcheck disable=SC1091
+source "$script_dir/custody-unit-state.sh"
 
 require_root
 require_command getent
@@ -33,15 +35,7 @@ case $(stat -c '%U:%G:%a:%h' -- "$authority") in
     *) die "frozen wallet authority ownership or mode is unsafe" ;;
 esac
 
-systemctl stop wcash-pool.service wcash-pool-wallet-init.service \
-    || die "could not stop mining and wallet initialization before sealing custody"
-for unit in wcash-pool.service wcash-pool-wallet-init.service; do
-    [[ $(systemctl show --property=ActiveState --value "$unit") == inactive \
-        && $(systemctl show --property=SubState --value "$unit") == dead \
-        && $(systemctl show --property=MainPID --value "$unit") == 0 \
-        && $(systemctl show --property=ControlPID --value "$unit") == 0 ]] \
-        || die "service is not fully inactive before sealing custody"
-done
+stop_custody_units_for_sealing
 require_no_processes_for_user wcash-pool "mining identity"
 
 seed=$(read_setting "$settings" WEC_SEED_FILE)
