@@ -26,6 +26,17 @@ require_absolute_path "$authority"
 [[ -f $authority && ! -L $authority ]] || die "backend authority file is unavailable"
 require_private_regular_file "$cidrs"
 
+# Reject a missing, expiring, wrong-host, untrusted, or mismatched mining
+# certificate before the transition closes listeners or mutates rendered
+# state. The live endpoint is independently probed after nginx reload.
+mining_certificate=$(read_setting "$settings" MINING_TLS_CERT)
+mining_private_key=$(read_setting "$settings" MINING_TLS_KEY)
+mining_host=$(read_setting "$settings" MINING_HOST)
+require_trusted_etc_file "$mining_certificate" false
+require_trusted_etc_file "$mining_private_key" true
+require_public_tls_certificate \
+    "$mining_certificate" "$mining_private_key" "$mining_host"
+
 target="$ZECWEC_RELEASE_ROOT/$version"
 [[ -d $target && ! -L $target ]] || die "rollback release is not installed"
 # Security epoch 2 introduced the isolated projector/migrator identities and

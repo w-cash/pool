@@ -102,11 +102,10 @@ expected = {
 raise SystemExit(0 if value == expected else 1)
 ' <<<"$portal_readiness" || die "portal does not confirm a fresh external payout worker"
 ss -H -ltn "sport = :$plain_port" | grep -q . || die "plaintext Stratum listener is unavailable"
-if systemctl is-active --quiet nginx.service; then
-    ss -H -ltn "sport = :$tls_port" | grep -q . || die "TLS Stratum listener is unavailable"
-    require_public_tls_listener \
-        "$(read_setting "$settings" MINING_HOST)" "$tls_port" 127.0.0.1
-fi
+systemctl is-active --quiet nginx.service || die "nginx TLS edge is not active"
+ss -H -ltn "sport = :$tls_port" | grep -q . || die "TLS Stratum listener is unavailable"
+require_public_tls_listener \
+    "$(read_setting "$settings" MINING_HOST)" "$tls_port" 127.0.0.1
 
 "$script_dir/restrict-mining-firewall.sh" check "$settings" "$cidrs" >/dev/null
 trap - EXIT

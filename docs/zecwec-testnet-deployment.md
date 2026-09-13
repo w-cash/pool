@@ -167,25 +167,29 @@ both its binary and deployment-package manifests verify exactly.
 ### First security-epoch-2 bootstrap
 
 When upgrading a host whose `current` selector still names an epoch-1 release,
-do not switch that link by hand and do not let a pre-authority command resolve
+do not switch that link by hand and do not let a preparation command resolve
 the selector implicitly. The epoch-2 authority does not exist yet, so normal
 forward activation cannot run. Pin the newly installed immutable release for
-every wallet-bootstrap, credential-installation, bootstrap, and custody command
-until the backend authority has been created and the final policy rendered:
+every wallet, credential, custody, render, database, preflight, firewall, and
+edge-preparation command until the final activation:
 
 ```bash
 ZECWEC_BOOTSTRAP_RELEASE=/opt/wcash/releases/<epoch-2-release-id>
+ZECWEC_BOOTSTRAP_DEPLOY="$ZECWEC_BOOTSTRAP_RELEASE/deployment/scripts/deploy"
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
-  "$ZECWEC_BOOTSTRAP_RELEASE/deployment/scripts/deploy/render-deployment.sh" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/render-deployment.sh" \
   wallet-bootstrap /etc/wcash-pool/deployment.env
 ```
 
 Use the same `sudo env ZECWEC_RELEASE_PATH=...` prefix and the same release's
-snapshotted script for the remaining pre-authority steps below. Verify the
+snapshotted script for all remaining preparation steps below. Verify the
 literal path is one installed, root-owned, immutable release; never substitute
-`/opt/wcash/current`. After `backend-authority-protocol-v2.json` exists, use
-`activate-release.sh` once to perform the fail-closed selector transition,
-migration, preflight, start, and health gate. This is the only supported first
+`/opt/wcash/current`. Creating `backend-authority-protocol-v2.json` alone is not
+an activation signal. First finish the final render and preflight, install the
+exact miner CIDRs and publicly trusted mining certificate, and close the
+firewall as described through section 8. Then use `activate-release.sh` once in
+section 9 to perform the fail-closed selector transition, migration, preflight,
+start, edge enablement, and health gate. This is the only supported first
 epoch-1-to-epoch-2 transition.
 
 For every later forward rollout, first install and independently review schema
@@ -211,7 +215,8 @@ If an older deployment owns `wcash-pool.service`, archive and disable it before
 rendering any new unit:
 
 ```bash
-sudo scripts/deploy/disable-legacy-pool.sh wcash-pool.service
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/disable-legacy-pool.sh" wcash-pool.service
 ```
 
 The command preserves a root-only copy of the resolved unit and, for a local
@@ -254,7 +259,8 @@ fallback in this pool deployment. Do not place temporary source files in a
 repository or shared directory. Install the seed first:
 
 ```bash
-sudo scripts/deploy/install-protected-seed.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/install-protected-seed.sh" \
   /protected/wcash-seed \
   /etc/wcash-pool/deployment.env
 ```
@@ -273,7 +279,9 @@ and validate the host database first; do not bypass the numeric
 `server_version_num` gate.
 
 ```bash
-sudo scripts/deploy/provision-postgres.sh /etc/wcash-pool/deployment.env
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/provision-postgres.sh" \
+  /etc/wcash-pool/deployment.env
 ```
 
 This creates or reconciles a schema-owning migrator plus distinct public,
@@ -303,7 +311,8 @@ arguments.
 ## 5. Discover, review, and freeze fresh wallet authorities
 
 ```bash
-sudo scripts/deploy/render-deployment.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/render-deployment.sh" \
   wallet-bootstrap /etc/wcash-pool/deployment.env
 ```
 
@@ -370,7 +379,8 @@ temporary root-owned mode-`0600` files. After comparing them independently,
 seal the live-host copy of the seed:
 
 ```bash
-sudo scripts/deploy/seal-wcash-custody.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/seal-wcash-custody.sh" \
   /etc/wcash-pool/deployment.env \
   /protected/recovery-init.json \
   /protected/recovery-identity.json \
@@ -528,10 +538,13 @@ UUIDs, commitments, and Zallet account index. Install both address credentials
 and the Wcash IVK, then render the bootstrap policy:
 
 ```bash
-sudo scripts/deploy/install-backend-credentials.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/install-backend-credentials.sh" \
   /etc/wcash-pool/deployment.env \
   /protected/wcash-address /protected/zcash-address /protected/wcash-ivk
-sudo scripts/deploy/render-deployment.sh bootstrap /etc/wcash-pool/deployment.env
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/render-deployment.sh" \
+  bootstrap /etc/wcash-pool/deployment.env
 ```
 
 Restart the Wcash initializer, restart the original Zallet service, then run
@@ -609,7 +622,8 @@ valid recovery.
 Finalize the policy from that authority:
 
 ```bash
-sudo scripts/deploy/render-deployment.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/render-deployment.sh" \
   finalize \
   /etc/wcash-pool/deployment.env \
   /var/lib/wcash-pool-backend/backend-authority-protocol-v2.json
@@ -625,7 +639,9 @@ instance, wallet collector commitments, and journal stream during startup.
 ## 7. Migrate and preflight with no miner listener
 
 ```bash
-sudo scripts/deploy/preflight.sh /etc/wcash-pool/deployment.env
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/preflight.sh" \
+  /etc/wcash-pool/deployment.env
 ```
 
 This explicitly stops the full target and every key-bearing runtime, disables
@@ -708,7 +724,8 @@ the exact guard order and contents in both address families as well as the UFW
 rule set.
 
 ```bash
-sudo scripts/deploy/restrict-mining-firewall.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/restrict-mining-firewall.sh" \
   close /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
 ```
 
@@ -742,15 +759,32 @@ preflight refuses any process that already owns the plaintext port.
 
 ## 9. Private start and ASIC gate
 
-Only after source review and all deterministic tests pass:
+Only after source review, deterministic tests, final policy, miner CIDRs, and
+the mining certificate gate are complete may the runtime start. For the first
+epoch-1-to-epoch-2 rollout, activate the pinned release; this is the operation
+that atomically changes the selector and starts it:
 
 ```bash
-sudo scripts/deploy/start-testnet-pool.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/activate-release.sh" \
+  "${ZECWEC_BOOTSTRAP_RELEASE##*/}" \
+  /etc/wcash-pool/deployment.env \
+  /var/lib/wcash-pool-backend/backend-authority-protocol-v2.json \
+  /etc/wcash-pool/miner-cidrs \
+  --ack-forward-schema-compatible
+```
+
+On a host whose selector already names this reviewed epoch-2 release, use the
+normal readiness-gated start instead:
+
+```bash
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/start-testnet-pool.sh" \
   /etc/wcash-pool/deployment.env /etc/wcash-pool/miner-cidrs
 ```
 
-The command first removes all current and legacy mining allow rules, repeats
-probe-only listener-free preflight, starts the full Testnet target behind the
+Both paths first remove all current and legacy mining allow rules, repeat
+probe-only listener-free preflight, start the full Testnet target behind the
 closed firewall, and waits a bounded interval for signer recovery and a fresh
 payout-worker heartbeat. Only then does it restore the exact source allowlist,
 reconcile nginx to the durable portal launch mode, and run health. Health requires the public pool, backend,
@@ -777,7 +811,8 @@ Before the browser gate, create a Cloudflare Access application covering
 verify the default policy denies every other identity. Then stage the portal:
 
 ```bash
-sudo scripts/deploy/enable-nginx-edge.sh \
+sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
+  "$ZECWEC_BOOTSTRAP_DEPLOY/enable-nginx-edge.sh" \
   stage-portal \
   /etc/wcash-pool/deployment.env \
   /etc/wcash-pool/miner-cidrs \
