@@ -100,23 +100,41 @@ grep -Fx "libprotoc $protoc_version" "$temporary/protoc-version" >/dev/null
     cd "$source_dir"
     cargo "+$toolchain" fmt --all -- --check
     cargo "+$toolchain" test --locked --package zallet-core pool_config_tests
+    zallet_core_test_harnesses=()
+    shopt -s nullglob
+    for candidate in "$target_dir"/debug/deps/zallet_core-*; do
+        if [[ -f $candidate && ! -L $candidate && -x $candidate ]]; then
+            zallet_core_test_harnesses+=("$candidate")
+        fi
+    done
+    shopt -u nullglob
+    [[ ${#zallet_core_test_harnesses[@]} -eq 1 ]] || {
+        printf 'build-zallet-testnet: expected exactly one Zallet core test harness, found %s\n' \
+            "${#zallet_core_test_harnesses[@]}" >&2
+        exit 1
+    }
+    zallet_core_test_harness=${zallet_core_test_harnesses[0]}
     # beta.3's original assertion raced a reload request against Tokio's
     # asynchronous task abort. The audited upstream #766 backport observes
     # eventual shutdown with its own 30-second bound; repeat it to exercise the
     # scheduling boundary before accepting the full sync suite.
-    for _stress_iteration in {1..100}; do
-        timeout --signal=TERM --kill-after=10s 40s \
-            cargo "+$toolchain" test --locked --package zallet-core \
-            components::sync::tests::wallet_sync_error_shuts_down_the_spawned_batch_decryptor \
-            -- --exact --test-threads=1
-    done
-    # These Tokio cancellation tests share global tracing/i18n state and can
-    # deadlock each other when the Rust harness runs them concurrently.  They
-    # complete in seconds serially; keep an outer bound so a regression cannot
-    # hold an isolated release build indefinitely.
-    timeout --signal=TERM --kill-after=10s 300s \
-        cargo "+$toolchain" test --locked --package zallet-core \
-        components::sync::tests -- --test-threads=1
+    # Invoke the exact harness already built by the pool-config gate so Cargo
+    # cannot rebuild or relink inside the per-execution timeout.
+    (
+        cd "$source_dir/zallet-core"
+        for _stress_iteration in {1..100}; do
+            timeout --signal=TERM --kill-after=10s 40s \
+                "$zallet_core_test_harness" \
+                components::sync::tests::wallet_sync_error_shuts_down_the_spawned_batch_decryptor \
+                --exact --test-threads=1
+        done
+        # These Tokio cancellation tests share global tracing/i18n state and
+        # can deadlock each other when the Rust harness runs them concurrently.
+        # They complete in seconds serially; keep an outer bound so a
+        # regression cannot hold an isolated release build indefinitely.
+        timeout --signal=TERM --kill-after=10s 300s \
+            "$zallet_core_test_harness" components::sync::tests --test-threads=1
+    )
     cargo "+$toolchain" build --locked --release \
         --manifest-path backends/zaino/Cargo.toml \
         --features rpc-cli,zcashd-import \

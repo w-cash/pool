@@ -199,9 +199,22 @@ grep -Fq -- '--features rpc-cli,zcashd-import' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'timeout --signal=TERM --kill-after=10s 300s' \
     "$repo_root/scripts/build-zallet-testnet.sh"
-grep -Fq 'components::sync::tests -- --test-threads=1' \
+# shellcheck disable=SC2016
+grep -Fq 'for candidate in "$target_dir"/debug/deps/zallet_core-*; do' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq '[[ ${#zallet_core_test_harnesses[@]} -eq 1 ]]' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq '[[ -f $candidate && ! -L $candidate && -x $candidate ]]' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'for _stress_iteration in {1..100}; do' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq 'cd "$source_dir/zallet-core"' \
+    "$repo_root/scripts/build-zallet-testnet.sh"
+# shellcheck disable=SC2016
+grep -Fq '"$zallet_core_test_harness" components::sync::tests --test-threads=1' \
     "$repo_root/scripts/build-zallet-testnet.sh"
 grep -Fq 'components::sync::tests::wallet_sync_error_shuts_down_the_spawned_batch_decryptor' \
     "$repo_root/scripts/build-zallet-testnet.sh"
