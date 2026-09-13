@@ -2132,14 +2132,18 @@ assert 'restrict-mining-firewall.sh" close' in common
 assert "mode == apply || $mode == close" in firewall
 assert "a mining allow rule remains after closing port" in firewall
 closed_guard = firewall.index("install_mining_guard 4 closed")
+nat_check = firewall.rindex("verify_no_managed_nat")
 ufw_mutation = firewall.index('ufw --force delete "$number"')
 policy_guard = firewall.index('install_mining_guard 4 "$firewall_policy"')
-assert closed_guard < ufw_mutation < policy_guard
+assert closed_guard < nat_check < ufw_mutation < policy_guard
 assert firewall.count("install_mining_guard 4 closed") == 2
 assert firewall.count("install_mining_guard 6 closed") == 2
 assert firewall.count('install_mining_guard 4 "$firewall_policy"') == 1
 assert firewall.count('install_mining_guard 6 "$firewall_policy"') == 1
 assert "elif [[ $guard_mode == public ]]" in firewall
+assert "trap rollback_failed_apply EXIT" in firewall
+assert '"$script_dir/restrict-mining-firewall.sh" close' in firewall
+assert 'verify-mining-nat.py' in firewall
 assert '"$firewall" --wait 5 -t filter -I INPUT 1 -j "$staging"' in firewall
 assert 'readonly guard_chain=ZECWEC-MINING-GUARD' in firewall
 PY

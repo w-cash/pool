@@ -157,12 +157,49 @@ install_mining_guard() {
     done
 }
 
+verify_no_managed_nat() {
+    iptables-save -t nat \
+        | python3 "$script_dir/verify-mining-nat.py" \
+            "$plain_port" "$tls_port" "$legacy_port"
+    ip6tables-save -t nat \
+        | python3 "$script_dir/verify-mining-nat.py" \
+            "$plain_port" "$tls_port" "$legacy_port"
+}
+
+apply_succeeded=0
+rollback_failed_apply() {
+    local status=$?
+    trap - EXIT
+    if [[ $mode == apply && $apply_succeeded -eq 0 ]]; then
+        set +e
+        "$script_dir/restrict-mining-firewall.sh" close \
+            "$settings" "$cidr_file" >/dev/null 2>&1
+        local rollback_status=$?
+        set -e
+        if ((rollback_status != 0)); then
+            log "CRITICAL: public mining activation failed and automatic firewall closure also failed"
+        else
+            log "public mining activation failed; managed Stratum ingress was restored closed"
+        fi
+    fi
+    ((status != 0)) || status=1
+    exit "$status"
+}
+
+if [[ $mode == apply ]]; then
+    trap rollback_failed_apply EXIT
+fi
+
 # Mutating modes first put a closed guard at the first INPUT position in both
 # address families. UFW reconciliation therefore cannot expose a managed port,
 # and any later error leaves a closed guard in place.
 if [[ $mode == apply || $mode == close ]]; then
     install_mining_guard 4 closed
     install_mining_guard 6 closed
+fi
+
+if [[ $mode == apply || $mode == check ]]; then
+    verify_no_managed_nat
 fi
 
 status=$(ufw status verbose)
@@ -313,3 +350,5 @@ if [[ $firewall_policy == public ]]; then
 else
     log "mining firewall is active, default-deny, source-restricted, and legacy-port closed"
 fi
+apply_succeeded=1
+trap - EXIT

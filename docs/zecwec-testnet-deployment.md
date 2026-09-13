@@ -784,9 +784,14 @@ bypass.
 `apply` and `close` stage a closed replacement guard before changing UFW. The
 open replacement is activated only after the exact persistent UFW policy is
 installed. Guard replacement uses a new populated chain and a rule-one hook,
-so it never flushes the active chain in place. `check` is read-only and proves
-the selected public/restricted guard contents in both address families, the
-legacy-port drop, and the matching UFW rule set.
+so it never flushes the active chain in place. A failed `apply` invokes the
+same reviewed `close` path before exit, removing managed UFW allows and
+restoring both guards closed. Before opening or checking ingress, the script
+also rejects any IPv4 or IPv6 NAT translation that matches or rewrites a
+current or legacy mining port; a stale `28237` redirect therefore cannot reach
+a publicly allowed current port. `check` is read-only and proves the selected
+public/restricted guard contents in both address families, exact non-narrowed
+UFW accepts, the legacy-port drop, and the matching persistent rule set.
 
 ```bash
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \

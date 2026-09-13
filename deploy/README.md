@@ -105,7 +105,8 @@ service mounts; the Internet-facing pool UID cannot read any custody path.
     first-position IPv4/IPv6 `INPUT` guard exposes the two current ports only
     under that reviewed policy and drops the legacy port before any unrelated
     host rule can accept it; UFW remains the persistent second enforcement
-    layer.
+    layer. Activation rejects managed-port NAT translations and automatically
+    restores both guards closed if public-policy application fails.
 
 `zecwec-testnet-pool.target` supervises the projector, public service, payout
 Zallet, and payout worker. The public unit requires and binds to the projector;

@@ -9,6 +9,7 @@ import unittest
 
 
 VERIFIER = pathlib.Path(__file__).with_name("verify-mining-firewall.py")
+NAT_VERIFIER = pathlib.Path(__file__).with_name("verify-mining-nat.py")
 POLICY_PARSER = pathlib.Path(__file__).with_name("parse-mining-firewall-policy.py")
 GUARD_CHAIN = "ZECWEC-MINING-GUARD"
 
@@ -92,6 +93,18 @@ def run_verifier(
             "28237",
             *sources,
         ],
+        input=payload,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def run_nat_verifier(rules: list[str]):
+    payload = "\n".join(("*nat", *rules, "COMMIT", ""))
+    return subprocess.run(
+        ["python3", str(NAT_VERIFIER), "3333", "3443", "28237"],
         input=payload,
         text=True,
         stdout=subprocess.PIPE,
@@ -187,6 +200,32 @@ class MiningFirewallVerifierTests(unittest.TestCase):
             public_rules,
             guard_override=tuple(guard_rules("ipv4", "open", (source,))),
         )
+
+    def test_public_mode_rejects_narrowing_or_extra_predicates(self) -> None:
+        public_tls = rule("ufw-user-input", "0.0.0.0/0", "3443")
+        candidates = (
+            "-A ufw-user-input -s 0.0.0.0/0 -i nonexistent -p tcp "
+            "-m tcp --dport 3333 -j ACCEPT",
+            "-A ufw-user-input -s 0.0.0.0/0 -d 203.0.113.9/32 -p tcp "
+            "-m tcp --dport 3333 -j ACCEPT",
+            "-A ufw-user-input -s 0.0.0.0/0 -p tcp -m tcp "
+            "--tcp-flags SYN SYN --dport 3333 -j ACCEPT",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.assert_rejected(
+                    "ipv4", "public", (), [candidate, public_tls]
+                )
+
+    def test_inert_ufw_comment_match_is_accepted(self) -> None:
+        rules = [
+            rule("ufw-user-input", "0.0.0.0/0", str(port)).replace(
+                " -j ACCEPT", " -m comment --comment zecwec -j ACCEPT"
+            )
+            for port in (3333, 3443)
+        ]
+        result = run_verifier("ipv4", "public", (), rules)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_closed_mode_accepts_no_managed_rules(self) -> None:
         result = run_verifier("ipv4", "closed", ("203.0.113.9/32",), [])
@@ -311,6 +350,33 @@ class MiningFirewallPolicyTests(unittest.TestCase):
                 result = self.parse(contents)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("mining firewall policy is invalid:", result.stderr)
+
+
+class MiningNatVerifierTests(unittest.TestCase):
+    def test_unrelated_nat_rules_are_accepted(self) -> None:
+        result = run_nat_verifier(
+            [
+                "-A PREROUTING -p tcp -m tcp --dport 80 -j DNAT "
+                "--to-destination 192.0.2.10:8080",
+                "-A POSTROUTING -j MASQUERADE",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_managed_match_or_translation_is_rejected(self) -> None:
+        candidates = (
+            "-A PREROUTING -p tcp -m tcp --dport 28237 -j REDIRECT --to-ports 3333",
+            "-A PREROUTING -p tcp -m tcp --dport 9999 -j DNAT "
+            "--to-destination 192.0.2.10:3443",
+            "-A OUTPUT -p tcp -m multiport --dports 80,3333 -j REDIRECT --to-ports 8080",
+            "-A CUSTOM -p tcp -j DNAT --to-destination '[2001:db8::1]:3333'",
+            "-A PREROUTING -p 6 --dport 28237 -j REDIRECT --to-ports 3333",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                result = run_nat_verifier([candidate])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("mining NAT verification failed:", result.stderr)
 
 
 if __name__ == "__main__":
