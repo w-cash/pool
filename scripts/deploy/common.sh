@@ -257,6 +257,81 @@ require_direct_origin_mtls_rejection() (
     die "direct origin did not explicitly reject the missing client certificate"
 )
 
+# Prove that a direct-ASIC certificate is usable before nginx is allowed to
+# expose it.  File ownership alone is insufficient: an expired certificate, a
+# certificate for another hostname, an incomplete chain, or a mismatched key
+# would leave the advertised TLS endpoint unusable while the service appeared
+# healthy.
+require_public_tls_certificate() (
+    local certificate=${1:?certificate path is required}
+    local private_key=${2:?private key path is required}
+    local hostname=${3:?certificate hostname is required}
+    [[ $hostname =~ ^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$ \
+        && $hostname == *.* && $hostname != *..* ]] \
+        || die "TLS certificate hostname is invalid"
+    require_command cmp
+    require_command mktemp
+    require_command openssl
+    [[ -d /etc/ssl/certs && ! -L /etc/ssl/certs ]] \
+        || die "system TLS trust store is unavailable"
+
+    local scratch leaf certificate_key private_public_key
+    scratch=$(mktemp -d)
+    # Expand the mktemp-owned path now because an EXIT trap runs after local
+    # function variables have left scope on the deployment host's Bash version.
+    # shellcheck disable=SC2064
+    trap "rm -rf -- $(printf '%q' "$scratch")" EXIT
+    leaf=$scratch/leaf.pem
+    certificate_key=$scratch/certificate-key.pem
+    private_public_key=$scratch/private-key.pem
+
+    openssl x509 -in "$certificate" -out "$leaf" \
+        || die "mining TLS certificate could not be parsed"
+    openssl x509 -in "$leaf" -noout -checkhost "$hostname" >/dev/null \
+        || die "mining TLS certificate does not cover the configured hostname"
+    openssl x509 -in "$leaf" -noout -checkend 604800 >/dev/null \
+        || die "mining TLS certificate expires in less than seven days"
+    openssl x509 -in "$leaf" -pubkey -noout >"$certificate_key" \
+        || die "mining TLS certificate public key could not be read"
+    openssl pkey -in "$private_key" -pubout >"$private_public_key" \
+        || die "mining TLS private key could not be read"
+    cmp -s -- "$certificate_key" "$private_public_key" \
+        || die "mining TLS certificate and private key do not match"
+    openssl verify \
+        -purpose sslserver \
+        -verify_hostname "$hostname" \
+        -CApath /etc/ssl/certs \
+        -untrusted "$certificate" \
+        "$leaf" >/dev/null \
+        || die "mining TLS certificate chain is not publicly trusted"
+)
+
+require_public_tls_listener() (
+    local hostname=${1:?TLS hostname is required}
+    local port=${2:?TLS port is required}
+    local address=${3:-127.0.0.1}
+    [[ $hostname =~ ^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$ \
+        && $hostname == *.* && $hostname != *..* ]] \
+        || die "TLS listener hostname is invalid"
+    [[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] \
+        || die "TLS listener port is invalid"
+    [[ $address =~ ^[0-9a-fA-F:.]+$ ]] \
+        || die "TLS listener address is invalid"
+    require_command openssl
+    require_command timeout
+    [[ -d /etc/ssl/certs && ! -L /etc/ssl/certs ]] \
+        || die "system TLS trust store is unavailable"
+    timeout --signal=TERM --kill-after=2s 15s \
+        openssl s_client \
+        -connect "$address:$port" \
+        -servername "$hostname" \
+        -verify_hostname "$hostname" \
+        -verify_return_error \
+        -CApath /etc/ssl/certs \
+        </dev/null >/dev/null 2>&1 \
+        || die "TLS listener did not present a publicly trusted certificate for the configured hostname"
+)
+
 require_cleanup_trees_safe() {
     (($# > 0)) || die "cleanup tree is required"
     local unsupported_entries multiply_linked_entries

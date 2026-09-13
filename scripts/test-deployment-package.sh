@@ -1393,6 +1393,133 @@ for rejected_origin_probe in accepted generic-tls-failure untrusted-server; do
         exit 1
     fi
 done
+
+# Exercise the mining-certificate and live-listener gates deterministically.
+# The deployment host performs the real OpenSSL verification against its
+# system trust store; this fake records the security-relevant arguments and
+# lets each failure boundary be tested without a private key fixture.
+tls_fake_bin="$temporary/tls-fake-bin"
+mkdir -p "$tls_fake_bin"
+cat >"$tls_fake_bin/openssl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+
+printf '%s\n' "$*" >>"${TLS_TEST_LOG:?}"
+command_name=${1:-}
+shift || true
+case "$command_name" in
+    x509)
+        output=
+        operation=copy
+        while (($#)); do
+            case "$1" in
+                -out) output=$2; shift 2 ;;
+                -checkhost) operation=host; shift 2 ;;
+                -checkend) operation=expiry; shift 2 ;;
+                -pubkey) operation=public-key; shift ;;
+                *) shift ;;
+            esac
+        done
+        case "$operation" in
+            copy) printf '%s\n' leaf >"$output" ;;
+            host) exit "${TLS_TEST_HOST_STATUS:-0}" ;;
+            expiry) exit "${TLS_TEST_EXPIRY_STATUS:-0}" ;;
+            public-key) printf '%s\n' public-key ;;
+        esac
+        ;;
+    pkey)
+        printf '%s\n' "${TLS_TEST_PRIVATE_PUBLIC_KEY:-public-key}"
+        ;;
+    verify)
+        exit "${TLS_TEST_VERIFY_STATUS:-0}"
+        ;;
+    s_client)
+        exit "${TLS_TEST_LISTENER_STATUS:-0}"
+        ;;
+    *) exit 64 ;;
+esac
+SH
+cat >"$tls_fake_bin/timeout" <<'SH'
+#!/usr/bin/env bash
+set -eu
+
+while [[ ${1:-} == --* ]]; do
+    shift
+done
+[[ ${1:-} =~ ^[0-9]+s$ ]]
+shift
+exec "$@"
+SH
+chmod 0555 "$tls_fake_bin/openssl" "$tls_fake_bin/timeout"
+tls_test_log="$temporary/tls-gate.log"
+tls_test_cert="$temporary/tls-certificate.pem"
+tls_test_key="$temporary/tls-private-key.pem"
+printf 'fixture\n' >"$tls_test_cert"
+printf 'fixture\n' >"$tls_test_key"
+PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
+    bash -c 'source "$1"; require_public_tls_certificate "$2" "$3" "$4"' \
+    bash "$repo_root/scripts/deploy/common.sh" \
+    "$tls_test_cert" "$tls_test_key" testnet-mine.zecwec.com
+PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
+    bash -c 'source "$1"; require_public_tls_listener "$2" "$3" "$4"' \
+    bash "$repo_root/scripts/deploy/common.sh" \
+    testnet-mine.zecwec.com 3443 127.0.0.1
+for rejected_tls_gate in wrong-host expiring mismatched-key untrusted-chain; do
+    host_status=0
+    expiry_status=0
+    private_public_key=public-key
+    verify_status=0
+    case "$rejected_tls_gate" in
+        wrong-host) host_status=1 ;;
+        expiring) expiry_status=1 ;;
+        mismatched-key) private_public_key=different-key ;;
+        untrusted-chain) verify_status=1 ;;
+    esac
+    if PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
+        TLS_TEST_HOST_STATUS=$host_status \
+        TLS_TEST_EXPIRY_STATUS=$expiry_status \
+        TLS_TEST_PRIVATE_PUBLIC_KEY=$private_public_key \
+        TLS_TEST_VERIFY_STATUS=$verify_status \
+        bash -c 'source "$1"; require_public_tls_certificate "$2" "$3" "$4"' \
+        bash "$repo_root/scripts/deploy/common.sh" \
+        "$tls_test_cert" "$tls_test_key" testnet-mine.zecwec.com \
+        >/dev/null 2>&1; then
+        printf 'deployment-package-test: mining TLS gate accepted %s\n' \
+            "$rejected_tls_gate" >&2
+        exit 1
+    fi
+done
+if PATH="$tls_fake_bin:$PATH" TLS_TEST_LOG="$tls_test_log" \
+    TLS_TEST_LISTENER_STATUS=1 \
+    bash -c 'source "$1"; require_public_tls_listener "$2" "$3" "$4"' \
+    bash "$repo_root/scripts/deploy/common.sh" \
+    testnet-mine.zecwec.com 3443 127.0.0.1 >/dev/null 2>&1; then
+    printf 'deployment-package-test: mining TLS gate accepted a failed listener\n' >&2
+    exit 1
+fi
+grep -Fq 'x509 -in' "$tls_test_log"
+grep -Fq -- '-checkhost testnet-mine.zecwec.com' "$tls_test_log"
+grep -Fq -- '-checkend 604800' "$tls_test_log"
+grep -Fq -- '-verify_hostname testnet-mine.zecwec.com -CApath /etc/ssl/certs' \
+    "$tls_test_log"
+grep -Fq -- 's_client -connect 127.0.0.1:3443 -servername testnet-mine.zecwec.com' \
+    "$tls_test_log"
+
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$repo_root/scripts/deploy/enable-nginx-edge.sh" \
+    "$repo_root/scripts/deploy/health-check.sh" <<'PY'
+import pathlib
+import sys
+
+edge, health = (pathlib.Path(path).read_text(encoding="utf-8") for path in sys.argv[1:])
+certificate_gate = edge.index("require_public_tls_certificate")
+stream_enable = edge.index('ln -s -- "$stream_source" "$stream_link"')
+nginx_reload = edge.index("if ! systemctl reload nginx.service", stream_enable)
+listener_gate = edge.index('require_public_tls_listener "$mining_host"')
+assert certificate_gate < stream_enable < nginx_reload < listener_gate
+assert 'rm -f -- "$stream_link"' in edge[listener_gate:]
+assert "require_public_tls_listener" in health
+PY
 grep -Fq '"payout_execution": "enabled"' \
     "$repo_root/scripts/deploy/health-check.sh"
 grep -Fq 'require_hot_testnet_payout_custody' \
@@ -1600,6 +1727,19 @@ PY
 for release_command in activate-release.sh rollback-release.sh; do
     grep -Fq "$release_command" "$repo_root/docs/zecwec-testnet-deployment.md" || {
         printf 'deployment-package-test: runbook omits %s\n' "$release_command" >&2
+        exit 1
+    }
+done
+# shellcheck disable=SC2016
+for bootstrap_contract in \
+    'First security-epoch-2 bootstrap' \
+    'ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE"' \
+    'never substitute' \
+    'at least seven days remaining'; do
+    grep -Fq "$bootstrap_contract" \
+        "$repo_root/docs/zecwec-testnet-deployment.md" || {
+        printf 'deployment-package-test: runbook omits launch contract: %s\n' \
+            "$bootstrap_contract" >&2
         exit 1
     }
 done
