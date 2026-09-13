@@ -1,7 +1,8 @@
 //! Fail-closed database, journal replay, and live mining bootstrap.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
+use tokio::time;
 use uuid::Uuid;
 use wcash_pool_backend_client::{
     BackendClient, BackendClientConfig, ClientError, ExpectedBackend, MonotonicTimeline,
@@ -25,6 +26,8 @@ const REPLAY_PAGE_ITEMS: u16 = 1_024;
 const JOB_UPDATE_CAPACITY: usize = 256;
 const MAXIMUM_RECENT_JOBS: usize = 16;
 const MAXIMUM_GENERATIONS_PER_PROCESS: usize = 65_536;
+const BACKEND_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKEND_READINESS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Database-clock lease duration renewed by the serving process.
 pub const NONCE_NAMESPACE_LEASE_DURATION: Duration = Duration::from_secs(60);
 
@@ -149,7 +152,7 @@ pub async fn preflight(config: &RuntimeConfig) -> Result<MiningPreflight, Bootst
         client,
         authentication,
         timeline,
-    } = prepare(config).await?;
+    } = wait_for_ready_backend(config).await?;
     client.shutdown().await?;
 
     let nonce_claim = claim_nonce_namespace(&store, config).await?;
@@ -161,6 +164,63 @@ pub async fn preflight(config: &RuntimeConfig) -> Result<MiningPreflight, Bootst
         _authentication: authentication,
         _timeline: timeline,
     })
+}
+
+async fn wait_for_ready_backend(
+    config: &RuntimeConfig,
+) -> Result<PreparedBootstrap, BootstrapError> {
+    wait_for_backend_readiness(
+        BACKEND_READINESS_TIMEOUT,
+        BACKEND_READINESS_RETRY_INTERVAL,
+        || prepare_readiness_attempt(config),
+    )
+    .await
+}
+
+async fn prepare_readiness_attempt(
+    config: &RuntimeConfig,
+) -> Result<Option<PreparedBootstrap>, BootstrapError> {
+    let mut prepared = match prepare(config).await {
+        Ok(prepared) => prepared,
+        Err(BootstrapError::NoCurrentJob) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let health = prepared.client.health().await?;
+    let event_queue_empty = prepared.client.queued_event_count() == 0;
+    if backend_snapshot_is_ready(health.healthy, event_queue_empty) {
+        Ok(Some(prepared))
+    } else {
+        prepared.client.shutdown().await?;
+        Ok(None)
+    }
+}
+
+const fn backend_snapshot_is_ready(healthy: bool, event_queue_empty: bool) -> bool {
+    healthy && event_queue_empty
+}
+
+async fn wait_for_backend_readiness<T, Attempt, AttemptFuture>(
+    timeout: Duration,
+    retry_interval: Duration,
+    mut attempt: Attempt,
+) -> Result<T, BootstrapError>
+where
+    Attempt: FnMut() -> AttemptFuture,
+    AttemptFuture: Future<Output = Result<Option<T>, BootstrapError>>,
+{
+    match time::timeout(timeout, async {
+        loop {
+            if let Some(ready) = attempt().await? {
+                return Ok(ready);
+            }
+            time::sleep(retry_interval).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(BootstrapError::BackendReadinessTimeout),
+    }
 }
 
 /// Verifies the payout worker's database identity and policy without claiming
@@ -596,6 +656,9 @@ pub enum BootstrapError {
     /// Wolf did not provide a current proposal-validated job.
     #[error("backend snapshot has no current mineable job")]
     NoCurrentJob,
+    /// Wolf did not expose one current, healthy, event-exact snapshot in time.
+    #[error("backend did not become ready before the bounded preflight deadline")]
+    BackendReadinessTimeout,
     /// An incomplete replay page did not advance its cursor.
     #[error("backend journal replay made no progress")]
     StalledReplay,
@@ -611,7 +674,14 @@ pub enum BootstrapError {
 
 #[cfg(test)]
 mod tests {
-    use super::smaller_nonce_reservation;
+    #![allow(clippy::expect_used)]
+
+    use std::{cell::Cell, rc::Rc, time::Duration};
+
+    use super::{
+        backend_snapshot_is_ready, smaller_nonce_reservation, wait_for_backend_readiness,
+        BootstrapError,
+    };
 
     #[test]
     fn nonce_tail_backoff_terminates_at_one_without_skipping_it() {
@@ -619,5 +689,48 @@ mod tests {
         assert_eq!(smaller_nonce_reservation(4), Some(2));
         assert_eq!(smaller_nonce_reservation(2), Some(1));
         assert_eq!(smaller_nonce_reservation(1), None);
+    }
+
+    #[test]
+    fn preflight_requires_a_healthy_event_exact_backend_snapshot() {
+        assert!(backend_snapshot_is_ready(true, true));
+        assert!(!backend_snapshot_is_ready(false, true));
+        assert!(!backend_snapshot_is_ready(true, false));
+        assert!(!backend_snapshot_is_ready(false, false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_waits_through_transient_backend_rotation() {
+        let attempts = Rc::new(Cell::new(0_u8));
+        let observed = Rc::clone(&attempts);
+        let ready = wait_for_backend_readiness(
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            move || {
+                let attempt = observed.get();
+                observed.set(attempt + 1);
+                async move { Ok::<_, BootstrapError>((attempt == 2).then_some(attempt)) }
+            },
+        )
+        .await
+        .expect("the third exact snapshot is healthy");
+
+        assert_eq!(ready, 2);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_backend_readiness_wait_has_a_hard_deadline() {
+        let result = wait_for_backend_readiness(
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            || async { Ok::<Option<()>, BootstrapError>(None) },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(BootstrapError::BackendReadinessTimeout)
+        ));
     }
 }

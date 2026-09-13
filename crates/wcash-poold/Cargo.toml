@@ -37,6 +37,7 @@ wcash-zec-payout-signer = { path = "../wcash-zec-payout-signer" }
 [dev-dependencies]
 sqlx.workspace = true
 tempfile = "3.23.0"
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
