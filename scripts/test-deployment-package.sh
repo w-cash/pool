@@ -1436,6 +1436,10 @@ assert "limit_req zone=zecwec_portal_credentials burst=4 nodelay;" in portal
 assert "limit_req_status 429;" in portal
 assert '\"POST:/api/v1/workers\" $http_cf_connecting_ip;' in portal
 assert "return 444;" in portal
+assert "location ^~ /api/v1/ {" in portal
+assert "location = /readyz {" in portal
+assert "location / {\n        return 404;\n    }" in portal
+assert "location / {\n        limit_req" not in portal
 PY
 
 PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/scripts/deploy/grant-runtime.sh" <<'PY'

@@ -119,9 +119,13 @@ database DML, so rollback rejects them before stopping the live target or
 executing any target-owned deployment code. Only an epoch-2 release that also
 passes the explicit schema-compatibility review can be selected.
 
-The portal origin must remain behind Cloudflare Full (strict) plus
-Authenticated Origin Pulls. The mining hostname is DNS-only and protected by
-firewall CIDRs; generic Cloudflare HTTP proxying does not carry ZIP-301 TCP.
+The HTTP origin is deployed API-only: nginx exposes `/api/v1/*`, `/readyz`, and
+`/healthz`, and returns `404` for `/` and bundled static assets. A separately
+reviewed frontend must use this same protected origin so the strict session,
+CSRF, and origin policy remains intact. The origin must remain behind
+Cloudflare Full (strict) plus Authenticated Origin Pulls. The mining hostname
+is DNS-only and protected by firewall CIDRs; generic Cloudflare HTTP proxying
+does not carry ZIP-301 TCP.
 
 See [`docs/zecwec-testnet-deployment.md`](../docs/zecwec-testnet-deployment.md)
 for the detailed ceremony, launch gates, health contract, and rollback rules.
