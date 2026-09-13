@@ -42,6 +42,10 @@ fi
 if systemctl is-active --quiet wcash-pool-backend.service; then
     die "wcash-pool-backend.service must be stopped before rendering deployment state"
 fi
+for wallet_unit in zecwec-zallet.service zecwec-zallet-recovery.service; do
+    systemctl is-active --quiet "$wallet_unit" \
+        && die "$wallet_unit must be stopped before rendering deployment state"
+done
 # Cached backend/Wcash oneshots must be reconciled against every newly rendered
 # exact policy. The ZEC gate itself is deliberately transient: it repeats the
 # strict zero check only while no backend authority exists.
@@ -82,6 +86,8 @@ python3 "$source_root/scripts/deploy/render_deployment.py" "${arguments[@]}"
 
 install -d -o root -g root -m 0755 "$ZECWEC_CONFIG_DIR"
 install -o zecwec-zallet -g zecwec-zallet -m 0600 "$staging/zallet.toml" "$ZECWEC_CONFIG_DIR/zallet.toml"
+install -o root -g zecwec-zallet-recovery -m 0640 \
+    "$staging/zallet-recovery.toml" "$ZECWEC_CONFIG_DIR/zallet-recovery.toml"
 install -o root -g wcash-pool -m 0640 "$staging/wcash-wallet-bootstrap.env" \
     "$ZECWEC_CONFIG_DIR/wcash-wallet-bootstrap.env"
 if [[ $phase != wallet-bootstrap ]]; then

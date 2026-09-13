@@ -186,8 +186,10 @@ DISCOVERABLE_INTEGER_KEYS = {"ZCASH_SIGNER_ACCOUNT_INDEX"}
 WALLET_BOOTSTRAP_TEMPLATES = {
     "deploy/config/wcash-wallet-bootstrap.env.in": "wcash-wallet-bootstrap.env",
     "deploy/config/zallet.testnet.toml.in": "zallet.toml",
+    "deploy/config/zallet-recovery.testnet.toml.in": "zallet-recovery.toml",
     "deploy/systemd/wcash-pool-wallet-init.service.in": "systemd/wcash-pool-wallet-init.service",
     "deploy/systemd/zecwec-zallet.service.in": "systemd/zecwec-zallet.service",
+    "deploy/systemd/zecwec-zallet-recovery.service.in": "systemd/zecwec-zallet-recovery.service",
 }
 
 DEPLOYMENT_TEMPLATES = {
@@ -538,10 +540,19 @@ def main() -> None:
     values["POOL_UID"] = str(args.pool_uid)
     values["WCASH_RELEASE_ROOT"] = str(release_root)
     values["WCASH_WALLET_AUTHORITY"] = "/var/lib/wcash-pool/wcash-wallet-authority.json"
+    values["ZALLET_RECOVERY_RPC"] = "127.0.0.1:28242"
+    values["ZALLET_RECOVERY_STATE_DIR"] = "/var/lib/zecwec-zallet-recovery"
+    values["ZALLET_RECOVERY_CONFIG_FILE"] = "/etc/wcash-pool/zallet-recovery.toml"
     values["ZCASH_INITIAL_ZERO_RESULT"] = (
-        "/var/lib/wcash-pool-backend/zec-collector-initial-zero.json"
+        "/var/lib/zecwec-custody/zec-collector-initial-zero.json"
     )
     values["ZCASH_INITIAL_ZERO_ATTESTATION"] = (
+        "/var/lib/zecwec-custody/zec-collector-initial-zero.attestation"
+    )
+    values["ZCASH_INITIAL_ZERO_STAGING_RESULT"] = (
+        "/var/lib/wcash-pool-backend/zec-collector-initial-zero.json"
+    )
+    values["ZCASH_INITIAL_ZERO_STAGING_ATTESTATION"] = (
         "/var/lib/wcash-pool-backend/zec-collector-initial-zero.attestation"
     )
     values["WCASH_WALLET_SHA256"] = hash_file(release_root / "wcash-wallet")

@@ -27,14 +27,7 @@ deployment_source=${ZECWEC_DEPLOY_SOURCE_ROOT:-$default_deployment_source}
 require_absolute_path "$deployment_source"
 [[ -d $deployment_source/deploy && -d $deployment_source/scripts/deploy \
     && -d $deployment_source/docs ]] || die "deployment package source is incomplete"
-if find "$deployment_source/deploy" "$deployment_source/scripts" \
-    "$deployment_source/docs" -type l -print -quit | grep -q .; then
-    die "deployment package source must not contain symbolic links"
-fi
-if find "$deployment_source/deploy" "$deployment_source/scripts" \
-    "$deployment_source/docs" ! -type d ! -type f -print -quit | grep -q .; then
-    die "deployment package source contains an unsupported file type"
-fi
+require_deployment_source_tree_safe "$deployment_source"
 
 allowed=(wcash-poold wcash-merge-miner wcash-wallet zallet)
 manifest="$source_dir/SHA256SUMS"

@@ -761,13 +761,93 @@ def require_output_absent(path: str) -> None:
         fail("capture output path must be absolute")
     directory = output_directory(target.parent)
     try:
+        for name, label in (
+            (target.name, "capture output"),
+            (f"{target.name}.mutation-intent", "mutation intent"),
+        ):
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                fail(f"{label} path cannot be inspected safely")
+            fail(f"{label} already exists; refusing a mutating RPC ceremony")
+    finally:
+        os.close(directory)
+
+
+def mutation_intent_name(output: str) -> str:
+    target = pathlib.Path(output)
+    if not target.is_absolute() or target.name in {"", ".", ".."}:
+        fail("capture output path must be absolute")
+    return f"{target.name}.mutation-intent"
+
+
+def create_mutation_intent(output: str, operation: str, nonce: str) -> bytes:
+    target = pathlib.Path(output)
+    serialized = canonical_json(
+        {
+            "schema_version": 1,
+            "network": "testnet",
+            "operation": operation,
+            "capture_nonce": nonce,
+        }
+    )
+    directory = output_directory(target.parent)
+    name = mutation_intent_name(output)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
         try:
-            os.stat(target.name, dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            return
+            descriptor = os.open(name, flags, 0o400, dir_fd=directory)
         except OSError:
-            fail("capture output path cannot be inspected safely")
-        fail("capture output already exists; refusing a mutating RPC ceremony")
+            fail("mutation intent already exists or cannot be created safely")
+        try:
+            offset = 0
+            while offset < len(serialized):
+                written = os.write(descriptor, serialized[offset:])
+                if written <= 0:
+                    fail("cannot write mutation intent")
+                offset += written
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return serialized
+
+
+def clear_mutation_intent(output: str, expected: bytes) -> None:
+    target = pathlib.Path(output)
+    directory = output_directory(target.parent)
+    name = mutation_intent_name(output)
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory,
+            )
+        except OSError:
+            fail("mutation intent is unavailable after the RPC operation")
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != TRUSTED_UID
+                or stat.S_IMODE(metadata.st_mode) != 0o400
+                or metadata.st_nlink != 1
+                or read_descriptor(descriptor, len(expected)) != expected
+            ):
+                fail("mutation intent changed during the RPC operation")
+        finally:
+            os.close(descriptor)
+        try:
+            os.unlink(name, dir_fd=directory)
+        except OSError:
+            fail("mutation intent cannot be removed after durable capture")
+        os.fsync(directory)
     finally:
         os.close(directory)
 
@@ -884,6 +964,7 @@ def capture_original(
     )
     if pre_accounts["response"]["result"] != []:
         fail("original collector wallet already contains an account")
+    intent = create_mutation_intent(output, "z_getnewaccount", nonce)
     operation = rpc_call(
         host, port, cookie, nonce, 3, "z_getnewaccount", [ACCOUNT_NAME]
     )
@@ -935,6 +1016,7 @@ def capture_original(
     }
     validate_capture(capture, "original_wallet_creation", settings, native_program)
     write_once(output, capture)
+    clear_mutation_intent(output, intent)
 
 
 def capture_recovered(
@@ -972,6 +1054,7 @@ def capture_recovered(
         "zip32_account_index": original["zip32_account_index"],
         "birthday_height": birthday,
     }
+    intent = create_mutation_intent(output, "z_recoveraccounts", nonce)
     operation = rpc_call(
         host,
         port,
@@ -1037,6 +1120,7 @@ def capture_recovered(
     if any(original[field] != recovered[field] for field in PORTABLE_FIELDS):
         fail("independent recovery differs from the original portable collector identity")
     write_once(output, capture)
+    clear_mutation_intent(output, intent)
 
 
 def policy_binding(settings: dict[str, str]) -> dict:
