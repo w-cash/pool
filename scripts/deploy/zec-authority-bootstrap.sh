@@ -28,6 +28,18 @@ mode=$1
 [[ -f $ZEC_AUTHORITY_CONFIG && ! -L $ZEC_AUTHORITY_CONFIG ]] \
     || die "ZEC authority configuration is unavailable"
 
+verify_canonical_policy() {
+    local backend_gid metadata
+    [[ $ZEC_AUTHORITY_CONFIG == /etc/wcash-pool/zec-authority.testnet.toml ]] \
+        || die "ZEC authority configuration differs from the reviewed path"
+    backend_gid=$(id -g wcash-pool-backend) \
+        || die "backend authority group is unavailable"
+    metadata=$(stat -c '%u:%g:%a:%h' -- "$ZEC_AUTHORITY_CONFIG") \
+        || die "ZEC authority configuration metadata is unavailable"
+    [[ $metadata == "0:$backend_gid:640:1" ]] \
+        || die "ZEC authority configuration ownership or mode is unsafe"
+}
+
 verify_artifact() {
     local transport=${1:?artifact transport is required}
     [[ -f $ZEC_AUTHORITY_RESULT && ! -L $ZEC_AUTHORITY_RESULT \
@@ -119,6 +131,7 @@ if [[ $mode == verify || $mode == verify-sealed ]]; then
             && $ZEC_AUTHORITY_RESULT == /var/lib/zecwec-custody/zec-collector-initial-zero.json \
             && $ZEC_AUTHORITY_ATTESTATION == /var/lib/zecwec-custody/zec-collector-initial-zero.attestation ]] \
             || die "sealed authority inputs differ from the reviewed root namespace"
+        verify_canonical_policy
         verify_artifact sealed
         exit 0
     fi
@@ -135,10 +148,10 @@ fi
 
 : "${STATE_DIRECTORY:?systemd state directory is required}"
 : "${BACKEND_AUTHORITY:?backend authority path is required}"
+verify_canonical_policy
 [[ $STATE_DIRECTORY == /var/lib/wcash-pool-backend ]] \
     || die "state directory differs from the reviewed authority namespace"
-[[ $ZEC_AUTHORITY_CONFIG == "$CREDENTIALS_DIRECTORY/zec-authority-config" \
-    && $ZEC_AUTHORITY_RESULT == "$STATE_DIRECTORY/zec-collector-initial-zero.json" \
+[[ $ZEC_AUTHORITY_RESULT == "$STATE_DIRECTORY/zec-collector-initial-zero.json" \
     && $ZEC_AUTHORITY_ATTESTATION == "$STATE_DIRECTORY/zec-collector-initial-zero.attestation" \
     && $BACKEND_AUTHORITY == "$STATE_DIRECTORY/backend-authority-protocol-v2.json" ]] \
     || die "authority inputs differ from the reviewed protocol-v2 namespace"

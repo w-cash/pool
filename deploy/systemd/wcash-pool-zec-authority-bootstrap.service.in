@@ -14,13 +14,12 @@ Group=wcash-pool-socket
 SupplementaryGroups=wcash-pool-backend
 UMask=0077
 Environment=ZECWEC_RELEASE_PATH=@WCASH_RELEASE_ROOT@
-Environment=ZEC_AUTHORITY_CONFIG=/run/credentials/wcash-pool-zec-authority-bootstrap.service/zec-authority-config
+Environment=ZEC_AUTHORITY_CONFIG=/etc/wcash-pool/zec-authority.testnet.toml
 Environment=ZEC_AUTHORITY_RESULT=@ZCASH_INITIAL_ZERO_STAGING_RESULT@
 Environment=ZEC_AUTHORITY_ATTESTATION=@ZCASH_INITIAL_ZERO_STAGING_ATTESTATION@
 Environment=BACKEND_AUTHORITY=@BACKEND_STATE_DIR@/backend-authority-protocol-v2.json
 LoadCredential=zallet-cookie:@ZALLET_STATE_DIR@/.cookie
 LoadCredential=zcash-node-cookie:@ZCASH_VALIDATOR_COOKIE_SOURCE@
-LoadCredential=zec-authority-config:/etc/wcash-pool/zec-authority.testnet.toml
 ExecStartPre=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/verify-release.sh wcash-poold
 ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/zec-authority-bootstrap.sh reconcile
 TimeoutStartSec=300s
