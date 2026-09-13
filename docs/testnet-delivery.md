@@ -38,8 +38,9 @@ No miner wallet key is requested.
    payments as separate observations.
 
 The explorer is outside this release. Existing wallet/node state and balances
-must survive ordinary deployment and restart. No new VPS or data migration is
-required merely to finish the pool.
+must survive ordinary deployment and restart. Use the existing VPS and durable
+state, applying the reviewed proof-lifecycle schema migration without resetting
+the database, journals, or wallets.
 
 ## Evidence
 
@@ -48,11 +49,19 @@ and result. Never put credentials, full payout destinations or wallet material
 in this file. A completed component test is not a substitute for the complete
 service flow. Pending evidence must remain labeled pending.
 
+Record the runtime-source revision and deployment-package-source revision
+separately. The validated pool binary uses runtime source
+`e85ea46cc04c7d35083a526eff28d11704254903`; a later documentation-only package
+revision reuses that binary with its exact newly generated deployment-package
+manifest. The native production build from selected `c0e3687` remains after
+the complete local acceptance gate.
+
 | Gate | Status |
 | --- | --- |
-| Integrated Rust release checks | Component suites passed; final proof-lifecycle correction under verification |
+| Integrated Rust release checks | Passed: final `bbe4274`/`e85ea46` component suites and real PostgreSQL alias, lifecycle, migration/backfill, and side-chain regressions; native `c0e3687` passed 217 tests |
+| Final Linux pool artifact and component checks | Passed: production-default `e85ea46` static x86_64 musl binary ran on Ubuntu 22.04; 203 `bbe4274` protocol/backend/core/edge tests executed there |
 | Miner portal on the real local services | Passed: 42 browser checks, including account, worker revocation and both Zcash destination profiles |
-| Complete local regtest mining and accounting | Pending: preserved chains at height 23 exposed duplicate Wcash economic-block insertion; recovery under verification |
+| Complete local regtest mining and accounting | In progress: preserved-height-23 recovery succeeded with the proof-lifecycle correction and real mining resumed; full payout, controlled restart, and replay gates remain pending |
 | Real Zcash transparent and shielded payments | Pending |
 | Real Wcash payment and restart reconciliation | Pending |
 | Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
@@ -60,9 +69,16 @@ service flow. Pending evidence must remain labeled pending.
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
 
-At pool revision `1e9650956ef1928df2dc64e6ccc5f8d9b5866523`, dependency policy
-checks passed and a production-default static x86_64 Linux pool binary built
-successfully with Rust 1.91 and cargo-zigbuild. That binary ran on Ubuntu 22.04;
-115 cross-compiled component tests also passed there. These platform checks do
-not approve that revision for deployment: the real height-23 accounting failure
-requires the subsequent proof-lifecycle correction and a new exact release.
+The final production-default static x86_64 musl pool binary at `e85ea46` has
+SHA-256 `4aea7f43990231743b2a911359163bead06e95980c46a54947308fafb7ead026`.
+It is byte-identical to the `bbe4274` production binary and its `--help` command
+ran successfully on Ubuntu 22.04 AMD64. The matching Linux test executables
+passed all 203 protocol/backend/core/edge tests (39/40/63/61), matching the
+macOS results. An earlier `1e96509` run also passed 115 signer/component tests
+on Ubuntu; the signer code in those checks is unchanged.
+
+The 42 real browser checks and prior real worker-token authorization/revocation
+checks remain separate evidence. Component tests, successful preserved-state
+recovery, and platform checks do not complete the outstanding actual payment,
+recipient-receipt, controlled restart, and same-session replay acceptance gates.
+Remote activation remains pending those local results.

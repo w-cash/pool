@@ -164,6 +164,36 @@ only an operator selection marker: rendered services and policies contain the
 resolved immutable version directory. An existing release is accepted only if
 both its binary and deployment-package manifests verify exactly.
 
+### Parent-node and proof-lifecycle compatibility
+
+The node executables are managed separately from the four executables in this
+pool release package. Before initializing or activating the new backend, update
+**both pinned Zcash parents**: the template node and its independent proposal
+validator. Use the selected native release
+`c0e3687b21bd2faf7a57156a5754abbe26a91424` or a reviewed compatible descendant,
+preserving each node's existing data directory. Updating only
+`wcash-merge-miner` does not update these node services.
+
+On each parent, independently verify `getblockhash(0)` against the configured
+Zcash Testnet genesis, then call `getblockstatus` with that exact display-order
+hash. Require `state: "best_chain"`, the same hash, `height: 0`, and positive
+confirmations. A missing method, a different identity, or an unknown result
+fails this prerequisite. The native startup check performs the same proof on
+every pinned parent before advertising the required `winner_side_chain_v1`
+backend capability. Use the existing protected RPC credential mechanism; do
+not put credentials in command arguments or evidence files.
+
+Deploy the matching pool protocol/projector and native journal reader together.
+The reviewed pool includes `bbe42749651862e1b92cefe995e72901e35f3546` and the
+`e85ea46` fixture correction. Stop old public, projector, payout, and backend
+processes before the existing migration/preflight sequence. Migration
+`0012_winner_proof_lifecycle.sql` preserves each economic winner and its original
+allocation, backfills individual proof lifecycles, and permits distinct typed
+ledger movements for one backend event. The migration unit reapplies the
+matching restricted grants before the projector starts. Confirm the migration
+and the new projector's canonical journal catch-up succeed before opening
+listeners; no schema reset or journal replacement is part of this upgrade.
+
 ### First security-epoch-2 bootstrap
 
 This bootstrap supports only a pre-provisioned launch host or a never-activated,
@@ -995,6 +1025,17 @@ failed start, payout-readiness wait, or health check leaves the target, health
 timer, public pool, payout worker, and payout Zallet stopped. Database rollback
 is never automatic; the explicit schema-compatible acknowledgement is
 mandatory.
+
+The proof-lifecycle release adds a compatibility boundary within epoch 2.
+After migration `0012` has been applied, a pre-`bbe4274` pool is not an eligible
+rollback target. After a `winner_side_chain` record has been appended, a native
+journal reader predating `1f1f70cdb2f07c0d3313f1bd1b861caeed3ab5f1` cannot read
+that retained state. The selected minimum native release is
+`c0e3687b21bd2faf7a57156a5754abbe26a91424`, which also verifies the required
+parent-node RPC capability at startup. Review database schema, event readers,
+and the negotiated capability together; the epoch-2 marker alone does not
+establish compatibility. Keep the upgraded node services and durable journals
+when selecting a reviewed compatible application release.
 
 Epoch 1 is intentionally not rollback-compatible. Those packages predate the
 separate projector and migrator identities and can reinstall broad public
