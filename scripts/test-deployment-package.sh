@@ -3068,6 +3068,26 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --output "$temporary/ironwood-output" \
     --pool-uid 12345 \
     --payout-uid 12346
+for insufficient_listeners in 1 2 3; do
+    sed "s/^BACKEND_LISTENERS=[0-9][0-9]*$/BACKEND_LISTENERS=$insufficient_listeners/" \
+        "$temporary/deployment.env" >"$temporary/insufficient-listeners.env"
+    if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
+        --settings "$temporary/insufficient-listeners.env" \
+        --source-root "$repo_root" \
+        --release-root "$temporary/release" \
+        --output "$temporary/insufficient-listeners-output" \
+        --pool-uid 12345 \
+        --payout-uid 12346 >"$temporary/insufficient-listeners.log" 2>&1; then
+        printf 'deployment-package-test: renderer accepted insufficient backend listener capacity\n' >&2
+        exit 1
+    fi
+    grep -Fq 'BACKEND_LISTENERS must reserve public, projector, and both payout snapshot connections' \
+        "$temporary/insufficient-listeners.log"
+    [[ ! -e $temporary/insufficient-listeners-output ]] || {
+        printf 'deployment-package-test: insufficient listener capacity produced deployment output\n' >&2
+        exit 1
+    }
+done
 [[ -f $temporary/ironwood-output/zallet-payout.toml ]] \
     || {
         printf 'deployment-package-test: bootstrap omitted payout Zallet policy\n' >&2

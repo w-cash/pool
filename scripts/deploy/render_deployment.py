@@ -417,8 +417,8 @@ def validate(values: dict[str, str], phase: str) -> None:
         }
     ) != 4:
         fail("PostgreSQL migration, public, projector, and payout roles must be distinct")
-    if int(values["BACKEND_LISTENERS"]) < 3:
-        fail("BACKEND_LISTENERS must reserve public, projector, and payout-startup capacity")
+    if int(values["BACKEND_LISTENERS"]) < 4:
+        fail("BACKEND_LISTENERS must reserve public, projector, and both payout snapshot connections")
 
     exact_paths = {
         "POOL_STATE_DIR": "/var/lib/wcash-pool",
