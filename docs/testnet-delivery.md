@@ -77,7 +77,7 @@ production build follows the complete local acceptance gate, which passed at
 | Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
 | Remote node upgrades, migration and preflight | Passed: all four verified node binaries preserve chain state; both chain-specific committed-proof status checks and independent node agreement pass; PostgreSQL migration and listener-free preflight passed |
 | Native validator-tip rollover | Passed with `ebb620d50`: four real loopback RPC regressions, 225 library tests and 17 CLI tests; two existing library tests ignored; actual three-node Regtest job preparation and retirement passed at unchanged height 206 |
-| Remote activation and public endpoint acceptance | Pending: startup credential and validator-tip rollover failures were reproduced and corrected locally; the updated backend must pass remote activation and external acceptance |
+| Remote activation and public endpoint acceptance | Pending: third activation failed closed on one private peer transport error; the corrected backend must pass remote activation and external acceptance |
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
 
@@ -127,6 +127,15 @@ submitted. Its macOS binary SHA-256 is
 `d66977d4b7ff9343ac30cc7434fed0be1ac41eda596f6fcaefa43a50f3e5c326`.
 The node and wallet binaries remain the verified `11ffc3b` artifacts; only the
 mining backend needs rebuilding for this correction.
+
+The third activation failed closed at 04:19 UTC when a private peer transport
+error terminated the entire native backend. The wallet was scanning normally;
+the payout worker had not started. The listener correction distinguishes request
+decoding from response encoding. Peer framing errors, finite deadlines and
+expected disconnects close only their session. Invalid server responses,
+authority mismatches and unexpected local I/O still fail the service. A failed
+response does not retry a request or advance its event cursor; durable accounting
+is recovered through the existing explicit reconnect and replay protocol.
 
 The normal payout worker created exactly two batches covering three recipient
 profiles. Its first ZEC proof exceeded the unchanged 180-second deadline in an
