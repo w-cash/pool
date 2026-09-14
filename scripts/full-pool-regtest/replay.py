@@ -22,7 +22,9 @@ from verify import GENESIS, Verifier, display_block, require
 
 MAX_LINE = 262144
 IDLE_DEADLINE_SECONDS = 20
-PROJECTION_DEADLINE_SECONDS = 30
+# The native reconciler checks retained proofs serially with a 100ms delay per
+# proof. A mature harness can legitimately need more than 30s for both chains.
+PROJECTION_DEADLINE_SECONDS = 120
 
 
 class ReplayVerifier(Verifier):

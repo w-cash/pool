@@ -201,13 +201,13 @@ class ReplayBoundaryTests(unittest.TestCase):
                   'allocations': [1], 'credit': [1]} for chain in ('wcash', 'zcash')]
         ledger.winner_facts = lambda: facts
         submission = {**SUBMIT, 'params': [SUBMIT['params'][0], 'ab' * 32, *SUBMIT['params'][2:]]}
-        with patch('replay.time.monotonic', side_effect=[0, 12]):
+        with patch('replay.time.monotonic', side_effect=[0, 45]):
             ledger.await_original(submission)
         self.assertEqual(ledger.original_facts, facts)
         self.assertIsNone(ledger.verifier.query_deadline)
-        with patch('replay.time.monotonic', side_effect=[0, 12]):
+        with patch('replay.time.monotonic', side_effect=[0, 45]):
             with self.assertRaisesRegex(RuntimeError, 'did not project'):
-                ledger.await_original(submission, deadline=10)
+                ledger.await_original(submission, deadline=30)
         self.assertIsNone(ledger.verifier.query_deadline)
 
     def test_proxy_returns_acceptance_then_replays_after_client_exit_on_same_connection(self):
