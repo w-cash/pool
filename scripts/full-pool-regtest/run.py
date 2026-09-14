@@ -24,6 +24,7 @@ from urllib.parse import urlsplit, unquote
 WEC_GENESIS = '70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c'
 ZEC_GENESIS = '029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327'
 TARGET = '7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+BACKEND_LISTENERS = 4
 
 
 def private(path, value):
@@ -212,6 +213,9 @@ filter = "info"
                     'WCASH_POOL_BACKEND_SUBMIT_UID': str(os.getuid()),
                     'WCASH_POOL_BACKEND_PROJECTOR_UID': str(os.getuid() + 1),
                     'WCASH_POOL_BACKEND_PAYOUT_UID': str(os.getuid() + 2),
+                    # Public, projector and payout startup retain independent
+                    # Unix sessions; a payout gap snapshot needs a fourth slot.
+                    'WCASH_POOL_BACKEND_LISTENERS': str(BACKEND_LISTENERS),
                     'WCASH_POOL_BACKEND_SOCKET_GID': str(self.root.stat().st_gid), 'WCASH_SHARE_TARGET': TARGET})
         for name, prefix in [('wec', 'WCASH_RPC'), ('zec', 'ZCASH_TEMPLATE_RPC'), ('validator', 'ZCASH_VALIDATOR_RPC')]:
             user, password = (self.root / name / '.cookie').read_text().strip().split(':', 1)
@@ -224,6 +228,8 @@ filter = "info"
             raise RuntimeError('this merged-winner harness requires equal actual Regtest targets')
         self.network_target = parent_target
         authority = json.loads(self.command('backend-init', [args.miner, 'pool-backend-init', *urls], env=env))
+        if authority.get('listener_workers') != BACKEND_LISTENERS:
+            raise RuntimeError('backend must reserve listener capacity for public, projector and payout startup')
         self.spawn('backend', [args.miner, 'native-pool-backend', *urls], env=env)
         self.until('backend socket', lambda: (self.root / 'backend.sock').exists())
         config = self.write_pool_config(authority)
