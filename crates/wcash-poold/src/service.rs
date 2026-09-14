@@ -68,7 +68,13 @@ const PAYOUT_MAXIMUM_CONSECUTIVE_FAILURES: u32 = 20;
 const PAYOUT_MAXIMUM_CONFIRMATION_WATCHES: u32 = 8;
 const PAYOUT_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PROJECTOR_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
-const PROJECTOR_BACKEND_UNHEALTHY_GRACE: Duration = Duration::from_secs(30);
+// A Zcash block can take longer than thirty seconds on the Testnet and the
+// backend must briefly retry while its two pinned parents converge on the
+// same tip. The backend advertises jobs for 45 seconds, so the projector must
+// tolerate a bounded rotation gap without tearing down the public pool. A
+// two-minute grace still fails closed well before an operator would mistake a
+// stale backend for a healthy one.
+const PROJECTOR_BACKEND_UNHEALTHY_GRACE: Duration = Duration::from_secs(120);
 const PROJECTOR_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
 const PAYOUT_WORKER_LEASE_DURATION: Duration = Duration::from_secs(35 * 60);
 const PAYOUT_WORKER_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
