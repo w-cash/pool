@@ -6,6 +6,7 @@ After=wcash-pool.service
 Type=oneshot
 User=root
 ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/health-check.sh --quiet
+TimeoutStartSec=1200s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes

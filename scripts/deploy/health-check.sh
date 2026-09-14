@@ -85,10 +85,11 @@ stratum=$(read_setting "$settings" STRATUM_LISTEN)
 plain_port=${stratum##*:}
 tls_port=$(read_setting "$settings" STRATUM_TLS_PORT)
 portal_ready=false
-# Keep the edge open through the same bounded parent-tip rollover window used
-# by the pool and projector. A transient validator/template disagreement must
-# not close every public listener before the backend can publish its next job.
-for attempt in $(seq 1 30); do
+# Keep the edge open through the same bounded parent-tip rollover and wallet
+# recovery window used by the pool and projector. A transient
+# validator/template disagreement or supervised payout-wallet scan must not
+# close every public listener before the backend can publish its next job.
+for attempt in $(seq 1 540); do
     if portal_readiness=$(curl --fail --silent --show-error --max-time 5 \
         "http://$portal/readyz"); then
         if python3 -c '
@@ -110,7 +111,7 @@ raise SystemExit(0 if value == expected else 1)
             break
         fi
     fi
-    if ((attempt < 30)); then
+    if ((attempt < 540)); then
         sleep 2
     fi
 done

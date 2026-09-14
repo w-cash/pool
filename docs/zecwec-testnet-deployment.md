@@ -960,7 +960,9 @@ acknowledged edge mode, proves full health, and only then starts the minute
 health timer. The root-owned portal mode is persisted before its nginx link;
 missing, stale, or invalid state removes the managed link and fails closed. A
 failed scheduled health check closes the target, its listeners, and the mining
-firewall. The health unit retains only the additional `CAP_NET_ADMIN` capability
+firewall. The scheduled probe allows an 18-minute bounded recovery window for
+normal Zcash template/validator tip rollover and a supervised payout-wallet
+scan before it closes the runtime. The health unit retains only the additional `CAP_NET_ADMIN` capability
 needed to inspect and close the raw guard, and its otherwise read-only
 filesystem namespace exposes only UFW's configuration and the two existing
 firewall lock files as writable. There is no boot-time window where the timer
