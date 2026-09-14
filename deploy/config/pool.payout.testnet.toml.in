@@ -16,6 +16,7 @@ database_url_file = "@DATABASE_URL_RUNTIME_PATH@"
 stratum_listen = "@STRATUM_LISTEN@"
 portal_listen = "@PORTAL_LISTEN@"
 portal_origin = "@PORTAL_ORIGIN@"
+payout_change_hold_secs = @PAYOUT_CHANGE_HOLD_SECS@
 nonce_namespace = @NONCE_NAMESPACE@
 nonce_reservation = @NONCE_RESERVATION@
 database_connections = @DATABASE_CONNECTIONS@

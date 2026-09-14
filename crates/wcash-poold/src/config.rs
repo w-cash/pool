@@ -57,6 +57,8 @@ pub struct RuntimeConfig {
     pub portal_listen: SocketAddr,
     /// Exact public HTTPS portal origin.
     pub portal_origin: String,
+    /// Safety hold applied to every initial or replacement payout destination.
+    pub payout_change_hold_secs: u64,
     /// Non-zero, deployment-exclusive nonce namespace.
     pub nonce_namespace: u8,
     /// Number of nonce prefixes reserved transactionally per start.
@@ -193,6 +195,7 @@ struct RawConfig {
     stratum_listen: SocketAddr,
     portal_listen: SocketAddr,
     portal_origin: String,
+    payout_change_hold_secs: u64,
     nonce_namespace: u8,
     nonce_reservation: u64,
     database_connections: u32,
@@ -317,6 +320,21 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             || !raw.portal_origin.starts_with("https://")
             || raw.portal_origin.ends_with('/')
             || raw.portal_origin.chars().any(char::is_whitespace)
+            || {
+                let minimum = {
+                    #[cfg(feature = "regtest")]
+                    if network == ChainNetwork::Regtest {
+                        1
+                    } else {
+                        60
+                    }
+                    #[cfg(not(feature = "regtest"))]
+                    {
+                        60
+                    }
+                };
+                !(minimum..=7 * 24 * 60 * 60).contains(&raw.payout_change_hold_secs)
+            }
             || !(1..=127).contains(&raw.nonce_namespace)
             || !(1..=16_777_216).contains(&raw.nonce_reservation)
             || !(1..=64).contains(&raw.database_connections)
@@ -386,6 +404,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             stratum_listen: raw.stratum_listen,
             portal_listen: raw.portal_listen,
             portal_origin: raw.portal_origin,
+            payout_change_hold_secs: raw.payout_change_hold_secs,
             nonce_namespace: raw.nonce_namespace,
             nonce_reservation: raw.nonce_reservation,
             database_connections: raw.database_connections,
@@ -797,6 +816,7 @@ database_url_file = "{root}/database"
 stratum_listen = "0.0.0.0:28237"
 portal_listen = "127.0.0.1:8080"
 portal_origin = "https://testnet.zecwec.com"
+payout_change_hold_secs = 172800
 nonce_namespace = 1
 nonce_reservation = 1000000
 database_connections = 8

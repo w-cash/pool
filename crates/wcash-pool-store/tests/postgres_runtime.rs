@@ -931,6 +931,8 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
              TO {public_role}; \
          GRANT EXECUTE ON FUNCTION public.configure_payout_destination_v1( \
              UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN) TO {public_role}; \
+         GRANT EXECUTE ON FUNCTION public.configure_payout_destination_v2( \
+             UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN,BIGINT) TO {public_role}; \
          GRANT SELECT ON deployments,backend_cursors,backend_events,chain_policies, \
              chain_safety_state,jobs,shares,winners,winner_proofs,winner_allocations,ledger_transactions, \
              ledger_entries,payout_batches TO {projector_role}; \
@@ -1196,6 +1198,7 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
 
     for signature in [
         "public.configure_payout_destination_v1(uuid,uuid,text,text,text,text,bytea,bigint,boolean)",
+        "public.configure_payout_destination_v2(uuid,uuid,text,text,text,text,bytea,bigint,boolean,bigint)",
         "public.activate_due_payout_destinations_v1(uuid,text)",
         "public.freeze_chain_payouts_v1(uuid,text,bigint,text)",
         "public.ensure_projected_worker_v1(uuid,uuid,uuid,text)",
@@ -1221,6 +1224,11 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (
             &public_role,
             "public.configure_payout_destination_v1(uuid,uuid,text,text,text,text,bytea,bigint,boolean)",
+            true,
+        ),
+        (
+            &public_role,
+            "public.configure_payout_destination_v2(uuid,uuid,text,text,text,text,bytea,bigint,boolean,bigint)",
             true,
         ),
         (
@@ -1261,6 +1269,11 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (
             &payout_role,
             "public.configure_payout_destination_v1(uuid,uuid,text,text,text,text,bytea,bigint,boolean)",
+            false,
+        ),
+        (
+            &payout_role,
+            "public.configure_payout_destination_v2(uuid,uuid,text,text,text,text,bytea,bigint,boolean,bigint)",
             false,
         ),
         (

@@ -1636,10 +1636,7 @@ fn build_preflight_portal(
 ) -> Result<PortalApp, ServiceError> {
     let mut portal_config = PortalConfig::testnet();
     portal_config.network = config.network;
-    #[cfg(feature = "regtest")]
-    if config.network == ChainNetwork::Regtest {
-        portal_config.payout_change_hold_secs = 1;
-    }
+    portal_config.payout_change_hold_secs = config.payout_change_hold_secs;
     portal_config
         .canonical_origin
         .clone_from(&config.portal_origin);
@@ -2530,6 +2527,7 @@ mod tests {
             stratum_listen: SocketAddr::from_str("0.0.0.0:28237").expect("stratum address"),
             portal_listen: SocketAddr::from_str("127.0.0.1:8080").expect("portal address"),
             portal_origin: "https://testnet.zecwec.com".to_owned(),
+            payout_change_hold_secs: 172800,
             nonce_namespace: 1,
             nonce_reservation: 1_000_000,
             database_connections: 8,

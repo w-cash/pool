@@ -12,6 +12,7 @@ let currentAccount = null;
 let refreshTimer = null;
 let refreshInFlight = false;
 let cachedSettings = null;
+let payoutHoldSecs = 172800;
 let workerListAvailable = false;
 let workersRequest = 0;
 let settingsRequest = 0;
@@ -122,6 +123,14 @@ function formatFeePolicy(data, asset) {
 function formatTime(value) {
   if (!Number.isSafeInteger(value) || value <= 0) return "—";
   return new Date(value * 1000).toLocaleString();
+}
+
+function formatDuration(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return "the configured hold";
+  if (value % 86400 === 0) return `${value / 86400} day${value === 86400 ? "" : "s"}`;
+  if (value % 3600 === 0) return `${value / 3600} hour${value === 3600 ? "" : "s"}`;
+  if (value % 60 === 0) return `${value / 60} minute${value === 60 ? "" : "s"}`;
+  return `${value} second${value === 1 ? "" : "s"}`;
 }
 
 function formatState(value) {
@@ -454,9 +463,10 @@ function renderWorkerTelemetry() {
 async function refreshPayoutSettings(generation = authGeneration) {
   const request = ++settingsRequest;
   try {
-    const { settings } = await api("/api/v1/settings/payouts");
+    const { settings, payout_change_hold_secs } = await api("/api/v1/settings/payouts");
     if (!currentGeneration(generation) || request !== settingsRequest) return;
     if (!Array.isArray(settings)) throw new Error("Payout settings are unavailable.");
+    if (Number.isSafeInteger(payout_change_hold_secs) && payout_change_hold_secs > 0) payoutHoldSecs = payout_change_hold_secs;
     cachedSettings = settings.filter((setting) => ["wec", "zec"].includes(setting.asset));
     for (const asset of ["wec", "zec"]) renderPayoutSetting(asset, cachedSettings.find((setting) => setting.asset === asset));
     updateSetupGuide();
@@ -486,7 +496,7 @@ function renderPayoutSetting(asset, setting) {
   }
   if (setting.pending_destination) {
     line(`Pending destination: ${setting.pending_destination}`);
-    line(`Safety hold until ${formatTime(setting.pending_effective_at)}. Payouts remain paused until the change is active.`);
+    line(`Safety hold (${formatDuration(payoutHoldSecs)}) until ${formatTime(setting.pending_effective_at)}. Payouts remain paused until the change is active.`);
     line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${setting.pending_automatic ? "automatic" : "paused"}`);
     setText(`#${asset}-payout-status`, `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`);
   } else {

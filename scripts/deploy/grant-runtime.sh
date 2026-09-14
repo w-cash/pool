@@ -59,6 +59,9 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.configure_payout_destination_v1(
     UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN
 ) FROM :"public_role", :"projector_role", :"payout_role";
+REVOKE ALL ON FUNCTION public.configure_payout_destination_v2(
+    UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN,BIGINT
+) FROM :"public_role", :"projector_role", :"payout_role";
 REVOKE ALL ON FUNCTION public.ensure_projected_worker_v1(UUID,UUID,UUID,TEXT)
 FROM :"public_role", :"projector_role", :"payout_role";
 REVOKE ALL ON FUNCTION public.activate_due_payout_destinations_v1(UUID,TEXT)
@@ -143,6 +146,9 @@ GRANT DELETE ON TABLE portal_sessions TO :"public_role";
 
 GRANT EXECUTE ON FUNCTION public.configure_payout_destination_v1(
     UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN
+) TO :"public_role";
+GRANT EXECUTE ON FUNCTION public.configure_payout_destination_v2(
+    UUID,UUID,TEXT,TEXT,TEXT,TEXT,BYTEA,BIGINT,BOOLEAN,BIGINT
 ) TO :"public_role";
 
 -- Only this no-listener role can advance Wolf's journal projection and the

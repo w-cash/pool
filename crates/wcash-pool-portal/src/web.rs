@@ -672,7 +672,10 @@ async fn list_payout_settings(
                 }),
         );
     }
-    Ok(Json(json!({ "settings": settings })))
+    Ok(Json(json!({
+        "settings": settings,
+        "payout_change_hold_secs": state.config.payout_change_hold_secs,
+    })))
 }
 
 #[derive(Deserialize)]

@@ -382,8 +382,12 @@ wallet state. The payout role has no mining-token, session, share, job, winner,
 or backend-event mutation authority. Payout-destination creation and activation
 and chain freezes cross narrow migrator-owned `SECURITY DEFINER` routines;
 direct service-role table updates are revoked. Every new or replacement
-destination receives an exact database-clock 48-hour pending hold and audit
-entry. Only the migrator binds deployment identity and chain policy; all
+destination receives the exact `PAYOUT_CHANGE_HOLD_SECS` database-clock pending
+hold and audit entry. Testnet accepts 60 seconds through seven days; the
+reviewed default is 172800 seconds (48 hours). Change this root-owned setting
+only for controlled testing, then restart the pool and submit the destination
+again; existing pending rows keep their original release time. Only the
+migrator binds deployment identity and chain policy; all
 runtimes verify those rows. Sequence access is granted only for each role's
 actual identity inserts. The script generates strong local passwords and
 protected connection URL files; it never prints them or places them in process

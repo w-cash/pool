@@ -19,7 +19,6 @@ use crate::{
     Chain, NewPortalSessionRecord, PostgresStore, StoreError,
 };
 
-const PAYOUT_CONFIGURATION_HOLD_SECS: u64 = 48 * 60 * 60;
 const MAXIMUM_MONEY_ZAT: u64 = 2_100_000_000_000_000;
 const MAXIMUM_WORKERS_PER_ACCOUNT: i64 = 100;
 
@@ -518,7 +517,7 @@ async fn configure_payout(
     if change.account_id.is_nil()
         || change.threshold_zat == 0
         || change.threshold_zat > MAXIMUM_MONEY_ZAT
-        || change.replacement_hold_secs != payout_configuration_hold_secs(change.network)
+        || !payout_configuration_hold_is_valid(change.network, change.replacement_hold_secs)
         || change.address_digest.iter().all(|byte| *byte == 0)
     {
         return Err(RepositoryError::InvalidState);
@@ -527,8 +526,8 @@ async fn configure_payout(
     let chain = chain_for_asset(change.asset);
     let mut transaction = store.pool.begin().await.map_err(repository_error)?;
     sqlx::query_scalar::<_, Uuid>(
-        "SELECT public.configure_payout_destination_v1( \
-             $1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        "SELECT public.configure_payout_destination_v2( \
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(store.identity.id)
     .bind(change.account_id)
@@ -539,6 +538,7 @@ async fn configure_payout(
     .bind(change.address_digest.as_slice())
     .bind(i64::try_from(change.threshold_zat).map_err(|_| RepositoryError::InvalidState)?)
     .bind(change.automatic)
+    .bind(i64::try_from(change.replacement_hold_secs).map_err(|_| RepositoryError::InvalidState)?)
     .fetch_one(&mut *transaction)
     .await
     .map_err(repository_error)?;
@@ -1240,13 +1240,23 @@ fn portal_receiver_from_name(value: &str) -> Result<PortalReceiverKind, Reposito
     }
 }
 
-fn payout_configuration_hold_secs(network: ChainNetwork) -> u64 {
-    #[cfg(feature = "regtest")]
-    if network == ChainNetwork::Regtest {
-        return 1;
-    }
-    let _ = network;
-    PAYOUT_CONFIGURATION_HOLD_SECS
+fn payout_configuration_hold_is_valid(network: ChainNetwork, hold_secs: u64) -> bool {
+    let minimum = {
+        #[cfg(feature = "regtest")]
+        {
+            if network == ChainNetwork::Regtest {
+                1
+            } else {
+                60
+            }
+        }
+        #[cfg(not(feature = "regtest"))]
+        {
+            let _ = network;
+            60
+        }
+    };
+    (minimum..=7 * 24 * 60 * 60).contains(&hold_secs)
 }
 
 #[cfg(test)]
