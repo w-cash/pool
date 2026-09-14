@@ -1449,7 +1449,7 @@ assert "NotifyAccess=main\n" in payout_unit
 assert "TimeoutStartSec=4200s\n" in payout_unit
 assert "User=wcash-payout\n" in payout_unit
 assert "SupplementaryGroups=wcash-pool-socket\n" in payout_unit
-assert "payout-config-check --config /etc/wcash-pool/pool.payout.toml" in payout_unit
+assert "payout-config-check" not in payout_unit
 assert "wcash-poold preflight --config /etc/wcash-pool/pool.payout.toml" not in payout_unit
 assert "LoadCredential=database-url:/etc/wcash-pool/credentials/database-url-payout" in payout_unit
 assert "LoadCredential=wcash-seed:/var/lib/wcash-pool-secrets/wcash-seed" in payout_unit
@@ -1463,7 +1463,7 @@ for inaccessible in (
     "/var/lib/zecwec-custody",
 ):
     assert inaccessible in payout_unit
-assert "ExecStart=" + str(root.parent / "release" / "wcash-poold") + " payout-worker" in payout_unit
+assert "ExecStart=" + str(root.parent / "release" / "deployment/scripts/deploy/pool-entrypoint.sh") + " payout" in payout_unit
 zallet_payout_unit = (root / "systemd/zecwec-zallet-payout.service").read_text(encoding="utf-8")
 assert "LoadCredential=encryption-identity:" in zallet_payout_unit
 assert "WantedBy=zecwec-testnet-pool.target" in zallet_payout_unit
@@ -2192,15 +2192,18 @@ grep -Fq 'stop_testnet_runtime_after_failure' \
     "$repo_root/scripts/deploy/refresh-runtime-credentials.sh"
 grep -Fq 'wait_payout_ready.py' "$repo_root/scripts/deploy/start-testnet-pool.sh"
 # systemd 249 can retire LoadCredential mounts between separate service
-# commands. Both pool modes must retain one main entrypoint process until the
+# commands. All pool modes must retain one main entrypoint process until the
 # final daemon/probe replaces it.
 grep -Fq 'ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/pool-entrypoint.sh preflight' \
     "$repo_root/deploy/systemd/wcash-pool-preflight.service.in"
 grep -Fq 'ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/pool-entrypoint.sh serve' \
     "$repo_root/deploy/systemd/wcash-pool.service.in"
-if grep -Eq '^ExecStart(Pre)?=@WCASH_RELEASE_ROOT@/wcash-poold (config-check|preflight)' \
+grep -Fq 'ExecStart=@WCASH_RELEASE_ROOT@/deployment/scripts/deploy/pool-entrypoint.sh payout' \
+    "$repo_root/deploy/systemd/wcash-payout-worker.service.in"
+if grep -Eq '^ExecStart(Pre)?=@WCASH_RELEASE_ROOT@/wcash-poold (config-check|preflight|payout-config-check)' \
     "$repo_root/deploy/systemd/wcash-pool-preflight.service.in" \
-    "$repo_root/deploy/systemd/wcash-pool.service.in"; then
+    "$repo_root/deploy/systemd/wcash-pool.service.in" \
+    "$repo_root/deploy/systemd/wcash-payout-worker.service.in"; then
     printf 'deployment-package-test: pool credentials cross a service command boundary\n' >&2
     exit 1
 fi
@@ -2217,6 +2220,10 @@ assert check < probe < serve
 assert 'exec "$release_root/wcash-poold" preflight' in entrypoint
 assert "/run/credentials/wcash-pool-preflight.service" in entrypoint
 assert "/run/credentials/wcash-pool.service" in entrypoint
+assert "/run/credentials/wcash-payout-worker.service" in entrypoint
+payout_check = entrypoint.index('"$release_root/wcash-poold" payout-config-check')
+payout_worker = entrypoint.index('exec "$release_root/wcash-poold" payout-worker')
+assert payout_check < payout_worker < check
 PY
 # shellcheck disable=SC2016
 grep -Fq '"http://$portal/readyz" 4200' \

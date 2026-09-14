@@ -75,7 +75,8 @@ production build follows the complete local acceptance gate, which passed at
 | Due payout settings and settled restart | Passed with `9567b7e`: all three paid profiles active with automatic payouts disabled, no pending settings, fresh matched wallet/ledger reconciliations, clean worker exits and lease release, unchanged signed bytes and signer journals |
 | Prompt network block submission | Passed with `11ffc3b`: three actual accepted proofs reached exact committed membership on all three nodes within 1.326, 0.306 and 0.323 seconds after client completion, with the historical backlog preserved |
 | Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
-| Remote preflight and public endpoint acceptance | Pending |
+| Remote node upgrades, migration and preflight | Passed: all four verified node binaries preserve chain state; both chain-specific committed-proof status checks and independent node agreement pass; PostgreSQL migration and listener-free preflight passed |
+| Remote activation and public endpoint acceptance | Pending: first activation failed closed at payout service startup; the reproduced systemd 249 credential-lifetime correction passed local package and actual operating-system tests before retry |
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
 
@@ -87,6 +88,22 @@ disabled. The earlier Linux test executables passed all 203 unchanged
 protocol/backend/core/edge tests (39/40/63/61), matching the macOS results.
 An earlier `1e96509` run also passed 115 signer/component tests on Ubuntu;
 the signer code in those checks is unchanged.
+
+The first remote activation on 2026-09-14 reached exact Zallet readiness at
+03:33 UTC, then rejected the payout worker's protected database credential in
+its separate startup command. The safety handler closed mining access and
+stopped public and payout services. Actual Ubuntu 22.04/systemd 249 reproduced
+the credential mount disappearing between startup commands. The payout mode
+of the existing entrypoint now runs the unchanged configuration check and then
+executes the worker in one main process. The operating-system regression checks
+main-PID readiness, rejection of a failed check, and rejection of missing
+credentials. File policy, custody, sandboxing and Rust binaries are unchanged.
+
+Zallet's pinned embedded index uses ephemeral index state, so a normal restart
+rebuilds its recent chain view before the preserved wallet catches up. During
+this activation its historical scan advanced while the reported saved wallet
+tip remained unchanged. The exact validator-tip and complete-scan readiness
+gate was retained; no wallet state or confirmation rule was reset.
 
 The normal payout worker created exactly two batches covering three recipient
 profiles. Its first ZEC proof exceeded the unchanged 180-second deadline in an

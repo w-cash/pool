@@ -37,16 +37,39 @@ if [[ -f /run/wcash-credential-smoke/fail \
     && $(cat /run/wcash-credential-smoke/fail) == "$1" ]]; then
     exit 9
 fi
+if [[ $1 == payout-worker ]]; then
+    exec python3 - <<'PY'
+import os
+import pathlib
+import signal
+import socket
+
+pathlib.Path('/run/wcash-credential-smoke/worker-pid').write_text(str(os.getpid()))
+address = os.environ['NOTIFY_SOCKET']
+if address.startswith('@'):
+    address = '\0' + address[1:]
+with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+    notifier.sendto(b'READY=1', address)
+signal.pause()
+PY
+fi
 FIXTURE
 chmod 0755 /opt/wcash/releases/credential-test/{wcash-poold,pool-entrypoint.sh}
 
-for mode in preflight serve; do
-    if [[ $mode == preflight ]]; then unit=wcash-pool-preflight.service; else unit=wcash-pool.service; fi
+for mode in preflight serve payout; do
+    case "$mode" in
+        preflight) unit=wcash-pool-preflight.service; service_type=oneshot ;;
+        serve) unit=wcash-pool.service; service_type=oneshot ;;
+        payout) unit=wcash-payout-worker.service; service_type=notify ;;
+    esac
     cat >"/etc/systemd/system/$unit" <<UNIT
 [Unit]
 Description=Disposable credential-lifetime smoke test
 [Service]
-Type=oneshot
+Type=$service_type
+NotifyAccess=main
+TimeoutStartSec=10
+TimeoutStopSec=5
 User=wcash-smoke
 Group=wcash-smoke
 NoNewPrivileges=true
@@ -56,19 +79,32 @@ PrivateMounts=true
 ReadWritePaths=/run/wcash-credential-smoke
 Environment=ZECWEC_RELEASE_PATH=/opt/wcash/releases/credential-test
 LoadCredential=smoke:/etc/wcash-pool/credentials/smoke
+ExecStartPre=/usr/bin/true
+ExecStartPre=/usr/bin/true
 ExecStart=/opt/wcash/releases/credential-test/pool-entrypoint.sh $mode
 UNIT
     rm -f /run/wcash-credential-smoke/{order,fail}
     systemctl daemon-reload
     systemctl start "$unit"
-    if [[ $mode == preflight ]]; then
-        expected=$'config-check\npreflight'
-    else
-        expected=$'config-check\npreflight\nserve'
-    fi
+    failures=(config-check preflight)
+    case "$mode" in
+        preflight) expected=$'config-check\npreflight' ;;
+        serve) expected=$'config-check\npreflight\nserve' ;;
+        payout)
+            expected=$'payout-config-check\npayout-worker'
+            failures=(payout-config-check)
+            ;;
+    esac
     [[ $(cat /run/wcash-credential-smoke/order) == "$expected" ]]
+    if [[ $mode == payout ]]; then
+        [[ $(systemctl show "$unit" --property=MainPID --value) \
+            == "$(cat /run/wcash-credential-smoke/worker-pid)" ]]
+        systemctl stop "$unit"
+        rm /run/wcash-credential-smoke/worker-pid
+        printf 'PASS payout READY notification from exec-preserved MainPID\n'
+    fi
     printf 'PASS actual systemd credential lifetime: %s\n' "$mode"
-    for failure in config-check preflight; do
+    for failure in "${failures[@]}"; do
         rm -f /run/wcash-credential-smoke/order
         printf '%s' "$failure" >/run/wcash-credential-smoke/fail
         systemctl reset-failed "$unit" 2>/dev/null || true
@@ -76,13 +112,27 @@ UNIT
             printf 'Startup ignored %s failure\n' "$failure" >&2
             exit 1
         fi
-        if [[ $failure == config-check ]]; then
-            expected=config-check
+        if [[ $failure == config-check || $failure == payout-config-check ]]; then
+            expected=$failure
         else
             expected=$'config-check\npreflight'
         fi
         [[ $(cat /run/wcash-credential-smoke/order) == "$expected" ]]
+        [[ ! -e /run/wcash-credential-smoke/worker-pid ]]
     done
     printf 'PASS startup failure stops later commands: %s\n' "$mode"
+    if [[ $mode == payout ]]; then
+        rm -f /run/wcash-credential-smoke/{order,fail}
+        sed -i '/^LoadCredential=/d' "/etc/systemd/system/$unit"
+        systemctl daemon-reload
+        systemctl reset-failed "$unit"
+        if systemctl start "$unit" >/dev/null 2>&1; then
+            printf 'Payout startup ignored missing credential directory\n' >&2
+            exit 1
+        fi
+        [[ ! -e /run/wcash-credential-smoke/order \
+            && ! -e /run/wcash-credential-smoke/worker-pid ]]
+        printf 'PASS missing credentials prevent payout check and worker\n'
+    fi
 done
 systemd --version | head -n 1

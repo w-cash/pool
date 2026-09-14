@@ -7,7 +7,8 @@ services, wallet material, existing containers or databases.
 
 The checks use real systemd 249 and nginx. A non-root binary fixture verifies
 that the packaged startup entrypoint retains read-only systemd credentials
-through config-check, preflight and serve, and stops on earlier failures. nginx
+through config-check, preflight and serve, as well as payout-config-check and
+payout-worker, and stops on earlier failures. nginx
 tests exercise the rendered portal config with temporary mutual-TLS certificates,
 the exact UI asset allowlist, method restrictions and unknown-path rejection.
 They also prove that HTTP serves only GET requests for an exact ACME token file:
