@@ -1,12 +1,18 @@
 [Unit]
 Description=Verify isolated hot Wcash and Zcash payout custody before mining
 Documentation=file://@WCASH_RELEASE_ROOT@/deployment/docs/zecwec-testnet-deployment.md
+PartOf=zecwec-testnet-pool.target
 Before=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
 Conflicts=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
 After=zecwec-zallet.service zecwec-zallet-recovery.service wcash-pool-wallet-init.service wcash-pool-zec-authority-bootstrap.service
 
 [Service]
 Type=oneshot
+# Keep the successful custody check active for the lifetime of the pool.
+# Without this, every dependent service start re-runs the gate after the
+# payout wallet has started and the gate incorrectly rejects the healthy
+# runtime as an active custody process.
+RemainAfterExit=yes
 User=root
 Group=root
 UMask=0077

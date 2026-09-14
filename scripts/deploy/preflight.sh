@@ -32,7 +32,8 @@ stop_preflight_authorities() {
 }
 
 stop_failed_preflight() {
-    systemctl stop zecwec-testnet-pool.target wcash-pool-health.timer \
+    systemctl stop zecwec-testnet-pool.target wcash-pool-custody-gate.service \
+        wcash-pool-health.timer \
         wcash-payout-worker.service zecwec-zallet-payout.service \
         wcash-pool.service wcash-pool-projector.service \
         wcash-pool-backend.service >/dev/null 2>&1 || true
@@ -40,7 +41,7 @@ stop_failed_preflight() {
 
 trap stop_preflight_authorities EXIT
 trap stop_failed_preflight ERR
-systemctl stop zecwec-testnet-pool.target >/dev/null 2>&1 || true
+systemctl stop zecwec-testnet-pool.target wcash-pool-custody-gate.service >/dev/null 2>&1 || true
 systemctl stop wcash-pool-health.timer >/dev/null 2>&1 || true
 systemctl stop zecwec-cookie-refresh.path >/dev/null 2>&1 || true
 systemctl stop zecwec-cookie-refresh.service >/dev/null 2>&1 || true

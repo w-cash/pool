@@ -71,8 +71,9 @@ if [[ $phase == finalize ]]; then
     done
 fi
 # Cached backend/Wcash oneshots must be reconciled against every newly rendered
-# exact policy. The ZEC gate itself is deliberately transient: it repeats the
-# strict zero check only while no backend authority exists.
+# exact policy. The custody gate remains active for the runtime transaction so
+# dependent services do not re-run the inactive-wallet check after the payout
+# wallet has started; stopping the pool also stops the gate.
 systemctl stop wcash-pool-backend-init.service wcash-pool-zec-authority-bootstrap.service \
     wcash-pool-wallet-init.service >/dev/null 2>&1 || true
 if [[ $phase == wallet-bootstrap ]]; then

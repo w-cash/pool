@@ -106,7 +106,8 @@ stop_testnet_runtime_after_failure() {
     local settings=${1:-/etc/wcash-pool/deployment.env}
     local cidrs=${2:-/etc/wcash-pool/miner-cidrs}
     local deploy_dir
-    systemctl stop zecwec-testnet-pool.target wcash-pool-health.timer \
+    systemctl stop zecwec-testnet-pool.target wcash-pool-custody-gate.service \
+        wcash-pool-health.timer \
         wcash-payout-worker.service zecwec-zallet-payout.service \
         wcash-pool.service wcash-pool-projector.service >/dev/null 2>&1 || true
     deploy_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -538,6 +539,7 @@ stop_backend_units_for_zec_sealing() {
         zecwec-cookie-refresh.path \
         zecwec-cookie-refresh.service \
         zecwec-testnet-pool.target \
+        wcash-pool-custody-gate.service \
         wcash-pool.service \
         wcash-pool-projector.service \
         wcash-payout-worker.service \

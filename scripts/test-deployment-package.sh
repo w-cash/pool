@@ -1382,6 +1382,8 @@ custody_gate_unit = (root / "systemd/wcash-pool-custody-gate.service").read_text
     encoding="utf-8"
 )
 assert "User=root\n" in custody_gate_unit
+assert "RemainAfterExit=yes\n" in custody_gate_unit
+assert "PartOf=zecwec-testnet-pool.target\n" in custody_gate_unit
 assert "verify-offline-custody.sh /etc/wcash-pool/deployment.env" in custody_gate_unit
 assert "verify-release.sh wcash-poold" in custody_gate_unit
 assert "verify-release.sh deployment-package" in custody_gate_unit

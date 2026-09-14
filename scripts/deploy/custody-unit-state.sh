@@ -52,6 +52,7 @@ stop_custody_units_for_sealing() {
     stop_loaded_custody_unit zecwec-cookie-refresh.path true
     stop_loaded_custody_unit zecwec-cookie-refresh.service true
     stop_loaded_custody_unit zecwec-testnet-pool.target true
+    stop_loaded_custody_unit wcash-pool-custody-gate.service false
     stop_loaded_custody_unit wcash-pool.service true
     stop_loaded_custody_unit wcash-pool-projector.service true
     stop_loaded_custody_unit wcash-payout-worker.service true
