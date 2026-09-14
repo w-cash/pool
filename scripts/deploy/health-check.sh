@@ -84,9 +84,11 @@ portal=$(read_setting "$settings" PORTAL_LISTEN)
 stratum=$(read_setting "$settings" STRATUM_LISTEN)
 plain_port=${stratum##*:}
 tls_port=$(read_setting "$settings" STRATUM_TLS_PORT)
-portal_readiness=$(curl --fail --silent --show-error --max-time 5 "http://$portal/readyz") \
-    || die "portal readiness failed"
-python3 -c '
+portal_ready=false
+for attempt in 1 2 3 4 5; do
+    if portal_readiness=$(curl --fail --silent --show-error --max-time 5 \
+        "http://$portal/readyz"); then
+        if python3 -c '
 import json
 import sys
 try:
@@ -100,7 +102,16 @@ expected = {
     "payout_execution": "enabled",
 }
 raise SystemExit(0 if value == expected else 1)
-' <<<"$portal_readiness" || die "portal does not confirm a fresh external payout worker"
+' <<<"$portal_readiness"; then
+            portal_ready=true
+            break
+        fi
+    fi
+    if ((attempt < 5)); then
+        sleep 2
+    fi
+done
+[[ $portal_ready == true ]] || die "portal readiness failed after bounded retries"
 ss -H -ltn "sport = :$plain_port" | grep -q . || die "plaintext Stratum listener is unavailable"
 systemctl is-active --quiet nginx.service || die "nginx TLS edge is not active"
 ss -H -ltn "sport = :$tls_port" | grep -q . || die "TLS Stratum listener is unavailable"
