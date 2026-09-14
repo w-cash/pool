@@ -2050,6 +2050,9 @@ grep -Fq -- '-verify_hostname testnet-mine.zecwec.com -CApath /etc/ssl/certs' \
     "$tls_test_log"
 grep -Fq -- 's_client -connect 127.0.0.1:3443 -servername testnet-mine.zecwec.com -showcerts' \
     "$tls_test_log"
+grep -Fq 'probe_status' "$repo_root/scripts/deploy/common.sh"
+grep -Fq 'probe_status == 0 || probe_status == 124' \
+    "$repo_root/scripts/deploy/common.sh"
 
 PYTHONDONTWRITEBYTECODE=1 python3 - \
     "$repo_root/scripts/deploy/enable-nginx-edge.sh" \

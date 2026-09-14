@@ -430,14 +430,22 @@ require_public_tls_listener() (
     require_command timeout
     [[ -d /etc/ssl/certs && ! -L /etc/ssl/certs ]] \
         || die "system TLS trust store is unavailable"
-    local scratch handshake expected_der served_der served_leaf
+    local scratch handshake verify_log expected_der served_der served_leaf probe_status
     scratch=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf -- $(printf '%q' "$scratch")" EXIT
     handshake=$scratch/handshake.pem
+    verify_log=$scratch/verify.log
     expected_der=$scratch/expected.der
     served_der=$scratch/served.der
     served_leaf=$scratch/served-leaf.pem
+    # Stratum is a long-lived protocol: after completing the TLS handshake,
+    # nginx keeps the socket open for the miner session.  `s_client` can
+    # therefore exit with timeout 124 even though it already received and
+    # verified the complete certificate chain.  Preserve both streams and
+    # validate the captured certificate below; only a failed handshake or a
+    # missing certificate is fatal.
+    set +e
     timeout --signal=TERM --kill-after=2s 15s \
         openssl s_client \
         -connect "$address:$port" \
@@ -446,10 +454,20 @@ require_public_tls_listener() (
         -verify_hostname "$hostname" \
         -verify_return_error \
         -CApath /etc/ssl/certs \
-        </dev/null >"$handshake" 2>/dev/null \
-        || die "TLS listener did not present a publicly trusted certificate for the configured hostname"
+        </dev/null >"$handshake" 2>"$verify_log"
+    probe_status=$?
+    set -e
+    ((probe_status == 0 || probe_status == 124)) \
+        || die "TLS listener handshake failed for the configured hostname"
     openssl x509 -in "$handshake" -out "$served_leaf" \
         || die "TLS listener response did not contain a certificate"
+    openssl verify \
+        -purpose sslserver \
+        -verify_hostname "$hostname" \
+        -CApath /etc/ssl/certs \
+        -untrusted "$handshake" \
+        "$served_leaf" >/dev/null \
+        || die "TLS listener certificate chain is not publicly trusted"
     openssl x509 -in "$served_leaf" -noout -checkend 604800 >/dev/null \
         || die "live mining TLS certificate expires in less than seven days"
     openssl x509 -in "$expected_certificate" -outform DER -out "$expected_der" \
