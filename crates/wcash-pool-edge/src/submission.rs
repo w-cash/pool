@@ -1543,6 +1543,7 @@ mod tests {
             let socket = TestSocket::new()?;
             let listener = UnixListener::bind(&socket.path)?;
             let (finish_peer, peer_finished) = oneshot::channel();
+            let (following_rpc, following_rpc_started) = oneshot::channel();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await?;
                 establish_live_stream(&mut stream, descriptor(0x64)).await?;
@@ -1576,6 +1577,9 @@ mod tests {
                     )
                 {
                     return TestResult::Err("paused actor sent non-health request".into());
+                }
+                if stall_following_rpc {
+                    let _ = following_rpc.send(());
                 }
                 peer_finished.await?;
                 TestResult::Ok(())
@@ -1614,18 +1618,38 @@ mod tests {
                 }
             });
             tokio::time::advance(Duration::from_secs(10)).await;
-            while router.current_generation()?.is_some() {
+            for _ in 0..1_024 {
+                if router.current_generation()?.is_none() {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(
+                router.current_generation()?.is_none(),
+                "unhealthy status did not suspend mining after bounded scheduling"
+            );
+            // Let the actor arm its absolute health-deadline timer after
+            // publishing the suspended router state.
             for _ in 0..32 {
                 tokio::task::yield_now().await;
             }
-            assert!(!service.is_finished());
-            tokio::time::advance(Duration::from_secs(1)).await;
-            while !service.is_finished() {
+            if stall_following_rpc {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                following_rpc_started.await?;
+                tokio::time::advance(BACKEND_HEALTH_GRACE - Duration::from_secs(10)).await;
+            } else {
+                tokio::time::advance(BACKEND_HEALTH_GRACE).await;
+            }
+            for _ in 0..1_024 {
+                if service.is_finished() {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
+            assert!(
+                service.is_finished(),
+                "health deadline did not terminate the actor after bounded scheduling"
+            );
             assert_eq!(
                 service.shutdown().await,
                 Err(ShareRouterError::BackendHealthDeadline)
