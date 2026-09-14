@@ -26,7 +26,10 @@ const REPLAY_PAGE_ITEMS: u16 = 1_024;
 const JOB_UPDATE_CAPACITY: usize = 256;
 const MAXIMUM_RECENT_JOBS: usize = 16;
 const MAXIMUM_GENERATIONS_PER_PROCESS: usize = 65_536;
-const BACKEND_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+// Startup may cross one normal Zcash parent-tip rollover while the template
+// node and independent validator converge. Keep preflight bounded, but long
+// enough to match the live share-router and projector recovery windows.
+const BACKEND_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const BACKEND_READINESS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Database-clock lease duration renewed by the serving process.
 pub const NONCE_NAMESPACE_LEASE_DURATION: Duration = Duration::from_secs(60);
