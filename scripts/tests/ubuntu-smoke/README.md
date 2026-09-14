@@ -10,6 +10,9 @@ that the packaged startup entrypoint retains read-only systemd credentials
 through config-check, preflight and serve, and stops on earlier failures. nginx
 tests exercise the rendered portal config with temporary mutual-TLS certificates,
 the exact UI asset allowlist, method restrictions and unknown-path rejection.
+They also prove that HTTP serves only GET requests for an exact ACME token file:
+existing files return 200, missing files return 404, and other methods, paths
+and API requests close without a response. HTTPS APIs still require origin mTLS.
 
 Docker's private `/run` mount must be shared inside this disposable container
 for systemd 249's credential helper to propagate its mount. The checker applies

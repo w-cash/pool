@@ -912,6 +912,27 @@ filesystem namespace exposes only UFW's configuration and the two existing
 firewall lock files as writable. There is no boot-time window where the timer
 can race a recovering payout lease.
 
+Before enabling the managed portal, inspect and archive only the verified
+bootstrap HTTP virtual hosts for `zecwec.com` and `testnet.zecwec.com` that the
+managed configuration will replace. On the existing host the portal bootstrap
+link is `/etc/nginx/sites-enabled/zecwec-testnet-acme.conf`; do not leave it
+enabled alongside `zecwec-testnet-portal.conf`, because both claim the same
+hostname and port. Preserve their files for rollback and remove their enabled
+links only as part of the managed portal activation. If activation fails and
+removes the managed link, restore the verified bootstrap links and validate
+nginx before reloading, so certificate renewal remains reachable.
+
+Keep `/etc/nginx/sites-enabled/zecwec-mining-acme.conf` enabled. It serves the
+separate DNS-only mining hostname and remains responsible for that
+certificate's HTTP-01 renewal. The managed portal serves HTTP GET requests only
+for `/.well-known/acme-challenge/<base64url-token>` files below
+`/var/lib/letsencrypt`; missing tokens return 404 and every other HTTP request
+closes without a response. HTTPS APIs and the apex HTTPS redirect retain
+Cloudflare Authenticated Origin Pulls. Preserve the existing Certbot webroot
+renewal configuration and nginx reload hook, and verify that Cloudflare's
+redirect and Access policies allow the exact challenge path to reach the
+HTTP origin during issuance and renewal.
+
 Before the browser gate, create a Cloudflare Access application covering
 `testnet.zecwec.com/*`, allow only the named Testnet operator identity, and
 verify the default policy denies every other identity. Then stage the portal:

@@ -72,6 +72,10 @@ with tempfile.TemporaryDirectory(prefix="zecwec-nginx-") as directory:
     run("nginx", "-t", "-c", str(config))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 8080), Backend)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    challenge_root = Path("/var/lib/letsencrypt/.well-known/acme-challenge")
+    challenge_root.mkdir(parents=True, exist_ok=True)
+    challenge = challenge_root / "disposable-smoke_token-0123456789"
+    challenge.write_text("disposable ACME proof")
     run("nginx", "-c", str(config))
     try:
         trusted = ssl.create_default_context(cafile=str(root / "ca.pem"))
@@ -88,6 +92,18 @@ with tempfile.TemporaryDirectory(prefix="zecwec-nginx-") as directory:
             result = response.status, response.read()
             connection.close()
             return result
+
+        def plain_request(host, path, method="GET"):
+            connection = http.client.HTTPConnection("127.0.0.1", 80, timeout=5)
+            try:
+                connection.request(method, path, headers={
+                    "Host": host, "CF-Connecting-IP": "192.0.2.20"})
+                response = connection.getresponse()
+                return response.status, response.read()
+            except http.client.RemoteDisconnected:
+                return None  # nginx 444 closes without an HTTP response.
+            finally:
+                connection.close()
 
         for _ in range(50):
             try:
@@ -107,7 +123,20 @@ with tempfile.TemporaryDirectory(prefix="zecwec-nginx-") as directory:
             assert request(path)[0] == 200, path
         assert request("/", context=anonymous)[0] in (400, 403)
         assert request("/", client_header=False)[0] == 403
-        print("PASS real nginx: UI/API routes, method limits, unknown paths and origin mTLS")
+        assert request("/api/v1/overview", context=anonymous)[0] in (400, 403)
+        challenge_path = "/.well-known/acme-challenge/" + challenge.name
+        for host in ("testnet.zecwec.test", "zecwec.test"):
+            assert plain_request(host, challenge_path) == (200, b"disposable ACME proof"), host
+            assert plain_request(host, "/.well-known/acme-challenge/missing-token")[0] == 404, host
+            for method in ("HEAD", "POST", "PUT"):
+                assert plain_request(host, challenge_path, method) is None, (host, method)
+            for path in ("/", "/api/v1/overview", "/readyz", "/healthz", "/assets/app.js",
+                         "/.well-known/acme-challenge/", challenge_path + "/nested",
+                         "/.well-known/acme-challenge/invalid.token",
+                         "/.well-known/acme-challenge/../../api/v1/overview"):
+                assert plain_request(host, path) is None, (host, path)
+        print("PASS real nginx: UI/API routes, origin mTLS, exact GET-only ACME files and closed HTTP")
     finally:
         run("nginx", "-s", "quit", "-c", str(config))
         server.shutdown()
+        challenge.unlink()

@@ -23,9 +23,18 @@ server {
     listen 80;
     listen [::]:80;
     server_name @APEX_HOST@ @PORTAL_HOST@;
-    # The mining hostname reveals the origin IP. Plain HTTP is therefore never
-    # an origin path; Cloudflare redirects clients at the edge.
-    return 444;
+    # Certbot HTTP-01 renewal reads only a single base64url token filename.
+    # This static exception never reaches the portal or its session API.
+    location ~ ^/\.well-known/acme-challenge/[A-Za-z0-9_-]+$ {
+        if ($request_method != GET) { return 444; }
+        root /var/lib/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+
+    # The mining hostname reveals the origin IP. Every other HTTP request is
+    # closed; Cloudflare redirects normal clients at the edge.
+    location / { return 444; }
 }
 
 server {
