@@ -25,7 +25,11 @@ use crate::JobRouter;
 const MAXIMUM_QUEUE_CAPACITY: usize = 4_096;
 const MAXIMUM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const MAXIMUM_EVENT_CONSUMER_TIMEOUT: Duration = Duration::from_secs(60);
-const BACKEND_HEALTH_GRACE: Duration = Duration::from_secs(30);
+// The two pinned Zcash parents can rotate at slightly different times. Keep
+// miner sessions suspended during that bounded convergence window instead of
+// tearing down the whole pool before the backend can publish the next job.
+// This matches the projector's two-minute backend-health grace.
+const BACKEND_HEALTH_GRACE: Duration = Duration::from_secs(120);
 
 /// Finite queue and time policy for the one live Wolf actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,7 +654,7 @@ pub enum ShareRouterError {
     #[error("backend event consumer is unavailable")]
     EventConsumerUnusable,
     /// An authenticated unhealthy status outlasted the bounded job-rollover window.
-    #[error("backend remained unhealthy beyond the 30-second job-rollover deadline")]
+    #[error("backend remained unhealthy beyond the two-minute job-rollover deadline")]
     BackendHealthDeadline,
     /// Wolf rejected the exact share with a stable protocol category.
     #[error("backend rejected share with {0:?}")]
@@ -1508,7 +1512,7 @@ mod tests {
         while router.current_generation()?.is_some() {
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::time::advance(Duration::from_secs(119)).await;
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }

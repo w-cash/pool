@@ -2014,7 +2014,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "authoritative share router exited: backend remained unhealthy beyond the 30-second job-rollover deadline"
+            "authoritative share router exited: backend remained unhealthy beyond the two-minute job-rollover deadline"
         );
         assert!(std::error::Error::source(&error)
             .and_then(|source| source.downcast_ref::<wcash_pool_edge::ShareRouterError>())
