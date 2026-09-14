@@ -39,7 +39,7 @@ BEGIN
         OR p_payout_threshold_zat NOT BETWEEN 1 AND 2100000000000000
         OR p_automatic IS NULL
         OR p_hold_secs IS NULL
-        OR p_hold_secs < CASE WHEN p_network = 'regtest' THEN 1 ELSE 60 END
+        OR p_hold_secs < (CASE WHEN p_network = 'regtest' THEN 1 ELSE 60 END)
         OR p_hold_secs > 604800
     THEN
         RAISE EXCEPTION 'invalid payout destination request' USING ERRCODE = '22023';
