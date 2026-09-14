@@ -56,8 +56,6 @@ with tempfile.TemporaryDirectory(prefix="zecwec-nginx-") as directory:
     source = Path("/workspace/deploy/nginx/zecwec-testnet-portal.conf.in").read_text()
     values = {
         "PORTAL_LISTEN": "127.0.0.1:8080", "PORTAL_HOST": "testnet.zecwec.test",
-        "APEX_HOST": "zecwec.test", "APEX_TLS_CERT": str(root / "server.pem"),
-        "APEX_TLS_KEY": str(root / "server.key"),
         "PORTAL_TLS_CERT": str(root / "server.pem"),
         "PORTAL_TLS_KEY": str(root / "server.key"),
         "CLOUDFLARE_ORIGIN_PULL_CA": str(root / "ca.pem"),
@@ -125,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix="zecwec-nginx-") as directory:
         assert request("/", client_header=False)[0] == 403
         assert request("/api/v1/overview", context=anonymous)[0] in (400, 403)
         challenge_path = "/.well-known/acme-challenge/" + challenge.name
-        for host in ("testnet.zecwec.test", "zecwec.test"):
+        for host in ("testnet.zecwec.test",):
             assert plain_request(host, challenge_path) == (200, b"disposable ACME proof"), host
             assert plain_request(host, "/.well-known/acme-challenge/missing-token")[0] == 404, host
             for method in ("HEAD", "POST", "PUT"):
@@ -135,7 +133,22 @@ with tempfile.TemporaryDirectory(prefix="zecwec-nginx-") as directory:
                          "/.well-known/acme-challenge/invalid.token",
                          "/.well-known/acme-challenge/../../api/v1/overview"):
                 assert plain_request(host, path) is None, (host, path)
-        print("PASS real nginx: UI/API routes, origin mTLS, exact GET-only ACME files and closed HTTP")
+        for host in ("zecwec.test", "unrelated.example"):
+            assert plain_request(host, challenge_path) is None, host
+            assert plain_request(host, "/api/v1/overview") is None, host
+            connection = http.client.HTTPSConnection("127.0.0.1", 443, context=trusted, timeout=5)
+            try:
+                connection.request("GET", "/api/v1/overview", headers={
+                    "Host": host, "CF-Connecting-IP": "192.0.2.20"})
+                try:
+                    connection.getresponse()
+                except http.client.RemoteDisconnected:
+                    pass
+                else:
+                    raise AssertionError("unrelated HTTPS Host was accepted")
+            finally:
+                connection.close()
+        print("PASS real nginx: Testnet-only UI/API, origin mTLS, exact GET-only ACME and unrelated-host rejection")
     finally:
         run("nginx", "-s", "quit", "-c", str(config))
         server.shutdown()

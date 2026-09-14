@@ -42,6 +42,12 @@ must survive ordinary deployment and restart. Use the existing VPS and durable
 state, applying the reviewed proof-lifecycle schema migration without resetting
 the database, journals, or wallets.
 
+The deployment manages only the Testnet portal and mining host. The apex
+`zecwec.com` keeps its existing website or redirect and needs no pool certificate.
+When upgrading an older deployment, back up its protected settings and remove
+the retired `APEX_HOST`, `APEX_TLS_CERT` and `APEX_TLS_KEY` entries before rendering.
+Portal origin authentication and its exact hostname remain required.
+
 ## Evidence
 
 Record source revisions, artifact digests, scenario, environment, timestamp

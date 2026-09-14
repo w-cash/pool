@@ -99,8 +99,6 @@ fi
 certificate_keys=(MINING_TLS_CERT MINING_TLS_KEY)
 if [[ $effective_mode != stratum-only ]]; then
     certificate_keys+=(
-        APEX_TLS_CERT
-        APEX_TLS_KEY
         PORTAL_TLS_CERT
         PORTAL_TLS_KEY
         CLOUDFLARE_ORIGIN_PULL_CA

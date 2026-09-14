@@ -31,7 +31,6 @@ REQUIRED = {
     "WCASH_PAYOUT_MODE",
     "INITIAL_SHARE_TARGET_BE",
     "EASIEST_SHARE_TARGET_BE",
-    "APEX_HOST",
     "PORTAL_HOST",
     "MINING_HOST",
     "PORTAL_ORIGIN",
@@ -106,8 +105,6 @@ REQUIRED = {
     "ZEC_POLICY_VERSION",
     "ZCASH_SIGNER_ACCOUNT_INDEX",
     "CLOUDFLARE_ORIGIN_PULL_CA",
-    "APEX_TLS_CERT",
-    "APEX_TLS_KEY",
     "PORTAL_TLS_CERT",
     "PORTAL_TLS_KEY",
     "MINING_TLS_CERT",
@@ -349,12 +346,11 @@ def validate(values: dict[str, str], phase: str) -> None:
             fail(f"{prefix} display and wire genesis values are not exact byte reversals")
 
     hostname_pattern = r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"
-    for key in ("APEX_HOST", "PORTAL_HOST", "MINING_HOST"):
+    for key in ("PORTAL_HOST", "MINING_HOST"):
         if not re.fullmatch(hostname_pattern, values[key]):
             fail(f"{key} must be a lowercase DNS hostname")
     if (
-        values["APEX_HOST"] != "zecwec.com"
-        or values["PORTAL_HOST"] != "testnet.zecwec.com"
+        values["PORTAL_HOST"] != "testnet.zecwec.com"
         or values["MINING_HOST"] != "testnet-mine.zecwec.com"
     ):
         fail("hostnames must match the reviewed Testnet-only DNS contract")
@@ -456,8 +452,6 @@ def validate(values: dict[str, str], phase: str) -> None:
         if path.name != ".cookie" or not str(path).startswith(("/run/", "/var/lib/")):
             fail(f"{key} must be a .cookie below /run or /var/lib")
     for key in (
-        "APEX_TLS_CERT",
-        "APEX_TLS_KEY",
         "PORTAL_TLS_CERT",
         "PORTAL_TLS_KEY",
         "MINING_TLS_CERT",

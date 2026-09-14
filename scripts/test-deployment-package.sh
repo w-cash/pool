@@ -1618,11 +1618,15 @@ assert "listen 3443 ssl;" in stratum
 assert "server 127.0.0.1:3333;" in stratum
 
 portal = (root / "nginx/zecwec-testnet-portal.conf").read_text(encoding="utf-8")
-assert portal.count("ssl_verify_client on;") == 2
-assert portal.count("listen 443 ssl http2;") == 2
-assert portal.count("listen [::]:443 ssl http2;") == 2
+assert portal.count("ssl_verify_client on;") == 1
+assert portal.count("listen 443 ssl http2;") == 1
+assert portal.count("listen [::]:443 ssl http2;") == 1
 assert "http2 on;" not in portal
-assert portal.count("ssl_client_certificate /etc/wcash-pool/tls/cloudflare-origin-pull-ca.pem;") == 2
+assert portal.count("ssl_client_certificate /etc/wcash-pool/tls/cloudflare-origin-pull-ca.pem;") == 1
+assert portal.count("server_name testnet.zecwec.com;") == 2
+assert portal.count("if ($host != testnet.zecwec.com) { return 444; }") == 2
+assert "server_name zecwec.com" not in portal
+assert "/live/zecwec.com/" not in portal
 assert "proxy_set_header X-Forwarded-For $http_cf_connecting_ip;" in portal
 assert "limit_req_zone $zecwec_credential_client zone=zecwec_portal_credentials:10m rate=6r/m;" in portal
 assert "limit_req zone=zecwec_portal_credentials burst=4 nodelay;" in portal

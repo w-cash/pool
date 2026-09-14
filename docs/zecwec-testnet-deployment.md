@@ -13,11 +13,18 @@ This runbook deploys one account-based WEC/ZEC merged-mining **Testnet** pool:
 - automatic threshold payouts from isolated hot Testnet collectors, with a
   listener-free worker and chain-separated crash-safe signer journals.
 
-It does not enable Mainnet. Installing these files is not evidence that the
-pool is ASIC-ready. The private mining signal requires all source gates,
-independent collector-recovery proofs, initial-zero attestations, deployment
-preflight, restart/reorganization tests, automatic payout evidence, and one
-real accepted ASIC share.
+It does not enable Mainnet. Public Testnet launch requires the complete local
+end-to-end gate, verified collector-recovery and initial-zero evidence, remote
+deployment preflight, and the exact remote health checks below. After those
+gates, the operator may launch the public portal and mining endpoints directly.
+Cloudflare Access staging and a private ASIC session are optional. Record the
+first real accepted ASIC share and subsequent job rotation after miners can
+connect; installation alone does not prove that hardware acceptance.
+
+For a forward rollout of an already sealed epoch-2 deployment, verify and
+preserve its existing custody evidence, wallet databases, backend authority,
+journals, and accounting state. Do not regenerate keys or repeat the initial
+custody ceremony merely because the application release changes.
 
 ## Security boundaries
 
@@ -92,7 +99,6 @@ this runbook and requires a separately reviewed ledger migration.
 | Endpoint | Exposure | Purpose |
 | --- | --- | --- |
 | Portal backend | loopback | Registration, dashboard, payout settings |
-| Apex web | Cloudflare-proxied plus origin mTLS after the launch gate | `zecwec.com`, redirects to Testnet |
 | Portal HTTPS | Cloudflare-proxied plus origin mTLS after the launch gate | `testnet.zecwec.com` |
 | ZIP-301 plaintext | explicitly public Testnet or approved exact hosts | Legacy ASIC compatibility |
 | ZIP-301 TLS | explicitly public Testnet or approved exact hosts, nginx TLS | Preferred ASIC endpoint |
@@ -117,11 +123,13 @@ Argon2 password hash, token hash, or verification and returns HTTP 429 with
 `Retry-After` when the memory-hard work budget is full. These independent
 bounds remain required even when Cloudflare edge rate limiting is enabled.
 
-The reviewed DNS contract is deliberately narrow: `zecwec.com` and
-`testnet.zecwec.com` are proxied web records; `testnet-mine.zecwec.com` is a
-DNS-only mining record for ports 3333 and 3443. `mine.zecwec.com` is reserved
-and must remain absent or disabled. DNS publication and origin activation wait
-for the end-to-end launch gate.
+The Testnet package owns only `testnet.zecwec.com`, a proxied portal record, and
+`testnet-mine.zecwec.com`, a DNS-only mining record for ports 3333 and 3443.
+`mine.zecwec.com` is reserved and must remain absent or disabled. Preserve the
+existing `zecwec.com` website, nginx configuration, DNS, and Cloudflare redirect;
+the Testnet package neither manages that hostname nor requires its certificate.
+Publish the Testnet records after the local end-to-end gate and remote
+readiness checks, as described in section 9.
 
 nginx enforces the real client-IP connection limit for TLS before forwarding
 to the loopback pool listener. The pool sees nginx as the TLS peer, so its
@@ -264,7 +272,7 @@ It never removes legacy data. The renderer refuses an unarchived collision.
 
 ## 2. Create the operator policy
 
-Copy `deploy/config/deployment.env.example` to
+For a fresh deployment, copy `deploy/config/deployment.env.example` to
 `/etc/wcash-pool/deployment.env`, replace every `CHANGE_ME`, then set owner
 `root:root` and mode `0600`. It contains no secret value. Leave the five exact
 `BOOTSTRAP_DISCOVERY_REQUIRED` values in place until the fresh wallets emit
@@ -277,6 +285,40 @@ pool instance, signer account IDs, backend identity, backend journal, payout
 commitments, or nonce namespace on restart. The renderer proves that each
 display-order genesis hash is the exact reverse of the configured wire-order
 value.
+
+For an existing deployment, retain that protected policy and remove only the
+obsolete `APEX_HOST`, `APEX_TLS_CERT`, and `APEX_TLS_KEY` entries before rendering
+this release. Make a root-only backup first; the following migration preserves
+every other setting and does not touch the existing apex site or Cloudflare
+redirect:
+
+```bash
+sudo python3 - <<'PY'
+import os
+import pathlib
+import stat
+import time
+
+policy = pathlib.Path('/etc/wcash-pool/deployment.env')
+metadata = policy.lstat()
+assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == metadata.st_gid == 0
+assert stat.S_IMODE(metadata.st_mode) == 0o600
+original = policy.read_bytes()
+suffix = str(time.time_ns())
+backup = policy.with_name('deployment.env.pre-testnet-hosts.' + suffix)
+temporary = policy.with_name('.deployment.env.testnet-hosts.' + suffix)
+obsolete = {b'APEX_HOST', b'APEX_TLS_CERT', b'APEX_TLS_KEY'}
+updated = b''.join(line for line in original.splitlines(keepends=True)
+                   if line.partition(b'=')[0].strip() not in obsolete)
+for destination, content in ((backup, original), (temporary, updated)):
+    with destination.open('xb') as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+os.replace(temporary, policy)
+PY
+```
 
 The supplied defaults name the deployed Testnet units
 `wcash-testnet-node.service`, `wcash-peer-testnet.service`,
@@ -837,22 +879,22 @@ mining ingress is still closed. A missing stream-capable nginx installation or
 failed start aborts before preflight and leaves the pool inaccessible.
 
 Install the publicly trusted mining certificate and matching private key before
-starting the pool, but do not publish mining DNS yet. The edge gate proves the
+starting the pool. The edge gate proves the
 certificate covers `testnet-mine.zecwec.com`, has at least seven days remaining,
 matches its private key, chains to the host's public trust store, and is the
 certificate actually served by nginx on port 3443. A file-presence or listening-
 port check alone is not accepted.
 
-The apex and portal certificates, Cloudflare Authenticated Origin Pull CA,
-proxied web DNS, Full (strict) zone setting, and Access application are not
-prerequisites for this Stratum-only start. Configure them immediately before
-`stage-portal`; that command requires both the apex and Testnet portal
-certificate/key pairs because nginx loads both web virtual hosts. Install
+The portal certificate/key pair, Cloudflare Authenticated Origin Pull CA,
+proxied portal DNS, and Full (strict) setting must be ready before portal
+publication. They are not prerequisites for a Stratum-only start. Install
 Cloudflare's current official Authenticated Origin Pull CA at the exact
-configured root-owned path and do not substitute an arbitrary client CA. nginx
-snippets are staged in `sites-available` and `streams-available`. The start
-command enables only the policy-controlled TLS mining edge and deliberately
-leaves the portal site disabled. An SSH tunnel may be used for service
+configured root-owned path and do not substitute an arbitrary client CA.
+Cloudflare Access is needed only if the operator chooses optional portal
+staging. nginx snippets are staged in `sites-available` and
+`streams-available`; the start command restores the recorded portal mode and
+enables the policy-controlled TLS mining edge. The initial portal mode leaves
+its site disabled until publication or optional staging. An SSH tunnel may be used for service
 diagnostics, but it is not browser E2E evidence: it does not exercise the
 canonical HTTPS origin, `Secure`/`__Host-` cookies, or Cloudflare Authenticated
 Origin Pulls.
@@ -861,10 +903,18 @@ If an older pool uses a different unit name but still occupies either mining
 port, archive and disable that unit before continuing. The listener-free
 preflight refuses any process that already owns the plaintext port.
 
-## 9. Readiness-gated start and ASIC gate
+## 9. Readiness-gated public launch and hardware acceptance
 
-Only after source review, deterministic tests, final mining-ingress policy, and
-the mining certificate gate are complete may the runtime start. On the scoped
+Before changing the remote deployment, run the complete pool against local
+Wcash and Zcash regtest nodes. Use the real portal, edge, PostgreSQL projection,
+wallet construction and node broadcast paths. Record the exact source pair and
+exercise independent winners, accounting conservation, both Zcash destination
+types, Wcash payouts, the required confirmations, and restart recovery without
+duplicate payment. Unit tests with substituted wallet or node responses do not
+complete this gate.
+
+Only after that local gate, source review, the final mining-ingress policy, and
+the mining certificate gate are complete may the remote runtime start. On the scoped
 never-activated prototype described in section 1, activate the pinned release;
 this is the operation that atomically changes its stale selector and starts it:
 
@@ -889,8 +939,8 @@ sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
 
 Both paths first remove all current and legacy mining allow rules, repeat
 probe-only listener-free preflight, start the full Testnet target behind the
-closed firewall, and waits a bounded interval for signer recovery and a fresh
-payout-worker heartbeat. Only then does it restore the selected public or
+closed firewall, and wait a bounded interval for signer recovery and a fresh
+payout-worker heartbeat. Only then do they restore the selected public or
 exact-host firewall policy, reconcile nginx to the durable portal launch mode,
 and run health. Health requires the public pool, backend,
 payout worker, and payout Zallet to be active; Zallet must listen only on
@@ -913,8 +963,9 @@ firewall lock files as writable. There is no boot-time window where the timer
 can race a recovering payout lease.
 
 Before enabling the managed portal, inspect and archive only the verified
-bootstrap HTTP virtual hosts for `zecwec.com` and `testnet.zecwec.com` that the
-managed configuration will replace. On the existing host the portal bootstrap
+bootstrap HTTP virtual host for `testnet.zecwec.com` that the managed
+configuration will replace. Preserve the existing apex website and its nginx
+links. On the existing host the portal bootstrap
 link is `/etc/nginx/sites-enabled/zecwec-testnet-acme.conf`; do not leave it
 enabled alongside `zecwec-testnet-portal.conf`, because both claim the same
 hostname and port. Preserve their files for rollback and remove their enabled
@@ -927,15 +978,16 @@ separate DNS-only mining hostname and remains responsible for that
 certificate's HTTP-01 renewal. The managed portal serves HTTP GET requests only
 for `/.well-known/acme-challenge/<base64url-token>` files below
 `/var/lib/letsencrypt`; missing tokens return 404 and every other HTTP request
-closes without a response. HTTPS APIs and the apex HTTPS redirect retain
+closes without a response. Portal HTTPS APIs retain
 Cloudflare Authenticated Origin Pulls. Preserve the existing Certbot webroot
 renewal configuration and nginx reload hook, and verify that Cloudflare's
-redirect and Access policies allow the exact challenge path to reach the
+redirect rules and any optional Access policy allow the exact challenge path to reach the
 HTTP origin during issuance and renewal.
 
-Before the browser gate, create a Cloudflare Access application covering
-`testnet.zecwec.com/*`, allow only the named Testnet operator identity, and
-verify the default policy denies every other identity. Then stage the portal:
+If the operator chooses to test the browser flow behind Cloudflare Access,
+create an application covering `testnet.zecwec.com/*`, allow only the named
+Testnet operator identity, and verify the default policy denies every other
+identity. This optional staging step is not required for direct public launch:
 
 ```bash
 sudo env ZECWEC_RELEASE_PATH="$ZECWEC_BOOTSTRAP_RELEASE" \
@@ -954,30 +1006,24 @@ enabled portal link and reloads nginx. The authorized operator can now run the
 complete browser flow at the canonical HTTPS hostname with real cookie and
 origin semantics while the portal remains unavailable to the public.
 
-Before changing the remote deployment, run the complete pool against local
-Wcash and Zcash regtest nodes. Use the real portal, edge, PostgreSQL projection,
-wallet construction and node broadcast paths. Record the exact source pair and
-exercise independent winners, accounting conservation, both Zcash destination
-types, Wcash payouts and restart recovery. Unit tests with substituted wallet
-or node responses do not complete this gate.
-
-Before inviting the first controlled ASIC, prove all of the following on the
-selected remote release:
+Before opening the public endpoints, verify these remote readiness conditions
+and the recorded local acceptance evidence:
 
 - both Wcash nodes agree on canonical tip and genesis;
 - both Zcash Testnet nodes agree on canonical tip and genesis;
-- both protected backups independently reproduce their frozen collector
-  account, address, and payout commitment;
+- the existing sealed independent-recovery evidence verifies both frozen
+  collector accounts, addresses, and payout commitments;
 - the Wcash recovery attestation matches the frozen authority and the mining
   identity cannot read or traverse either wallet custody store;
 - payout Zallet is active only on its configured loopback RPC; the bootstrap
   and recovery Zallet units are inactive and the recovery port is absent;
 - backend identity, journal stream, payout commitments, and chain ID match;
-- the projector is active under its dedicated UID, has no TCP listener, and a
-  forced projector stop also closes public miner intake;
-- registration, login, TOTP, worker creation/revocation, and both payout
-  destination flows work through HTTPS;
-- external ZIP-301 clients receive jobs on both TCP and hostname-verified TLS;
+- the projector is active under its dedicated UID and has no TCP listener;
+  local failure-injection evidence proves a projector stop closes miner intake;
+- the complete local browser flow covers registration, login, TOTP, worker
+  creation/revocation, and both payout destination types;
+- the selected remote TCP and hostname-verified TLS paths pass the edge health
+  checks; verify external job delivery immediately after publication;
 - invalid worker credentials fail closed and legacy ports remain closed;
 - local evidence covers accepted/rejected/duplicate/stale work, independent
   winner accounting and restart/reorganization recovery;
@@ -985,19 +1031,15 @@ selected remote release:
 - the real regtest payout path constructs, journals and broadcasts transactions
   accepted by each chain, then confirms and recovers them idempotently.
 
-The controlled ASIC can now connect. Record its first actual accepted share and
-subsequent job rotation. A public Testnet block must be discovered and satisfy
-the chain's confirmation rules before its mined reward can be paid. Record that
-later payout separately; neither a physical ASIC share nor an already matured
-public block can be a prerequisite for allowing the first ASIC to connect.
-
 For Wcash chain readiness, compare actual canonical tips, genesis identities,
 known peers and validated current templates. A wall-clock `estimatedheight`
 alone is not evidence of missing blocks on a chain awaiting miners.
 
-After every gate above has evidence recorded, remove the Cloudflare Access
-application, confirm the zone still uses Full (strict) and Authenticated Origin
-Pulls, then enable the public portal with an explicit operator acknowledgement:
+After the local end-to-end and remote readiness gates pass, confirm Full
+(strict) and Authenticated Origin Pulls remain enabled, then publish the portal
+with the explicit operator acknowledgement below. If optional Access staging
+was used, remove only that Testnet portal Access application first. A prior
+private ASIC session is not required:
 
 ```bash
 sudo scripts/deploy/enable-nginx-edge.sh \
@@ -1007,12 +1049,28 @@ sudo scripts/deploy/enable-nginx-edge.sh \
   --ack-e2e-gates
 ```
 
-Immediately before that command, activate only the proxied apex/Testnet web
-records after confirming the zone's origin-pull setting; remove them again if
-the command fails. Portal publication fails closed unless an unauthenticated
-direct-origin probe is rejected and the same health path succeeds through
-Cloudflare. Publish the DNS-only `testnet-mine.zecwec.com` record only after
-the private ASIC gate. Do not create or enable `mine.zecwec.com`.
+Immediately before that command, publish the proxied `testnet.zecwec.com`
+record after confirming its origin-pull setting. Publish the DNS-only
+`testnet-mine.zecwec.com` record once the selected mining policy and remote
+readiness checks pass. Portal publication fails closed unless an
+unauthenticated direct-origin probe is rejected and
+`https://testnet.zecwec.com/healthz` returns HTTP 200 with the exact body
+`{"status":"ok"}` through Cloudflare. Redirects and generic successful pages
+do not satisfy that check. If publication fails, remove any Testnet DNS
+records newly introduced for this activation and keep ingress closed while
+correcting the failure. Preserve the apex website, DNS, certificate, and
+existing Cloudflare redirect throughout. Do not create or enable
+`mine.zecwec.com`.
+
+After publication, verify registration, login, TOTP, worker
+creation/revocation, and both payout destination flows through the canonical
+HTTPS hostname, plus external ZIP-301 job delivery over TCP and verified TLS.
+Miners can then connect directly. Record the first actual accepted ASIC share
+and subsequent job rotation. A public Testnet block must be discovered and
+satisfy the chain's confirmation rules before its mined reward can be paid;
+record that later payout separately. Neither a physical ASIC share nor an
+already matured public block is a prerequisite for opening the first miner
+connection after the required local and remote gates.
 
 Run the local health contract at any time:
 

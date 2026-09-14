@@ -1,4 +1,4 @@
-# The key is authoritative only because both HTTPS virtual hosts require
+# The key is authoritative only because the HTTPS virtual host requires
 # Cloudflare Authenticated Origin Pulls before evaluating these zones.
 limit_req_zone $http_cf_connecting_ip zone=zecwec_portal_requests:10m rate=20r/s;
 
@@ -22,7 +22,8 @@ upstream zecwec_testnet_portal {
 server {
     listen 80;
     listen [::]:80;
-    server_name @APEX_HOST@ @PORTAL_HOST@;
+    server_name @PORTAL_HOST@;
+    if ($host != @PORTAL_HOST@) { return 444; }
     # Certbot HTTP-01 renewal reads only a single base64url token filename.
     # This static exception never reaches the portal or its session API.
     location ~ ^/\.well-known/acme-challenge/[A-Za-z0-9_-]+$ {
@@ -40,25 +41,6 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name @APEX_HOST@;
-
-    ssl_certificate @APEX_TLS_CERT@;
-    ssl_certificate_key @APEX_TLS_KEY@;
-    ssl_client_certificate @CLOUDFLARE_ORIGIN_PULL_CA@;
-    ssl_verify_client on;
-    ssl_verify_depth 1;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_cache shared:ZecWecApex:2m;
-    ssl_session_timeout 1h;
-    ssl_session_tickets off;
-    if ($http_cf_connecting_ip = "") { return 403; }
-
-    return 302 https://@PORTAL_HOST@$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
     server_name @PORTAL_HOST@;
 
     ssl_certificate @PORTAL_TLS_CERT@;
@@ -71,6 +53,7 @@ server {
     ssl_session_timeout 1d;
     ssl_session_tickets off;
     if ($http_cf_connecting_ip = "") { return 403; }
+    if ($host != @PORTAL_HOST@) { return 444; }
 
     client_max_body_size 16k;
     proxy_connect_timeout 3s;
