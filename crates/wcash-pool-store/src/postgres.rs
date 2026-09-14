@@ -1805,6 +1805,11 @@ impl PostgresStore {
         .fetch_all(&mut *transaction)
         .await?;
         if rows.is_empty() {
+            // Due preference changes can themselves remove the last eligible
+            // output (automatic=false or a higher threshold). Preserve those
+            // promotions after the normal safety/reconciliation checks; no
+            // batch, reservation, or ledger entry has been written yet.
+            transaction.commit().await?;
             return Err(StoreError::NoPayableBalances);
         }
         let mut outputs = Vec::with_capacity(rows.len());
@@ -1835,7 +1840,9 @@ impl PostgresStore {
             .iter()
             .map(|output| output.liability_amount_zat)
             .min()
-            .ok_or(StoreError::NoPayableBalances)?;
+            .ok_or(StoreError::CorruptDatabaseState(
+                "empty selected payout outputs",
+            ))?;
         let maximum_network_fee_zat = absolute_fee_limit
             .min(relative_fee_limit)
             .min(smallest_liability.saturating_sub(1));

@@ -345,6 +345,134 @@ async fn reconcile_wallet(
         .await
 }
 
+async fn assert_due_preferences_survive_empty_payout_selection(
+    database_url: &str,
+    admin: &sqlx::PgPool,
+) {
+    // Disabling the only recipient and raising its threshold both remove all
+    // eligible outputs. The preference must still take effect durably without
+    // creating a payment or changing the original payable liability.
+    for (chain, seed, automatic, threshold) in [
+        (Chain::Wcash, 101, false, 1_i64),
+        (Chain::Zcash, 102, true, 200_i64),
+    ] {
+        let store = PostgresStore::connect(database_url, 2, identity(seed))
+            .await
+            .expect("empty-selection store connects");
+        store.bind_deployment().await.expect("identity binds");
+        store
+            .bind_zero_fee_launch_policies(&policy(Chain::Wcash), &policy(Chain::Zcash))
+            .await
+            .expect("policies bind");
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO accounts (deployment_id,id,login) VALUES ($1,$2,'preference_owner')",
+        )
+        .bind(store.deployment_id())
+        .bind(account_id)
+        .execute(admin)
+        .await
+        .expect("preference owner seeds");
+        insert_destination(&store, admin, account_id, chain)
+            .await
+            .expect("initial automatic destination seeds");
+        credit_payable(&store, admin, account_id, chain, 100)
+            .await
+            .expect("payable liability seeds");
+        let pending_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO payout_destinations \
+             (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by, \
+              validated_at,active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
+             VALUES ($1,$2,$3,$4,'testnet','integration-due-preference','transparent', \
+                     'integration-authority-v1',clock_timestamp(), \
+                     clock_timestamp()-INTERVAL '1 second',$5,$6,$7,'pending',2)",
+        )
+        .bind(store.deployment_id())
+        .bind(pending_id)
+        .bind(account_id)
+        .bind(chain.as_str())
+        .bind([0x45_u8; 32].as_slice())
+        .bind(threshold)
+        .bind(automatic)
+        .execute(admin)
+        .await
+        .expect("already-due replacement seeds");
+        let before = reconcile_wallet(&store, admin, chain)
+            .await
+            .expect("original liability matches wallet");
+
+        assert!(matches!(
+            store
+                .create_payout_batch(chain, Uuid::new_v4(), Uuid::new_v4())
+                .await,
+            Err(StoreError::WalletReconciliationStale)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM payout_destinations WHERE deployment_id=$1 AND id=$2",
+            )
+            .bind(store.deployment_id())
+            .bind(pending_id)
+            .fetch_one(admin)
+            .await
+            .expect("failed reconciliation leaves pending preference"),
+            "pending",
+            "the empty-selection commit must not bypass reconciliation"
+        );
+
+        let batch_key = Uuid::new_v4();
+        for _ in 0..2 {
+            assert!(matches!(
+                store.create_payout_batch(chain, batch_key, before.id).await,
+                Err(StoreError::NoPayableBalances)
+            ));
+            let active = sqlx::query(
+                "SELECT id,automatic,payout_threshold_zat,revision \
+                 FROM payout_destinations \
+                 WHERE deployment_id=$1 AND account_id=$2 AND chain=$3 AND state='active'",
+            )
+            .bind(store.deployment_id())
+            .bind(account_id)
+            .bind(chain.as_str())
+            .fetch_one(admin)
+            .await
+            .expect("replacement persists even when no batch is created");
+            assert_eq!(active.get::<Uuid, _>("id"), pending_id);
+            assert_eq!(active.get::<bool, _>("automatic"), automatic);
+            assert_eq!(active.get::<i64, _>("payout_threshold_zat"), threshold);
+            assert_eq!(active.get::<i64, _>("revision"), 2);
+        }
+
+        let counts = sqlx::query(
+            "SELECT \
+               (SELECT COUNT(*) FROM payout_destinations WHERE deployment_id=$1 \
+                 AND state='pending') AS pending, \
+               (SELECT COUNT(*) FROM payout_destinations WHERE deployment_id=$1 \
+                 AND state='disabled' AND disabled_at IS NOT NULL) AS disabled, \
+               (SELECT COUNT(*) FROM payout_batches WHERE deployment_id=$1) AS batches, \
+               (SELECT COUNT(*) FROM payout_items WHERE deployment_id=$1) AS items",
+        )
+        .bind(store.deployment_id())
+        .fetch_one(admin)
+        .await
+        .expect("empty selection has no payment artifacts");
+        assert_eq!(counts.get::<i64, _>("pending"), 0);
+        assert_eq!(counts.get::<i64, _>("disabled"), 1);
+        assert_eq!(counts.get::<i64, _>("batches"), 0);
+        assert_eq!(counts.get::<i64, _>("items"), 0);
+        let after = reconcile_wallet(&store, admin, chain)
+            .await
+            .expect("unchanged payable liability still matches wallet");
+        assert_eq!(after.ledger_root, before.ledger_root);
+        assert_eq!(
+            after.ledger_transaction_count,
+            before.ledger_transaction_count
+        );
+        assert_eq!(after.wallet_spendable_zat, before.wallet_spendable_zat);
+    }
+}
+
 async fn assert_full_balance_payout_is_miner_fee_funded(
     database_url: &str,
     admin: &sqlx::PgPool,
@@ -2277,6 +2405,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .expect("runtime policies verify without writes");
     assert_full_balance_payout_is_miner_fee_funded(&database_url, &admin, Chain::Wcash, 81).await;
     assert_full_balance_payout_is_miner_fee_funded(&database_url, &admin, Chain::Zcash, 82).await;
+    assert_due_preferences_survive_empty_payout_selection(&database_url, &admin).await;
     assert_database_privilege_boundaries(&admin, &database_url).await;
     assert_winner_depth_regression_is_reversible(&admin, &database_url).await;
     let mut mismatched_identity = store_identity.clone();
