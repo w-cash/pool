@@ -192,17 +192,40 @@ class ReplayBoundaryTests(unittest.TestCase):
         ledger.winner_facts = lambda: ledger.original_facts
         ledger.verify_unchanged(0)
 
-    def test_proxy_holds_acceptance_and_notifications_on_same_connection(self):
+    def test_projection_wait_outlives_client_budget_but_respects_total_deadline(self):
+        ledger = object.__new__(LedgerCheck)
+        ledger.before = {'total': 1, 'worker': 1}
+        ledger.verifier = SimpleNamespace(query_deadline=None)
+        ledger.counts = lambda: {'total': 2, 'worker': 2}
+        facts = [{'chain': chain, 'share': 'same-proof', 'state': 'observed',
+                  'allocations': [1], 'credit': [1]} for chain in ('wcash', 'zcash')]
+        ledger.winner_facts = lambda: facts
+        submission = {**SUBMIT, 'params': [SUBMIT['params'][0], 'ab' * 32, *SUBMIT['params'][2:]]}
+        with patch('replay.time.monotonic', side_effect=[0, 12]):
+            ledger.await_original(submission)
+        self.assertEqual(ledger.original_facts, facts)
+        self.assertIsNone(ledger.verifier.query_deadline)
+        with patch('replay.time.monotonic', side_effect=[0, 12]):
+            with self.assertRaisesRegex(RuntimeError, 'did not project'):
+                ledger.await_original(submission, deadline=10)
+        self.assertIsNone(ledger.verifier.query_deadline)
+
+    def test_proxy_returns_acceptance_then_replays_after_client_exit_on_same_connection(self):
         downstream, miner = socket.socketpair()
         upstream, pool = socket.socketpair()
         results = []
         failures = []
         hooks = []
         transcript = io.BytesIO()
+        miner_completed = threading.Event()
+        def before_replay(request):
+            self.assertEqual(request, SUBMIT)
+            self.assertTrue(miner_completed.wait(3), 'acceptance must precede projection wait')
+            hooks.append('projected')
         def run_proxy():
             try:
                 results.append(proxy(downstream, upstream, transcript,
-                                     lambda request: hooks.append('projected'),
+                                     before_replay,
                                      lambda: hooks.append('unchanged'),
                                      time.monotonic() + 5))
             except BaseException as error:
@@ -218,18 +241,23 @@ class ReplayBoundaryTests(unittest.TestCase):
                 miner.sendall(raw[10:])
                 with pool.makefile('rb') as reader:
                     self.assertEqual(json.loads(reader.readline()), SUBMIT)
-                    # This notification must not become the one-shot client's
-                    # submit response while the actual acceptance is withheld.
+                    # Acceptance reaches the miner before the durable baseline
+                    # exists, even with a server notice in the same TCP chunk.
                     pool.sendall(encode(ACCEPTED) + encode({'id': None,
                                   'method': 'mining.notify', 'params': ['new-job']}))
+                    with miner.makefile('rb') as miner_reader:
+                        self.assertEqual(json.loads(miner_reader.readline()), ACCEPTED)
+                    miner.close()
+                    self.assertEqual(hooks, [])
+                    miner_completed.set()
                     replay = json.loads(reader.readline())
                     self.assertEqual({**replay, 'id': 4}, SUBMIT)
                     self.assertEqual(hooks, ['projected'])
-                    pool.sendall(encode({'id': replay['id'], 'result': None,
+                    pool.sendall(encode({'id': None, 'method': 'mining.notify', 'params': ['later-job']})
+                                 + encode({'id': replay['id'], 'result': None,
                                          'error': [21, 'stale job', None]}))
-                with miner.makefile('rb') as reader:
-                    self.assertEqual(json.loads(reader.readline()), ACCEPTED)
             finally:
+                miner_completed.set()
                 thread.join(timeout=6)
             self.assertFalse(thread.is_alive())
             self.assertEqual(failures, [])
@@ -238,6 +266,17 @@ class ReplayBoundaryTests(unittest.TestCase):
             recorded = [json.loads(line) for line in transcript.getvalue().splitlines()]
             self.assertEqual(sum(row['direction'] == 'proxy-replay-to-pool'
                                  for row in recorded), 1)
+
+    def test_proxy_requires_upstream_to_remain_open(self):
+        downstream, miner = socket.socketpair()
+        upstream, pool = socket.socketpair()
+        with downstream, miner, upstream, pool:
+            miner.sendall(encode(SUBMIT))
+            pool.sendall(encode(ACCEPTED))
+            pool.shutdown(socket.SHUT_WR)
+            with self.assertRaisesRegex(RuntimeError, 'connection closed'):
+                proxy(downstream, upstream, io.BytesIO(), lambda request: None,
+                      lambda: self.fail('closed upstream must not pass'), time.monotonic() + 2)
 
 
 if __name__ == '__main__':

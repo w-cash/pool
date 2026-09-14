@@ -22,10 +22,11 @@ from verify import GENESIS, Verifier, display_block, require
 
 MAX_LINE = 262144
 IDLE_DEADLINE_SECONDS = 20
+PROJECTION_DEADLINE_SECONDS = 30
 
 
 class ReplayVerifier(Verifier):
-    """Keep live SQL inside the native client's short response deadline."""
+    """Keep each live query inside the bounded replay check deadline."""
     query_deadline = None
 
     def rpc(self, chain, method, params):
@@ -246,35 +247,38 @@ class LedgerCheck:
             WHERE s.deployment_id={self.dep} AND s.worker_id={self.worker}
               AND s.job_id=decode('{self.job}','hex') ORDER BY w.chain,w.block_hash_le''')
 
-    def await_original(self, submission):
+    def await_original(self, submission, *, deadline=None):
         params = submission['params']
         require(len(params) == 5 and isinstance(params[1], str) and len(params[1]) == 64,
                 'native proof does not contain an exact job ID')
         self.job = bytes.fromhex(params[1]).hex()
-        # The native client allows ten seconds for its submit response. Keep
-        # this pre-replay projection wait bounded and fail closed if lagging.
-        deadline = time.monotonic() + 5
+        # Acceptance has already reached the one-shot miner. Its independent
+        # upstream connection remains authorized while real winners project.
+        projection_deadline = time.monotonic() + PROJECTION_DEADLINE_SECONDS
+        deadline = projection_deadline if deadline is None else min(deadline, projection_deadline)
         self.verifier.query_deadline = deadline
         expected = {key: value + 1 for key, value in self.before.items()}
-        while time.monotonic() < deadline:
-            current = self.counts()
-            require(all(self.before[key] <= current[key] <= expected[key] for key in expected),
-                    'share count changed unexpectedly; run with other mining stopped')
-            if current == expected:
-                facts = self.winner_facts()
-                # The harness assigns the actual Regtest network target. This
-                # proof must produce one observed winner and allocation on each
-                # chain before its replay can be compared without projection lag.
-                if (len(facts) == 2 and {row['chain'] for row in facts} == {'wcash', 'zcash'}
-                        and len({row['share'] for row in facts}) == 1
-                        and all(row['state'] in ('observed', 'matured')
-                                and row['allocations'] and row['credit'] for row in facts)):
-                    self.projected = current
-                    self.original_facts = facts
-                    self.verifier.query_deadline = None
-                    return
-            time.sleep(0.2)
-        raise RuntimeError('original share and both winner allocations did not project before replay')
+        try:
+            while time.monotonic() < deadline:
+                current = self.counts()
+                require(all(self.before[key] <= current[key] <= expected[key] for key in expected),
+                        'share count changed unexpectedly; run with other mining stopped')
+                if current == expected:
+                    facts = self.winner_facts()
+                    # The harness assigns the actual Regtest network target. This
+                    # proof must produce one observed winner and allocation on each
+                    # chain before its replay can be compared without projection lag.
+                    if (len(facts) == 2 and {row['chain'] for row in facts} == {'wcash', 'zcash'}
+                            and len({row['share'] for row in facts}) == 1
+                            and all(row['state'] in ('observed', 'matured')
+                                    and row['allocations'] and row['credit'] for row in facts)):
+                        self.projected = current
+                        self.original_facts = facts
+                        return
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+            raise RuntimeError('original share and both winner allocations did not project before replay')
+        finally:
+            self.verifier.query_deadline = None
 
     def verify_unchanged(self, seconds):
         require(self.projected is not None, 'original share projection was not checked')
@@ -298,6 +302,11 @@ def proxy(downstream, upstream, transcript, before_replay, after_replay, deadlin
             for key, _ in selector.select(timeout=min(1, max(0, deadline - time.monotonic()))):
                 source = key.fileobj
                 chunk = source.recv(65536)
+                if not chunk and source is downstream and exchange.accepted is not None:
+                    # A one-shot miner exits after acceptance. Retain its exact
+                    # authorized upstream session and stop polling the closed end.
+                    selector.unregister(downstream)
+                    continue
                 require(bool(chunk), 'connection closed before replay acceptance checks completed')
                 buffer = buffers[source]
                 buffer.extend(chunk)
@@ -316,20 +325,19 @@ def proxy(downstream, upstream, transcript, before_replay, after_replay, deadlin
                         continue
                     result = exchange.response(message)
                     if result == 'accepted':
-                        # The miner exits on success. Retain this response until
-                        # the replay has used exactly the same upstream session.
+                        downstream.sendall(line + b'\n')
                         before_replay(exchange.original)
+                        require(time.monotonic() < deadline, 'projection exhausted replay deadline')
                         replay = exchange.replay()
                         transcript.write(encode({'direction': 'proxy-replay-to-pool', 'message': replay}))
                         transcript.flush()
                         upstream.sendall(encode(replay))
                     elif result == 'replayed':
-                        downstream.sendall(encode(exchange.accepted))
                         after_replay()
                         return exchange
                     elif exchange.accepted is None:
-                        # A native one-shot client expects its submit response
-                        # next; notifications must not overtake held acceptance.
+                        # After acceptance the one-shot client can close; drain
+                        # upstream notices without writing to the completed miner.
                         downstream.sendall(line + b'\n')
                 require(len(buffer) <= MAX_LINE, 'unterminated ZIP-301 message exceeded proxy limit')
         raise RuntimeError('real mining or replay timed out')
@@ -370,9 +378,11 @@ def run(args):
             with downstream, socket.create_connection(('127.0.0.1', 18237), timeout=10) as upstream:
                 downstream.settimeout(10)
                 upstream.settimeout(10)
-                exchange = proxy(downstream, upstream, transcript, ledger.await_original,
+                deadline = time.monotonic() + args.timeout
+                exchange = proxy(downstream, upstream, transcript,
+                                 lambda request: ledger.await_original(request, deadline=deadline),
                                  lambda: ledger.verify_unchanged(args.observe_seconds),
-                                 time.monotonic() + args.timeout)
+                                 deadline)
                 require(proc.wait(timeout=15) == 0, 'native miner did not finish successfully')
             # Check once more after the real native client has exited.
             ledger.verify_unchanged(0)
