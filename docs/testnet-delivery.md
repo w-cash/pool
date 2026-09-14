@@ -51,34 +51,71 @@ service flow. Pending evidence must remain labeled pending.
 
 Record the runtime-source revision and deployment-package-source revision
 separately. The validated pool binary uses runtime source
-`e85ea46cc04c7d35083a526eff28d11704254903`; a later documentation-only package
-revision reuses that binary with its exact newly generated deployment-package
-manifest. The native production build from selected `c0e3687` remains after
-the complete local acceptance gate.
+`9567b7e0597e38ef315a77df8fa0d9c4e7b3423b`. Deployment package changes include
+backend connection capacity and certificate renewal routes. The native
+production build follows the complete local acceptance gate, which passed at
+2026-09-14 02:06 UTC.
 
 | Gate | Status |
 | --- | --- |
-| Integrated Rust release checks | Passed: final `bbe4274`/`e85ea46` component suites and real PostgreSQL alias, lifecycle, migration/backfill, and side-chain regressions; native `c0e3687` passed 217 tests |
-| Final Linux pool artifact and component checks | Passed: production-default `e85ea46` static x86_64 musl binary ran on Ubuntu 22.04; 203 `bbe4274` protocol/backend/core/edge tests executed there |
+| Integrated Rust release checks | Passed: final `bbe4274`/`e85ea46` component suites and real PostgreSQL alias, lifecycle, migration/backfill, and side-chain regressions; `9567b7e` preference regression passed on PostgreSQL 16 with store Clippy; native `11ffc3b` passed 221 library and 17 CLI tests (two existing library tests ignored) |
+| Final Linux pool artifact and component checks | Passed: production-default `9567b7e` static x86_64 musl binary ran on Ubuntu 22.04 and rejected the actual Regtest config; 203 unchanged protocol/backend/core/edge tests previously executed there |
 | Miner portal on the real local services | Passed: 42 browser checks, including account, worker revocation and both Zcash destination profiles |
-| Complete local regtest mining and accounting | In progress: preserved-height-23 recovery succeeded with the proof-lifecycle correction and real mining resumed; full payout, controlled restart, and replay gates remain pending |
-| Real Zcash transparent and shielded payments | Pending |
-| Real Wcash payment and restart reconciliation | Pending |
+| Complete local regtest mining and accounting | Passed at 206: 219 shares, 214 canonical mature winners and two settled payments; original state preserved through exact-tip restarts |
+| Same-session duplicate replay | Passed at 105: one accepted share, identical replay rejected as stale, unchanged share/allocation/ledger totals |
+| Real Zcash transparent and shielded payments | Passed at 206: exact mixed-recipient transaction included at 106 on both independent parents, 101 confirmations, both recipient output values and account deltas match, one conserved settlement |
+| Real Wcash payment and restart reconciliation | Passed at 206 with 101 confirmations; separate recipient wallet decrypted the matching non-change note; normal worker restarts preserved both payments and produced no duplicate |
+| Interrupted signing recovery | Passed through broadcast: the original unsigned ZEC batch resumed after a clean worker/wallet stop; the two original batch IDs and WEC transaction were preserved |
+| Due payout settings and settled restart | Passed with `9567b7e`: all three paid profiles active with automatic payouts disabled, no pending settings, fresh matched wallet/ledger reconciliations, clean worker exits and lease release, unchanged signed bytes and signer journals |
+| Prompt network block submission | Passed with `11ffc3b`: three actual accepted proofs reached exact committed membership on all three nodes within 1.326, 0.306 and 0.323 seconds after client completion, with the historical backlog preserved |
 | Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
 | Remote preflight and public endpoint acceptance | Pending |
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
 
-The final production-default static x86_64 musl pool binary at `e85ea46` has
-SHA-256 `4aea7f43990231743b2a911359163bead06e95980c46a54947308fafb7ead026`.
-It is byte-identical to the `bbe4274` production binary and its `--help` command
-ran successfully on Ubuntu 22.04 AMD64. The matching Linux test executables
-passed all 203 protocol/backend/core/edge tests (39/40/63/61), matching the
-macOS results. An earlier `1e96509` run also passed 115 signer/component tests
-on Ubuntu; the signer code in those checks is unchanged.
+The final production-default static x86_64 musl pool binary at `9567b7e` has
+SHA-256 `09b20c60c6a920dfe790bf9caefb18272474bc1f0bf96b5d07a02d0459a0b82d`.
+Its `--help` command ran successfully on Ubuntu 22.04 AMD64, and the exact
+production binary rejected the actual Regtest configuration with networking
+disabled. The earlier Linux test executables passed all 203 unchanged
+protocol/backend/core/edge tests (39/40/63/61), matching the macOS results.
+An earlier `1e96509` run also passed 115 signer/component tests on Ubuntu;
+the signer code in those checks is unchanged.
 
-The 42 real browser checks and prior real worker-token authorization/revocation
-checks remain separate evidence. Component tests, successful preserved-state
-recovery, and platform checks do not complete the outstanding actual payment,
-recipient-receipt, controlled restart, and same-session replay acceptance gates.
-Remote activation remains pending those local results.
+The normal payout worker created exactly two batches covering three recipient
+profiles. Its first ZEC proof exceeded the unchanged 180-second deadline in an
+unoptimized debug Zallet. The worker and wallet stopped gracefully. The same
+pinned, patched source built with standard release optimization resumed the
+original unsigned batch, reaching verified proof within 18 seconds and signed
+preparation within 42 seconds of worker startup. No replacement payment was
+created. Both actual signed transactions were independently matched to node
+bytes, canonical block membership, immutable payout items and recipient receipts.
+
+Automatic payouts were then disabled through the ordinary authenticated portal
+API while the worker was stopped. The run mined 100 full blocks after inclusion,
+then resumed the same worker. Both original payments reached Confirmed with
+101 confirmations at height 206, and each settled exactly once. The independent
+live verifier passed with 219 shares, 214 canonical mature winners, two confirmed
+batches, three recipient profiles and a conserved ledger. No confirmation policy,
+balance, journal, wallet or batch was reset.
+
+This check exposed a preference-promotion bug: an empty eligible-payment set
+rolled back an otherwise valid due setting change. Runtime `9567b7e` commits
+those promotions after the existing safety and wallet reconciliation checks and
+before any payment or reservation write. A real PostgreSQL regression verifies
+disabling the final recipient, raising its threshold, durable settings across
+repeated empty selections, unchanged financial state and rollback on invalid
+reconciliation. The updated worker then promoted all three paid profiles and
+completed an additional normal restart. Both starts reached ready, produced fresh
+matched wallet/ledger reconciliations and exited cleanly with their leases
+released. The original two confirmed payments, signed bytes and signer journals
+were unchanged; each retained exactly one reservation and settlement.
+
+The 42 real browser checks, actual duplicate replay and recipient receipts remain
+separate evidence. The full local acceptance gate passed at 2026-09-14 02:06 UTC;
+remote and physical ASIC checks remain separate pending gates. Prompt block submission passed after a
+controlled upgrade at height 170 that preserved all three exact tips, 180 shares,
+350 economic winners, 360 proofs, 494 sealed ledger transactions and both original
+signed payment batches. The scheduler uses the existing worker and unchanged
+journal/CAS rules; new pending winners receive a bounded first attempt before
+historical status checks. All four scheduling regression tests passed.
