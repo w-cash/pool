@@ -76,7 +76,8 @@ production build follows the complete local acceptance gate, which passed at
 | Prompt network block submission | Passed with `11ffc3b`: three actual accepted proofs reached exact committed membership on all three nodes within 1.326, 0.306 and 0.323 seconds after client completion, with the historical backlog preserved |
 | Ubuntu package and origin routing | Passed locally: actual systemd 249 credentials and nginx origin mTLS/routes on Ubuntu 22.04; deployment package checks passed |
 | Remote node upgrades, migration and preflight | Passed: all four verified node binaries preserve chain state; both chain-specific committed-proof status checks and independent node agreement pass; PostgreSQL migration and listener-free preflight passed |
-| Remote activation and public endpoint acceptance | Pending: first activation failed closed at payout service startup; the reproduced systemd 249 credential-lifetime correction passed local package and actual operating-system tests before retry |
+| Native validator-tip rollover | Passed with `ebb620d50`: four real loopback RPC regressions, 225 library tests and 17 CLI tests; two existing library tests ignored; actual three-node Regtest job preparation and retirement passed at unchanged height 206 |
+| Remote activation and public endpoint acceptance | Pending: startup credential and validator-tip rollover failures were reproduced and corrected locally; the updated backend must pass remote activation and external acceptance |
 | Physical ASIC accepted work | Pending |
 | Public Testnet mined-reward payment | Await block discovery and confirmation |
 
@@ -104,6 +105,28 @@ rebuilds its recent chain view before the preserved wallet catches up. During
 this activation its historical scan advanced while the reported saved wallet
 tip remained unchanged. The exact validator-tip and complete-scan readiness
 gate was retained; no wallet state or confirmation rule was reset.
+
+A later remote attempt exposed a normal validator-tip rollover during proposal
+validation. The rejected proposal had become stale, but the backend returned a
+fatal error before checking the new tip. Native commit
+`ebb620d50e67834268b2cbf5f671d3a9324d4c34` now requires a fresh atomic validator
+snapshot proving a changed hash or height before retrying. An unchanged,
+malformed or unavailable snapshot preserves the original rejection. The same
+check covers a rollover while fetching the independent payout template;
+version, payout and content checks remain unchanged. The existing preparation
+guard retires the unpublished auxiliary candidate before retry, and rejected
+work cannot reach activation or accounting.
+
+After the focused RPC and existing native suites passed, the exact updated
+release prepared, independently proposal-validated and retired one real Regtest
+job in 1.031 seconds. All three chain tips remained at 206. Ten economic/payment
+tables, both payment identities, wallet state and the primary share journal
+were unchanged. A separate existing Wcash recipient and private test journal
+kept this check independent of the running collector. No block was mined or
+submitted. Its macOS binary SHA-256 is
+`d66977d4b7ff9343ac30cc7434fed0be1ac41eda596f6fcaefa43a50f3e5c326`.
+The node and wallet binaries remain the verified `11ffc3b` artifacts; only the
+mining backend needs rebuilding for this correction.
 
 The normal payout worker created exactly two batches covering three recipient
 profiles. Its first ZEC proof exceeded the unchanged 180-second deadline in an
