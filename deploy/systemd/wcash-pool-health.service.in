@@ -10,7 +10,13 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock
+# iptables creates its lock lazily.  Give the hardened probe a private
+# runtime directory so namespace setup does not depend on a host-created
+# /run/xtables.lock file (which disappears on reboot).
+RuntimeDirectory=wcash-pool-health
+RuntimeDirectoryMode=0700
+Environment=XTABLES_LOCKFILE=/run/wcash-pool-health/xtables.lock
+ReadWritePaths=/etc/ufw /run/ufw.lock /run/wcash-pool-health
 # Health re-verifies the sealed authority below a wcash-payout-owned 0700
 # directory. Keep the bypass read-only; CAP_DAC_OVERRIDE is intentionally absent.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH

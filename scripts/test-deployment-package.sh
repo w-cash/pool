@@ -1277,7 +1277,13 @@ assert (
     "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH"
     in health_unit
 )
-assert "ReadWritePaths=/etc/ufw /run/ufw.lock /run/xtables.lock" in health_unit
+assert "RuntimeDirectory=wcash-pool-health" in health_unit
+assert "RuntimeDirectoryMode=0700" in health_unit
+assert (
+    "Environment=XTABLES_LOCKFILE=/run/wcash-pool-health/xtables.lock"
+    in health_unit
+)
+assert "ReadWritePaths=/etc/ufw /run/ufw.lock /run/wcash-pool-health" in health_unit
 assert "SupplementaryGroups=wcash-pool-backend\n" in backend_init_unit
 for authority_consumer in (pool_unit, preflight_unit, backend_unit, backend_init_unit):
     assert (
