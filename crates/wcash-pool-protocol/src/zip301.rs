@@ -165,6 +165,13 @@ pub enum Zip301Request {
         /// Request identifier.
         id: Zip301Id,
     },
+    /// Bitmain compatibility probe for Bitcoin-style version rolling.
+    MultiVersion {
+        /// Request identifier.
+        id: Zip301Id,
+        /// Nonzero number of versions requested by the miner.
+        requested_versions: u32,
+    },
     /// Submits one Equihash solution.
     Submit {
         /// Request identifier.
@@ -205,6 +212,13 @@ impl fmt::Debug for Zip301Request {
                 .debug_struct("ExtranonceSubscribe")
                 .field("id", &"[REDACTED]")
                 .finish(),
+            Self::MultiVersion {
+                requested_versions, ..
+            } => formatter
+                .debug_struct("MultiVersion")
+                .field("id", &"[REDACTED]")
+                .field("requested_versions", requested_versions)
+                .finish(),
             Self::Submit { job_id, time, .. } => formatter
                 .debug_struct("Submit")
                 .field("id", &"[REDACTED]")
@@ -226,6 +240,7 @@ impl Zip301Request {
             | Self::Authorize { id, .. }
             | Self::SuggestTarget { id, .. }
             | Self::ExtranonceSubscribe { id }
+            | Self::MultiVersion { id, .. }
             | Self::Submit { id, .. } => id,
         }
     }
@@ -448,6 +463,23 @@ pub fn decode_zip301_request(
         "mining.extranonce.subscribe" => {
             require_parameter_count(params, 0, "mining.extranonce.subscribe")?;
             Ok(Zip301Request::ExtranonceSubscribe { id: raw.id })
+        }
+        "mining.multi_version" => {
+            require_parameter_count(params, 1, "mining.multi_version")?;
+            let requested_versions = params[0]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    invalid(
+                        "mining.multi_version count",
+                        "must be a nonzero 32-bit unsigned integer",
+                    )
+                })?;
+            Ok(Zip301Request::MultiVersion {
+                id: raw.id,
+                requested_versions,
+            })
         }
         "mining.submit" => decode_zip301_submit(raw.id, params, profile),
         _ => Err(ProtocolError::UnsupportedMethod(raw.method)),

@@ -401,6 +401,13 @@ impl ConnectionActor {
                 )?;
                 Ok(None)
             }
+            Zip301Request::MultiVersion { .. } => {
+                // Stock Bitmain cgminer sends this asynchronous Bitcoin
+                // ASICBoost probe after authorization and does not wait for a
+                // response. Equihash work has one consensus-bound version, so
+                // retain the connection without advertising version rolling.
+                Ok(None)
+            }
             Zip301Request::Submit {
                 id,
                 worker,
@@ -1281,6 +1288,40 @@ mod tests {
         assert!(matches!(
             actor.pop_outbound(),
             Some(Zip301ServerMessage::Notify(_))
+        ));
+    }
+
+    #[test]
+    fn authorized_bitmain_multi_version_probe_keeps_equihash_session_open() {
+        let mut actor = actor(8);
+        authorize(&mut actor);
+        while actor.pop_outbound().is_some() {}
+
+        assert!(actor
+            .handle_request(
+                Zip301Request::MultiVersion {
+                    id: Zip301Id::Number(3),
+                    requested_versions: 1,
+                },
+                2,
+            )
+            .expect("compatibility probe is handled")
+            .is_none());
+        assert!(!actor.is_closed());
+        assert!(actor.pop_outbound().is_none());
+
+        actor
+            .handle_request(
+                Zip301Request::SuggestTarget {
+                    id: Zip301Id::Number(4),
+                    target_be: wcash_pool_protocol::TargetBe::new([0x11; 32]),
+                },
+                3,
+            )
+            .expect("the same connection remains usable");
+        assert!(matches!(
+            actor.pop_outbound(),
+            Some(Zip301ServerMessage::SetTarget { .. })
         ));
     }
 

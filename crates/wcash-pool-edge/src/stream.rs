@@ -963,6 +963,27 @@ mod tests {
             .into_bytes()
         );
 
+        client
+            .write_all(
+                concat!(
+                    "{\"id\":20,\"method\":\"mining.multi_version\",\"params\":[1]}\n",
+                    "{\"id\":21,\"method\":\"mining.suggest_target\",\"params\":[\"",
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    "\"]}\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        assert_eq!(
+            read_line(&mut client).await?,
+            format!(
+                "{{\"id\":null,\"method\":\"mining.set_target\",\"params\":[\"{}\"]}}\n",
+                "04".repeat(32)
+            )
+            .into_bytes(),
+            "the Bitmain compatibility probe must be consumed without closing the session"
+        );
+
         let submit = format!(
             concat!(
                 "{{\"id\":3,\"method\":\"mining.submit\",\"params\":[",
