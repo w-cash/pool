@@ -1477,6 +1477,8 @@ assert "LoadCredential=encryption-identity:" in zallet_payout_unit
 assert "WantedBy=zecwec-testnet-pool.target" in zallet_payout_unit
 assert "StartLimitIntervalSec=300" in payout_unit
 assert "StartLimitBurst=3" in payout_unit
+assert "StartLimitIntervalSec=300" in pool_unit
+assert "StartLimitBurst=3" in pool_unit
 target_unit = (root / "systemd/zecwec-testnet-pool.target").read_text(encoding="utf-8")
 startup_unit = (root / "systemd/zecwec-testnet-pool-start.service").read_text(
     encoding="utf-8"
@@ -1496,9 +1498,10 @@ cookie_refresh_path = (root / "systemd/zecwec-cookie-refresh.path").read_text(
     encoding="utf-8"
 )
 assert (
-    "Upholds=wcash-pool-projector.service wcash-pool.service "
-    "wcash-payout-worker.service zecwec-zallet-payout.service"
+    "Upholds=wcash-pool-projector.service wcash-payout-worker.service "
+    "zecwec-zallet-payout.service"
 ) in target_unit
+assert "Upholds=wcash-pool-projector.service wcash-pool.service" not in target_unit
 assert "wcash-pool-health.timer" not in target_unit
 assert "WantedBy=multi-user.target" not in target_unit
 assert "WantedBy=timers.target" not in health_timer

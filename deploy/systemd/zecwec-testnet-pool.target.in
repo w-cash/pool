@@ -4,4 +4,4 @@ Requires=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.ser
 BindsTo=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
 Wants=zecwec-cookie-refresh.path
 After=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
-Upholds=wcash-pool-projector.service wcash-pool.service wcash-payout-worker.service zecwec-zallet-payout.service
+Upholds=wcash-pool-projector.service wcash-payout-worker.service zecwec-zallet-payout.service
