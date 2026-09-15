@@ -67,7 +67,7 @@ const PAYOUT_MAXIMUM_CONSECUTIVE_FAILURES: u32 = 20;
 // any backlog advances deterministically on later ticks.
 const PAYOUT_MAXIMUM_CONFIRMATION_WATCHES: u32 = 8;
 const PAYOUT_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-const PROJECTOR_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const PROJECTOR_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 // A Zcash block can take longer than thirty seconds on the Testnet and the
 // backend must briefly retry while its two pinned parents converge on the
 // same tip. The backend advertises jobs for 45 seconds, so the projector must

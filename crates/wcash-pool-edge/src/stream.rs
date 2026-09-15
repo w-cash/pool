@@ -139,9 +139,11 @@ impl AcceptedStreamDriver {
     /// Drives strict requests, ordered job updates, and bounded external actions.
     ///
     /// Actions are deliberately awaited inline: one connection cannot create an
-    /// unbounded set of authentication or backend tasks. Cancelling this future
-    /// drops the owned stream and permit; explicit shutdown additionally sends a
-    /// bounded TCP write-half shutdown.
+    /// unbounded set of authentication or backend tasks. While a share is awaiting
+    /// its bounded result, newer jobs are still forwarded on the same ordered
+    /// stream so backend latency cannot leave the miner on stale work. Cancelling
+    /// this future drops the owned stream and permit; explicit shutdown additionally
+    /// sends a bounded TCP write-half shutdown.
     pub async fn run(
         mut self,
         mut shutdown: oneshot::Receiver<()>,
@@ -298,18 +300,28 @@ impl AcceptedStreamDriver {
             ConnectionAction::Submit(pending) => {
                 let (ticket, context) = pending.into_parts();
                 let deadline = Instant::now() + self.config.submission_timeout();
-                let (result, timed_out) = {
-                    let submission = self.submissions.submit(context);
-                    tokio::pin!(submission);
+                let submissions = Arc::clone(&self.submissions);
+                let submission = async move { submissions.submit(context).await };
+                tokio::pin!(submission);
+                let submission_deadline = time::sleep_until(deadline);
+                tokio::pin!(submission_deadline);
+                let (result, timed_out) = loop {
                     tokio::select! {
                         biased;
                         _ = &mut *shutdown => {
                             return Ok(Some(StreamTermination::LocalShutdown));
                         }
-                        result = time::timeout_at(deadline, &mut submission) => match result {
-                            Ok(result) => (result, false),
-                            Err(_) => (Err(ShareRouterError::Unavailable), true),
-                        },
+                        _ = &mut submission_deadline => {
+                            break (Err(ShareRouterError::Unavailable), true);
+                        }
+                        update = self.job_updates.receive() => {
+                            self.actor.apply_job_update(update?)?;
+                            self.flush_outbound().await?;
+                            if self.actor.is_closed() {
+                                return Ok(Some(StreamTermination::ActorClosed));
+                            }
+                        }
+                        result = &mut submission => break (result, false),
                     }
                 };
                 self.actor.complete_submission(ticket, result)?;
@@ -624,7 +636,7 @@ mod tests {
         NoncePrefixAllocator, ShareTarget, TargetBounds, VardiffConfig,
     };
     use wcash_pool_protocol::{
-        AcceptableJob, BackendErrorCode, Hex108, Hex32, JobDescriptor, TargetLe,
+        AcceptableJob, BackendErrorCode, BackendEvent, Hex108, Hex32, JobDescriptor, TargetLe,
     };
 
     use super::*;
@@ -804,6 +816,13 @@ mod tests {
     }
 
     fn actor(config: EdgeConfig, profile: NonceProfile) -> ConnectionActor {
+        actor_and_router(config, profile).0
+    }
+
+    fn actor_and_router(
+        config: EdgeConfig,
+        profile: NonceProfile,
+    ) -> (ConnectionActor, crate::JobRouter) {
         let descriptor = descriptor(1);
         let generation =
             BackendGeneration::from_descriptor(descriptor.clone()).expect("descriptor is valid");
@@ -832,8 +851,16 @@ mod tests {
             profile,
             NonceNamespaceLease::new(7).expect("nonce lease is valid"),
         ));
-        ConnectionActor::new(Uuid::from_u128(1), config, policy, allocator, router, 0)
-            .expect("actor is valid")
+        let actor = ConnectionActor::new(
+            Uuid::from_u128(1),
+            config,
+            policy,
+            allocator,
+            router.clone(),
+            0,
+        )
+        .expect("actor is valid");
+        (actor, router)
     }
 
     async fn tcp_pair() -> Result<(TcpStream, TcpStream), io::Error> {
@@ -1185,6 +1212,88 @@ mod tests {
             Err(StreamDriverError::SubmissionTimeout)
         ));
         assert_eq!(submissions.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(capacity.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_update_is_forwarded_while_a_share_submission_is_pending() -> TestResult {
+        let (mut client, server) = tcp_pair().await?;
+        let config = edge_config(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let capacity = ConnectionCapacity::new(1)?;
+        let submissions = Arc::new(HangingSubmissions::default());
+        let (actor, router) = actor_and_router(config, NonceProfile::FourByte);
+        let driver = standard_driver(
+            server,
+            actor,
+            Arc::new(AllowAuthentication),
+            submissions.clone(),
+            &capacity,
+        )?;
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(driver.run(stopped));
+
+        client
+            .write_all(
+                concat!(
+                    "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n",
+                    "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"account.rig\",\"x\"]}\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        for _ in 0..4 {
+            let _ = read_line(&mut client).await?;
+        }
+
+        let submit = format!(
+            concat!(
+                "{{\"id\":3,\"method\":\"mining.submit\",\"params\":[",
+                "\"account.rig\",\"{}\",\"01020301\",\"{}\",\"fd4005{}\"]}}\n"
+            ),
+            "01".repeat(32),
+            "22".repeat(28),
+            "00".repeat(1_344),
+        );
+        client.write_all(submit.as_bytes()).await?;
+        while submissions.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        router.apply_event_for_test(
+            &BackendEvent::JobActivated {
+                event_seq: 2,
+                job: descriptor(2),
+            },
+            router.now_ms_for_test()?,
+        )?;
+
+        let notification = time::timeout(Duration::from_millis(250), async {
+            loop {
+                let frame = read_line(&mut client).await?;
+                if std::str::from_utf8(&frame)
+                    .is_ok_and(|line| line.contains("\"method\":\"mining.notify\""))
+                {
+                    return Ok::<_, io::Error>(frame);
+                }
+            }
+        })
+        .await
+        .map_err(|_| "new job was blocked behind the pending share")??;
+        assert!(
+            std::str::from_utf8(&notification)?.contains(&"02".repeat(32)),
+            "the notification must contain the replacement job id"
+        );
+
+        stop.send(())
+            .map_err(|_| "stream stopped before shutdown")?;
+        assert_eq!(task.await??, StreamTermination::LocalShutdown);
         assert_eq!(capacity.available_permits(), 1);
         Ok(())
     }
