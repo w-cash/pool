@@ -114,7 +114,7 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
     let (nonce_claim, nonces) = claim_nonce_allocator(&store, config).await?;
     let share_config = ShareRouterConfig::new(
         config.maximum_miners.min(4_096),
-        Duration::from_secs(5),
+        Duration::from_millis(50),
         Duration::from_secs(10),
     )?;
     let shares = match ShareRouter::spawn(

@@ -330,6 +330,11 @@ The initial nonce reservation is 65,536. A reservation of one million would
 consume the 24-bit namespace after roughly seventeen starts and is not an
 acceptable operational default.
 
+The public pool unit permits at most three starts in five minutes, and the
+aggregate target does not uphold that unit after it reaches the limit. This
+bounds abandoned nonce reservations during a persistent startup failure. A
+failed readiness check runs before `serve` and reserves no nonce range.
+
 ## 3. Install the protected Wcash seed and prepare collector credentials
 
 Prepare root-owned `0600` one-line files for a fresh Wcash spending seed, its

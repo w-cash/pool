@@ -1569,6 +1569,38 @@ fn zip301_authorize_is_strict_and_password_debug_is_redacted() -> TestResult {
 }
 
 #[test]
+fn zip301_accepts_the_bounded_bitmain_multi_version_probe() -> TestResult {
+    let frame = encoded_zip_frame(&serde_json::json!({
+        "id": 3,
+        "method": "mining.multi_version",
+        "params": [1]
+    }))?;
+    assert_eq!(
+        decode_zip301_request(&frame, NonceProfile::FourByte)?,
+        Zip301Request::MultiVersion {
+            id: Zip301Id::Number(3),
+            requested_versions: 1,
+        }
+    );
+
+    for params in [
+        serde_json::json!([]),
+        serde_json::json!([0]),
+        serde_json::json!([-1]),
+        serde_json::json!(["1"]),
+        serde_json::json!([1, 2]),
+    ] {
+        let malformed = encoded_zip_frame(&serde_json::json!({
+            "id": 4,
+            "method": "mining.multi_version",
+            "params": params,
+        }))?;
+        assert!(decode_zip301_request(&malformed, NonceProfile::FourByte).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn zip301_submit_accepts_uppercase_hex_and_strips_compact_size() -> TestResult {
     let solution = format!("FD4005{}", "AB".repeat(1_344));
     let frame = encoded_zip_frame(&serde_json::json!({

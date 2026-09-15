@@ -403,7 +403,7 @@ for cleanup_status in 0 7; do
         bash -c 'source "$1"; stop_testnet_runtime_after_failure' \
         bash "$repo_root/scripts/deploy/common.sh"
     [[ $(cat "$cleanup_log") == \
-        "stop zecwec-testnet-pool.target wcash-pool-health.timer wcash-payout-worker.service zecwec-zallet-payout.service wcash-pool.service wcash-pool-projector.service" ]] \
+        "stop zecwec-testnet-pool.target wcash-pool-custody-gate.service wcash-pool-health.timer wcash-payout-worker.service zecwec-zallet-payout.service wcash-pool.service wcash-pool-projector.service" ]] \
         || {
             printf 'deployment-package-test: failure cleanup omitted a runtime unit\n' >&2
             exit 1
@@ -1477,6 +1477,8 @@ assert "LoadCredential=encryption-identity:" in zallet_payout_unit
 assert "WantedBy=zecwec-testnet-pool.target" in zallet_payout_unit
 assert "StartLimitIntervalSec=300" in payout_unit
 assert "StartLimitBurst=3" in payout_unit
+assert "StartLimitIntervalSec=300" in pool_unit
+assert "StartLimitBurst=3" in pool_unit
 target_unit = (root / "systemd/zecwec-testnet-pool.target").read_text(encoding="utf-8")
 startup_unit = (root / "systemd/zecwec-testnet-pool-start.service").read_text(
     encoding="utf-8"
@@ -1496,9 +1498,10 @@ cookie_refresh_path = (root / "systemd/zecwec-cookie-refresh.path").read_text(
     encoding="utf-8"
 )
 assert (
-    "Upholds=wcash-pool-projector.service wcash-pool.service "
-    "wcash-payout-worker.service zecwec-zallet-payout.service"
+    "Upholds=wcash-pool-projector.service wcash-payout-worker.service "
+    "zecwec-zallet-payout.service"
 ) in target_unit
+assert "Upholds=wcash-pool-projector.service wcash-pool.service" not in target_unit
 assert "wcash-pool-health.timer" not in target_unit
 assert "WantedBy=multi-user.target" not in target_unit
 assert "WantedBy=timers.target" not in health_timer
@@ -2396,6 +2399,7 @@ case $1 in
             *:zecwec-testnet-pool.target:LoadState) printf 'not-found\n' ;;
             *:wcash-payout-worker.service:LoadState) printf 'not-found\n' ;;
             *:wcash-pool-projector.service:LoadState) printf 'not-found\n' ;;
+            *:wcash-pool-custody-gate.service:LoadState) printf 'loaded\n' ;;
             expected:wcash-pool.service:LoadState) printf 'not-found\n' ;;
             expected:wcash-pool-wallet-init.service:LoadState) printf 'loaded\n' ;;
             missing-wallet:wcash-pool.service:LoadState) printf 'not-found\n' ;;
@@ -2414,6 +2418,7 @@ case $1 in
                 | *:wcash-pool.service:ActiveState \
                 | *:wcash-pool-projector.service:ActiveState \
                 | *:wcash-payout-worker.service:ActiveState \
+                | *:wcash-pool-custody-gate.service:ActiveState \
                 | *:wcash-pool-wallet-init.service:ActiveState)
                 printf 'inactive\n'
                 ;;
@@ -2421,6 +2426,7 @@ case $1 in
                 | *:wcash-pool.service:SubState \
                 | *:wcash-pool-projector.service:SubState \
                 | *:wcash-payout-worker.service:SubState \
+                | *:wcash-pool-custody-gate.service:SubState \
                 | *:wcash-pool-wallet-init.service:SubState)
                 printf 'dead\n'
                 ;;
@@ -2435,12 +2441,14 @@ case $1 in
             *:wcash-pool.service:MainPID \
                 | *:wcash-pool-projector.service:MainPID \
                 | *:wcash-payout-worker.service:MainPID \
+                | *:wcash-pool-custody-gate.service:MainPID \
                 | *:wcash-pool-wallet-init.service:MainPID)
                 printf '0\n'
                 ;;
             *:wcash-pool.service:ControlPID \
                 | *:wcash-pool-projector.service:ControlPID \
                 | *:wcash-payout-worker.service:ControlPID \
+                | *:wcash-pool-custody-gate.service:ControlPID \
                 | *:wcash-pool-wallet-init.service:ControlPID)
                 printf '0\n'
                 ;;
@@ -2485,7 +2493,8 @@ run_custody_systemctl_scenario() {
 }
 
 run_custody_systemctl_scenario expected pass
-[[ $(cat "$custody_systemctl_test/expected.stops") == wcash-pool-wallet-init.service ]] \
+[[ $(cat "$custody_systemctl_test/expected.stops") == \
+    $'wcash-pool-custody-gate.service\nwcash-pool-wallet-init.service' ]] \
     || {
         printf 'deployment-package-test: custody seal did not stop exactly the loaded wallet unit\n' >&2
         exit 1
@@ -2564,8 +2573,8 @@ run_zec_seal_systemctl_scenario() {
 
 run_zec_seal_systemctl_scenario expected pass
 zec_stopped_units=$(wc -l <"$zec_seal_systemctl_test/expected.stops")
-((zec_stopped_units == 14)) || {
-    printf 'deployment-package-test: ZEC seal stopped %s backend-capable units, expected 14\n' \
+((zec_stopped_units == 15)) || {
+    printf 'deployment-package-test: ZEC seal stopped %s backend-capable units, expected 15\n' \
         "$zec_stopped_units" >&2
     exit 1
 }
