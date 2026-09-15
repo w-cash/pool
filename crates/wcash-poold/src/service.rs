@@ -68,6 +68,8 @@ const PAYOUT_MAXIMUM_CONSECUTIVE_FAILURES: u32 = 20;
 const PAYOUT_MAXIMUM_CONFIRMATION_WATCHES: u32 = 8;
 const PAYOUT_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PROJECTOR_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+const PREFLIGHT_PAYOUT_AUTHORITY_ATTEMPTS: u8 = 30;
+const PREFLIGHT_PAYOUT_AUTHORITY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 // A Zcash block can take longer than thirty seconds on the Testnet and the
 // backend must briefly retry while its two pinned parents converge on the
 // same tip. The backend advertises jobs for 45 seconds, so the projector must
@@ -737,14 +739,26 @@ async fn maintain_payout_worker_heartbeat(
 /// [`run_payout_worker`] after this service-manager probe succeeds. Every
 /// resource is dropped before return.
 pub async fn preflight(config: &RuntimeConfig) -> Result<(), ServiceError> {
-    let started = bootstrap::preflight(config).await?;
-    let mut probe = LivePreflightProbe {
-        config,
-        started,
-        validator: None,
-        payout_boundary: None,
-    };
-    exercise_preflight(&mut probe).await
+    for attempt in 0..PREFLIGHT_PAYOUT_AUTHORITY_ATTEMPTS {
+        let started = bootstrap::preflight(config).await?;
+        let mut probe = LivePreflightProbe {
+            config,
+            started,
+            validator: None,
+            payout_boundary: None,
+        };
+        match exercise_preflight(&mut probe).await {
+            Err(ServiceError::PayoutAuthorityUnavailable)
+                if attempt + 1 < PREFLIGHT_PAYOUT_AUTHORITY_ATTEMPTS =>
+            {
+                // A preflight snapshot has no live subscription. Reconnect
+                // to Wolf so the next attempt starts from its current job.
+                time::sleep(PREFLIGHT_PAYOUT_AUTHORITY_RETRY_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+    Err(ServiceError::PayoutAuthorityUnavailable)
 }
 
 trait PreflightProbe {
@@ -825,7 +839,8 @@ async fn run_started(
 
     let validator = build_address_validator(config)?;
     verify_address_authority(Arc::clone(&validator), config.network).await?;
-    let payout_boundary = build_probe_only_payout_boundary(config, &started.jobs).await?;
+    let payout_boundary =
+        build_probe_only_payout_boundary_with_retry(config, &started.jobs).await?;
 
     let pool_data = PostgresPoolDataSource::new(started.store.as_ref().clone());
     pool_data.refresh().await?;
@@ -1033,6 +1048,27 @@ struct PayoutServices {
 /// In particular, this path cannot create, recover, sign, rebroadcast, or
 /// reconcile a payout. Those durable transitions remain exclusive to
 /// [`build_payout_services`] during actual service startup.
+async fn build_probe_only_payout_boundary_with_retry(
+    config: &RuntimeConfig,
+    jobs: &wcash_pool_edge::JobRouter,
+) -> Result<Arc<TestnetPayoutBoundary>, ServiceError> {
+    for attempt in 0..PREFLIGHT_PAYOUT_AUTHORITY_ATTEMPTS {
+        match build_probe_only_payout_boundary(config, jobs).await {
+            Err(ServiceError::PayoutAuthorityUnavailable)
+                if attempt + 1 < PREFLIGHT_PAYOUT_AUTHORITY_ATTEMPTS =>
+            {
+                // Wolf can rotate while the two read-only node observations
+                // are in flight. Discard every fact from this attempt and
+                // compare a fresh snapshot instead of spending systemd's
+                // restart budget on an ordinary moving-tip race.
+                time::sleep(PREFLIGHT_PAYOUT_AUTHORITY_RETRY_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+    Err(ServiceError::PayoutAuthorityUnavailable)
+}
+
 async fn build_probe_only_payout_boundary(
     config: &RuntimeConfig,
     jobs: &wcash_pool_edge::JobRouter,
