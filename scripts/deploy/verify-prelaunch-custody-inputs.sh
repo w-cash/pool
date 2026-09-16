@@ -110,8 +110,8 @@ if (
     or identity["protocol_version"] != 2
     or identity["network"] != "testnet"
     or identity["genesis_hash"]
-    != "0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a"
-    or identity["branch_id"] != "b3cfd27e"
+    != "efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7"
+    or identity["branch_id"] != "a8d6c929"
     or identity["fund_source"] != "ironwood"
     or identity["synchronized"] is not True
 ):

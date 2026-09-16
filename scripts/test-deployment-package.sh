@@ -2757,7 +2757,7 @@ grep -Fq 'WCASH_EXPECTED_SIGNER_ACCOUNT=BOOTSTRAP_DISCOVERY_REQUIRED' \
 wallet_protocol_fixture="$temporary/wallet-protocol-v2"
 mkdir -p "$wallet_protocol_fixture"
 wallet_account=33333333-3333-4333-8333-333333333333
-wallet_genesis=0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
+wallet_genesis=efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7
 wallet_commitment=4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60
 python3 - \
     "$wallet_protocol_fixture" \
@@ -2789,7 +2789,7 @@ root.joinpath("identity-v2.json").write_text(
             "protocol_version": 2,
             "network": "testnet",
             "genesis_hash": genesis,
-            "branch_id": "b3cfd27e",
+            "branch_id": "a8d6c929",
             "account_id": account,
             "collector_payout_commitment": commitment,
             "fund_source": "ironwood",
