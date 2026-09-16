@@ -444,8 +444,15 @@ impl NodePayoutAuthority {
         let best_tip_hash = parse_display_hash_to_wire(&info.best_block_hash)
             .filter(|hash| *hash != [0; 32])
             .ok_or(ObservationFailure::Invariant)?;
-        // Zebra's BIP70 name is "test" for both Testnet and Regtest. Only the
-        // explicitly selected, exact Regtest genesis may precede NU6.3 at height 1.
+        // Zebra's BIP70 name is "test" for both Testnet and Regtest. A freshly
+        // launched Wcash Testnet must be able to start its pool at the exact
+        // pinned genesis, before block 1 activates the transaction branch.
+        // Zcash Testnet is an established parent chain and may never use this
+        // bootstrap exception.
+        let at_wcash_testnet_genesis = self.network == ChainNetwork::Testnet
+            && self.chain == Chain::Wcash
+            && info.blocks == 0
+            && info.best_block_hash == self.expected_genesis_display;
         let at_regtest_genesis = match self.network {
             #[cfg(feature = "regtest")]
             ChainNetwork::Regtest => {
@@ -453,13 +460,14 @@ impl NodePayoutAuthority {
             }
             _ => false,
         };
-        let expected_tip_branch = if at_regtest_genesis {
+        let at_allowed_genesis = at_wcash_testnet_genesis || at_regtest_genesis;
+        let expected_tip_branch = if at_allowed_genesis {
             "00000000"
         } else {
             self.expected_branch
         };
         if info.chain != "test"
-            || (info.blocks == 0 && !at_regtest_genesis)
+            || (info.blocks == 0 && !at_allowed_genesis)
             || info.headers != info.blocks
             || info.consensus.chain_tip != expected_tip_branch
             || info.consensus.next_block != self.expected_branch
@@ -1697,15 +1705,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_node_authority_rejects_genesis_and_regtest_branch() {
-        for (height, branch) in [(0, WCASH_TESTNET_BRANCH_ID), (100, "c3a6678a")] {
+    async fn default_node_authority_accepts_only_exact_wcash_bootstrap_genesis() {
+        let mut valid = tip_steps_with_direct(WCASH_TESTNET_BRANCH_ID, GENESIS, 0, json!(GENESIS));
+        valid[0].result.as_mut().expect("info")["consensus"]["chaintip"] = json!("00000000");
+        let rpc = Arc::new(ScriptedRpc::new(valid));
+        assert_eq!(
+            authority(Chain::Wcash, Arc::clone(&rpc))
+                .verified_tip()
+                .await,
+            Ok(VerifiedTip {
+                hash: GENESIS,
+                height: 0,
+            })
+        );
+        rpc.assert_drained();
+
+        for (chain, height, branch) in [
+            (Chain::Zcash, 0, WCASH_TESTNET_BRANCH_ID),
+            (Chain::Wcash, 0, WCASH_TESTNET_BRANCH_ID),
+            (Chain::Wcash, 100, "c3a6678a"),
+        ] {
             let mut steps = tip_steps_with_direct(branch, GENESIS, height, json!(GENESIS));
+            if height == 0 && chain == Chain::Wcash {
+                steps[0].result.as_mut().expect("info")["bestblockhash"] = json!(display_hash(TIP));
+            }
             steps.truncate(1);
             let rpc = Arc::new(ScriptedRpc::new(steps));
             assert_eq!(
-                authority(Chain::Wcash, Arc::clone(&rpc))
-                    .verified_tip()
-                    .await,
+                authority(chain, Arc::clone(&rpc)).verified_tip().await,
                 Err(ObservationFailure::Invariant)
             );
             rpc.assert_drained();
