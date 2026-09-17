@@ -7,11 +7,11 @@ use wcash_pool_portal::ReceiverKind;
 
 use crate::SecretSeed;
 
-/// Frozen display-order Wcash Testnet V2 genesis block identifier.
+/// Frozen display-order Wcash public Testnet V3 genesis block identifier.
 pub const WCASH_TESTNET_GENESIS_HASH: &str =
-    "efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7";
-/// Frozen Wcash Testnet V2 transaction-signature branch identifier.
-pub const WCASH_TESTNET_BRANCH_ID: &str = "a8d6c929";
+    "6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98";
+/// Frozen Wcash public Testnet V3 transaction-signature branch identifier.
+pub const WCASH_TESTNET_BRANCH_ID: &str = "54ba2bfb";
 
 /// Frozen display-order genesis of the explicitly enabled local Wcash Regtest.
 #[cfg(feature = "regtest")]
