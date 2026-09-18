@@ -1,0 +1,89 @@
+{
+  "schema": "zecwec-public-pool-mocked-share-acceptance-v1",
+  "generated_on": "2026-09-18",
+  "scope": {
+    "pool_commit": "05c71684c21faff7856bb06adad71f8e60fe877a",
+    "wolf_commit": "3f54aafaa408934c168e68413b2f7cad4575b0bb",
+    "network": "local-fixtures",
+    "postgres_major": 16,
+    "share_and_winner_input": "deterministic test doubles",
+    "wallet_and_node_responses": "deterministic test doubles",
+    "public_infrastructure_changed": false,
+    "real_chain_broadcast_performed": false
+  },
+  "production_components_exercised": [
+    "portal authentication and session policy",
+    "account and worker ownership policy",
+    "payout destination configuration and holds",
+    "PostgreSQL projection and conserved ledger",
+    "wallet reconciliation and payout batch reservation",
+    "WEC signer journal and settlement coordinator",
+    "ZEC PCZT journal and effects verification",
+    "persisted signed bytes and transaction identifiers",
+    "exact-byte restart and rebroadcast recovery",
+    "confirmation settlement, fee accounting, and reorg fencing"
+  ],
+  "commands": [
+    "cargo test -p wcash-pool-portal --test portal_api -- --nocapture",
+    "node --test crates/wcash-pool-portal/tests/browser_ui.cjs",
+    "WCASH_POOL_TEST_DATABASE_URL=<disposable-postgresql-16-url> cargo test -p wcash-poold --test settlement payout_lifecycle::authenticated_winner_reaches_confirmed_recipient_ledger -- --ignored --exact --nocapture",
+    "WCASH_POOL_TEST_DATABASE_URL=<disposable-postgresql-16-url> cargo test -p wcash-pool-store --test postgres_runtime durable_runtime_is_chain_scoped_conserved_and_revocable -- --ignored --exact --nocapture",
+    "cargo test -p wcash-poold --test settlement -- --skip payout_lifecycle::authenticated_winner_reaches_confirmed_recipient_ledger",
+    "cargo test -p wcash-wec-payout-signer",
+    "cargo test -p wcash-zec-payout-signer",
+    "python3 -m unittest discover -s scripts/full-pool-regtest -p test_*.py",
+    "cargo fmt --all -- --check",
+    "git diff --check"
+  ],
+  "results": [
+    {
+      "suite": "portal API",
+      "passed": 19,
+      "failed": 0
+    },
+    {
+      "suite": "portal browser UI",
+      "passed": 7,
+      "failed": 0
+    },
+    {
+      "suite": "PostgreSQL authenticated mocked-winner payout lifecycle",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "suite": "PostgreSQL durable runtime",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "suite": "cross-chain settlement and recovery",
+      "passed": 19,
+      "failed": 0
+    },
+    {
+      "suite": "WEC signer",
+      "passed": 23,
+      "failed": 0
+    },
+    {
+      "suite": "ZEC signer and PCZT",
+      "passed": 31,
+      "failed": 0
+    },
+    {
+      "suite": "full-pool helper unit tests",
+      "passed": 23,
+      "failed": 0
+    }
+  ],
+  "focused_acceptance_total": {
+    "passed": 101,
+    "failed": 0
+  },
+  "additional_checks": {
+    "cargo_fmt": "pass",
+    "git_diff_check": "pass"
+  },
+  "conclusion": "User configuration and payout execution pass locally with mocked share, wallet, and node boundaries. This certificate is not evidence of real mining or an on-chain recipient receipt."
+}

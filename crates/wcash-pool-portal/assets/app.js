@@ -496,7 +496,7 @@ function renderPayoutSetting(asset, setting) {
   }
   if (setting.pending_destination) {
     line(`Pending destination: ${setting.pending_destination}`);
-    line(`Safety hold (${formatDuration(payoutHoldSecs)}) until ${formatTime(setting.pending_effective_at)}. Payouts remain paused until the change is active.`);
+    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). Payouts remain paused until the change is active.`);
     line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${setting.pending_automatic ? "automatic" : "paused"}`);
     setText(`#${asset}-payout-status`, `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`);
   } else {
