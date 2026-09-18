@@ -1095,7 +1095,7 @@ fn wcash_witness_quarantine_has_an_explicit_requeue_transition() {
     };
     assert!(quarantined_below_height.validate().is_err());
 
-    let wrong_id_at_winner_height = BackendEvent::WinnerQuarantined {
+    let competing_tip_at_winner_height = BackendEvent::WinnerQuarantined {
         event_seq: 2,
         share_id: share_id.clone(),
         job_id: job_id.clone(),
@@ -1105,7 +1105,7 @@ fn wcash_witness_quarantine_has_an_explicit_requeue_transition() {
             height: wcash.height,
         },
     };
-    assert!(wrong_id_at_winner_height.validate().is_err());
+    assert!(competing_tip_at_winner_height.validate().is_ok());
 
     let winner_id_at_later_height = BackendEvent::WinnerQuarantined {
         event_seq: 2,

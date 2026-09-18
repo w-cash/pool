@@ -1983,10 +1983,13 @@ fn validate_wcash_winner_quarantine(
             "quarantine tip must be at or above the Wcash winner height",
         ));
     }
-    if tip_is_winner != tip_is_at_winner_height {
+    // A conflicting candidate can be quarantined after a different block wins at
+    // the same height. The winner ID may only appear at its own height, but the
+    // canonical tip is allowed to identify that competing block.
+    if tip_is_winner && !tip_is_at_winner_height {
         return Err(invalid(
             "winner_event.tip",
-            "tip hash must equal the Wcash winner ID exactly at its height",
+            "the Wcash winner ID cannot appear at a different tip height",
         ));
     }
     Ok(())
