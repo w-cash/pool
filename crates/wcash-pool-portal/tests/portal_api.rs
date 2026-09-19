@@ -1246,7 +1246,7 @@ async fn mainnet_staging_reports_deferred_payouts_and_does_not_invite_registrati
         .expect("bounded page");
     let html = std::str::from_utf8(&html).expect("UTF-8 page");
     assert!(html.contains("Wcash Mainnet"));
-    assert!(html.contains("accounting preview"));
+    assert!(html.contains("payouts paused"));
     assert!(!html.contains("Create account</button>"));
     assert!(!html.contains("Zcash Testnet"));
 
@@ -1263,6 +1263,7 @@ async fn mainnet_staging_reports_deferred_payouts_and_does_not_invite_registrati
         .expect("bounded script");
     let script = std::str::from_utf8(&script).expect("UTF-8 script");
     assert!(script.contains("mainnet.zecwec.com:3334"));
+    assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = false;"));
     assert!(!script.contains("testnet-mine.zecwec.com"));
 }
 
