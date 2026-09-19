@@ -208,7 +208,7 @@ impl AcceptedStreamDriver {
                     }
                 }
                 WaitEvent::JobUpdate(update) => {
-                    self.actor.apply_job_update(update?)?;
+                    self.apply_job_update(update?)?;
                     self.flush_outbound().await?;
                 }
                 WaitEvent::Read(Ok(0)) => return Ok(StreamTermination::PeerClosed),
@@ -315,7 +315,7 @@ impl AcceptedStreamDriver {
                             break (Err(ShareRouterError::Unavailable), true);
                         }
                         update = self.job_updates.receive() => {
-                            self.actor.apply_job_update(update?)?;
+                            self.apply_job_update(update?)?;
                             self.flush_outbound().await?;
                             if self.actor.is_closed() {
                                 return Ok(Some(StreamTermination::ActorClosed));
@@ -336,6 +336,20 @@ impl AcceptedStreamDriver {
         } else {
             Ok(None)
         }
+    }
+
+    fn apply_job_update(&mut self, update: crate::JobUpdate) -> Result<(), ConnectionActorError> {
+        // A low-hash miner can legitimately submit no share for many minutes.
+        // Fresh work delivered to an authorized session proves that the socket
+        // is useful and must refresh its liveness deadline. Unauthenticated
+        // sockets still expire even while the global job stream is active.
+        let delivered_work = self.actor.authentication_grant().is_some()
+            && matches!(&update, crate::JobUpdate::Activated { .. });
+        self.actor.apply_job_update(update)?;
+        if delivered_work && !self.actor.is_closed() {
+            self.idle_deadline = Instant::now() + self.config.idle_timeout();
+        }
+        Ok(())
     }
 
     async fn revalidate_authorization(
@@ -1315,6 +1329,67 @@ mod tests {
         stop.send(())
             .map_err(|_| "stream stopped before shutdown")?;
         assert_eq!(task.await??, StreamTermination::LocalShutdown);
+        assert_eq!(capacity.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivered_jobs_keep_an_authorized_quiet_miner_connected() -> TestResult {
+        let (mut client, server) = tcp_pair().await?;
+        let idle = Duration::from_millis(300);
+        let config = edge_config(
+            idle,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let capacity = ConnectionCapacity::new(1)?;
+        let (actor, router) = actor_and_router(config, NonceProfile::FourByte);
+        let driver = standard_driver(
+            server,
+            actor,
+            Arc::new(AllowAuthentication),
+            Arc::new(RejectingSubmissions::default()),
+            &capacity,
+        )?;
+        let (_stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(driver.run(stopped));
+
+        client
+            .write_all(
+                concat!(
+                    "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n",
+                    "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"account.rig\",\"x\"]}\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        for _ in 0..4 {
+            let _ = read_line(&mut client).await?;
+        }
+
+        time::sleep(Duration::from_millis(200)).await;
+        router.apply_event_for_test(
+            &BackendEvent::JobActivated {
+                event_seq: 2,
+                job: descriptor(2),
+            },
+            router.now_ms_for_test()?,
+        )?;
+        for _ in 0..2 {
+            let _ = read_line(&mut client).await?;
+        }
+
+        // The original connection deadline has elapsed, but the miner remains
+        // connected because it received usable replacement work.
+        time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+
+        assert!(matches!(
+            time::timeout(Duration::from_millis(200), task).await??,
+            Err(StreamDriverError::IdleTimeout)
+        ));
         assert_eq!(capacity.available_permits(), 1);
         Ok(())
     }
