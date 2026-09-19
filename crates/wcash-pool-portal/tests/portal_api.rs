@@ -645,7 +645,7 @@ impl AddressValidator for FixtureValidator {
         _asset: Asset,
         network: ChainNetwork,
     ) -> Result<(), AddressValidationError> {
-        if network == ChainNetwork::Testnet {
+        if matches!(network, ChainNetwork::Testnet | ChainNetwork::Mainnet) {
             Ok(())
         } else {
             Err(AddressValidationError::WrongNetwork)
@@ -1179,6 +1179,91 @@ fn mainnet_router_is_disabled() {
         Arc::new(FixedClock::default()),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn mainnet_router_accepts_accounting_only_boundary() {
+    let mut config = PortalConfig::testnet();
+    config.network = ChainNetwork::Mainnet;
+    config.canonical_origin = "https://pool.zecwec.com".to_owned();
+    config.allow_registration = false;
+    let result = PortalApp::with_clock(
+        config,
+        PortalSecrets::new([3; 32], [7; 32]),
+        Arc::new(MemoryRepository::default()),
+        Arc::new(FixtureValidator),
+        Arc::new(UnavailablePoolData),
+        Arc::new(TestnetPayoutBoundary::deferred().with_mainnet_network()),
+        Arc::new(FixedClock::default()),
+    );
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn mainnet_staging_reports_deferred_payouts_and_does_not_invite_registration() {
+    let mut config = PortalConfig::testnet();
+    config.network = ChainNetwork::Mainnet;
+    config.canonical_origin = "https://pool.zecwec.com".to_owned();
+    config.allow_registration = false;
+    let repository = Arc::new(MemoryRepository::default());
+    repository.1.store(false, Ordering::SeqCst);
+    let app = PortalApp::with_clock(
+        config,
+        PortalSecrets::new([3; 32], [7; 32]),
+        repository,
+        Arc::new(FixtureValidator),
+        Arc::new(FixturePoolData::ready()),
+        Arc::new(TestnetPayoutBoundary::deferred().with_mainnet_network()),
+        Arc::new(FixedClock::default()),
+    )
+    .expect("accounting-only Mainnet portal")
+    .router();
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(ready.status(), StatusCode::OK);
+    let body = to_bytes(ready.into_body(), 1024)
+        .await
+        .expect("bounded body");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["payout_execution"],
+        "deferred"
+    );
+
+    let page = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).expect("request"))
+        .await
+        .expect("Mainnet page");
+    let html = to_bytes(page.into_body(), 128 * 1024)
+        .await
+        .expect("bounded page");
+    let html = std::str::from_utf8(&html).expect("UTF-8 page");
+    assert!(html.contains("Wcash Mainnet"));
+    assert!(html.contains("accounting preview"));
+    assert!(!html.contains("Create account</button>"));
+    assert!(!html.contains("Zcash Testnet"));
+
+    let script = app
+        .oneshot(
+            Request::get("/assets/app.js")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("Mainnet script");
+    let script = to_bytes(script.into_body(), 256 * 1024)
+        .await
+        .expect("bounded script");
+    let script = std::str::from_utf8(&script).expect("UTF-8 script");
+    assert!(script.contains("mainnet.zecwec.com:3334"));
+    assert!(!script.contains("testnet-mine.zecwec.com"));
 }
 
 #[tokio::test]

@@ -143,7 +143,9 @@ impl PortalApp {
     ) -> Result<Self, PortalBuildError> {
         config.validate()?;
         secrets.validate()?;
-        if config.network == crate::ChainNetwork::Mainnet {
+        if config.network == crate::ChainNetwork::Mainnet
+            && payout.execution() != crate::PayoutExecution::Deferred
+        {
             return Err(PortalBuildError::MainnetDisabled);
         }
         let dummy_password_hash = hash_password("dummy credential never authenticates")?;
@@ -242,7 +244,9 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
         return Err(AppError::Unavailable);
     }
     state.store.readiness().await?;
-    if !state.store.payout_worker_is_live().await? {
+    if state.payout.execution() == crate::PayoutExecution::Enabled
+        && !state.store.payout_worker_is_live().await?
+    {
         return Err(AppError::Unavailable);
     }
     address_validator_readiness(&state, Asset::Wec).await?;
@@ -256,12 +260,25 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
         "ready": true,
         "component": "miner-portal",
         "network": state.config.network,
-        "payout_execution": "enabled"
+        "payout_execution": state.payout.execution().as_str()
     })))
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../assets/index.html"))
+async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
+    let page = include_str!("../assets/index.html");
+    if state.config.network == crate::ChainNetwork::Mainnet {
+        Html(page
+            .replace("Testnet", "Mainnet")
+            .replace("TESTNET", "MAINNET")
+            .replace("TWC", "WEC")
+            .replace("Two test networks.", "Two main networks.")
+            .replace("· no monetary value", "· accounting preview")
+            .replace("<li>Create an account</li>", "<li>Sign in to an invited account</li>")
+            .replace("<button class=\"segment\" data-auth-mode=\"register\" type=\"button\" aria-pressed=\"false\">Create account</button>", "")
+            .replace("Automatic payouts after maturity and threshold", "Payout preference saved; execution is currently on hold"))
+    } else {
+        Html(page.to_owned())
+    }
 }
 
 async fn styles() -> impl IntoResponse {
@@ -278,10 +295,19 @@ async fn form_styles() -> impl IntoResponse {
     )
 }
 
-async fn script() -> impl IntoResponse {
+async fn script(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let source = include_str!("../assets/app.js");
+    let source = if state.config.network == crate::ChainNetwork::Mainnet {
+        source
+            .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3444")
+            .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3334")
+            .replace("Zcash Testnet", "Zcash Mainnet")
+    } else {
+        source.to_owned()
+    };
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        include_str!("../assets/app.js"),
+        source,
     )
 }
 

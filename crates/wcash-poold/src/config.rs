@@ -1,4 +1,4 @@
-//! Strict, Testnet-only daemon configuration and protected credential loading.
+//! Strict daemon configuration and protected credential loading.
 
 use std::{
     ffi::OsStr,
@@ -23,8 +23,13 @@ use zeroize::Zeroizing;
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_WCASH_WALLET_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
+const WCASH_MAINNET_GENESIS: &str =
+    "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48";
+const ZCASH_MAINNET_GENESIS: &str =
+    "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08";
+const WCASH_AUXILIARY_CHAIN_ID: u32 = 0x5743_4153;
 
-/// Fully decoded, immutable Testnet service policy.
+/// Fully decoded, immutable service policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
     /// Explicit chain environment; Regtest exists only in integration builds.
@@ -245,6 +250,9 @@ impl RuntimeConfig {
 
     /// Frozen signature branch for the explicitly selected Wcash environment.
     pub(crate) fn wcash_branch_id(&self) -> &'static str {
+        if self.network == ChainNetwork::Mainnet {
+            return "d9c6a7ee";
+        }
         #[cfg(feature = "regtest")]
         if self.network == ChainNetwork::Regtest {
             return wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID;
@@ -286,10 +294,16 @@ impl TryFrom<RawConfig> for RuntimeConfig {
     fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
         let network = match raw.network.as_str() {
             "testnet" => ChainNetwork::Testnet,
+            "mainnet" => ChainNetwork::Mainnet,
             #[cfg(feature = "regtest")]
             "regtest" => ChainNetwork::Regtest,
             _ => return Err(ConfigError::MainnetDisabled),
         };
+        // Mainnet payout signing is a separate release gate. A Mainnet mining
+        // process may account for liabilities, but cannot hold spending keys.
+        if network == ChainNetwork::Mainnet && raw.payout_mode != PayoutMode::Deferred {
+            return Err(ConfigError::MainnetDisabled);
+        }
         let isolated = network.as_str() == "regtest";
         if raw.deployment_id.is_nil()
             || raw.pool_instance.is_nil()
@@ -351,6 +365,18 @@ impl TryFrom<RawConfig> for RuntimeConfig {
         }
         let wcash_genesis = decode_hex32("wcash_genesis", &raw.wcash_genesis)?;
         let zcash_genesis = decode_hex32("zcash_genesis", &raw.zcash_genesis)?;
+        if network == ChainNetwork::Mainnet {
+            let mut child_display = wcash_genesis;
+            let mut parent_display = zcash_genesis;
+            child_display.reverse();
+            parent_display.reverse();
+            if hex::encode(child_display) != WCASH_MAINNET_GENESIS
+                || hex::encode(parent_display) != ZCASH_MAINNET_GENESIS
+                || raw.chain_id != WCASH_AUXILIARY_CHAIN_ID
+            {
+                return Err(ConfigError::InvalidIdentity);
+            }
+        }
         #[cfg(feature = "regtest")]
         if isolated {
             let mut child = wcash_genesis;
@@ -969,6 +995,45 @@ policy_version = 1
         assert!(matches!(
             RuntimeConfig::load(&contaminated),
             Err(ConfigError::InvalidPolicy)
+        ));
+    }
+
+    #[test]
+    fn mainnet_requires_deferred_payout_and_uses_mainnet_branch() {
+        let directory = TempDir::new().expect("temp dir");
+        let wire = |display: &str| {
+            let mut bytes = hex::decode(display).expect("genesis hex");
+            bytes.reverse();
+            hex::encode(bytes)
+        };
+        let mainnet = deferred_fixture(&directory)
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 1991772603", "chain_id = 1464025427")
+            .replace(&"01".repeat(32), &wire(WCASH_MAINNET_GENESIS))
+            .replace(&"02".repeat(32), &wire(ZCASH_MAINNET_GENESIS));
+        let path = write_file(
+            &directory,
+            "mainnet-deferred.toml",
+            mainnet.as_bytes(),
+            0o600,
+        );
+        let loaded = RuntimeConfig::load(&path).expect("mainnet accounting-only policy");
+        assert_eq!(loaded.network, ChainNetwork::Mainnet);
+        assert_eq!(loaded.payout_mode, PayoutMode::Deferred);
+        assert_eq!(loaded.wcash_branch_id(), "d9c6a7ee");
+
+        let wrong_genesis = mainnet.replace(&wire(WCASH_MAINNET_GENESIS), &"01".repeat(32));
+        write_path(&path, wrong_genesis.as_bytes(), 0o600);
+        assert!(matches!(
+            RuntimeConfig::load(&path),
+            Err(ConfigError::InvalidIdentity)
+        ));
+
+        let wrong_chain_id = mainnet.replace("chain_id = 1464025427", "chain_id = 1");
+        write_path(&path, wrong_chain_id.as_bytes(), 0o600);
+        assert!(matches!(
+            RuntimeConfig::load(&path),
+            Err(ConfigError::InvalidIdentity)
         ));
     }
 

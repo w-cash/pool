@@ -50,6 +50,12 @@ impl TestnetAddressValidator {
         }
     }
 
+    /// Selects the distinct Wcash and Zcash Mainnet address namespaces.
+    pub fn with_mainnet_network(mut self) -> Self {
+        self.network = ChainNetwork::Mainnet;
+        self
+    }
+
     /// Selects isolated Regtest validation in an explicitly enabled test build.
     #[cfg(feature = "regtest")]
     pub fn with_regtest_network(mut self) -> Self {
@@ -58,6 +64,9 @@ impl TestnetAddressValidator {
     }
 
     fn wcash_network(&self) -> WcashNetwork {
+        if self.network == ChainNetwork::Mainnet {
+            return WcashNetwork::Mainnet;
+        }
         #[cfg(feature = "regtest")]
         if self.network == ChainNetwork::Regtest {
             return WcashNetwork::Regtest;
@@ -66,6 +75,9 @@ impl TestnetAddressValidator {
     }
 
     fn zcash_network(&self) -> NetworkType {
+        if self.network == ChainNetwork::Mainnet {
+            return NetworkType::Main;
+        }
         #[cfg(feature = "regtest")]
         if self.network == ChainNetwork::Regtest {
             return NetworkType::Regtest;
@@ -91,16 +103,14 @@ impl TestnetAddressValidator {
                 if parse_supported_zcash(candidate, self.zcash_network()).is_ok() {
                     return Err(AddressValidationError::WrongAsset);
                 }
-                if self
-                    .wcash
-                    .validate_for(
-                        match self.wcash_network() {
-                            WcashNetwork::Testnet => WcashNetwork::Regtest,
-                            WcashNetwork::Regtest => WcashNetwork::Testnet,
-                        },
-                        candidate,
-                    )
-                    .is_ok()
+                let wrong_networks: &[WcashNetwork] = match self.wcash_network() {
+                    WcashNetwork::Mainnet => &[WcashNetwork::Testnet, WcashNetwork::Regtest],
+                    WcashNetwork::Testnet => &[WcashNetwork::Mainnet, WcashNetwork::Regtest],
+                    WcashNetwork::Regtest => &[WcashNetwork::Mainnet, WcashNetwork::Testnet],
+                };
+                if wrong_networks
+                    .iter()
+                    .any(|network| self.wcash.validate_for(*network, candidate).is_ok())
                 {
                     return Err(AddressValidationError::WrongNetwork);
                 }
@@ -320,6 +330,7 @@ impl WcashCommandValidator {
 
 #[derive(Clone, Copy)]
 enum WcashNetwork {
+    Mainnet,
     Testnet,
     Regtest,
 }
@@ -327,6 +338,7 @@ enum WcashNetwork {
 impl WcashNetwork {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Mainnet => "mainnet",
             Self::Testnet => "testnet",
             Self::Regtest => "regtest",
         }
@@ -731,6 +743,11 @@ mod tests {
                 "printf '%s\\n' '{\"network\":\"regtest\",\"receiver_kind\":\"ironwood\",\"canonical\":\"WRtestfixture\"}'\n",
                 "exit 0\n",
                 "fi\n",
+                "if [ \"$1 $2 $3\" = \"--network mainnet validate-address\" ] && ",
+                "[ \"$candidate\" = \"WImainfixture\" ]; then\n",
+                "printf '%s\\n' '{\"network\":\"mainnet\",\"receiver_kind\":\"ironwood\",\"canonical\":\"WImainfixture\"}'\n",
+                "exit 0\n",
+                "fi\n",
                 "exit 2\n",
             ),
         )
@@ -793,6 +810,28 @@ mod tests {
         assert_eq!(
             validator.validate(Asset::Zec, ChainNetwork::Mainnet, &mainnet_transparent()),
             Err(AddressValidationError::AuthorityUnavailable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mainnet_validator_requires_explicit_selection() {
+        let (_directory, command) = command_fixture();
+        let validator = TestnetAddressValidator::new(command).with_mainnet_network();
+        let wec = validator
+            .validate(Asset::Wec, ChainNetwork::Mainnet, "WImainfixture")
+            .expect("mainnet Wcash Ironwood address");
+        assert_eq!(wec.receiver_kind(), ReceiverKind::Ironwood);
+        assert!(validator
+            .validate(Asset::Zec, ChainNetwork::Mainnet, &mainnet_transparent())
+            .is_ok());
+        assert_eq!(
+            validator.validate(Asset::Wec, ChainNetwork::Mainnet, "WItestfixture"),
+            Err(AddressValidationError::WrongNetwork)
+        );
+        assert_eq!(
+            validator.validate(Asset::Zec, ChainNetwork::Mainnet, &testnet_transparent()),
+            Err(AddressValidationError::WrongNetwork)
         );
     }
 

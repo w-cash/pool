@@ -9,9 +9,12 @@ accounted WEC and ZEC rewards at two chain-specific payout destinations.
 > public launch. `wcash-poold serve` combines the bounded ZIP-301 edge,
 > shared PostgreSQL account/accounting truth, authoritative address adapters,
 > account-isolated portal, and independently fenced WEC/ZEC payout services.
-> Mainnet is rejected. Public miners and funds remain blocked until the exact
-> Wolf/pool release pair passes every private ASIC, payout, restart, reorg, and
-> HTTPS gate in the [Testnet deployment runbook](docs/zecwec-testnet-deployment.md).
+> The `feat/mainnet-parallel-pool` branch adds a separate Mainnet accounting-only
+> staging mode. Mainnet signing is rejected, self-registration is closed, and
+> no current Wolf shares are imported. Public miners and automatic payouts
+> remain blocked until the exact Wolf/pool release pair passes the independent
+> custody, ASIC, restart, reorg, and HTTPS gates in
+> [Mainnet parallel staging](docs/mainnet-parallel-staging.md).
 
 ## Product decision
 

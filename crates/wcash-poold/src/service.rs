@@ -1013,6 +1013,11 @@ fn build_address_validator(
     )
     .map_err(|_| ServiceError::AddressAuthorityUnavailable)?;
     let validator = TestnetAddressValidator::new(command);
+    let validator = if config.network == ChainNetwork::Mainnet {
+        validator.with_mainnet_network()
+    } else {
+        validator
+    };
     #[cfg(feature = "regtest")]
     let validator = if config.network == ChainNetwork::Regtest {
         validator.with_regtest_network()
@@ -1085,6 +1090,14 @@ async fn build_probe_only_payout_boundary(
     );
     let wcash_authority = NodePayoutAuthority::new(Chain::Wcash, wcash_rpc, config.wcash_genesis)?;
     let zcash_authority = NodePayoutAuthority::new(Chain::Zcash, zcash_rpc, config.zcash_genesis)?;
+    let (wcash_authority, zcash_authority) = if config.network == ChainNetwork::Mainnet {
+        (
+            wcash_authority.with_mainnet_network(),
+            zcash_authority.with_mainnet_network(),
+        )
+    } else {
+        (wcash_authority, zcash_authority)
+    };
     #[cfg(feature = "regtest")]
     let (wcash_authority, zcash_authority) = if config.network == ChainNetwork::Regtest {
         (
@@ -1115,6 +1128,11 @@ async fn build_probe_only_payout_boundary(
     // Preflight composes the portal without giving it an execution-capable
     // signer. No listener is opened, and the boundary is dropped on return.
     let boundary = TestnetPayoutBoundary::deferred();
+    let boundary = if config.network == ChainNetwork::Mainnet {
+        boundary.with_mainnet_network()
+    } else {
+        boundary
+    };
     #[cfg(feature = "regtest")]
     let boundary = if config.network == ChainNetwork::Regtest {
         boundary.with_regtest_network()
@@ -1672,6 +1690,10 @@ fn build_preflight_portal(
 ) -> Result<PortalApp, ServiceError> {
     let mut portal_config = PortalConfig::testnet();
     portal_config.network = config.network;
+    if config.network == ChainNetwork::Mainnet {
+        // Mainnet registration needs an explicit public launch review.
+        portal_config.allow_registration = false;
+    }
     portal_config.payout_change_hold_secs = config.payout_change_hold_secs;
     portal_config
         .canonical_origin

@@ -415,6 +415,16 @@ impl NodePayoutAuthority {
         })
     }
 
+    /// Selects the pinned Mainnet consensus domain for read-only authority checks.
+    pub(crate) fn with_mainnet_network(mut self) -> Self {
+        self.network = ChainNetwork::Mainnet;
+        self.expected_branch = match self.chain {
+            Chain::Wcash => "d9c6a7ee",
+            Chain::Zcash => ZCASH_NU6_3_BRANCH_ID,
+        };
+        self
+    }
+
     /// Selects only the frozen local Regtest identities in an explicitly enabled build.
     #[cfg(feature = "regtest")]
     pub(crate) fn with_regtest_network(mut self) -> Result<Self, LivePayoutConfigError> {
@@ -466,7 +476,12 @@ impl NodePayoutAuthority {
         } else {
             self.expected_branch
         };
-        if info.chain != "test"
+        let expected_chain = if self.network == ChainNetwork::Mainnet {
+            "main"
+        } else {
+            "test"
+        };
+        if info.chain != expected_chain
             || (info.blocks == 0 && !at_allowed_genesis)
             || info.headers != info.blocks
             || info.consensus.chain_tip != expected_tip_branch
@@ -1702,6 +1717,32 @@ mod tests {
 
     fn authority(chain: Chain, rpc: Arc<ScriptedRpc>) -> NodePayoutAuthority {
         NodePayoutAuthority::with_client(chain, rpc, GENESIS).expect("valid authority")
+    }
+
+    #[tokio::test]
+    async fn mainnet_authority_requires_main_chain_and_distinct_wcash_branch() {
+        let mut steps = tip_steps_with_direct("d9c6a7ee", TIP, 100, json!(TIP));
+        steps[0].result.as_mut().expect("chain info")["chain"] = json!("main");
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+        let selected = authority(Chain::Wcash, Arc::clone(&rpc)).with_mainnet_network();
+        assert_eq!(
+            selected.verified_tip().await,
+            Ok(VerifiedTip {
+                hash: TIP,
+                height: 100,
+            })
+        );
+        rpc.assert_drained();
+
+        let mut wrong = tip_steps_with_direct("d9c6a7ee", TIP, 100, json!(TIP));
+        wrong.truncate(1);
+        let rpc = Arc::new(ScriptedRpc::new(wrong));
+        let selected = authority(Chain::Wcash, Arc::clone(&rpc)).with_mainnet_network();
+        assert_eq!(
+            selected.verified_tip().await,
+            Err(ObservationFailure::Invariant)
+        );
+        rpc.assert_drained();
     }
 
     #[tokio::test]

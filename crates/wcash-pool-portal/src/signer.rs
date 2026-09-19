@@ -260,6 +260,12 @@ impl TestnetPayoutBoundary {
         }
     }
 
+    /// Selects a Mainnet accounting-only boundary with no spending authority.
+    pub fn with_mainnet_network(mut self) -> Self {
+        self.network = ChainNetwork::Mainnet;
+        self
+    }
+
     /// Selects the isolated integration network without weakening default boundaries.
     #[cfg(feature = "regtest")]
     pub fn with_regtest_network(mut self) -> Self {
