@@ -1691,8 +1691,9 @@ fn build_preflight_portal(
     let mut portal_config = PortalConfig::testnet();
     portal_config.network = config.network;
     if config.network == ChainNetwork::Mainnet {
-        // Mainnet registration needs an explicit public launch review.
-        portal_config.allow_registration = false;
+        // Mainnet registration remains closed until the operator explicitly
+        // opens the isolated, accounting-backed deployment.
+        portal_config.allow_registration = config.registration_open;
     }
     portal_config.payout_change_hold_secs = config.payout_change_hold_secs;
     portal_config
@@ -2585,6 +2586,7 @@ mod tests {
             stratum_listen: SocketAddr::from_str("0.0.0.0:28237").expect("stratum address"),
             portal_listen: SocketAddr::from_str("127.0.0.1:8080").expect("portal address"),
             portal_origin: "https://testnet.zecwec.com".to_owned(),
+            registration_open: true,
             payout_change_hold_secs: 172800,
             nonce_namespace: 1,
             nonce_reservation: 1_000_000,

@@ -4,6 +4,8 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const ATOMIC_UNITS = 100_000_000;
 const MAX_PAYOUT_THRESHOLD_ZAT = 2_100_000_000_000_000n;
+const AUTOMATIC_PAYOUT_ENABLED = true;
+const TLS_STRATUM_AVAILABLE = true;
 let authMode = "login";
 let cachedWorkers = [];
 let cachedTelemetry = null;
@@ -492,15 +494,19 @@ function renderPayoutSetting(asset, setting) {
   if (setting.active_destination) {
     const receiver = setting.active_receiver === "transparent" ? "Transparent address" : "Shielded Unified Address";
     line(`${receiver}: ${setting.active_destination}`);
-    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${setting.automatic ? "automatic" : "paused"}`);
+    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${AUTOMATIC_PAYOUT_ENABLED ? (setting.automatic ? "automatic" : "paused") : "payouts paused"}`);
   }
   if (setting.pending_destination) {
     line(`Pending destination: ${setting.pending_destination}`);
-    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). Payouts remain paused until the change is active.`);
-    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${setting.pending_automatic ? "automatic" : "paused"}`);
-    setText(`#${asset}-payout-status`, `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`);
+    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). ${AUTOMATIC_PAYOUT_ENABLED ? "Payouts remain paused until the change is active." : "Automatic payout execution remains paused after the hold."}`);
+    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${AUTOMATIC_PAYOUT_ENABLED ? (setting.pending_automatic ? "automatic" : "paused") : "payouts paused"}`);
+    setText(`#${asset}-payout-status`, AUTOMATIC_PAYOUT_ENABLED
+      ? `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`
+      : "Automatic payouts are paused. Rewards continue accumulating.");
   } else {
-    setText(`#${asset}-payout-status`, setting.automatic ? `Automatic payouts after maturity and ${formatCoin(setting.threshold_zat, asset)} threshold.` : "Automatic payouts paused. Earned rewards remain in this balance.");
+    setText(`#${asset}-payout-status`, !AUTOMATIC_PAYOUT_ENABLED
+      ? "Automatic payouts are paused. Earned rewards remain in this balance."
+      : setting.automatic ? `Automatic payouts after maturity and ${formatCoin(setting.threshold_zat, asset)} threshold.` : "Automatic payouts paused. Earned rewards remain in this balance.");
   }
   // Never refill a masked destination or replace an in-progress edit with a poll.
   if (form.dataset.dirty !== "true") {
@@ -705,7 +711,9 @@ $("#refresh-data").addEventListener("click", () => refreshAll());
 $("#stratum-transport").addEventListener("change", () => {
   const transport = $("#stratum-transport").value;
   $("#stratum-url").value = STRATUM_ENDPOINTS[transport];
-  setText("#transport-help", transport === "tls" ? "Use TLS when your ASIC firmware supports it." : "TCP is unencrypted. Use it only when your ASIC cannot use TLS. Enter the mining-only token, never your account password.");
+  setText("#transport-help", transport === "tls" ? "Use TLS when your ASIC firmware supports it." : TLS_STRATUM_AVAILABLE
+    ? "TCP is unencrypted. Use it only when your ASIC cannot use TLS. Enter the mining-only token, never your account password."
+    : "TCP is unencrypted. Enter the mining-only token, never your account password.");
 });
 $$('[data-copy]').forEach((button) => button.addEventListener("click", () => copyInput(document.getElementById(button.dataset.copy))));
 $("#zec-address-type").addEventListener("change", updateAddressType);

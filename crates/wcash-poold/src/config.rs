@@ -62,6 +62,8 @@ pub struct RuntimeConfig {
     pub portal_listen: SocketAddr,
     /// Exact public HTTPS portal origin.
     pub portal_origin: String,
+    /// Explicit Mainnet self-service registration gate; closed by default.
+    pub registration_open: bool,
     /// Safety hold applied to every initial or replacement payout destination.
     pub payout_change_hold_secs: u64,
     /// Non-zero, deployment-exclusive nonce namespace.
@@ -200,6 +202,8 @@ struct RawConfig {
     stratum_listen: SocketAddr,
     portal_listen: SocketAddr,
     portal_origin: String,
+    #[serde(default)]
+    registration_open: bool,
     payout_change_hold_secs: u64,
     nonce_namespace: u8,
     nonce_reservation: u64,
@@ -430,6 +434,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             stratum_listen: raw.stratum_listen,
             portal_listen: raw.portal_listen,
             portal_origin: raw.portal_origin,
+            registration_open: raw.registration_open,
             payout_change_hold_secs: raw.payout_change_hold_secs,
             nonce_namespace: raw.nonce_namespace,
             nonce_reservation: raw.nonce_reservation,
@@ -1020,7 +1025,19 @@ policy_version = 1
         let loaded = RuntimeConfig::load(&path).expect("mainnet accounting-only policy");
         assert_eq!(loaded.network, ChainNetwork::Mainnet);
         assert_eq!(loaded.payout_mode, PayoutMode::Deferred);
+        assert!(!loaded.registration_open);
         assert_eq!(loaded.wcash_branch_id(), "d9c6a7ee");
+
+        let open = mainnet.replace(
+            "\n[wcash_policy]",
+            "\nregistration_open = true\n\n[wcash_policy]",
+        );
+        write_path(&path, open.as_bytes(), 0o600);
+        assert!(
+            RuntimeConfig::load(&path)
+                .expect("explicit registration gate")
+                .registration_open
+        );
 
         let wrong_genesis = mainnet.replace(&wire(WCASH_MAINNET_GENESIS), &"01".repeat(32));
         write_path(&path, wrong_genesis.as_bytes(), 0o600);

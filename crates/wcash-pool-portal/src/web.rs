@@ -265,20 +265,31 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(render_index(&state.config))
+}
+
+fn render_index(config: &PortalConfig) -> String {
     let page = include_str!("../assets/index.html");
-    if state.config.network == crate::ChainNetwork::Mainnet {
-        Html(page
-            .replace("Testnet", "Mainnet")
-            .replace("TESTNET", "MAINNET")
-            .replace("TWC", "WEC")
-            .replace("Two test networks.", "Two main networks.")
-            .replace("· no monetary value", "· accounting preview")
-            .replace("<li>Create an account</li>", "<li>Sign in to an invited account</li>")
-            .replace("<button class=\"segment\" data-auth-mode=\"register\" type=\"button\" aria-pressed=\"false\">Create account</button>", "")
-            .replace("Automatic payouts after maturity and threshold", "Payout preference saved; execution is currently on hold"))
-    } else {
-        Html(page.to_owned())
+    if config.network != crate::ChainNetwork::Mainnet {
+        return page.to_owned();
     }
+    let mut page = page
+        .replace("Testnet", "Mainnet")
+        .replace("TESTNET", "MAINNET")
+        .replace("TWC", "WEC")
+        .replace("Two test networks.", "Two main networks.")
+        .replace("· no monetary value", "· payouts paused")
+        .replace("Automatic payouts after maturity and threshold", "Payout preference saved; automatic execution is paused")
+        .replace("<option value=\"tls\">TLS · preferred</option>", "")
+        .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
+        .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3334")
+        .replace("Use TLS when your ASIC firmware supports it.", "This account pool uses a separate Stratum endpoint. Existing invited workers remain on port 3333.");
+    if !config.allow_registration {
+        page = page
+            .replace("<li>Create an account</li>", "<li>Sign in to an invited account</li>")
+            .replace("<button class=\"segment\" data-auth-mode=\"register\" type=\"button\" aria-pressed=\"false\">Create account</button>", "");
+    }
+    page
 }
 
 async fn styles() -> impl IntoResponse {
@@ -296,19 +307,31 @@ async fn form_styles() -> impl IntoResponse {
 }
 
 async fn script(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let source = include_str!("../assets/app.js");
-    let source = if state.config.network == crate::ChainNetwork::Mainnet {
-        source
-            .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3444")
-            .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3334")
-            .replace("Zcash Testnet", "Zcash Mainnet")
-    } else {
-        source.to_owned()
-    };
+    let source = render_script(state.config.network);
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
         source,
     )
+}
+
+fn render_script(network: crate::ChainNetwork) -> String {
+    let source = include_str!("../assets/app.js");
+    if network != crate::ChainNetwork::Mainnet {
+        return source.to_owned();
+    }
+    source
+        .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3334")
+        .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3334")
+        .replace("Testnet", "Mainnet")
+        .replace("TWC", "WEC")
+        .replace(
+            "const AUTOMATIC_PAYOUT_ENABLED = true;",
+            "const AUTOMATIC_PAYOUT_ENABLED = false;",
+        )
+        .replace(
+            "const TLS_STRATUM_AVAILABLE = true;",
+            "const TLS_STRATUM_AVAILABLE = false;",
+        )
 }
 
 async fn overview(State(state): State<Arc<AppState>>) -> Json<crate::PoolOverview> {
@@ -1216,6 +1239,33 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mainnet_portal_shows_only_the_isolated_tcp_pool_and_paused_payouts() {
+        let mut config = PortalConfig::testnet();
+        config.network = crate::ChainNetwork::Mainnet;
+        config.allow_registration = false;
+        let page = render_index(&config);
+        let script = render_script(config.network);
+
+        assert!(page.contains("ZecWec Pool — Mainnet"));
+        assert!(page.contains("· payouts paused"));
+        assert!(page.contains("mainnet.zecwec.com:3334"));
+        assert!(!page.contains("data-auth-mode=\"register\""));
+        assert!(!page.contains("<option value=\"tls\">"));
+        assert!(!page.contains("testnet-mine.zecwec.com"));
+        assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = false;"));
+        assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
+        assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3334"));
+        assert!(!script.contains("testnet-mine.zecwec.com"));
+
+        config.allow_registration = true;
+        assert!(render_index(&config).contains("data-auth-mode=\"register\""));
+        assert_eq!(
+            render_index(&PortalConfig::testnet()),
+            include_str!("../assets/index.html")
+        );
+    }
 
     #[test]
     fn argon2_slots_reject_excess_work_without_waiting() -> Result<(), &'static str> {

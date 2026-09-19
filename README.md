@@ -15,6 +15,8 @@ accounted WEC and ZEC rewards at two chain-specific payout destinations.
 > remain blocked until the exact Wolf/pool release pair passes the independent
 > custody, ASIC, restart, reorg, and HTTPS gates in
 > [Mainnet parallel staging](docs/mainnet-parallel-staging.md).
+> The account-portal activation boundary is in
+> [Mainnet account portal cutover](docs/mainnet-account-portal.md).
 
 ## Product decision
 
