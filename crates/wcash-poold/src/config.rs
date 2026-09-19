@@ -18,6 +18,7 @@ use rustix::{
 use serde::Deserialize;
 use uuid::Uuid;
 use wcash_pool_portal::ChainNetwork;
+use wcash_pool_store::MiningAuthenticationMode;
 use zeroize::Zeroizing;
 
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
@@ -78,6 +79,8 @@ pub struct RuntimeConfig {
     pub maximum_miners_per_ip: usize,
     /// Concurrent Argon2 verification ceiling.
     pub authentication_parallelism: usize,
+    /// Explicit miner authorization policy.
+    pub mining_authentication: MiningAuthenticationMode,
     /// Integrity-pinned Wolf address command.
     pub wcash_wallet_program: PathBuf,
     /// Expected executable digest.
@@ -211,6 +214,8 @@ struct RawConfig {
     maximum_miners: usize,
     maximum_miners_per_ip: usize,
     authentication_parallelism: usize,
+    #[serde(default = "default_mining_authentication")]
+    mining_authentication: RawMiningAuthenticationMode,
     wcash_wallet_program: PathBuf,
     wcash_wallet_sha256: String,
     wcash_wallet_uid: u32,
@@ -239,6 +244,17 @@ struct RawConfig {
     zcash_policy: RawChainPolicy,
     initial_share_target_be: String,
     easiest_share_target_be: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RawMiningAuthenticationMode {
+    Token,
+    UsernameOnly,
+}
+
+const fn default_mining_authentication() -> RawMiningAuthenticationMode {
+    RawMiningAuthenticationMode::Token
 }
 
 impl RuntimeConfig {
@@ -442,6 +458,10 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             maximum_miners: raw.maximum_miners,
             maximum_miners_per_ip: raw.maximum_miners_per_ip,
             authentication_parallelism: raw.authentication_parallelism,
+            mining_authentication: match raw.mining_authentication {
+                RawMiningAuthenticationMode::Token => MiningAuthenticationMode::Token,
+                RawMiningAuthenticationMode::UsernameOnly => MiningAuthenticationMode::UsernameOnly,
+            },
             wcash_wallet_program: raw.wcash_wallet_program,
             wcash_wallet_sha256,
             wcash_wallet_uid: raw.wcash_wallet_uid,
@@ -964,12 +984,31 @@ policy_version = 1
         let config = RuntimeConfig::load(&config_path).expect("valid config");
         assert_eq!(config.nonce_namespace, 1);
         assert_eq!(
+            config.mining_authentication,
+            MiningAuthenticationMode::Token
+        );
+        assert_eq!(
             config.database_url().expect("url").as_str(),
             "postgresql://pool@/zecwec"
         );
         assert_eq!(
             *RuntimeConfig::portal_secret(&config.portal_token_pepper_file).expect("secret"),
             [7; 32]
+        );
+    }
+
+    #[test]
+    fn username_only_mining_authentication_is_explicit() {
+        let directory = TempDir::new().expect("temp dir");
+        let policy = fixture(&directory, "testnet").replace(
+            "authentication_parallelism = 4",
+            "authentication_parallelism = 4\nmining_authentication = \"username_only\"",
+        );
+        let path = write_file(&directory, "pool.toml", policy.as_bytes(), 0o600);
+        let loaded = RuntimeConfig::load(&path).expect("username-only policy loads");
+        assert_eq!(
+            loaded.mining_authentication,
+            MiningAuthenticationMode::UsernameOnly
         );
     }
 

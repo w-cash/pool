@@ -16,8 +16,8 @@ pub use accounting::{
     allocate_pplns, target_work, AccountAllocation, AllocationPlan, PplnsError, WeightedShare,
 };
 pub use auth::{
-    generate_mining_token, hash_mining_token, MiningToken, MiningTokenError,
-    PostgresAuthenticationProvider,
+    generate_mining_token, hash_mining_token, MiningAuthenticationMode, MiningToken,
+    MiningTokenError, PostgresAuthenticationProvider,
 };
 pub use portal::PostgresPoolDataSource;
 pub use postgres::{

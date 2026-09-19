@@ -512,7 +512,7 @@ async fn authenticated_winner_reaches_confirmed_recipient_ledger() {
         .await
         .expect("production worker provisioning succeeds");
     let authenticator = store
-        .authentication_provider(1)
+        .authentication_provider(1, wcash_pool_store::MiningAuthenticationMode::Token)
         .expect("production Argon2 authentication provider builds");
     let grant = authenticator
         .authenticate_credentials("miner.z15", mining_token.expose_secret())

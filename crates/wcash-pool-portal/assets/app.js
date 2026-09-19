@@ -6,6 +6,7 @@ const ATOMIC_UNITS = 100_000_000;
 const MAX_PAYOUT_THRESHOLD_ZAT = 2_100_000_000_000_000n;
 const AUTOMATIC_PAYOUT_ENABLED = true;
 const TLS_STRATUM_AVAILABLE = true;
+const MINING_PASSWORD_IGNORED = false;
 let authMode = "login";
 let cachedWorkers = [];
 let cachedTelemetry = null;
@@ -552,12 +553,12 @@ function renderWorkerSecret(worker) {
   const target = $("#worker-secret");
   target.replaceChildren();
   const title = document.createElement("h3");
-  title.textContent = "Save your worker token now";
+  title.textContent = MINING_PASSWORD_IGNORED ? "Worker ready" : "Save your worker token now";
   const note = document.createElement("p");
   note.className = "fineprint";
-  note.textContent = "Shown once. Copy these into the ASIC’s username and password fields. Leaving this page clears the token.";
+  note.textContent = MINING_PASSWORD_IGNORED ? "Copy the exact mining username. Set the ASIC password to x." : "Shown once. Copy these into the ASIC’s username and password fields. Leaving this page clears the token.";
   target.append(title, note);
-  for (const [id, label, value] of [["issued-worker-username", "Mining username", worker.mining_username], ["issued-worker-token", "Miner password · mining-only token", worker.token]]) {
+  for (const [id, label, value] of [["issued-worker-username", "Mining username", worker.mining_username], ["issued-worker-token", MINING_PASSWORD_IGNORED ? "Password · ignored" : "Miner password · mining-only token", MINING_PASSWORD_IGNORED ? "x" : worker.token]]) {
     const field = document.createElement("div"); field.className = "secret-field";
     const heading = document.createElement("label"); heading.htmlFor = id; heading.textContent = label;
     const row = document.createElement("div"); row.className = "copy-row";
@@ -567,7 +568,7 @@ function renderWorkerSecret(worker) {
     row.append(input, copy); field.append(heading, row); target.append(field);
   }
   const actions = document.createElement("div"); actions.className = "secret-actions";
-  const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.className = "button secondary"; dismiss.textContent = "I saved it · hide token";
+  const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.className = "button secondary"; dismiss.textContent = MINING_PASSWORD_IGNORED ? "Done" : "I saved it · hide token";
   dismiss.addEventListener("click", () => { clearWorkerSecret(); $("#worker-create").classList.add("hidden"); $("#new-worker").setAttribute("aria-expanded", "false"); });
   actions.append(dismiss); target.append(actions); target.classList.remove("hidden");
   $("#new-worker").disabled = true;
@@ -711,7 +712,7 @@ $("#refresh-data").addEventListener("click", () => refreshAll());
 $("#stratum-transport").addEventListener("change", () => {
   const transport = $("#stratum-transport").value;
   $("#stratum-url").value = STRATUM_ENDPOINTS[transport];
-  setText("#transport-help", transport === "tls" ? "Use TLS when your ASIC firmware supports it." : TLS_STRATUM_AVAILABLE
+  setText("#transport-help", MINING_PASSWORD_IGNORED ? "Use the exact mining username shown below. Set the ASIC password to x." : transport === "tls" ? "Use TLS when your ASIC firmware supports it." : TLS_STRATUM_AVAILABLE
     ? "TCP is unencrypted. Use it only when your ASIC cannot use TLS. Enter the mining-only token, never your account password."
     : "TCP is unencrypted. Enter the mining-only token, never your account password.");
 });

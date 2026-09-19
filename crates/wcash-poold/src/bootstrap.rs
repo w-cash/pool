@@ -357,8 +357,10 @@ async fn prepare(config: &RuntimeConfig) -> Result<PreparedBootstrap, BootstrapE
         JOB_UPDATE_CAPACITY,
     )?;
     validate_initial_target_policy(&jobs, config)?;
-    let authentication =
-        Arc::new(store.authentication_provider(config.authentication_parallelism)?);
+    let authentication = Arc::new(store.authentication_provider(
+        config.authentication_parallelism,
+        config.mining_authentication,
+    )?);
 
     Ok(PreparedBootstrap {
         store,

@@ -763,6 +763,24 @@ fn portal(clock: Arc<FixedClock>) -> axum::Router {
     portal_with_repository(clock, Arc::new(MemoryRepository::default()))
 }
 
+fn username_only_portal(clock: Arc<FixedClock>) -> axum::Router {
+    clock.0.store(1_800_000_000, Ordering::SeqCst);
+    let mut config = PortalConfig::testnet();
+    config.mining_password_ignored = true;
+    PortalApp::with_clock_and_telemetry(
+        config,
+        PortalSecrets::new([3; 32], [7; 32]),
+        Arc::new(MemoryRepository::default()),
+        Arc::new(FixtureValidator),
+        Arc::new(FixturePoolData::ready()),
+        Arc::new(UnavailableMinerTelemetry),
+        Arc::new(TestnetPayoutBoundary::new(Arc::new(ReadySigner))),
+        clock,
+    )
+    .expect("valid username-only portal")
+    .router()
+}
+
 fn portal_with_repository(
     clock: Arc<FixedClock>,
     repository: Arc<MemoryRepository>,
@@ -1162,6 +1180,29 @@ async fn account_worker_and_payout_flow_enforces_security_boundaries() {
     assert_eq!(replacement_body["pending_threshold_zat"], 200_000);
     assert_eq!(replacement_body["pending_automatic"], false);
     assert_eq!(replacement_body["pending_revision"], 2);
+}
+
+#[tokio::test]
+async fn username_only_worker_returns_x_without_exposing_a_token() {
+    let app = username_only_portal(Arc::new(FixedClock::default()));
+    let (session, csrf_cookie, csrf) = register_and_login(&app, "simpleminer").await;
+    let response = app
+        .oneshot(authorized_mutation(
+            "/api/v1/workers",
+            "POST",
+            json!({"label":"rig1"}),
+            &session,
+            &csrf_cookie,
+            &csrf,
+        ))
+        .await
+        .expect("worker response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = json_response(response).await;
+    assert_eq!(body["worker"]["mining_username"], "simpleminer.rig1");
+    assert_eq!(body["worker"]["password"], "x");
+    assert_eq!(body["worker"]["password_ignored"], true);
+    assert!(body["worker"].get("token").is_none());
 }
 
 #[test]

@@ -3046,11 +3046,13 @@ impl PostgresStore {
     pub fn authentication_provider(
         &self,
         maximum_parallel_verifications: usize,
+        mode: crate::MiningAuthenticationMode,
     ) -> Result<crate::PostgresAuthenticationProvider, StoreError> {
         Ok(crate::PostgresAuthenticationProvider::new(
             self.pool.clone(),
             self.identity.id,
             maximum_parallel_verifications,
+            mode,
         )?)
     }
 }

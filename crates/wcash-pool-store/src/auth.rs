@@ -24,6 +24,15 @@ const ARGON_ITERATIONS: u32 = 2;
 const ARGON_LANES: u32 = 1;
 const MAX_ARGON2_PARALLELISM: usize = 32;
 
+/// Miner authorization policy selected explicitly by one deployment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiningAuthenticationMode {
+    /// Require the generated mining-only token.
+    Token,
+    /// Authorize an enabled, registered `account.worker`; ignore Stratum's password field.
+    UsernameOnly,
+}
+
 /// One generated mining credential. Its selector is public; the full token is
 /// secret and is zeroized when dropped.
 pub struct MiningToken {
@@ -163,6 +172,7 @@ pub struct PostgresAuthenticationProvider {
     deployment_id: Uuid,
     dummy_verifier: String,
     verification_slots: Arc<Semaphore>,
+    mode: MiningAuthenticationMode,
 }
 
 impl std::fmt::Debug for PostgresAuthenticationProvider {
@@ -180,6 +190,7 @@ impl PostgresAuthenticationProvider {
         pool: PgPool,
         deployment_id: Uuid,
         maximum_parallel_verifications: usize,
+        mode: MiningAuthenticationMode,
     ) -> Result<Self, MiningTokenError> {
         if deployment_id.is_nil() {
             return Err(MiningTokenError::NilDeployment);
@@ -192,6 +203,7 @@ impl PostgresAuthenticationProvider {
             deployment_id,
             dummy_verifier: dummy_verifier()?,
             verification_slots: Arc::new(Semaphore::new(maximum_parallel_verifications)),
+            mode,
         })
     }
 
@@ -202,7 +214,12 @@ impl PostgresAuthenticationProvider {
         login: &str,
         password: &str,
     ) -> Result<AuthenticationGrant, AuthenticationError> {
-        authenticate_credentials(self, login, password).await
+        match self.mode {
+            MiningAuthenticationMode::Token => {
+                authenticate_token_credentials(self, login, password).await
+            }
+            MiningAuthenticationMode::UsernameOnly => authenticate_username(self, login).await,
+        }
     }
 
     /// Revalidates one connected Stratum identity against fresh PostgreSQL
@@ -241,7 +258,52 @@ impl PostgresAuthenticationProvider {
     }
 }
 
-async fn authenticate_credentials(
+async fn authenticate_username(
+    provider: &PostgresAuthenticationProvider,
+    login: &str,
+) -> Result<AuthenticationGrant, AuthenticationError> {
+    if !valid_login(login) {
+        return Err(AuthenticationError::Denied);
+    }
+    let row = sqlx::query(
+        "SELECT a.id AS account_id, w.id AS worker_id, w.canonical_login, \
+                t.id AS credential_id \
+         FROM workers w \
+         JOIN accounts a ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
+         JOIN LATERAL ( \
+             SELECT id FROM mining_tokens \
+             WHERE deployment_id=w.deployment_id AND worker_id=w.id \
+               AND revoked_at IS NULL \
+               AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
+             ORDER BY created_at DESC, id DESC LIMIT 1 \
+         ) t ON TRUE \
+         WHERE w.deployment_id=$1 AND w.canonical_login=$2 \
+           AND w.enabled AND a.enabled",
+    )
+    .bind(provider.deployment_id)
+    .bind(login)
+    .fetch_optional(&provider.pool)
+    .await
+    .map_err(|_| AuthenticationError::Unavailable)?
+    .ok_or(AuthenticationError::Denied)?;
+    let account_id = row
+        .try_get::<Uuid, _>("account_id")
+        .map_err(|_| AuthenticationError::Unavailable)?;
+    let worker_id = row
+        .try_get::<Uuid, _>("worker_id")
+        .map_err(|_| AuthenticationError::Unavailable)?;
+    let canonical_login = row
+        .try_get::<String, _>("canonical_login")
+        .map_err(|_| AuthenticationError::Unavailable)?;
+    let credential_id = row
+        .try_get::<Uuid, _>("credential_id")
+        .map_err(|_| AuthenticationError::Unavailable)?;
+    let worker = AuthenticatedWorker::new(account_id, worker_id, canonical_login)
+        .map_err(|_| AuthenticationError::Unavailable)?;
+    AuthenticationGrant::new(worker, credential_id)
+}
+
+async fn authenticate_token_credentials(
     provider: &PostgresAuthenticationProvider,
     login: &str,
     password: &str,

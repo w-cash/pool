@@ -1364,7 +1364,7 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
     .await
     .expect("public role provisions worker through PortalRepository");
     assert!(public_store
-        .authentication_provider(1)
+        .authentication_provider(1, wcash_pool_store::MiningAuthenticationMode::Token)
         .expect("role authentication provider builds")
         .authenticate_credentials("roleapi.rig1", &api_worker.token)
         .await
@@ -2887,7 +2887,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .await
         .expect("worker provisions");
     let auth = store
-        .authentication_provider(2)
+        .authentication_provider(2, wcash_pool_store::MiningAuthenticationMode::Token)
         .expect("auth provider builds");
     let grant = auth
         .authenticate_credentials("alice.z15", token.expose_secret())
@@ -2897,6 +2897,24 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_eq!(grant.worker().worker_id(), worker_id);
     assert!(matches!(
         auth.authenticate_credentials("alice.z15", "invalid-token")
+            .await,
+        Err(AuthenticationError::Denied)
+    ));
+    let username_auth = store
+        .authentication_provider(2, wcash_pool_store::MiningAuthenticationMode::UsernameOnly)
+        .expect("username-only auth provider builds");
+    let username_grant = username_auth
+        .authenticate_credentials("alice.z15", "x")
+        .await
+        .expect("registered username authenticates with x");
+    assert_eq!(username_grant.worker().worker_id(), worker_id);
+    assert!(username_auth
+        .authenticate_credentials("alice.z15", "any-password-is-ignored")
+        .await
+        .is_ok());
+    assert!(matches!(
+        username_auth
+            .authenticate_credentials("alice.unknown", "x")
             .await,
         Err(AuthenticationError::Denied)
     ));
@@ -2919,6 +2937,10 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .expect("connected token revokes"));
     assert!(matches!(
         auth.revalidate_worker(&grant).await,
+        Err(AuthenticationError::Denied)
+    ));
+    assert!(matches!(
+        username_auth.revalidate_worker(&username_grant).await,
         Err(AuthenticationError::Denied)
     ));
     assert!(auth

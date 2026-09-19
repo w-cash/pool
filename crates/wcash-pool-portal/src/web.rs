@@ -269,11 +269,9 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
 }
 
 fn render_index(config: &PortalConfig) -> String {
-    let page = include_str!("../assets/index.html");
-    if config.network != crate::ChainNetwork::Mainnet {
-        return page.to_owned();
-    }
-    let mut page = page
+    let mut page = include_str!("../assets/index.html").to_owned();
+    if config.network == crate::ChainNetwork::Mainnet {
+        page = page
         .replace("Testnet", "Mainnet")
         .replace("TESTNET", "MAINNET")
         .replace("TWC", "WEC")
@@ -284,10 +282,23 @@ fn render_index(config: &PortalConfig) -> String {
         .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
         .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3334")
         .replace("Use TLS when your ASIC firmware supports it.", "This account pool uses a separate Stratum endpoint. Existing invited workers remain on port 3333.");
+    }
     if !config.allow_registration {
         page = page
             .replace("<li>Create an account</li>", "<li>Sign in to an invited account</li>")
             .replace("<button class=\"segment\" data-auth-mode=\"register\" type=\"button\" aria-pressed=\"false\">Create account</button>", "");
+    }
+    if config.mining_password_ignored {
+        page = page
+            .replace(
+                "Your ASIC uses a separate mining-only token.",
+                "Your ASIC uses its exact mining username and password x.",
+            )
+            .replace(
+                "Keep this separate from your worker token.",
+                "This password protects your portal account and payout settings.",
+            )
+            .replace("Create worker token", "Create worker");
     }
     page
 }
@@ -307,31 +318,37 @@ async fn form_styles() -> impl IntoResponse {
 }
 
 async fn script(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let source = render_script(state.config.network);
+    let source = render_script(&state.config);
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
         source,
     )
 }
 
-fn render_script(network: crate::ChainNetwork) -> String {
-    let source = include_str!("../assets/app.js");
-    if network != crate::ChainNetwork::Mainnet {
-        return source.to_owned();
+fn render_script(config: &PortalConfig) -> String {
+    let mut source = include_str!("../assets/app.js").to_owned();
+    if config.network == crate::ChainNetwork::Mainnet {
+        source = source
+            .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3334")
+            .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3334")
+            .replace("Testnet", "Mainnet")
+            .replace("TWC", "WEC")
+            .replace(
+                "const AUTOMATIC_PAYOUT_ENABLED = true;",
+                "const AUTOMATIC_PAYOUT_ENABLED = false;",
+            )
+            .replace(
+                "const TLS_STRATUM_AVAILABLE = true;",
+                "const TLS_STRATUM_AVAILABLE = false;",
+            );
+    }
+    if config.mining_password_ignored {
+        source = source.replace(
+            "const MINING_PASSWORD_IGNORED = false;",
+            "const MINING_PASSWORD_IGNORED = true;",
+        );
     }
     source
-        .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3334")
-        .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3334")
-        .replace("Testnet", "Mainnet")
-        .replace("TWC", "WEC")
-        .replace(
-            "const AUTOMATIC_PAYOUT_ENABLED = true;",
-            "const AUTOMATIC_PAYOUT_ENABLED = false;",
-        )
-        .replace(
-            "const TLS_STRATUM_AVAILABLE = true;",
-            "const TLS_STRATUM_AVAILABLE = false;",
-        )
 }
 
 async fn overview(State(state): State<Arc<AppState>>) -> Json<crate::PoolOverview> {
@@ -642,16 +659,27 @@ async fn create_worker(
     {
         return Err(AppError::Internal);
     }
+    let worker_json = if state.config.mining_password_ignored {
+        json!({
+            "id": worker.worker_id,
+            "label": label,
+            "mining_username": worker.canonical_login,
+            "password": "x",
+            "password_ignored": true
+        })
+    } else {
+        json!({
+            "id": worker.worker_id,
+            "label": label,
+            "mining_username": worker.canonical_login,
+            "token": worker.token,
+            "token_displayed_once": true
+        })
+    };
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "worker": {
-                "id": worker.worker_id,
-                "label": label,
-                "mining_username": worker.canonical_login,
-                "token": worker.token,
-                "token_displayed_once": true
-            }
+            "worker": worker_json
         })),
     ))
 }
@@ -1246,7 +1274,7 @@ mod tests {
         config.network = crate::ChainNetwork::Mainnet;
         config.allow_registration = false;
         let page = render_index(&config);
-        let script = render_script(config.network);
+        let script = render_script(&config);
 
         assert!(page.contains("ZecWec Pool — Mainnet"));
         assert!(page.contains("· payouts paused"));
@@ -1258,6 +1286,11 @@ mod tests {
         assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3334"));
         assert!(!script.contains("testnet-mine.zecwec.com"));
+
+        config.mining_password_ignored = true;
+        assert!(render_index(&config).contains("password x"));
+        assert!(render_index(&config).contains(">Create worker</button>"));
+        assert!(render_script(&config).contains("const MINING_PASSWORD_IGNORED = true;"));
 
         config.allow_registration = true;
         assert!(render_index(&config).contains("data-auth-mode=\"register\""));

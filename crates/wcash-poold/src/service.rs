@@ -1696,6 +1696,10 @@ fn build_preflight_portal(
         portal_config.allow_registration = config.registration_open;
     }
     portal_config.payout_change_hold_secs = config.payout_change_hold_secs;
+    portal_config.mining_password_ignored = matches!(
+        config.mining_authentication,
+        wcash_pool_store::MiningAuthenticationMode::UsernameOnly
+    );
     portal_config
         .canonical_origin
         .clone_from(&config.portal_origin);
@@ -2594,6 +2598,7 @@ mod tests {
             maximum_miners: 1_024,
             maximum_miners_per_ip: 8,
             authentication_parallelism: 4,
+            mining_authentication: wcash_pool_store::MiningAuthenticationMode::Token,
             wcash_wallet_program: program,
             wcash_wallet_sha256: wallet_digest,
             wcash_wallet_uid: rustix::process::geteuid().as_raw(),
