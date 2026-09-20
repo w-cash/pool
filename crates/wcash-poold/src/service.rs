@@ -1483,7 +1483,14 @@ async fn record_startup_reconciliation(
     store: &PostgresStore,
     observation: &wcash_pool_store::WalletObservation,
 ) -> Result<(), ServiceError> {
-    let recorded = store.record_wallet_reconciliation(observation).await?;
+    let recorded = match store.record_wallet_reconciliation(observation).await {
+        Ok(recorded) => recorded,
+        // The lifecycle loop performs the same reconciliation before it can
+        // reserve a batch. Let startup complete while the projector consumes
+        // a newly mature reward; payouts remain deferred until an exact match.
+        Err(StoreError::WalletReconciliationPending) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     if recorded.chain != observation.chain
         || recorded.wallet_spendable_zat != observation.wallet_spendable_zat
         || recorded.best_tip_hash != observation.best_tip_hash
