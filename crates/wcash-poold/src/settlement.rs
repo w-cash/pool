@@ -248,6 +248,10 @@ pub trait SettlementStore: Send + Sync {
     /// Reconstructs a previously authorized request without granting authority.
     fn signing_request(&self, batch_id: Uuid) -> SettlementFuture<'_, PayoutBatchRequest>;
 
+    /// Cancels a signing batch after an explicit pre-sign rejection and
+    /// returns every reserved liability to the miner payable balance.
+    fn cancel_rejected_signing(&self, batch_id: Uuid) -> SettlementFuture<'_, ()>;
+
     /// Persists every rich signer artifact in the Signing-to-Signed transition.
     fn mark_signed(&self, artifact: &SignedPayoutArtifact) -> SettlementFuture<'_, ()>;
 
@@ -286,6 +290,14 @@ impl SettlementStore for PostgresStore {
             self.signing_payout_request(batch_id)
                 .await
                 .map_err(|error| SettlementError::persistence("signing_request", error))
+        })
+    }
+
+    fn cancel_rejected_signing(&self, batch_id: Uuid) -> SettlementFuture<'_, ()> {
+        Box::pin(async move {
+            self.cancel_rejected_payout_signing(batch_id)
+                .await
+                .map_err(|error| SettlementError::persistence("cancel_rejected_signing", error))
         })
     }
 
@@ -717,11 +729,16 @@ impl SettlementOrchestrator {
                     // that exact idempotent request closes the clean
                     // post-authorization/pre-signer window without rewinding a
                     // fence that another process could have crossed.
-                    boundary
-                        .signer
-                        .prepare_exact(&request)
-                        .await
-                        .map_err(|failure| SettlementError::Boundary { chain, failure })?
+                    match boundary.signer.prepare_exact(&request).await {
+                        Ok(payout) => payout,
+                        Err(BoundaryFailure::Rejected) => {
+                            self.store.cancel_rejected_signing(batch.id).await?;
+                            return Ok(ReconciliationGate::Safe);
+                        }
+                        Err(failure) => {
+                            return Err(SettlementError::Boundary { chain, failure });
+                        }
+                    }
                 };
                 payout.validate_against(&request)?;
                 let artifact = payout.as_store_artifact(chain);
@@ -781,14 +798,22 @@ impl SettlementOrchestrator {
         if request.batch_id != batch.id || request.asset != asset_for_chain(batch.chain) {
             return Err(SettlementError::Invariant("signer request batch binding"));
         }
-        let execution = boundary
-            .signer
-            .prepare_exact(&request)
-            .await
-            .map_err(|failure| SettlementError::Boundary {
-                chain: batch.chain,
-                failure,
-            })?;
+        let execution = match boundary.signer.prepare_exact(&request).await {
+            Ok(execution) => execution,
+            Err(BoundaryFailure::Rejected) => {
+                self.store.cancel_rejected_signing(batch.id).await?;
+                return Ok(ResumeOutcome::Terminal {
+                    batch_id: batch.id,
+                    state: PayoutBatchState::Cancelled,
+                });
+            }
+            Err(failure) => {
+                return Err(SettlementError::Boundary {
+                    chain: batch.chain,
+                    failure,
+                });
+            }
+        };
         execution.validate_against(&request)?;
         let artifact = execution.as_store_artifact(batch.chain);
         self.store.mark_signed(&artifact).await?;
@@ -1077,6 +1102,35 @@ mod tests {
                     .get(&batch_id)
                     .cloned()
                     .ok_or(SettlementError::Invariant("fake signer request"))
+            })
+        }
+
+        fn cancel_rejected_signing(&self, batch_id: Uuid) -> SettlementFuture<'_, ()> {
+            Box::pin(async move {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| SettlementError::Invariant("fake store lock"))?;
+                let key = state
+                    .batches
+                    .iter()
+                    .find_map(|(key, batch)| (batch.id == batch_id).then_some(*key))
+                    .ok_or(SettlementError::Invariant("fake batch"))?;
+                let batch = state
+                    .batches
+                    .get_mut(&key)
+                    .ok_or(SettlementError::Invariant("fake batch"))?;
+                if batch.state == PayoutBatchState::Cancelled {
+                    return Ok(());
+                }
+                if batch.state != PayoutBatchState::Signing {
+                    return Err(SettlementError::Invariant(
+                        "fake rejected signing transition",
+                    ));
+                }
+                batch.state = PayoutBatchState::Cancelled;
+                state.transitions.push("cancelled");
+                Ok(())
             })
         }
 
@@ -1588,6 +1642,82 @@ mod tests {
         assert_eq!(
             state.batches[&ChainKey::Wec].state,
             PayoutBatchState::Signed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_pre_sign_rejection_cancels_and_never_broadcasts(
+    ) -> Result<(), SettlementError> {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(vec![Err(BoundaryFailure::Rejected)])?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.batches.insert(ChainKey::Wec, batch(&request));
+            state.requests.insert(request.batch_id, request.clone());
+        }
+
+        assert_eq!(
+            fixture.orchestrator.resume_next(Chain::Wcash).await?,
+            ResumeOutcome::Terminal {
+                batch_id: request.batch_id,
+                state: PayoutBatchState::Cancelled,
+            }
+        );
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        let state = fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.transitions, ["signing", "cancelled"]);
+        assert_eq!(
+            state.batches[&ChainKey::Wec].state,
+            PayoutBatchState::Cancelled
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_releases_empty_signing_after_explicit_rejection() -> Result<(), SettlementError>
+    {
+        let request = request(Asset::Wec);
+        let fixture = Fixture::new(vec![Err(BoundaryFailure::Rejected)])?;
+        {
+            let mut state = fixture
+                .store
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut payout = batch(&request);
+            payout.state = PayoutBatchState::Signing;
+            state.batches.insert(ChainKey::Wec, payout);
+            state.requests.insert(request.batch_id, request.clone());
+        }
+
+        assert_eq!(
+            fixture
+                .orchestrator
+                .recover_before_wallet_reconciliation(Chain::Wcash)
+                .await?,
+            ReconciliationGate::Safe
+        );
+        assert_eq!(fixture.wec_signer.recovery_calls(), [request.clone()]);
+        assert_eq!(fixture.wec_signer.calls(), [request]);
+        assert!(fixture.wec_broadcaster.calls().is_empty());
+        let state = fixture
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.transitions, ["cancelled"]);
+        assert_eq!(
+            state.batches[&ChainKey::Wec].state,
+            PayoutBatchState::Cancelled
         );
         Ok(())
     }

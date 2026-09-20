@@ -1975,12 +1975,13 @@ impl PostgresStore {
                      AND pending.account_id=e.account_id AND pending.chain=$2 \
                      AND pending.state='pending') \
              GROUP BY e.account_id,d.id,d.address,d.receiver_kind,d.payout_threshold_zat,paid.last_payout_at \
-             HAVING -SUM(e.amount_zat) >= d.payout_threshold_zat \
+             HAVING -SUM(e.amount_zat) >= GREATEST(d.payout_threshold_zat,$4) \
              ORDER BY paid.last_payout_at ASC NULLS FIRST,e.account_id LIMIT $3",
         )
         .bind(self.identity.id)
         .bind(chain.as_str())
         .bind(maximum_outputs)
+        .bind(as_i64(minimum_payout_zat)?)
         .fetch_all(&mut *transaction)
         .await?;
         if rows.is_empty() {
@@ -2877,6 +2878,68 @@ impl PostgresStore {
             self.identity.id,
             batch_id,
             PayoutBatchState::Draft,
+            PayoutBatchState::Cancelled,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Cancels an authorized signing batch only after the signer explicitly
+    /// rejected it before creating transaction bytes, and releases every
+    /// reserved miner liability. This transition is intentionally separate
+    /// from draft cancellation: callers must have crossed the durable signing
+    /// fence and obtained an unambiguous pre-sign rejection from the signer.
+    pub async fn cancel_rejected_payout_signing(&self, batch_id: Uuid) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let batch = load_payout_batch(&mut transaction, self.identity.id, batch_id).await?;
+        if batch.state == PayoutBatchState::Cancelled {
+            transaction.rollback().await?;
+            return Ok(());
+        }
+        if batch.state != PayoutBatchState::Signing {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        let has_external_facts = sqlx::query_scalar::<_, bool>(
+            "SELECT unsigned_digest IS NOT NULL OR transaction_id IS NOT NULL \
+                    OR signed_transaction IS NOT NULL OR network_fee_zat IS NOT NULL \
+               FROM payout_batches WHERE deployment_id=$1 AND id=$2",
+        )
+        .bind(self.identity.id)
+        .bind(batch_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_external_facts {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        let mut entries = Vec::with_capacity(batch.outputs.len() * 2);
+        for output in &batch.outputs {
+            entries.push((
+                Some(output.account_id),
+                "payout_pending".to_owned(),
+                as_i64(output.liability_amount_zat)?,
+            ));
+            entries.push((
+                Some(output.account_id),
+                "miner_payable".to_owned(),
+                -as_i64(output.liability_amount_zat)?,
+            ));
+        }
+        insert_owned_ledger_transaction(
+            &mut transaction,
+            self.identity.id,
+            batch.chain,
+            "payout_released",
+            None,
+            &batch_id.to_string(),
+            &entries,
+        )
+        .await?;
+        update_payout_state(
+            &mut transaction,
+            self.identity.id,
+            batch_id,
+            PayoutBatchState::Signing,
             PayoutBatchState::Cancelled,
         )
         .await?;

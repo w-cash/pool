@@ -58,7 +58,7 @@ fn policy(chain: Chain) -> ChainPolicy {
         required_confirmations: 100,
         payout_confirmations: 3,
         maximum_payout_outputs: 1,
-        minimum_payout_zat: 1_000_000_000_000,
+        minimum_payout_zat: 1,
         maximum_payout_zat: 1_000_000_000_000,
         payout_skip_bps: 0,
         maximum_network_fee_zat: 1_000_000,
@@ -475,6 +475,59 @@ async fn assert_due_preferences_survive_empty_payout_selection(
         );
         assert_eq!(after.wallet_spendable_zat, before.wallet_spendable_zat);
     }
+}
+
+async fn assert_pool_minimum_overrides_destination_threshold(
+    database_url: &str,
+    admin: &sqlx::PgPool,
+) {
+    let minimum_store = PostgresStore::connect(database_url, 2, identity(103))
+        .await
+        .expect("minimum-payout deployment connects");
+    minimum_store
+        .bind_deployment()
+        .await
+        .expect("minimum-payout deployment binds");
+    let mut wcash_policy = policy(Chain::Wcash);
+    wcash_policy.minimum_payout_zat = 100;
+    minimum_store
+        .bind_zero_fee_launch_policies(&wcash_policy, &policy(Chain::Zcash))
+        .await
+        .expect("minimum-payout policies bind");
+    let account_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts (deployment_id,id,login) VALUES ($1,$2,'minimum_owner')")
+        .bind(minimum_store.deployment_id())
+        .bind(account_id)
+        .execute(admin)
+        .await
+        .expect("minimum-payout account seeds");
+    insert_destination(&minimum_store, admin, account_id, Chain::Wcash)
+        .await
+        .expect("minimum-payout destination seeds");
+    credit_payable(&minimum_store, admin, account_id, Chain::Wcash, 99)
+        .await
+        .expect("sub-minimum liability seeds");
+    let below = reconcile_wallet(&minimum_store, admin, Chain::Wcash)
+        .await
+        .expect("sub-minimum liability reconciles");
+    assert!(matches!(
+        minimum_store
+            .create_payout_batch(Chain::Wcash, Uuid::new_v4(), below.id)
+            .await,
+        Err(StoreError::NoPayableBalances)
+    ));
+
+    credit_payable(&minimum_store, admin, account_id, Chain::Wcash, 1)
+        .await
+        .expect("minimum liability completes");
+    let eligible = reconcile_wallet(&minimum_store, admin, Chain::Wcash)
+        .await
+        .expect("minimum liability reconciles");
+    let batch = minimum_store
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), eligible.id)
+        .await
+        .expect("pool-wide minimum permits the exact threshold");
+    assert_eq!(batch.miner_total_zat, 100);
 }
 
 async fn assert_full_balance_payout_is_miner_fee_funded(
@@ -2423,6 +2476,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_full_balance_payout_is_miner_fee_funded(&database_url, &admin, Chain::Wcash, 81).await;
     assert_full_balance_payout_is_miner_fee_funded(&database_url, &admin, Chain::Zcash, 82).await;
     assert_due_preferences_survive_empty_payout_selection(&database_url, &admin).await;
+    assert_pool_minimum_overrides_destination_threshold(&database_url, &admin).await;
     assert_database_privilege_boundaries(&admin, &database_url).await;
     assert_winner_depth_regression_is_reversible(&admin, &database_url).await;
     let mut mismatched_identity = store_identity.clone();
@@ -3693,6 +3747,14 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         store.cancel_payout_draft(second_wec_batch.id).await,
         Err(StoreError::InvalidPayoutTransition)
     ));
+    store
+        .cancel_rejected_payout_signing(second_wec_batch.id)
+        .await
+        .expect("explicit pre-sign rejection releases the signing batch");
+    store
+        .cancel_rejected_payout_signing(second_wec_batch.id)
+        .await
+        .expect("rejected signing release is idempotent");
     let payout_states =
         sqlx::query("SELECT id,state FROM payout_batches WHERE deployment_id=$1 ORDER BY chain")
             .bind(store.deployment_id())
@@ -3708,7 +3770,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     }));
     assert!(payout_states.iter().any(|row| {
         row.get::<Uuid, _>("id") == second_wec_batch.id
-            && row.get::<String, _>("state") == "signing"
+            && row.get::<String, _>("state") == "cancelled"
     }));
 
     assert!(store
