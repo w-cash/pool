@@ -547,6 +547,7 @@ fn chain_policy(chain: Chain, config: &ChainRuntimePolicy) -> ChainPolicy {
         payout_threshold_zat: config.payout_threshold_zat,
         required_confirmations: config.required_confirmations,
         maximum_payout_outputs: config.maximum_payout_outputs,
+        maximum_payout_zat: config.maximum_payout_zat,
         maximum_network_fee_zat: config.maximum_network_fee_zat,
         maximum_network_fee_bps: config.maximum_network_fee_bps,
         policy_version: config.policy_version,

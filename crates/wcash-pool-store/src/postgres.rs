@@ -569,6 +569,8 @@ pub struct ChainPolicy {
     pub required_confirmations: u32,
     /// Maximum deterministic outputs reserved into one payout transaction.
     pub maximum_payout_outputs: u32,
+    /// Maximum gross liability reserved for one account in one payout transaction.
+    pub maximum_payout_zat: u64,
     /// Absolute network-fee ceiling accepted from the isolated signer.
     pub maximum_network_fee_zat: u64,
     /// Relative network-fee ceiling against frozen gross miner liabilities.
@@ -586,6 +588,7 @@ impl ChainPolicy {
             || self.required_confirmations > 1_000_000
             || !(1..=u32::try_from(wcash_pool_portal::MAX_PAYOUT_OUTPUTS).unwrap_or(u32::MAX))
                 .contains(&self.maximum_payout_outputs)
+            || self.maximum_payout_zat == 0
             || self.maximum_network_fee_bps == 0
             || self.maximum_network_fee_bps > 1_000
             || self.policy_version == 0
@@ -1264,8 +1267,8 @@ impl PostgresStore {
         sqlx::query(
             "INSERT INTO chain_policies \
              (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations, \
-              maximum_payout_outputs,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
-             VALUES ($1,$2,CAST($3 AS NUMERIC),$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",
+              maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
+             VALUES ($1,$2,CAST($3 AS NUMERIC),$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING",
         )
         .bind(self.identity.id)
         .bind(policy.chain.as_str())
@@ -1274,6 +1277,7 @@ impl PostgresStore {
         .bind(as_i64(policy.payout_threshold_zat)?)
         .bind(i32::try_from(policy.required_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
         .bind(i32::try_from(policy.maximum_payout_outputs).map_err(|_| StoreError::InvalidChainPolicy)?)
+        .bind(as_i64(policy.maximum_payout_zat)?)
         .bind(as_i64(policy.maximum_network_fee_zat)?)
         .bind(i32::from(policy.maximum_network_fee_bps))
         .bind(i64::try_from(policy.policy_version).map_err(|_| StoreError::InvalidChainPolicy)?)
@@ -1321,8 +1325,8 @@ impl PostgresStore {
             sqlx::query(
                 "INSERT INTO chain_policies \
                  (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations, \
-                  maximum_payout_outputs,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
-                 VALUES ($1,$2,CAST($3 AS NUMERIC),0,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+                  maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
+                 VALUES ($1,$2,CAST($3 AS NUMERIC),0,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",
             )
             .bind(self.identity.id)
             .bind(policy.chain.as_str())
@@ -1330,6 +1334,7 @@ impl PostgresStore {
             .bind(as_i64(policy.payout_threshold_zat)?)
             .bind(i32::try_from(policy.required_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
             .bind(i32::try_from(policy.maximum_payout_outputs).map_err(|_| StoreError::InvalidChainPolicy)?)
+            .bind(as_i64(policy.maximum_payout_zat)?)
             .bind(as_i64(policy.maximum_network_fee_zat)?)
             .bind(i32::from(policy.maximum_network_fee_bps))
             .bind(i64::try_from(policy.policy_version).map_err(|_| StoreError::InvalidChainPolicy)?)
@@ -1388,7 +1393,7 @@ impl PostgresStore {
     pub async fn chain_policy(&self, chain: Chain) -> Result<Option<ChainPolicy>, StoreError> {
         let row = sqlx::query(
             "SELECT pplns_window_work::TEXT AS pplns_window_work,fee_bps,\
-                    payout_threshold_zat,required_confirmations,maximum_payout_outputs, \
+                    payout_threshold_zat,required_confirmations,maximum_payout_outputs,maximum_payout_zat, \
                     maximum_network_fee_zat,maximum_network_fee_bps,policy_version \
              FROM chain_policies WHERE deployment_id=$1 AND chain=$2",
         )
@@ -1415,6 +1420,8 @@ impl PostgresStore {
                     row.try_get::<i32, _>("maximum_payout_outputs")?,
                 )
                 .map_err(|_| StoreError::CorruptDatabaseState("maximum payout outputs"))?,
+                maximum_payout_zat: u64::try_from(row.try_get::<i64, _>("maximum_payout_zat")?)
+                    .map_err(|_| StoreError::CorruptDatabaseState("maximum payout value"))?,
                 maximum_network_fee_zat: u64::try_from(
                     row.try_get::<i64, _>("maximum_network_fee_zat")?,
                 )
@@ -1862,7 +1869,7 @@ impl PostgresStore {
             return Err(StoreError::WalletReconciliationStale);
         }
         let policy = sqlx::query(
-            "SELECT maximum_payout_outputs,maximum_network_fee_zat, \
+            "SELECT maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat, \
                     maximum_network_fee_bps,policy_version FROM chain_policies \
              WHERE deployment_id=$1 AND chain=$2",
         )
@@ -1872,6 +1879,8 @@ impl PostgresStore {
         .await?
         .ok_or(StoreError::MissingChainPolicy(chain))?;
         let maximum_outputs = policy.try_get::<i32, _>("maximum_payout_outputs")?;
+        let maximum_payout_zat = u64::try_from(policy.try_get::<i64, _>("maximum_payout_zat")?)
+            .map_err(|_| StoreError::CorruptDatabaseState("maximum payout value"))?;
         let absolute_fee_limit =
             u64::try_from(policy.try_get::<i64, _>("maximum_network_fee_zat")?)
                 .map_err(|_| StoreError::CorruptDatabaseState("maximum network fee"))?;
@@ -1916,7 +1925,8 @@ impl PostgresStore {
         let mut total = 0u64;
         for row in rows {
             let amount_zat = u64::try_from(row.try_get::<i64, _>("amount_zat")?)
-                .map_err(|_| StoreError::MoneyOverflow)?;
+                .map_err(|_| StoreError::MoneyOverflow)?
+                .min(maximum_payout_zat);
             total = total
                 .checked_add(amount_zat)
                 .ok_or(StoreError::MoneyOverflow)?;

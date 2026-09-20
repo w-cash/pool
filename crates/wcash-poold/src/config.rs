@@ -170,6 +170,8 @@ pub struct ChainRuntimePolicy {
     pub required_confirmations: u32,
     /// Maximum recipients in one deterministic batch.
     pub maximum_payout_outputs: u32,
+    /// Maximum gross amount paid to one account in one transaction.
+    pub maximum_payout_zat: u64,
     /// Absolute transaction fee ceiling.
     pub maximum_network_fee_zat: u64,
     /// Relative transaction fee ceiling in basis points.
@@ -185,6 +187,7 @@ struct RawChainPolicy {
     payout_threshold_zat: u64,
     required_confirmations: u32,
     maximum_payout_outputs: u32,
+    maximum_payout_zat: u64,
     maximum_network_fee_zat: u64,
     maximum_network_fee_bps: u16,
     policy_version: u64,
@@ -568,6 +571,7 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
         || raw.payout_threshold_zat == 0
         || !(100..=1_000_000).contains(&raw.required_confirmations)
         || !(1..=200).contains(&raw.maximum_payout_outputs)
+        || raw.maximum_payout_zat == 0
         || raw.maximum_network_fee_zat == 0
         || !(1..=1_000).contains(&raw.maximum_network_fee_bps)
         || raw.policy_version == 0
@@ -579,6 +583,7 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
         payout_threshold_zat: raw.payout_threshold_zat,
         required_confirmations: raw.required_confirmations,
         maximum_payout_outputs: raw.maximum_payout_outputs,
+        maximum_payout_zat: raw.maximum_payout_zat,
         maximum_network_fee_zat: raw.maximum_network_fee_zat,
         maximum_network_fee_bps: raw.maximum_network_fee_bps,
         policy_version: raw.policy_version,
@@ -875,6 +880,7 @@ pplns_window_work = "1000000"
 payout_threshold_zat = 100000000
 required_confirmations = 100
 maximum_payout_outputs = 50
+maximum_payout_zat = 100000000
 maximum_network_fee_zat = 1000000
 maximum_network_fee_bps = 100
 policy_version = 1
@@ -884,6 +890,7 @@ pplns_window_work = "1000000"
 payout_threshold_zat = 100000000
 required_confirmations = 100
 maximum_payout_outputs = 50
+maximum_payout_zat = 100000000
 maximum_network_fee_zat = 1000000
 maximum_network_fee_bps = 100
 policy_version = 1
