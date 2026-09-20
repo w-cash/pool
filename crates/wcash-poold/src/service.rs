@@ -1156,6 +1156,11 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
         payout.wcash_lightwalletd_endpoint.clone(),
     )
     .map_err(|_| ServiceError::SignerConfiguration)?;
+    let wallet = if config.network == ChainNetwork::Mainnet {
+        wallet.with_mainnet_network()
+    } else {
+        wallet
+    };
     #[cfg(feature = "regtest")]
     let wallet = if config.network == ChainNetwork::Regtest {
         wallet.with_regtest_network()
@@ -1229,6 +1234,9 @@ async fn build_payout_services(
             payout.wcash_lightwalletd_endpoint.clone(),
         )
         .map(|wallet| {
+            if config.network == ChainNetwork::Mainnet {
+                return wallet.with_mainnet_network();
+            }
             #[cfg(feature = "regtest")]
             if config.network == ChainNetwork::Regtest {
                 return wallet.with_regtest_network();

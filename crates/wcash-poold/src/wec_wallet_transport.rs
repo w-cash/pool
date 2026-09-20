@@ -23,7 +23,8 @@ use wcash_wec_payout_signer::{
     BroadcastDisposition, BroadcastFailure, BroadcastOutcome, NativeWalletError,
     NativeWalletTransport, PersistedIntent, SecretSeed, WalletBroadcastCall, WalletFundSource,
     WalletIdentity, WalletInspectionCall, WalletNetwork, WalletOutput, WalletRecoveryCall,
-    WalletSignCall, WalletSignedTransaction, WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
+    WalletSignCall, WalletSignedTransaction, WCASH_MAINNET_BRANCH_ID, WCASH_MAINNET_GENESIS_HASH,
+    WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
 };
 use zeroize::Zeroizing;
 
@@ -169,7 +170,7 @@ pub struct WolfWalletTransport {
 }
 
 impl WolfWalletTransport {
-    /// Creates a Testnet-only subprocess boundary.
+    /// Creates a subprocess boundary which defaults to the frozen Testnet domain.
     pub fn new(
         program: PinnedWolfProgram,
         wallet_database: impl Into<PathBuf>,
@@ -188,6 +189,12 @@ impl WolfWalletTransport {
             invocation_lock: Arc::new(Mutex::new(())),
             network: WalletNetwork::Testnet,
         })
+    }
+
+    /// Selects the frozen public Wcash Mainnet identity.
+    pub fn with_mainnet_network(mut self) -> Self {
+        self.network = WalletNetwork::Mainnet;
+        self
     }
 
     /// Selects the isolated wallet CLI network in integration builds.
@@ -744,6 +751,12 @@ fn parse_wire_identity(bytes: &[u8]) -> Result<WalletIdentity, NativeWalletError
 
 fn parse_identity(identity: WireIdentity) -> Result<WalletIdentity, NativeWalletError> {
     let network = match identity.network.as_str() {
+        "mainnet"
+            if identity.genesis_hash == WCASH_MAINNET_GENESIS_HASH
+                && identity.branch_id == WCASH_MAINNET_BRANCH_ID =>
+        {
+            WalletNetwork::Mainnet
+        }
         "testnet"
             if identity.genesis_hash == WCASH_TESTNET_GENESIS_HASH
                 && identity.branch_id == WCASH_TESTNET_BRANCH_ID =>
@@ -1300,6 +1313,39 @@ mod tests {
             .remove("collector_payout_commitment");
         assert_eq!(
             parse_wire_identity(&serde_json::to_vec(&missing).unwrap()),
+            Err(NativeWalletError::ProtocolViolation)
+        );
+    }
+
+    #[test]
+    fn payout_v2_identity_accepts_only_the_frozen_mainnet_domain() {
+        let valid = WireIdentity {
+            protocol_version: WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
+            network: "mainnet".to_owned(),
+            genesis_hash: WCASH_MAINNET_GENESIS_HASH.to_owned(),
+            branch_id: WCASH_MAINNET_BRANCH_ID.to_owned(),
+            account_id: "10000000-0000-4000-8000-000000000001".to_owned(),
+            collector_payout_commitment: "66".repeat(32),
+            fund_source: "ironwood".to_owned(),
+            synchronized: true,
+        };
+        assert_eq!(
+            parse_identity(valid).unwrap().network,
+            WalletNetwork::Mainnet
+        );
+
+        let crossed = WireIdentity {
+            protocol_version: WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
+            network: "mainnet".to_owned(),
+            genesis_hash: WCASH_TESTNET_GENESIS_HASH.to_owned(),
+            branch_id: WCASH_MAINNET_BRANCH_ID.to_owned(),
+            account_id: "10000000-0000-4000-8000-000000000001".to_owned(),
+            collector_payout_commitment: "66".repeat(32),
+            fund_source: "ironwood".to_owned(),
+            synchronized: true,
+        };
+        assert_eq!(
+            parse_identity(crossed),
             Err(NativeWalletError::ProtocolViolation)
         );
     }

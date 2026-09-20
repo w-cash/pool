@@ -13,8 +13,8 @@ use uuid::Uuid;
 use wcash_pool_protocol::MAX_CHAIN_VALUE_ZAT;
 use wcash_pool_store::{Chain, PostgresStore, StoreError, WalletObservation, WalletReconciliation};
 use wcash_wec_payout_signer::{
-    NativeWalletError, WalletFundSource, WalletNetwork, WCASH_TESTNET_BRANCH_ID,
-    WCASH_TESTNET_GENESIS_HASH,
+    NativeWalletError, WalletFundSource, WalletNetwork, WCASH_MAINNET_BRANCH_ID,
+    WCASH_MAINNET_GENESIS_HASH, WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
 };
 
 use crate::wec_wallet_transport::{WolfWalletTransport, WCASH_WALLET_SUCCESS_PROTOCOL_VERSION};
@@ -32,7 +32,7 @@ struct ObservationAuthority {
     payout_commitment: [u8; 32],
 }
 
-/// Integrity-pinned, Testnet-only Wcash collector observer.
+/// Integrity-pinned Wcash collector observer.
 #[derive(Clone, Debug)]
 pub struct WcashWalletObserver {
     wallet: WolfWalletTransport,
@@ -43,7 +43,7 @@ pub struct WcashWalletObserver {
 
 impl WcashWalletObserver {
     /// Binds an already verified Wolf executable to the exact configured wallet
-    /// and Wcash Testnet consensus identity.
+    /// and the selected frozen Wcash consensus identity.
     ///
     /// `genesis_hash_wire` is the backend/configuration byte order. It is
     /// deliberately reversed before comparison with Wolf's conventional
@@ -69,15 +69,23 @@ impl WcashWalletObserver {
         let genesis_hash = hex::encode(genesis_hash_display);
         let branch_id = branch_id.into();
         let valid_network = match network {
+            WalletNetwork::Mainnet => {
+                genesis_hash == WCASH_MAINNET_GENESIS_HASH && branch_id == WCASH_MAINNET_BRANCH_ID
+            }
             WalletNetwork::Testnet => {
                 genesis_hash == WCASH_TESTNET_GENESIS_HASH && branch_id == WCASH_TESTNET_BRANCH_ID
             }
-            #[cfg(feature = "regtest")]
             WalletNetwork::Regtest => {
-                genesis_hash == wcash_wec_payout_signer::WCASH_REGTEST_GENESIS_HASH
-                    && branch_id == wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID
+                #[cfg(feature = "regtest")]
+                {
+                    genesis_hash == wcash_wec_payout_signer::WCASH_REGTEST_GENESIS_HASH
+                        && branch_id == wcash_wec_payout_signer::WCASH_REGTEST_BRANCH_ID
+                }
+                #[cfg(not(feature = "regtest"))]
+                {
+                    false
+                }
             }
-            _ => false,
         };
         if !valid_network
             || account_id.is_nil()
@@ -247,9 +255,9 @@ fn parse_canonical_hex32(value: &str) -> Option<[u8; 32]> {
 /// Invalid static authority for the Wcash wallet observer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum WcashObservationConfigError {
-    /// Only the frozen Wcash Testnet, configured collector account, and
+    /// Only a frozen Wcash network, configured collector account, and
     /// Ironwood source are accepted by this release.
-    #[error("Wcash observation authority does not match the frozen Testnet policy")]
+    #[error("Wcash observation authority does not match the frozen network policy")]
     AuthorityMismatch,
 }
 
@@ -284,13 +292,14 @@ mod tests {
     const ACCOUNT: &str = "10000000-0000-4000-8000-000000000001";
     const PAYOUT_COMMITMENT: [u8; 32] = [0x6a; 32];
 
-    fn genesis_wire() -> [u8; 32] {
-        let mut bytes: [u8; 32] = hex::decode(WCASH_TESTNET_GENESIS_HASH)
-            .unwrap()
-            .try_into()
-            .unwrap();
+    fn genesis_wire_for(display_hash: &str) -> [u8; 32] {
+        let mut bytes: [u8; 32] = hex::decode(display_hash).unwrap().try_into().unwrap();
         bytes.reverse();
         bytes
+    }
+
+    fn genesis_wire() -> [u8; 32] {
+        genesis_wire_for(WCASH_TESTNET_GENESIS_HASH)
     }
 
     fn valid_response() -> Value {
@@ -416,6 +425,38 @@ mod tests {
                 Err(WcashObservationConfigError::AuthorityMismatch)
             ));
         }
+    }
+
+    #[test]
+    fn constructor_accepts_only_the_frozen_mainnet_authority() {
+        let (_directory, _program, valid) = fixture_observer("printf '{}'");
+        let account = Uuid::parse_str(ACCOUNT).unwrap();
+        let observer = WcashWalletObserver::new(
+            valid.wallet.clone().with_mainnet_network(),
+            WalletNetwork::Mainnet,
+            genesis_wire_for(WCASH_MAINNET_GENESIS_HASH),
+            WCASH_MAINNET_BRANCH_ID,
+            account,
+            WalletFundSource::Ironwood,
+            PAYOUT_COMMITMENT,
+            Duration::from_secs(5),
+            16,
+        );
+        assert!(observer.is_ok());
+        assert!(matches!(
+            WcashWalletObserver::new(
+                valid.wallet.with_mainnet_network(),
+                WalletNetwork::Mainnet,
+                genesis_wire_for(WCASH_TESTNET_GENESIS_HASH),
+                WCASH_MAINNET_BRANCH_ID,
+                account,
+                WalletFundSource::Ironwood,
+                PAYOUT_COMMITMENT,
+                Duration::from_secs(5),
+                16,
+            ),
+            Err(WcashObservationConfigError::AuthorityMismatch)
+        ));
     }
 
     #[cfg(unix)]
