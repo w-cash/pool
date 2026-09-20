@@ -4378,7 +4378,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
           observed_at,valid_until,status,created_at) \
          SELECT deployment_id,$2,chain,ledger_root,ledger_transaction_count,wallet_state_digest, \
                 wallet_spendable_zat,ledger_spendable_zat,best_tip_hash,best_tip_height, \
-                observed_at,valid_until,status,clock_timestamp() - INTERVAL '31 seconds' \
+                observed_at,valid_until,status,clock_timestamp() - INTERVAL '181 seconds' \
          FROM wallet_reconciliations \
          WHERE deployment_id=$1 AND chain='wcash' AND status='mismatch' \
          ORDER BY created_at DESC LIMIT 1",
