@@ -35,6 +35,7 @@ const PUBLIC_PROJECTION_POLL: Duration = Duration::from_millis(25);
 const MAX_PPLNS_SHARES: i64 = 100_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
+const WALLET_RECONCILIATION_MISMATCH_GRACE_SECS: u64 = 30;
 const EXPIRED_SESSION_CLEANUP_BATCH: u32 = 128;
 const MAX_EXPIRED_SESSION_CLEANUP_BATCH: u32 = 1_024;
 const MIN_PAYOUT_WORKER_LEASE_SECS: u64 = 1;
@@ -1734,7 +1735,9 @@ impl PostgresStore {
 
     /// Records one short-lived, chain-specific wallet reconciliation. The
     /// ledger root and checkpoint UUID are always derived inside this store.
-    /// A mismatch is committed as durable evidence and freezes new payouts.
+    /// A mismatch is committed as durable evidence. New payouts are deferred
+    /// during a bounded projector catch-up window, then frozen if the same
+    /// wallet/ledger balance mismatch persists.
     pub async fn record_wallet_reconciliation(
         &self,
         observation: &WalletObservation,
@@ -1789,8 +1792,30 @@ impl PostgresStore {
 
         let snapshot =
             ledger_snapshot(&mut transaction, self.identity.id, observation.chain, None).await?;
-        let checkpoint_id = Uuid::new_v4();
         let matched = snapshot.collector_spendable_zat == observation.wallet_spendable_zat;
+        let persistent_mismatch = if matched {
+            false
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM wallet_reconciliations \
+                 WHERE deployment_id=$1 AND chain=$2 AND status='mismatch' \
+                   AND ledger_root=$3 \
+                   AND wallet_spendable_zat=$4 AND ledger_spendable_zat=$5 \
+                   AND created_at <= clock_timestamp() - ($6 * INTERVAL '1 second'))",
+            )
+            .bind(self.identity.id)
+            .bind(observation.chain.as_str())
+            .bind(snapshot.root.as_slice())
+            .bind(as_i64(observation.wallet_spendable_zat)?)
+            .bind(as_i64(snapshot.collector_spendable_zat)?)
+            .bind(
+                i64::try_from(WALLET_RECONCILIATION_MISMATCH_GRACE_SECS)
+                    .map_err(|_| StoreError::CollectorReconciliationFailed)?,
+            )
+            .fetch_one(&mut *transaction)
+            .await?
+        };
+        let checkpoint_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wallet_reconciliations \
              (deployment_id,id,chain,ledger_root,ledger_transaction_count,wallet_state_digest, \
@@ -1815,6 +1840,10 @@ impl PostgresStore {
         .await?;
 
         if !matched {
+            if !persistent_mismatch {
+                transaction.commit().await?;
+                return Err(StoreError::WalletReconciliationPending);
+            }
             sqlx::query(
                 "SELECT public.freeze_chain_payouts_v1( \
                      $1,$2,$3,'wallet_reconciliation_mismatch')",
@@ -5755,6 +5784,9 @@ pub enum StoreError {
     /// Reconciliation expired, belongs to another chain, or no longer matches the ledger.
     #[error("wallet reconciliation no longer matches the current ledger")]
     WalletReconciliationStale,
+    /// A wallet mismatch is blocking payouts during the bounded projector catch-up window.
+    #[error("wallet reconciliation is waiting for the accounting projector")]
+    WalletReconciliationPending,
     /// The payout-worker identity or database-clock lease duration was invalid.
     #[error("invalid isolated payout-worker lease")]
     InvalidPayoutWorkerLease,

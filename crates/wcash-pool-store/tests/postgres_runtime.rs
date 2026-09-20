@@ -4338,17 +4338,59 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
             .expect("database clock reads"),
     )
     .expect("database clock is positive");
+    let mismatched_observation = WalletObservation {
+        chain: Chain::Wcash,
+        wallet_state_digest: [0xc1; 32],
+        wallet_spendable_zat: 12,
+        best_tip_hash: [0xc2; 32],
+        best_tip_height: 60_000,
+        observed_at: database_now,
+        valid_until: database_now + 240,
+    };
     assert!(matches!(
         stale_store
-            .record_wallet_reconciliation(&WalletObservation {
-                chain: Chain::Wcash,
-                wallet_state_digest: [0xc1; 32],
-                wallet_spendable_zat: 12,
-                best_tip_hash: [0xc2; 32],
-                best_tip_height: 60_000,
-                observed_at: database_now,
-                valid_until: database_now + 240,
-            })
+            .record_wallet_reconciliation(&mismatched_observation)
+            .await,
+        Err(StoreError::WalletReconciliationPending)
+    ));
+    let pending_mismatch_state = sqlx::query(
+        "SELECT s.payouts_frozen,s.freeze_reason, \
+                (SELECT COUNT(*) FROM wallet_reconciliations r \
+                  WHERE r.deployment_id=s.deployment_id AND r.chain=s.chain \
+                    AND r.status='mismatch') AS mismatch_count \
+         FROM chain_safety_state s WHERE s.deployment_id=$1 AND s.chain='wcash'",
+    )
+    .bind(stale_store.deployment_id())
+    .fetch_one(&admin)
+    .await
+    .expect("pending wallet mismatch audit state reads");
+    assert!(!pending_mismatch_state.get::<bool, _>("payouts_frozen"));
+    assert_eq!(
+        pending_mismatch_state.get::<Option<String>, _>("freeze_reason"),
+        None
+    );
+    assert_eq!(pending_mismatch_state.get::<i64, _>("mismatch_count"), 1);
+
+    sqlx::query(
+        "INSERT INTO wallet_reconciliations \
+         (deployment_id,id,chain,ledger_root,ledger_transaction_count,wallet_state_digest, \
+          wallet_spendable_zat,ledger_spendable_zat,best_tip_hash,best_tip_height, \
+          observed_at,valid_until,status,created_at) \
+         SELECT deployment_id,$2,chain,ledger_root,ledger_transaction_count,wallet_state_digest, \
+                wallet_spendable_zat,ledger_spendable_zat,best_tip_hash,best_tip_height, \
+                observed_at,valid_until,status,clock_timestamp() - INTERVAL '31 seconds' \
+         FROM wallet_reconciliations \
+         WHERE deployment_id=$1 AND chain='wcash' AND status='mismatch' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(stale_store.deployment_id())
+    .bind(Uuid::new_v4())
+    .execute(&admin)
+    .await
+    .expect("persistent wallet mismatch audit fact seeds");
+    assert!(matches!(
+        stale_store
+            .record_wallet_reconciliation(&mismatched_observation)
             .await,
         Err(StoreError::CollectorReconciliationFailed)
     ));
@@ -4368,7 +4410,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         mismatch_state.get::<Option<String>, _>("freeze_reason"),
         Some("wallet_reconciliation_mismatch".to_owned())
     );
-    assert_eq!(mismatch_state.get::<i64, _>("mismatch_count"), 1);
+    assert_eq!(mismatch_state.get::<i64, _>("mismatch_count"), 3);
 
     let counts = sqlx::query(
         "SELECT \

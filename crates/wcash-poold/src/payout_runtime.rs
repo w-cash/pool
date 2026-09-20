@@ -192,6 +192,7 @@ fn classify_store_error(error: StoreError) -> LifecycleStoreFailure {
     match error {
         StoreError::NoPayableBalances => LifecycleStoreFailure::NoPayableBalances,
         StoreError::WalletReconciliationBlocked
+        | StoreError::WalletReconciliationPending
         | StoreError::PrematurePayoutConfirmation { .. } => LifecycleStoreFailure::Deferred,
         StoreError::InvalidWalletObservation
         | StoreError::WalletReconciliationStale
