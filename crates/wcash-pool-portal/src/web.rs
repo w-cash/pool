@@ -276,7 +276,7 @@ fn render_index(config: &PortalConfig) -> String {
         .replace("TESTNET", "MAINNET")
         .replace("TWC", "WEC")
         .replace("Two test networks.", "Two main networks.")
-        .replace("· no monetary value", "· WEC automatic · ZEC manual")
+        .replace("· no monetary value", "· automatic payout")
         .replace("<option value=\"tls\">TLS · preferred</option>", "")
         .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
         .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3334")
@@ -1281,7 +1281,7 @@ mod tests {
         let script = render_script(&config);
 
         assert!(page.contains("ZecWec Pool — Mainnet"));
-        assert!(page.contains("· WEC automatic · ZEC manual"));
+        assert!(page.contains("· automatic payout"));
         assert!(page.contains("mainnet.zecwec.com:3334"));
         assert!(!page.contains("data-auth-mode=\"register\""));
         assert!(!page.contains("<option value=\"tls\">"));
