@@ -4,6 +4,7 @@ use std::{future::Future, pin::Pin, str::FromStr, time::Duration};
 
 use futures_util::TryStreamExt;
 use num_bigint::BigUint;
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use sqlx::{
     postgres::{PgPoolOptions, PgRow},
@@ -571,8 +572,12 @@ pub struct ChainPolicy {
     pub payout_confirmations: u32,
     /// Maximum deterministic outputs reserved into one payout transaction.
     pub maximum_payout_outputs: u32,
+    /// Minimum randomly selected gross amount for one account in a payout.
+    pub minimum_payout_zat: u64,
     /// Maximum gross liability reserved for one account in one payout transaction.
     pub maximum_payout_zat: u64,
+    /// Probability, in basis points, of deferring an eligible payout cycle.
+    pub payout_skip_bps: u16,
     /// Absolute network-fee ceiling accepted from the isolated signer.
     pub maximum_network_fee_zat: u64,
     /// Relative network-fee ceiling against frozen gross miner liabilities.
@@ -592,7 +597,10 @@ impl ChainPolicy {
             || self.payout_confirmations > self.required_confirmations
             || !(1..=u32::try_from(wcash_pool_portal::MAX_PAYOUT_OUTPUTS).unwrap_or(u32::MAX))
                 .contains(&self.maximum_payout_outputs)
+            || self.minimum_payout_zat == 0
             || self.maximum_payout_zat == 0
+            || self.minimum_payout_zat > self.maximum_payout_zat
+            || self.payout_skip_bps > 10_000
             || self.maximum_network_fee_bps == 0
             || self.maximum_network_fee_bps > 1_000
             || self.policy_version == 0
@@ -1271,8 +1279,8 @@ impl PostgresStore {
         sqlx::query(
             "INSERT INTO chain_policies \
              (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations,payout_confirmations, \
-              maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
-             VALUES ($1,$2,CAST($3 AS NUMERIC),$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING",
+              maximum_payout_outputs,minimum_payout_zat,maximum_payout_zat,payout_skip_bps,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
+             VALUES ($1,$2,CAST($3 AS NUMERIC),$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING",
         )
         .bind(self.identity.id)
         .bind(policy.chain.as_str())
@@ -1282,7 +1290,9 @@ impl PostgresStore {
         .bind(i32::try_from(policy.required_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
         .bind(i32::try_from(policy.payout_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
         .bind(i32::try_from(policy.maximum_payout_outputs).map_err(|_| StoreError::InvalidChainPolicy)?)
+        .bind(as_i64(policy.minimum_payout_zat)?)
         .bind(as_i64(policy.maximum_payout_zat)?)
+        .bind(i32::from(policy.payout_skip_bps))
         .bind(as_i64(policy.maximum_network_fee_zat)?)
         .bind(i32::from(policy.maximum_network_fee_bps))
         .bind(i64::try_from(policy.policy_version).map_err(|_| StoreError::InvalidChainPolicy)?)
@@ -1330,8 +1340,8 @@ impl PostgresStore {
             sqlx::query(
                 "INSERT INTO chain_policies \
                  (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations,payout_confirmations, \
-                  maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
-                 VALUES ($1,$2,CAST($3 AS NUMERIC),0,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING",
+                  maximum_payout_outputs,minimum_payout_zat,maximum_payout_zat,payout_skip_bps,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
+                 VALUES ($1,$2,CAST($3 AS NUMERIC),0,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING",
             )
             .bind(self.identity.id)
             .bind(policy.chain.as_str())
@@ -1340,7 +1350,9 @@ impl PostgresStore {
             .bind(i32::try_from(policy.required_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
             .bind(i32::try_from(policy.payout_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
             .bind(i32::try_from(policy.maximum_payout_outputs).map_err(|_| StoreError::InvalidChainPolicy)?)
+            .bind(as_i64(policy.minimum_payout_zat)?)
             .bind(as_i64(policy.maximum_payout_zat)?)
+            .bind(i32::from(policy.payout_skip_bps))
             .bind(as_i64(policy.maximum_network_fee_zat)?)
             .bind(i32::from(policy.maximum_network_fee_bps))
             .bind(i64::try_from(policy.policy_version).map_err(|_| StoreError::InvalidChainPolicy)?)
@@ -1399,8 +1411,8 @@ impl PostgresStore {
     pub async fn chain_policy(&self, chain: Chain) -> Result<Option<ChainPolicy>, StoreError> {
         let row = sqlx::query(
             "SELECT pplns_window_work::TEXT AS pplns_window_work,fee_bps,\
-                    payout_threshold_zat,required_confirmations,payout_confirmations,maximum_payout_outputs,maximum_payout_zat, \
-                    maximum_network_fee_zat,maximum_network_fee_bps,policy_version \
+                    payout_threshold_zat,required_confirmations,payout_confirmations,maximum_payout_outputs, \
+                    minimum_payout_zat,maximum_payout_zat,payout_skip_bps,maximum_network_fee_zat,maximum_network_fee_bps,policy_version \
              FROM chain_policies WHERE deployment_id=$1 AND chain=$2",
         )
         .bind(self.identity.id)
@@ -1428,8 +1440,12 @@ impl PostgresStore {
                     row.try_get::<i32, _>("maximum_payout_outputs")?,
                 )
                 .map_err(|_| StoreError::CorruptDatabaseState("maximum payout outputs"))?,
+                minimum_payout_zat: u64::try_from(row.try_get::<i64, _>("minimum_payout_zat")?)
+                    .map_err(|_| StoreError::CorruptDatabaseState("minimum payout value"))?,
                 maximum_payout_zat: u64::try_from(row.try_get::<i64, _>("maximum_payout_zat")?)
                     .map_err(|_| StoreError::CorruptDatabaseState("maximum payout value"))?,
+                payout_skip_bps: u16::try_from(row.try_get::<i32, _>("payout_skip_bps")?)
+                    .map_err(|_| StoreError::CorruptDatabaseState("payout skip probability"))?,
                 maximum_network_fee_zat: u64::try_from(
                     row.try_get::<i64, _>("maximum_network_fee_zat")?,
                 )
@@ -1877,8 +1893,8 @@ impl PostgresStore {
             return Err(StoreError::WalletReconciliationStale);
         }
         let policy = sqlx::query(
-            "SELECT maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat, \
-                    maximum_network_fee_bps,policy_version FROM chain_policies \
+            "SELECT maximum_payout_outputs,minimum_payout_zat,maximum_payout_zat,payout_skip_bps, \
+                    maximum_network_fee_zat,maximum_network_fee_bps,policy_version FROM chain_policies \
              WHERE deployment_id=$1 AND chain=$2",
         )
         .bind(self.identity.id)
@@ -1887,8 +1903,12 @@ impl PostgresStore {
         .await?
         .ok_or(StoreError::MissingChainPolicy(chain))?;
         let maximum_outputs = policy.try_get::<i32, _>("maximum_payout_outputs")?;
+        let minimum_payout_zat = u64::try_from(policy.try_get::<i64, _>("minimum_payout_zat")?)
+            .map_err(|_| StoreError::CorruptDatabaseState("minimum payout value"))?;
         let maximum_payout_zat = u64::try_from(policy.try_get::<i64, _>("maximum_payout_zat")?)
             .map_err(|_| StoreError::CorruptDatabaseState("maximum payout value"))?;
+        let payout_skip_bps = u16::try_from(policy.try_get::<i32, _>("payout_skip_bps")?)
+            .map_err(|_| StoreError::CorruptDatabaseState("payout skip probability"))?;
         let absolute_fee_limit =
             u64::try_from(policy.try_get::<i64, _>("maximum_network_fee_zat")?)
                 .map_err(|_| StoreError::CorruptDatabaseState("maximum network fee"))?;
@@ -1906,15 +1926,22 @@ impl PostgresStore {
              JOIN payout_destinations d \
                ON (d.deployment_id,d.account_id)=(e.deployment_id,e.account_id) \
               AND d.chain=$2 AND d.state='active' AND d.automatic \
+             LEFT JOIN ( \
+                 SELECT pi.account_id,MAX(pb.created_at) AS last_payout_at \
+                 FROM payout_items pi JOIN payout_batches pb \
+                   ON (pb.deployment_id,pb.id)=(pi.deployment_id,pi.batch_id) \
+                 WHERE pb.deployment_id=$1 AND pb.chain=$2 AND pb.state <> 'cancelled' \
+                 GROUP BY pi.account_id \
+             ) paid ON paid.account_id=e.account_id \
              WHERE e.deployment_id=$1 AND t.chain=$2 \
                AND e.ledger_account='miner_payable' \
                AND NOT EXISTS (SELECT 1 FROM payout_destinations pending \
                    WHERE pending.deployment_id=e.deployment_id \
                      AND pending.account_id=e.account_id AND pending.chain=$2 \
                      AND pending.state='pending') \
-             GROUP BY e.account_id,d.id,d.address,d.receiver_kind,d.payout_threshold_zat \
+             GROUP BY e.account_id,d.id,d.address,d.receiver_kind,d.payout_threshold_zat,paid.last_payout_at \
              HAVING -SUM(e.amount_zat) >= d.payout_threshold_zat \
-             ORDER BY e.account_id LIMIT $3",
+             ORDER BY paid.last_payout_at ASC NULLS FIRST,e.account_id LIMIT $3",
         )
         .bind(self.identity.id)
         .bind(chain.as_str())
@@ -1929,12 +1956,20 @@ impl PostgresStore {
             transaction.commit().await?;
             return Err(StoreError::NoPayableBalances);
         }
+        let Some(payout_cap_zat) =
+            random_payout_cap(minimum_payout_zat, maximum_payout_zat, payout_skip_bps)?
+        else {
+            // A privacy deferral never reserves money or mutates payout
+            // history. The next independently reconciled cycle draws again.
+            transaction.commit().await?;
+            return Err(StoreError::NoPayableBalances);
+        };
         let mut outputs = Vec::with_capacity(rows.len());
         let mut total = 0u64;
         for row in rows {
             let amount_zat = u64::try_from(row.try_get::<i64, _>("amount_zat")?)
                 .map_err(|_| StoreError::MoneyOverflow)?
-                .min(maximum_payout_zat);
+                .min(payout_cap_zat);
             total = total
                 .checked_add(amount_zat)
                 .ok_or(StoreError::MoneyOverflow)?;
@@ -3668,6 +3703,56 @@ struct SignedTransitionFacts<'a> {
     transaction_id: &'a [u8; 32],
     signed_transaction: &'a [u8],
     network_fee_zat: u64,
+}
+
+fn random_payout_cap(
+    minimum_zat: u64,
+    maximum_zat: u64,
+    skip_bps: u16,
+) -> Result<Option<u64>, StoreError> {
+    if skip_bps == 0 && minimum_zat == maximum_zat {
+        return Ok(Some(maximum_zat));
+    }
+    let mut draws = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut draws)
+        .map_err(|_| StoreError::PayoutRandomnessUnavailable)?;
+    let skip_draw = u64::from_le_bytes(
+        draws[..8]
+            .try_into()
+            .map_err(|_| StoreError::PayoutRandomnessUnavailable)?,
+    );
+    let amount_draw = u64::from_le_bytes(
+        draws[8..]
+            .try_into()
+            .map_err(|_| StoreError::PayoutRandomnessUnavailable)?,
+    );
+    payout_cap_from_draws(minimum_zat, maximum_zat, skip_bps, skip_draw, amount_draw)
+}
+
+fn payout_cap_from_draws(
+    minimum_zat: u64,
+    maximum_zat: u64,
+    skip_bps: u16,
+    skip_draw: u64,
+    amount_draw: u64,
+) -> Result<Option<u64>, StoreError> {
+    if minimum_zat == 0 || minimum_zat > maximum_zat || skip_bps > 10_000 {
+        return Err(StoreError::InvalidChainPolicy);
+    }
+    let skip_bucket = ((u128::from(skip_draw) * 10_000) >> 64) as u16;
+    if skip_bucket < skip_bps {
+        return Ok(None);
+    }
+    let span = maximum_zat
+        .checked_sub(minimum_zat)
+        .and_then(|difference| difference.checked_add(1))
+        .ok_or(StoreError::MoneyOverflow)?;
+    let offset = ((u128::from(amount_draw) * u128::from(span)) >> 64) as u64;
+    minimum_zat
+        .checked_add(offset)
+        .map(Some)
+        .ok_or(StoreError::MoneyOverflow)
 }
 
 /// Deducts one immutable fee reserve from gross account liabilities using the
@@ -5622,6 +5707,9 @@ pub enum StoreError {
     /// No active, automatic destination currently has a payable balance at its threshold.
     #[error("no payable balances meet the active payout policy")]
     NoPayableBalances,
+    /// The operating system could not supply payout scheduling entropy.
+    #[error("operating-system payout randomness is unavailable")]
+    PayoutRandomnessUnavailable,
     /// Requested payout batch did not exist in this deployment.
     #[error("payout batch does not exist")]
     UnknownPayoutBatch,
@@ -5732,6 +5820,38 @@ mod payout_fee_tests {
             liability_amount_zat: amount_zat,
             amount_zat,
         }
+    }
+
+    #[test]
+    fn payout_privacy_draw_skips_or_selects_one_persistable_cap() {
+        assert_eq!(
+            payout_cap_from_draws(100, 400, 5_000, 0, u64::MAX).unwrap(),
+            None
+        );
+        assert_eq!(
+            payout_cap_from_draws(100, 400, 5_000, u64::MAX, 0).unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            payout_cap_from_draws(100, 400, 5_000, u64::MAX, u64::MAX).unwrap(),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn payout_privacy_draw_rejects_invalid_policy() {
+        assert!(matches!(
+            payout_cap_from_draws(0, 400, 5_000, 0, 0),
+            Err(StoreError::InvalidChainPolicy)
+        ));
+        assert!(matches!(
+            payout_cap_from_draws(400, 100, 5_000, 0, 0),
+            Err(StoreError::InvalidChainPolicy)
+        ));
+        assert!(matches!(
+            payout_cap_from_draws(100, 400, 10_001, 0, 0),
+            Err(StoreError::InvalidChainPolicy)
+        ));
     }
 
     #[test]

@@ -195,6 +195,7 @@ fn classify_store_error(error: StoreError) -> LifecycleStoreFailure {
         | StoreError::PrematurePayoutConfirmation { .. } => LifecycleStoreFailure::Deferred,
         StoreError::InvalidWalletObservation
         | StoreError::WalletReconciliationStale
+        | StoreError::PayoutRandomnessUnavailable
         | StoreError::Database(_) => LifecycleStoreFailure::Unavailable,
         StoreError::PayoutsFrozen(_) | StoreError::CollectorReconciliationFailed => {
             LifecycleStoreFailure::Frozen

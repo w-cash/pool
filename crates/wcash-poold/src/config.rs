@@ -172,8 +172,12 @@ pub struct ChainRuntimePolicy {
     pub payout_confirmations: u32,
     /// Maximum recipients in one deterministic batch.
     pub maximum_payout_outputs: u32,
+    /// Minimum randomly selected gross amount for one account in a payout.
+    pub minimum_payout_zat: u64,
     /// Maximum gross amount paid to one account in one transaction.
     pub maximum_payout_zat: u64,
+    /// Probability, in basis points, of deferring an otherwise eligible payout cycle.
+    pub payout_skip_bps: u16,
     /// Absolute transaction fee ceiling.
     pub maximum_network_fee_zat: u64,
     /// Relative transaction fee ceiling in basis points.
@@ -191,7 +195,11 @@ struct RawChainPolicy {
     #[serde(default = "default_payout_confirmations")]
     payout_confirmations: u32,
     maximum_payout_outputs: u32,
+    #[serde(default = "default_minimum_payout_zat")]
+    minimum_payout_zat: u64,
     maximum_payout_zat: u64,
+    #[serde(default)]
+    payout_skip_bps: u16,
     maximum_network_fee_zat: u64,
     maximum_network_fee_bps: u16,
     policy_version: u64,
@@ -576,7 +584,10 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
         || !(100..=1_000_000).contains(&raw.required_confirmations)
         || !(1..=raw.required_confirmations).contains(&raw.payout_confirmations)
         || !(1..=200).contains(&raw.maximum_payout_outputs)
+        || raw.minimum_payout_zat == 0
         || raw.maximum_payout_zat == 0
+        || raw.minimum_payout_zat > raw.maximum_payout_zat
+        || raw.payout_skip_bps > 10_000
         || raw.maximum_network_fee_zat == 0
         || !(1..=1_000).contains(&raw.maximum_network_fee_bps)
         || raw.policy_version == 0
@@ -589,7 +600,9 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
         required_confirmations: raw.required_confirmations,
         payout_confirmations: raw.payout_confirmations,
         maximum_payout_outputs: raw.maximum_payout_outputs,
+        minimum_payout_zat: raw.minimum_payout_zat,
         maximum_payout_zat: raw.maximum_payout_zat,
+        payout_skip_bps: raw.payout_skip_bps,
         maximum_network_fee_zat: raw.maximum_network_fee_zat,
         maximum_network_fee_bps: raw.maximum_network_fee_bps,
         policy_version: raw.policy_version,
@@ -598,6 +611,10 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
 
 const fn default_payout_confirmations() -> u32 {
     3
+}
+
+const fn default_minimum_payout_zat() -> u64 {
+    100_000_000
 }
 
 fn decode_hex32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
