@@ -413,7 +413,14 @@ impl ExactExecutionSigner for WecExecutionSigner {
             .await
             .map_err(|_| BoundaryFailure::Ambiguous)?
             .map(RichPayoutExecution::from)
-            .map_err(map_wec_error)
+            .map_err(|error| {
+                // WecPayoutError contains only stable error classes and never
+                // carries seed bytes, addresses, transaction bytes, or other
+                // miner-private data. Keep that class visible to operators so
+                // transient wallet failures are not mistaken for invariants.
+                eprintln!("Wcash payout preparation failed: {error}");
+                map_wec_error(error)
+            })
         })
     }
 
@@ -439,7 +446,10 @@ impl ExactExecutionSigner for WecExecutionSigner {
                     payout: payout.into(),
                 })
             })
-            .map_err(map_wec_error)
+            .map_err(|error| {
+                eprintln!("Wcash payout recovery failed: {error}");
+                map_wec_error(error)
+            })
         })
     }
 }
