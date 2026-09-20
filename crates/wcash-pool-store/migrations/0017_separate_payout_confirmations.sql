@@ -11,6 +11,21 @@ ALTER TABLE chain_policies
     ADD CONSTRAINT chain_policies_random_payout_range
         CHECK (minimum_payout_zat <= maximum_payout_zat);
 
+-- Existing Wcash launch rows were intentionally append-only. Perform this
+-- one reviewed policy transition inside the migration transaction, then
+-- restore the append-only fence before any service can observe the schema.
+DROP TRIGGER chain_policies_append_only ON chain_policies;
+UPDATE chain_policies
+SET payout_confirmations = 3,
+    maximum_payout_outputs = 1,
+    minimum_payout_zat = 100000000,
+    maximum_payout_zat = 400000000,
+    payout_skip_bps = 5000
+WHERE chain = 'wcash';
+CREATE TRIGGER chain_policies_append_only
+    BEFORE UPDATE OR DELETE ON chain_policies
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
+
 COMMENT ON COLUMN chain_policies.payout_confirmations IS
     'Best-chain depth required to settle a broadcast payout; independent from coinbase maturity.';
 
