@@ -36,7 +36,7 @@ pub enum SeedSource {
 
 impl SeedSource {
     /// Creates a protected-file source. The path must be absolute and the file
-    /// must be owned by `trusted_uid` with mode exactly `0600` on Unix.
+    /// must be owned by `trusted_uid` with mode `0400` or `0600` on Unix.
     pub fn protected_file(path: impl Into<PathBuf>, trusted_uid: u32) -> Self {
         Self::ProtectedFile {
             path: path.into(),
@@ -156,11 +156,12 @@ fn validate_file_metadata(
     metadata: &std::fs::Metadata,
     trusted_uid: u32,
 ) -> Result<(), WecPayoutError> {
+    let mode = metadata.permissions().mode() & 0o777;
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.nlink() != 1
         || metadata.uid() != trusted_uid
-        || metadata.permissions().mode() & 0o777 != 0o600
+        || !matches!(mode, 0o400 | 0o600)
         || metadata.len() == 0
         || metadata.len() > MAX_ENCODED_SEED_BYTES
     {
@@ -250,5 +251,30 @@ mod tests {
             .validate_protected_metadata()
             .expect("metadata is valid without reading the credential");
         assert_eq!(source.read().err(), Some(WecPayoutError::UnsafeCredential));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_seed_accepts_read_only_owner_access_and_rejects_write_only_access() {
+        let root = tempfile::tempdir().expect("temporary seed directory");
+        let root = fs::canonicalize(root.path()).expect("canonical seed directory");
+        let path = root.join("seed");
+        fs::write(&path, format!("{}\n", "42".repeat(32))).expect("write seed fixture");
+        let owner = fs::metadata(&path).expect("seed metadata").uid();
+        let source = SeedSource::protected_file(&path, owner);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+            .expect("protect read-only seed fixture");
+        source
+            .validate_protected_metadata()
+            .expect("owner-readable seed is protected");
+        source.read().expect("owner-readable seed is usable");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o200))
+            .expect("make seed write-only");
+        assert_eq!(
+            source.validate_protected_metadata().err(),
+            Some(WecPayoutError::UnsafeCredential)
+        );
     }
 }

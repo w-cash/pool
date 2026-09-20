@@ -185,6 +185,10 @@ impl WecPayoutSigner {
     /// collector without reading spending authority.
     pub fn readiness(&self) -> Result<(), WecPayoutError> {
         self.config.validate()?;
+        // Validate the protected credential before any accounting batch can
+        // cross the durable signing fence. This reads metadata only; seed
+        // bytes remain unopened until an authorized payout actually signs.
+        self.config.seed_source().validate_protected_metadata()?;
         let limits = self.config.limits();
         let identity = self
             .wallet
