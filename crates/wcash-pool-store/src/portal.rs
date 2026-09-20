@@ -1121,15 +1121,6 @@ impl PostgresPoolDataSource {
                 Some(_) => return Err(StoreError::CorruptDatabaseState("portal fee revision")),
             };
         }
-        let active_workers = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(DISTINCT s.worker_id)::BIGINT \
-             FROM shares s JOIN backend_events e \
-               ON (e.deployment_id,e.event_seq)=(s.deployment_id,s.event_seq) \
-             WHERE s.deployment_id=$1 AND e.recorded_at >= clock_timestamp()-INTERVAL '5 minutes'",
-        )
-        .bind(self.store.identity.id)
-        .fetch_one(&self.store.pool)
-        .await?;
         let latest_job = sqlx::query_scalar::<_, serde_json::Value>(
             "SELECT descriptor FROM jobs WHERE deployment_id=$1 \
              ORDER BY activation_event_seq DESC LIMIT 1",
@@ -1147,13 +1138,6 @@ impl PostgresPoolDataSource {
         let snapshot = PoolOverview {
             available: true,
             updated_at: Some(unix_u64(updated_at)?),
-            // Work-to-sol/s normalization belongs to a separately reviewed
-            // telemetry projector; never label share count as hashrate.
-            hashrate_sol_s: None,
-            active_workers: Some(
-                u64::try_from(active_workers)
-                    .map_err(|_| StoreError::CorruptDatabaseState("active workers"))?,
-            ),
             wcash_height: latest_job
                 .as_ref()
                 .map(|job| u64::from(job.wcash_height.saturating_sub(1))),

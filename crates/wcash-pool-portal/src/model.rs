@@ -452,10 +452,6 @@ pub struct PoolOverview {
     pub available: bool,
     /// Last read-model update time.
     pub updated_at: Option<u64>,
-    /// Current pool hashrate in solutions per second.
-    pub hashrate_sol_s: Option<u64>,
-    /// Connected worker count.
-    pub active_workers: Option<u64>,
     /// Wcash chain height.
     pub wcash_height: Option<u64>,
     /// Zcash chain height.

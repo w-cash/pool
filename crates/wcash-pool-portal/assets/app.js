@@ -320,9 +320,7 @@ async function refreshOverview(generation = authGeneration) {
   try {
     const [data, readiness] = await Promise.all([api("/api/v1/overview"), api("/readyz").then(() => true, () => false)]);
     if (!currentGeneration(generation)) return;
-    setText("#pool-hashrate", data.hashrate_sol_s == null ? "Unavailable" : formatCount(data.hashrate_sol_s));
-    setText("#pool-hashrate-note", data.hashrate_sol_s == null ? "No hashrate estimate yet" : "solutions / second");
-    setText("#pool-active-workers", formatCount(data.active_workers));
+    setText("#pool-mining-status", data.available && readiness ? "Active" : "Unavailable");
     setText("#wcash-height", formatCount(data.wcash_height));
     setText("#zcash-height", formatCount(data.zcash_height));
     setText("#wec-fee", formatFeePolicy(data, "wec"));
@@ -333,7 +331,7 @@ async function refreshOverview(generation = authGeneration) {
     $("#connection-readiness").className = `status ${data.available && readiness ? "ok" : "warning"}`;
     setText("#last-updated", data.updated_at ? `Pool data as of ${formatTime(data.updated_at)}` : "Pool update time unavailable");
     if (!data.available) {
-      for (const id of ["pool-hashrate", "pool-active-workers", "wcash-height", "zcash-height"]) setText(`#${id}`, "Unavailable");
+      for (const id of ["pool-mining-status", "wcash-height", "zcash-height"]) setText(`#${id}`, "Unavailable");
     }
   } catch (reason) {
     if (!currentGeneration(generation)) return;
@@ -341,7 +339,7 @@ async function refreshOverview(generation = authGeneration) {
     $("#data-state").className = "status warning";
     setText("#connection-readiness", "Status unavailable · check before connecting");
     $("#connection-readiness").className = "status warning";
-    for (const id of ["pool-hashrate", "pool-active-workers", "wcash-height", "zcash-height"]) setText(`#${id}`, "Unavailable");
+    for (const id of ["pool-mining-status", "wcash-height", "zcash-height"]) setText(`#${id}`, "Unavailable");
     setText("#last-updated", "Pool data unavailable");
   }
 }

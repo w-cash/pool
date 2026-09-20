@@ -1287,7 +1287,7 @@ async fn mainnet_staging_reports_chain_specific_payout_policy_and_no_registratio
         .expect("bounded page");
     let html = std::str::from_utf8(&html).expect("UTF-8 page");
     assert!(html.contains("Wcash Mainnet"));
-    assert!(html.contains("WEC automatic · ZEC manual"));
+    assert!(html.contains("· automatic payout"));
     assert!(!html.contains("Create account</button>"));
     assert!(!html.contains("Zcash Testnet"));
 
@@ -1374,7 +1374,9 @@ async fn repository_reads_cannot_promote_a_same_address_policy_hold() {
 fn unavailable_overview_is_explicit() {
     let overview = UnavailablePoolData.overview();
     assert!(!overview.available);
-    assert_eq!(overview.hashrate_sol_s, None);
+    let public = serde_json::to_value(&overview).expect("overview serializes");
+    assert!(public.get("hashrate_sol_s").is_none());
+    assert!(public.get("active_workers").is_none());
     assert!(!UnavailablePoolData.mining_ready());
 }
 
