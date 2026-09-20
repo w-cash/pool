@@ -168,6 +168,8 @@ pub struct ChainRuntimePolicy {
     pub payout_threshold_zat: u64,
     /// Conservative maturity and reorganization depth.
     pub required_confirmations: u32,
+    /// Best-chain depth required to settle an already broadcast payout.
+    pub payout_confirmations: u32,
     /// Maximum recipients in one deterministic batch.
     pub maximum_payout_outputs: u32,
     /// Maximum gross amount paid to one account in one transaction.
@@ -186,6 +188,8 @@ struct RawChainPolicy {
     pplns_window_work: String,
     payout_threshold_zat: u64,
     required_confirmations: u32,
+    #[serde(default = "default_payout_confirmations")]
+    payout_confirmations: u32,
     maximum_payout_outputs: u32,
     maximum_payout_zat: u64,
     maximum_network_fee_zat: u64,
@@ -570,6 +574,7 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
     if pplns_window_work == BigUint::default()
         || raw.payout_threshold_zat == 0
         || !(100..=1_000_000).contains(&raw.required_confirmations)
+        || !(1..=raw.required_confirmations).contains(&raw.payout_confirmations)
         || !(1..=200).contains(&raw.maximum_payout_outputs)
         || raw.maximum_payout_zat == 0
         || raw.maximum_network_fee_zat == 0
@@ -582,12 +587,17 @@ fn parse_chain_policy(raw: RawChainPolicy) -> Result<ChainRuntimePolicy, ConfigE
         pplns_window_work,
         payout_threshold_zat: raw.payout_threshold_zat,
         required_confirmations: raw.required_confirmations,
+        payout_confirmations: raw.payout_confirmations,
         maximum_payout_outputs: raw.maximum_payout_outputs,
         maximum_payout_zat: raw.maximum_payout_zat,
         maximum_network_fee_zat: raw.maximum_network_fee_zat,
         maximum_network_fee_bps: raw.maximum_network_fee_bps,
         policy_version: raw.policy_version,
     })
+}
+
+const fn default_payout_confirmations() -> u32 {
+    3
 }
 
 fn decode_hex32(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {

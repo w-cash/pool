@@ -89,6 +89,7 @@ fn policy(chain: Chain) -> ChainPolicy {
         fee_bps: 0,
         payout_threshold_zat: 1,
         required_confirmations: 100,
+        payout_confirmations: 3,
         maximum_payout_outputs: 10,
         maximum_payout_zat: 1_000_000_000_000,
         maximum_network_fee_zat: 1,

@@ -567,6 +567,8 @@ pub struct ChainPolicy {
     /// Pool confirmation policy, in addition to backend maturity; never below
     /// the 100-block launch coinbase floor.
     pub required_confirmations: u32,
+    /// Best-chain depth required before an outbound payout is settled.
+    pub payout_confirmations: u32,
     /// Maximum deterministic outputs reserved into one payout transaction.
     pub maximum_payout_outputs: u32,
     /// Maximum gross liability reserved for one account in one payout transaction.
@@ -586,6 +588,8 @@ impl ChainPolicy {
             || self.payout_threshold_zat == 0
             || self.required_confirmations < 100
             || self.required_confirmations > 1_000_000
+            || self.payout_confirmations == 0
+            || self.payout_confirmations > self.required_confirmations
             || !(1..=u32::try_from(wcash_pool_portal::MAX_PAYOUT_OUTPUTS).unwrap_or(u32::MAX))
                 .contains(&self.maximum_payout_outputs)
             || self.maximum_payout_zat == 0
@@ -1266,9 +1270,9 @@ impl PostgresStore {
         policy.validate()?;
         sqlx::query(
             "INSERT INTO chain_policies \
-             (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations, \
+             (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations,payout_confirmations, \
               maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
-             VALUES ($1,$2,CAST($3 AS NUMERIC),$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING",
+             VALUES ($1,$2,CAST($3 AS NUMERIC),$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING",
         )
         .bind(self.identity.id)
         .bind(policy.chain.as_str())
@@ -1276,6 +1280,7 @@ impl PostgresStore {
         .bind(i32::from(policy.fee_bps))
         .bind(as_i64(policy.payout_threshold_zat)?)
         .bind(i32::try_from(policy.required_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
+        .bind(i32::try_from(policy.payout_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
         .bind(i32::try_from(policy.maximum_payout_outputs).map_err(|_| StoreError::InvalidChainPolicy)?)
         .bind(as_i64(policy.maximum_payout_zat)?)
         .bind(as_i64(policy.maximum_network_fee_zat)?)
@@ -1324,15 +1329,16 @@ impl PostgresStore {
             policy.validate()?;
             sqlx::query(
                 "INSERT INTO chain_policies \
-                 (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations, \
+                 (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations,payout_confirmations, \
                   maximum_payout_outputs,maximum_payout_zat,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) \
-                 VALUES ($1,$2,CAST($3 AS NUMERIC),0,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",
+                 VALUES ($1,$2,CAST($3 AS NUMERIC),0,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING",
             )
             .bind(self.identity.id)
             .bind(policy.chain.as_str())
             .bind(policy.pplns_window_work.to_string())
             .bind(as_i64(policy.payout_threshold_zat)?)
             .bind(i32::try_from(policy.required_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
+            .bind(i32::try_from(policy.payout_confirmations).map_err(|_| StoreError::InvalidChainPolicy)?)
             .bind(i32::try_from(policy.maximum_payout_outputs).map_err(|_| StoreError::InvalidChainPolicy)?)
             .bind(as_i64(policy.maximum_payout_zat)?)
             .bind(as_i64(policy.maximum_network_fee_zat)?)
@@ -1393,7 +1399,7 @@ impl PostgresStore {
     pub async fn chain_policy(&self, chain: Chain) -> Result<Option<ChainPolicy>, StoreError> {
         let row = sqlx::query(
             "SELECT pplns_window_work::TEXT AS pplns_window_work,fee_bps,\
-                    payout_threshold_zat,required_confirmations,maximum_payout_outputs,maximum_payout_zat, \
+                    payout_threshold_zat,required_confirmations,payout_confirmations,maximum_payout_outputs,maximum_payout_zat, \
                     maximum_network_fee_zat,maximum_network_fee_bps,policy_version \
              FROM chain_policies WHERE deployment_id=$1 AND chain=$2",
         )
@@ -1416,6 +1422,8 @@ impl PostgresStore {
                     row.try_get::<i32, _>("required_confirmations")?,
                 )
                 .map_err(|_| StoreError::CorruptDatabaseState("required confirmations"))?,
+                payout_confirmations: u32::try_from(row.try_get::<i32, _>("payout_confirmations")?)
+                    .map_err(|_| StoreError::CorruptDatabaseState("payout confirmations"))?,
                 maximum_payout_outputs: u32::try_from(
                     row.try_get::<i32, _>("maximum_payout_outputs")?,
                 )
@@ -2521,7 +2529,7 @@ impl PostgresStore {
         // new signing or broadcast authorization.
         lock_chain_safety_row(&mut transaction, self.identity.id, batch.chain).await?;
         let required_confirmations = sqlx::query_scalar::<_, i32>(
-            "SELECT required_confirmations FROM chain_policies \
+            "SELECT payout_confirmations FROM chain_policies \
              WHERE deployment_id=$1 AND chain=$2 AND policy_version=$3",
         )
         .bind(self.identity.id)

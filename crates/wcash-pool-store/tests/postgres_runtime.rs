@@ -56,6 +56,7 @@ fn policy(chain: Chain) -> ChainPolicy {
         fee_bps: 0,
         payout_threshold_zat: 1,
         required_confirmations: 100,
+        payout_confirmations: 3,
         maximum_payout_outputs: 1,
         maximum_payout_zat: 1_000_000_000_000,
         maximum_network_fee_zat: 1_000_000,
@@ -3503,10 +3504,10 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     let payout_confirmation = PayoutConfirmation {
         block_hash: [0xf1; 32],
         block_height: 50_000,
-        confirmations: 100,
+        confirmations: 3,
     };
     let shallow_confirmation = PayoutConfirmation {
-        confirmations: 99,
+        confirmations: 2,
         ..payout_confirmation.clone()
     };
     assert!(matches!(
@@ -3514,8 +3515,8 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
             .confirm_payout(wec_batch.id, &shallow_confirmation)
             .await,
         Err(StoreError::PrematurePayoutConfirmation {
-            required: 100,
-            actual: 99
+            required: 3,
+            actual: 2
         })
     ));
     credit_immature(&store, &admin, account_id, Chain::Wcash, 1_000)

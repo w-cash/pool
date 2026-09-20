@@ -2456,6 +2456,7 @@ mod tests {
             pplns_window_work: BigUint::from(1_u8),
             payout_threshold_zat: 100_000_000,
             required_confirmations: 100,
+            payout_confirmations: 3,
             maximum_payout_outputs: 50,
             maximum_payout_zat: 100_000_000,
             maximum_network_fee_zat: 1_000_000,
