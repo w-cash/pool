@@ -1,9 +1,9 @@
-//! Crash-safe Wcash Testnet payout coordination through Wolf's native wallet.
+//! Crash-safe Wcash payout coordination through Wolf's native wallet.
 //!
 //! This crate binds an accounting-frozen WEC batch to one native wallet
 //! operation, independently verifies the wallet's persisted intent, journals
 //! the exact transaction before broadcast, and only ever retries those bytes.
-//! It intentionally contains no Mainnet mode and no general-purpose wallet.
+//! It is a narrowly pinned payout signer, not a general-purpose wallet.
 
 #![forbid(unsafe_code)]
 
@@ -25,7 +25,8 @@ pub use transport::{
     BroadcastDisposition, BroadcastFailure, BroadcastOutcome, NativeWalletError,
     NativeWalletTransport, PersistedIntent, WalletBroadcastCall, WalletFundSource, WalletIdentity,
     WalletInspectionCall, WalletNetwork, WalletOutput, WalletRecoveryCall, WalletSignCall,
-    WalletSignedTransaction, WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
+    WalletSignedTransaction, WCASH_MAINNET_BRANCH_ID, WCASH_MAINNET_GENESIS_HASH,
+    WCASH_TESTNET_BRANCH_ID, WCASH_TESTNET_GENESIS_HASH,
 };
 #[cfg(feature = "regtest")]
 pub use transport::{WCASH_REGTEST_BRANCH_ID, WCASH_REGTEST_GENESIS_HASH};

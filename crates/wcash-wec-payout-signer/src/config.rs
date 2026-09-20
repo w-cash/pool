@@ -1,4 +1,4 @@
-//! Testnet-only signer policy and bounded native-call configuration.
+//! Chain-pinned signer policy and bounded native-call configuration.
 
 use std::{
     fmt,
@@ -153,11 +153,21 @@ impl WecSignerConfig {
         Ok(self)
     }
 
+    /// Selects the frozen public Wcash Mainnet identity.
+    pub fn with_mainnet_network(mut self) -> Result<Self, WecPayoutError> {
+        self.network = ChainNetwork::Mainnet;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub(crate) const fn network(&self) -> ChainNetwork {
         self.network
     }
 
     pub(crate) fn wallet_network(&self) -> WalletNetwork {
+        if self.network == ChainNetwork::Mainnet {
+            return WalletNetwork::Mainnet;
+        }
         #[cfg(feature = "regtest")]
         if self.network == ChainNetwork::Regtest {
             return WalletNetwork::Regtest;
@@ -166,6 +176,9 @@ impl WecSignerConfig {
     }
 
     pub(crate) fn genesis_hash(&self) -> &'static str {
+        if self.network == ChainNetwork::Mainnet {
+            return crate::WCASH_MAINNET_GENESIS_HASH;
+        }
         #[cfg(feature = "regtest")]
         if self.network == ChainNetwork::Regtest {
             return crate::WCASH_REGTEST_GENESIS_HASH;
@@ -174,6 +187,9 @@ impl WecSignerConfig {
     }
 
     pub(crate) fn branch_id(&self) -> &'static str {
+        if self.network == ChainNetwork::Mainnet {
+            return crate::WCASH_MAINNET_BRANCH_ID;
+        }
         #[cfg(feature = "regtest")]
         if self.network == ChainNetwork::Regtest {
             return crate::WCASH_REGTEST_BRANCH_ID;
@@ -275,5 +291,26 @@ impl fmt::Debug for WecSignerConfig {
             .field("max_fee_zat", &self.max_fee_zat)
             .field("limits", &self.limits)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_selects_the_frozen_wallet_identity() {
+        let config = WecSignerConfig::new(
+            "/var/lib/zecwec/mainnet-payout-journal",
+            Uuid::from_u128(1),
+            [7; 32],
+            SeedSource::protected_file("/run/credentials/wcash-seed", 1000),
+        )
+        .expect("base signer policy")
+        .with_mainnet_network()
+        .expect("Mainnet signer policy");
+        assert_eq!(config.wallet_network(), WalletNetwork::Mainnet);
+        assert_eq!(config.genesis_hash(), crate::WCASH_MAINNET_GENESIS_HASH);
+        assert_eq!(config.branch_id(), crate::WCASH_MAINNET_BRANCH_ID);
     }
 }

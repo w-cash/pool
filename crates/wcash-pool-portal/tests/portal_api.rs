@@ -1241,7 +1241,7 @@ fn mainnet_router_accepts_accounting_only_boundary() {
 }
 
 #[tokio::test]
-async fn mainnet_staging_reports_deferred_payouts_and_does_not_invite_registration() {
+async fn mainnet_staging_reports_chain_specific_payout_policy_and_no_registration() {
     let mut config = PortalConfig::testnet();
     config.network = ChainNetwork::Mainnet;
     config.canonical_origin = "https://pool.zecwec.com".to_owned();
@@ -1287,7 +1287,7 @@ async fn mainnet_staging_reports_deferred_payouts_and_does_not_invite_registrati
         .expect("bounded page");
     let html = std::str::from_utf8(&html).expect("UTF-8 page");
     assert!(html.contains("Wcash Mainnet"));
-    assert!(html.contains("payouts paused"));
+    assert!(html.contains("WEC automatic · ZEC manual"));
     assert!(!html.contains("Create account</button>"));
     assert!(!html.contains("Zcash Testnet"));
 
@@ -1304,7 +1304,7 @@ async fn mainnet_staging_reports_deferred_payouts_and_does_not_invite_registrati
         .expect("bounded script");
     let script = std::str::from_utf8(&script).expect("UTF-8 script");
     assert!(script.contains("mainnet.zecwec.com:3334"));
-    assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = false;"));
+    assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
     assert!(!script.contains("testnet-mine.zecwec.com"));
 }
 

@@ -574,7 +574,7 @@ struct ChainBoundary {
 pub struct SettlementOrchestrator {
     store: Arc<dyn SettlementStore>,
     wec: ChainBoundary,
-    zec: ChainBoundary,
+    zec: Option<ChainBoundary>,
 }
 
 impl SettlementOrchestrator {
@@ -600,10 +600,30 @@ impl SettlementOrchestrator {
                 signer: wec_signer,
                 broadcaster: wec_broadcaster,
             },
-            zec: ChainBoundary {
+            zec: Some(ChainBoundary {
                 signer: zec_signer,
                 broadcaster: zec_broadcaster,
+            }),
+        })
+    }
+
+    /// Constructs a Wcash-only coordinator. Zcash balances remain accounted
+    /// but cannot enter an automatic signing or broadcast path.
+    pub fn new_wec_only(
+        store: Arc<dyn SettlementStore>,
+        wec_signer: Arc<dyn ExactExecutionSigner>,
+        wec_broadcaster: Arc<dyn ExactTransactionBroadcaster>,
+    ) -> Result<Self, SettlementError> {
+        if wec_signer.chain() != Chain::Wcash || wec_broadcaster.chain() != Chain::Wcash {
+            return Err(SettlementError::Invariant("chain boundary binding"));
+        }
+        Ok(Self {
+            store,
+            wec: ChainBoundary {
+                signer: wec_signer,
+                broadcaster: wec_broadcaster,
             },
+            zec: None,
         })
     }
 
@@ -620,7 +640,7 @@ impl SettlementOrchestrator {
         if batch.chain != chain {
             return Err(SettlementError::Invariant("resumable batch chain"));
         }
-        let boundary = self.boundary(chain);
+        let boundary = self.boundary(chain)?;
         match batch.state {
             PayoutBatchState::Draft => self.resume_draft(batch, boundary).await,
             PayoutBatchState::Signing => self.resume_signing(batch, boundary).await,
@@ -667,7 +687,7 @@ impl SettlementOrchestrator {
         if batch.chain != chain {
             return Err(SettlementError::Invariant("resumable batch chain"));
         }
-        let boundary = self.boundary(chain);
+        let boundary = self.boundary(chain)?;
         match batch.state {
             PayoutBatchState::Draft => Ok(ReconciliationGate::Safe),
             PayoutBatchState::Signing => {
@@ -712,10 +732,13 @@ impl SettlementOrchestrator {
         }
     }
 
-    fn boundary(&self, chain: Chain) -> &ChainBoundary {
+    fn boundary(&self, chain: Chain) -> Result<&ChainBoundary, SettlementError> {
         match chain {
-            Chain::Wcash => &self.wec,
-            Chain::Zcash => &self.zec,
+            Chain::Wcash => Ok(&self.wec),
+            Chain::Zcash => self
+                .zec
+                .as_ref()
+                .ok_or(SettlementError::Invariant("automatic chain disabled")),
         }
     }
 
@@ -1646,7 +1669,13 @@ mod tests {
         }
         let outcome = fixture
             .orchestrator
-            .resume_signed(stale, fixture.orchestrator.boundary(Chain::Wcash))
+            .resume_signed(
+                stale,
+                fixture
+                    .orchestrator
+                    .boundary(Chain::Wcash)
+                    .expect("Wcash boundary is configured"),
+            )
             .await?;
         assert!(matches!(
             outcome,

@@ -4,7 +4,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const ATOMIC_UNITS = 100_000_000;
 const MAX_PAYOUT_THRESHOLD_ZAT = 2_100_000_000_000_000n;
-const AUTOMATIC_PAYOUT_ENABLED = true;
+const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: true };
 const TLS_STRATUM_AVAILABLE = true;
 const MINING_PASSWORD_IGNORED = false;
 let authMode = "login";
@@ -495,24 +495,26 @@ function renderPayoutSetting(asset, setting) {
   if (setting.active_destination) {
     const receiver = setting.active_receiver === "transparent" ? "Transparent address" : "Shielded Unified Address";
     line(`${receiver}: ${setting.active_destination}`);
-    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${AUTOMATIC_PAYOUT_ENABLED ? (setting.automatic ? "automatic" : "paused") : "payouts paused"}`);
+    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${AUTOMATIC_PAYOUT_ENABLED[asset] ? (setting.automatic ? "automatic" : "paused") : "payouts paused"}`);
   }
   if (setting.pending_destination) {
     line(`Pending destination: ${setting.pending_destination}`);
-    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). ${AUTOMATIC_PAYOUT_ENABLED ? "Payouts remain paused until the change is active." : "Automatic payout execution remains paused after the hold."}`);
-    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${AUTOMATIC_PAYOUT_ENABLED ? (setting.pending_automatic ? "automatic" : "paused") : "payouts paused"}`);
-    setText(`#${asset}-payout-status`, AUTOMATIC_PAYOUT_ENABLED
+    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). ${AUTOMATIC_PAYOUT_ENABLED[asset] ? "Payouts remain paused until the change is active." : "Automatic payout execution remains paused after the hold."}`);
+    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${AUTOMATIC_PAYOUT_ENABLED[asset] ? (setting.pending_automatic ? "automatic" : "paused") : "payouts paused"}`);
+    setText(`#${asset}-payout-status`, AUTOMATIC_PAYOUT_ENABLED[asset]
       ? `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`
       : "Automatic payouts are paused. Rewards continue accumulating.");
   } else {
-    setText(`#${asset}-payout-status`, !AUTOMATIC_PAYOUT_ENABLED
+    setText(`#${asset}-payout-status`, !AUTOMATIC_PAYOUT_ENABLED[asset]
       ? "Automatic payouts are paused. Earned rewards remain in this balance."
       : setting.automatic ? `Automatic payouts after maturity and ${formatCoin(setting.threshold_zat, asset)} threshold.` : "Automatic payouts paused. Earned rewards remain in this balance.");
   }
   // Never refill a masked destination or replace an in-progress edit with a poll.
   if (form.dataset.dirty !== "true") {
     form.elements.threshold_coin.value = coinInputValue(setting.pending_threshold_zat ?? setting.threshold_zat);
-    form.elements.automatic.checked = setting.pending_automatic ?? setting.automatic;
+    form.elements.automatic.checked = AUTOMATIC_PAYOUT_ENABLED[asset]
+      && (setting.pending_automatic ?? setting.automatic);
+    form.elements.automatic.disabled = !AUTOMATIC_PAYOUT_ENABLED[asset];
     if (asset === "zec" && !setting.pending_destination) {
       form.elements.address_type.value = setting.active_receiver === "transparent" ? "transparent" : "shielded";
       updateAddressType();
@@ -765,7 +767,7 @@ $$('.payout-form').forEach((form) => form.addEventListener("submit", async (even
     const payload = {
       destination: form.elements.destination.value,
       threshold_zat: parseCoinInput(form.elements.threshold_coin.value),
-      automatic: form.elements.automatic.checked,
+      automatic: AUTOMATIC_PAYOUT_ENABLED[form.dataset.asset] && form.elements.automatic.checked,
       password: form.elements.password.value,
     };
     if (form.elements.totp_code.value) payload.totp_code = form.elements.totp_code.value;

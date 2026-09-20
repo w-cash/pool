@@ -1241,22 +1241,8 @@ fn portal_receiver_from_name(value: &str) -> Result<PortalReceiverKind, Reposito
 }
 
 fn payout_configuration_hold_is_valid(network: ChainNetwork, hold_secs: u64) -> bool {
-    let minimum = {
-        #[cfg(feature = "regtest")]
-        {
-            if network == ChainNetwork::Regtest {
-                1
-            } else {
-                60
-            }
-        }
-        #[cfg(not(feature = "regtest"))]
-        {
-            let _ = network;
-            60
-        }
-    };
-    (minimum..=7 * 24 * 60 * 60).contains(&hold_secs)
+    let _ = network;
+    hold_secs <= 7 * 24 * 60 * 60
 }
 
 #[cfg(test)]

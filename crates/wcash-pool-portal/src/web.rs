@@ -276,8 +276,7 @@ fn render_index(config: &PortalConfig) -> String {
         .replace("TESTNET", "MAINNET")
         .replace("TWC", "WEC")
         .replace("Two test networks.", "Two main networks.")
-        .replace("· no monetary value", "· payouts paused")
-        .replace("Automatic payouts after maturity and threshold", "Payout preference saved; automatic execution is paused")
+        .replace("· no monetary value", "· WEC automatic · ZEC manual")
         .replace("<option value=\"tls\">TLS · preferred</option>", "")
         .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
         .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3334")
@@ -334,8 +333,8 @@ fn render_script(config: &PortalConfig) -> String {
             .replace("Testnet", "Mainnet")
             .replace("TWC", "WEC")
             .replace(
-                "const AUTOMATIC_PAYOUT_ENABLED = true;",
-                "const AUTOMATIC_PAYOUT_ENABLED = false;",
+                "const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: true };",
+                "const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };",
             )
             .replace(
                 "const TLS_STRATUM_AVAILABLE = true;",
@@ -784,6 +783,11 @@ async fn update_payout_setting(
     let asset = Asset::from_str(&asset).map_err(|_| AppError::NotFound)?;
     if threshold_zat == 0 || threshold_zat > 2_100_000_000_000_000 {
         return Err(AppError::Validation("invalid payout threshold"));
+    }
+    if state.config.network == crate::ChainNetwork::Mainnet && asset == Asset::Zec && automatic {
+        return Err(AppError::Validation(
+            "automatic ZEC payouts are not enabled",
+        ));
     }
     let destination = validate_payout_destination(&state, asset, candidate).await?;
     if destination.asset() != asset || destination.network() != state.config.network {
@@ -1269,7 +1273,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mainnet_portal_shows_only_the_isolated_tcp_pool_and_paused_payouts() {
+    fn mainnet_portal_shows_wcash_automatic_and_zcash_manual() {
         let mut config = PortalConfig::testnet();
         config.network = crate::ChainNetwork::Mainnet;
         config.allow_registration = false;
@@ -1277,12 +1281,12 @@ mod tests {
         let script = render_script(&config);
 
         assert!(page.contains("ZecWec Pool — Mainnet"));
-        assert!(page.contains("· payouts paused"));
+        assert!(page.contains("· WEC automatic · ZEC manual"));
         assert!(page.contains("mainnet.zecwec.com:3334"));
         assert!(!page.contains("data-auth-mode=\"register\""));
         assert!(!page.contains("<option value=\"tls\">"));
         assert!(!page.contains("testnet-mine.zecwec.com"));
-        assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = false;"));
+        assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
         assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3334"));
         assert!(!script.contains("testnet-mine.zecwec.com"));

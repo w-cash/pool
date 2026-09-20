@@ -12,6 +12,11 @@ pub const WCASH_TESTNET_GENESIS_HASH: &str =
     "6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98";
 /// Frozen Wcash public Testnet V3 transaction-signature branch identifier.
 pub const WCASH_TESTNET_BRANCH_ID: &str = "54ba2bfb";
+/// Frozen display-order Wcash Mainnet genesis block identifier.
+pub const WCASH_MAINNET_GENESIS_HASH: &str =
+    "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48";
+/// Frozen Wcash Mainnet transaction-signature branch identifier.
+pub const WCASH_MAINNET_BRANCH_ID: &str = "d9c6a7ee";
 
 /// Frozen display-order genesis of the explicitly enabled local Wcash Regtest.
 #[cfg(feature = "regtest")]
@@ -28,7 +33,7 @@ pub enum WalletNetwork {
     Testnet,
     /// Local Wcash Regtest, accepted only by explicit integration configurations.
     Regtest,
-    /// Future Wcash Mainnet, deliberately unsupported here.
+    /// Public Wcash Mainnet.
     Mainnet,
 }
 

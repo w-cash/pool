@@ -126,6 +126,8 @@ pub enum PayoutMode {
 /// Spending-key-backed runtime inputs, absent from a deferred mining process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomaticPayoutConfig {
+    /// Independently enabled payout chains. Mainnet may start with WEC only.
+    pub chains: Vec<AutomaticPayoutChain>,
     /// Persistent native Wcash collector wallet database.
     pub wcash_wallet_database: PathBuf,
     /// Literal loopback Wcash compact-block endpoint.
@@ -142,18 +144,19 @@ pub struct AutomaticPayoutConfig {
     pub wcash_signer_journal_directory: PathBuf,
     /// Exact Wcash collector account identity.
     pub wcash_signer_account: Uuid,
-    /// Protected Zallet configuration with wallet broadcast disabled.
-    pub zallet_configuration: PathBuf,
-    /// Loopback Zallet JSON-RPC endpoint.
-    pub zallet_rpc: SocketAddr,
-    /// Protected Zallet JSON-RPC cookie.
-    pub zallet_cookie_file: PathBuf,
-    /// Crash-recovery journal for exact ZEC payout artifacts.
-    pub zcash_signer_journal_directory: PathBuf,
-    /// Exact Zallet collector account identity.
-    pub zcash_signer_account: Uuid,
-    /// Exact non-hardened ZIP 32 index of the Zallet collector account.
-    pub zcash_signer_account_index: u32,
+    /// Exact one-time collector surplus to recognize as pool equity before the
+    /// first reconciliation. Zero disables opening-balance recognition.
+    pub wcash_opening_pool_equity_zat: u64,
+}
+
+/// One independently enabled automatic payout chain.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticPayoutChain {
+    /// Wcash Ironwood payouts.
+    Wcash,
+    /// Zcash payouts through Zallet.
+    Zcash,
 }
 
 /// Explicit zero-fee launch policy for one independently settled chain.
@@ -220,6 +223,8 @@ struct RawConfig {
     wcash_wallet_sha256: String,
     wcash_wallet_uid: u32,
     payout_mode: PayoutMode,
+    #[serde(default)]
+    automatic_payout_chains: Vec<AutomaticPayoutChain>,
     wcash_wallet_database: Option<PathBuf>,
     wcash_lightwalletd_endpoint: Option<String>,
     wcash_wallet_sync_batch_size: Option<u32>,
@@ -230,6 +235,8 @@ struct RawConfig {
     wcash_seed_uid: Option<u32>,
     wcash_signer_journal_directory: Option<PathBuf>,
     wcash_signer_account: Option<Uuid>,
+    #[serde(default)]
+    wcash_opening_pool_equity_zat: u64,
     zallet_configuration: Option<PathBuf>,
     zallet_rpc: Option<SocketAddr>,
     zallet_cookie_file: Option<PathBuf>,
@@ -319,11 +326,6 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             "regtest" => ChainNetwork::Regtest,
             _ => return Err(ConfigError::MainnetDisabled),
         };
-        // Mainnet payout signing is a separate release gate. A Mainnet mining
-        // process may account for liabilities, but cannot hold spending keys.
-        if network == ChainNetwork::Mainnet && raw.payout_mode != PayoutMode::Deferred {
-            return Err(ConfigError::MainnetDisabled);
-        }
         let isolated = network.as_str() == "regtest";
         if raw.deployment_id.is_nil()
             || raw.pool_instance.is_nil()
@@ -354,21 +356,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             || !raw.portal_origin.starts_with("https://")
             || raw.portal_origin.ends_with('/')
             || raw.portal_origin.chars().any(char::is_whitespace)
-            || {
-                let minimum = {
-                    #[cfg(feature = "regtest")]
-                    if network == ChainNetwork::Regtest {
-                        1
-                    } else {
-                        60
-                    }
-                    #[cfg(not(feature = "regtest"))]
-                    {
-                        60
-                    }
-                };
-                !(minimum..=7 * 24 * 60 * 60).contains(&raw.payout_change_hold_secs)
-            }
+            || raw.payout_change_hold_secs > 7 * 24 * 60 * 60
             || !(1..=127).contains(&raw.nonce_namespace)
             || !(1..=16_777_216).contains(&raw.nonce_reservation)
             || !(1..=64).contains(&raw.database_connections)
@@ -482,7 +470,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
 }
 
 fn parse_automatic_payout(raw: &RawConfig) -> Result<Option<AutomaticPayoutConfig>, ConfigError> {
-    let fields_present = [
+    let wcash_fields_present = [
         raw.wcash_wallet_database.is_some(),
         raw.wcash_lightwalletd_endpoint.is_some(),
         raw.wcash_wallet_sync_batch_size.is_some(),
@@ -491,6 +479,8 @@ fn parse_automatic_payout(raw: &RawConfig) -> Result<Option<AutomaticPayoutConfi
         raw.wcash_seed_uid.is_some(),
         raw.wcash_signer_journal_directory.is_some(),
         raw.wcash_signer_account.is_some(),
+    ];
+    let zcash_fields_present = [
         raw.zallet_configuration.is_some(),
         raw.zallet_rpc.is_some(),
         raw.zallet_cookie_file.is_some(),
@@ -500,16 +490,24 @@ fn parse_automatic_payout(raw: &RawConfig) -> Result<Option<AutomaticPayoutConfi
     ];
     match raw.payout_mode {
         PayoutMode::Deferred => {
-            if fields_present.into_iter().any(|present| present) {
+            if wcash_fields_present.into_iter().any(|present| present)
+                || zcash_fields_present.into_iter().any(|present| present)
+                || !raw.automatic_payout_chains.is_empty()
+                || raw.wcash_opening_pool_equity_zat != 0
+            {
                 return Err(ConfigError::InvalidPolicy);
             }
             Ok(None)
         }
         PayoutMode::Automatic => {
-            if fields_present.into_iter().any(|present| !present) {
+            if raw.automatic_payout_chains.as_slice() != [AutomaticPayoutChain::Wcash]
+                || wcash_fields_present.into_iter().any(|present| !present)
+                || zcash_fields_present.into_iter().any(|present| present)
+            {
                 return Err(ConfigError::InvalidPolicy);
             }
             let config = AutomaticPayoutConfig {
+                chains: raw.automatic_payout_chains.clone(),
                 wcash_wallet_database: raw
                     .wcash_wallet_database
                     .clone()
@@ -535,31 +533,12 @@ fn parse_automatic_payout(raw: &RawConfig) -> Result<Option<AutomaticPayoutConfi
                     .clone()
                     .ok_or(ConfigError::InvalidPolicy)?,
                 wcash_signer_account: raw.wcash_signer_account.ok_or(ConfigError::InvalidPolicy)?,
-                zallet_configuration: raw
-                    .zallet_configuration
-                    .clone()
-                    .ok_or(ConfigError::InvalidPolicy)?,
-                zallet_rpc: raw.zallet_rpc.ok_or(ConfigError::InvalidPolicy)?,
-                zallet_cookie_file: raw
-                    .zallet_cookie_file
-                    .clone()
-                    .ok_or(ConfigError::InvalidPolicy)?,
-                zcash_signer_journal_directory: raw
-                    .zcash_signer_journal_directory
-                    .clone()
-                    .ok_or(ConfigError::InvalidPolicy)?,
-                zcash_signer_account: raw.zcash_signer_account.ok_or(ConfigError::InvalidPolicy)?,
-                zcash_signer_account_index: raw
-                    .zcash_signer_account_index
-                    .ok_or(ConfigError::InvalidPolicy)?,
+                wcash_opening_pool_equity_zat: raw.wcash_opening_pool_equity_zat,
             };
             for path in [
                 &config.wcash_wallet_database,
                 &config.wcash_wallet_seed_file,
                 &config.wcash_signer_journal_directory,
-                &config.zallet_configuration,
-                &config.zallet_cookie_file,
-                &config.zcash_signer_journal_directory,
             ] {
                 require_absolute(path)?;
             }
@@ -571,15 +550,10 @@ fn parse_automatic_payout(raw: &RawConfig) -> Result<Option<AutomaticPayoutConfi
                 || !(1..=16).contains(&config.wcash_wallet_sync_batch_size)
                 || config.wcash_wallet_sync_timeout.is_zero()
                 || config.wcash_wallet_sync_timeout > MAX_WCASH_WALLET_SYNC_TIMEOUT
-                || !config.zallet_rpc.ip().is_loopback()
-                || config.zallet_rpc.port() == 0
-                || config.zallet_rpc == raw.zcash_node_rpc
-                || config.zallet_rpc == raw.wcash_node_rpc
-                || config.zcash_signer_account_index >= (1 << 31)
             {
                 return Err(ConfigError::InvalidPolicy);
             }
-            if config.wcash_signer_account.is_nil() || config.zcash_signer_account.is_nil() {
+            if config.wcash_signer_account.is_nil() {
                 return Err(ConfigError::InvalidIdentity);
             }
             Ok(Some(config))
@@ -878,6 +852,7 @@ wcash_wallet_program = "/opt/wcash/bin/wcash-wallet"
 wcash_wallet_sha256 = "{five}"
 wcash_wallet_uid = 0
 payout_mode = "automatic"
+automatic_payout_chains = ["wcash"]
 wcash_wallet_database = "/var/lib/zecwec/wcash-wallet.sqlite"
 wcash_lightwalletd_endpoint = "http://127.0.0.1:38234"
 wcash_wallet_sync_batch_size = 16
@@ -888,14 +863,8 @@ wcash_wallet_seed_file = "{root}/wcash-seed"
 wcash_seed_uid = 0
 wcash_signer_journal_directory = "/var/lib/zecwec/wec-payout-journal"
 wcash_signer_account = "55555555-5555-4555-8555-555555555555"
-zallet_configuration = "{root}/zallet.toml"
-zallet_rpc = "127.0.0.1:28232"
-zallet_cookie_file = "{root}/zallet.cookie"
 zcash_node_rpc = "127.0.0.1:18242"
 zcash_node_cookie_file = "{root}/zebra.cookie"
-zcash_signer_journal_directory = "/var/lib/zecwec/zec-payout-journal"
-zcash_signer_account = "66666666-6666-4666-8666-666666666666"
-zcash_signer_account_index = 0
 portal_token_pepper_file = "{root}/pepper"
 portal_totp_key_file = "{root}/totp"
 initial_share_target_be = "{six}"
@@ -935,6 +904,7 @@ policy_version = 1
         let mut config = fixture(directory, "testnet")
             .replace("payout_mode = \"automatic\"", "payout_mode = \"deferred\"");
         for line in [
+            "automatic_payout_chains = [\"wcash\"]\n".to_owned(),
             "wcash_wallet_database = \"/var/lib/zecwec/wcash-wallet.sqlite\"\n".to_owned(),
             "wcash_lightwalletd_endpoint = \"http://127.0.0.1:38234\"\n".to_owned(),
             "wcash_wallet_sync_batch_size = 16\n".to_owned(),
@@ -946,18 +916,6 @@ policy_version = 1
             "wcash_seed_uid = 0\n".to_owned(),
             "wcash_signer_journal_directory = \"/var/lib/zecwec/wec-payout-journal\"\n".to_owned(),
             "wcash_signer_account = \"55555555-5555-4555-8555-555555555555\"\n".to_owned(),
-            format!(
-                "zallet_configuration = \"{}/zallet.toml\"\n",
-                root.display()
-            ),
-            "zallet_rpc = \"127.0.0.1:28232\"\n".to_owned(),
-            format!(
-                "zallet_cookie_file = \"{}/zallet.cookie\"\n",
-                root.display()
-            ),
-            "zcash_signer_journal_directory = \"/var/lib/zecwec/zec-payout-journal\"\n".to_owned(),
-            "zcash_signer_account = \"66666666-6666-4666-8666-666666666666\"\n".to_owned(),
-            "zcash_signer_account_index = 0\n".to_owned(),
         ] {
             config = config.replace(&line, "");
         }
@@ -1043,7 +1001,7 @@ policy_version = 1
     }
 
     #[test]
-    fn mainnet_requires_deferred_payout_and_uses_mainnet_branch() {
+    fn mainnet_deferred_payout_uses_mainnet_branch() {
         let directory = TempDir::new().expect("temp dir");
         let wire = |display: &str| {
             let mut bytes = hex::decode(display).expect("genesis hex");
@@ -1094,6 +1052,39 @@ policy_version = 1
     }
 
     #[test]
+    fn mainnet_accepts_explicit_wcash_only_automatic_payout() {
+        let directory = TempDir::new().expect("temp dir");
+        let wire = |display: &str| {
+            let mut bytes = hex::decode(display).expect("genesis hex");
+            bytes.reverse();
+            hex::encode(bytes)
+        };
+        let mainnet = fixture(&directory, "testnet")
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 1991772603", "chain_id = 1464025427")
+            .replace(&"01".repeat(32), &wire(WCASH_MAINNET_GENESIS))
+            .replace(&"02".repeat(32), &wire(ZCASH_MAINNET_GENESIS))
+            .replace(
+                "payout_change_hold_secs = 172800",
+                "payout_change_hold_secs = 0\nwcash_opening_pool_equity_zat = 123",
+            );
+        let path = write_file(
+            &directory,
+            "mainnet-wcash-payout.toml",
+            mainnet.as_bytes(),
+            0o600,
+        );
+        let loaded = RuntimeConfig::load(&path).expect("Mainnet Wcash payout policy");
+        let payout = loaded
+            .automatic_payout
+            .expect("automatic Wcash payout configuration");
+        assert_eq!(loaded.network, ChainNetwork::Mainnet);
+        assert_eq!(loaded.payout_change_hold_secs, 0);
+        assert_eq!(payout.chains, vec![AutomaticPayoutChain::Wcash]);
+        assert_eq!(payout.wcash_opening_pool_equity_zat, 123);
+    }
+
+    #[test]
     fn regtest_configuration_is_feature_gated_and_chain_pinned() {
         let directory = TempDir::new().expect("temp dir");
         let fixture = fixture(&directory, "regtest").replace("0.0.0.0:28237", "127.0.0.1:28237");
@@ -1139,7 +1130,7 @@ policy_version = 1
     }
 
     #[test]
-    fn mainnet_unknown_fields_and_weak_files_fail_closed() {
+    fn mainnet_identity_unknown_fields_and_weak_files_fail_closed() {
         let directory = TempDir::new().expect("temp dir");
         let mainnet = write_file(
             &directory,
@@ -1149,7 +1140,7 @@ policy_version = 1
         );
         assert!(matches!(
             RuntimeConfig::load(&mainnet),
-            Err(ConfigError::MainnetDisabled)
+            Err(ConfigError::InvalidIdentity)
         ));
 
         let unknown = write_file(

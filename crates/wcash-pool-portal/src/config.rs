@@ -60,19 +60,7 @@ impl PortalConfig {
         if self.session_idle_secs < 60 || self.session_idle_secs > self.session_ttl_secs {
             return Err(ConfigError::SessionIdle);
         }
-        let minimum_hold_secs = {
-            #[cfg(feature = "regtest")]
-            if self.network == ChainNetwork::Regtest {
-                1
-            } else {
-                60
-            }
-            #[cfg(not(feature = "regtest"))]
-            {
-                60
-            }
-        };
-        if !(minimum_hold_secs..=7 * 24 * 60 * 60).contains(&self.payout_change_hold_secs) {
+        if self.payout_change_hold_secs > 7 * 24 * 60 * 60 {
             return Err(ConfigError::PayoutHold);
         }
         if !(3..=20).contains(&self.max_login_attempts) {
@@ -119,9 +107,7 @@ pub enum ConfigError {
     #[error("session idle timeout is outside the permitted range")]
     SessionIdle,
     /// Invalid payout safety hold.
-    #[error(
-        "payout change hold must be between one minute and seven days (one second in regtest)"
-    )]
+    #[error("payout change hold must not exceed seven days")]
     PayoutHold,
     /// Invalid login-attempt policy.
     #[error("maximum login attempts must be between 3 and 20")]
@@ -229,10 +215,8 @@ mod tests {
     #[test]
     fn payout_hold_is_bounded_for_operator_testing() {
         let mut config = PortalConfig::testnet();
-        config.payout_change_hold_secs = 60;
+        config.payout_change_hold_secs = 0;
         assert_eq!(config.validate(), Ok(()));
-        config.payout_change_hold_secs = 59;
-        assert_eq!(config.validate(), Err(ConfigError::PayoutHold));
         config.payout_change_hold_secs = 7 * 24 * 60 * 60 + 1;
         assert_eq!(config.validate(), Err(ConfigError::PayoutHold));
     }

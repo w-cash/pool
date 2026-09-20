@@ -1601,6 +1601,106 @@ impl PostgresStore {
         Ok(activated)
     }
 
+    /// Recognizes one explicitly configured pre-accounting collector surplus
+    /// as pool equity before the first wallet reconciliation. This is an
+    /// idempotent launch operation; it never changes miner liabilities and it
+    /// cannot run after payout execution has begun.
+    pub async fn record_opening_pool_equity(
+        &self,
+        chain: Chain,
+        observed_wallet_spendable_zat: u64,
+        expected_surplus_zat: u64,
+    ) -> Result<(), StoreError> {
+        if expected_surplus_zat == 0 {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_chain_advisory(&mut transaction, self.identity.id, chain).await?;
+        lock_backend_projection(&mut transaction, self.identity.id).await?;
+        lock_chain_safety_row(&mut transaction, self.identity.id, chain).await?;
+
+        let reference = format!("opening-pool-equity:{}", chain.as_str());
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::BIGINT FROM ledger_transactions \
+             WHERE deployment_id=$1 AND chain=$2 \
+               AND kind='operator_capital_funded' AND reference=$3",
+        )
+        .bind(self.identity.id)
+        .bind(chain.as_str())
+        .bind(&reference)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if existing == 1 {
+            transaction.rollback().await?;
+            return Ok(());
+        }
+        if existing != 0 {
+            return Err(StoreError::CorruptDatabaseState(
+                "opening pool equity transaction",
+            ));
+        }
+
+        let prior_reconciliations = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::BIGINT FROM wallet_reconciliations \
+             WHERE deployment_id=$1 AND chain=$2",
+        )
+        .bind(self.identity.id)
+        .bind(chain.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let prior_batches = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::BIGINT FROM payout_batches \
+             WHERE deployment_id=$1 AND chain=$2",
+        )
+        .bind(self.identity.id)
+        .bind(chain.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if prior_reconciliations != 0 || prior_batches != 0 {
+            return Err(StoreError::CollectorReconciliationFailed);
+        }
+
+        let ledger_spendable = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(e.amount_zat),0)::BIGINT FROM ledger_entries e \
+             JOIN ledger_transactions t \
+               ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
+             WHERE e.deployment_id=$1 AND t.chain=$2 \
+               AND e.ledger_account='collector_spendable_asset'",
+        )
+        .bind(self.identity.id)
+        .bind(chain.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let ledger_spendable = u64::try_from(ledger_spendable)
+            .map_err(|_| StoreError::CollectorReconciliationFailed)?;
+        let actual_surplus = observed_wallet_spendable_zat
+            .checked_sub(ledger_spendable)
+            .ok_or(StoreError::CollectorReconciliationFailed)?;
+        if actual_surplus != expected_surplus_zat {
+            return Err(StoreError::CollectorReconciliationFailed);
+        }
+
+        insert_ledger_transaction(
+            &mut transaction,
+            self.identity.id,
+            chain,
+            "operator_capital_funded",
+            None,
+            &reference,
+            &[
+                (
+                    None,
+                    "collector_spendable_asset",
+                    as_i64(expected_surplus_zat)?,
+                ),
+                (None, "pool_equity", -as_i64(expected_surplus_zat)?),
+            ],
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Records one short-lived, chain-specific wallet reconciliation. The
     /// ledger root and checkpoint UUID are always derived inside this store.
     /// A mismatch is committed as durable evidence and freezes new payouts.
