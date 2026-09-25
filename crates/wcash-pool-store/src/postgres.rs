@@ -37,11 +37,12 @@ const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
 // The wallet observes newly matured coinbase outputs at the chain tip before
 // the backend journal projector has necessarily applied the corresponding
-// maturity event. Mainnet has shown a normal one-block projection delay of
-// roughly 40-50 seconds, so allow a bounded catch-up window without permitting
-// a payout from a mismatched checkpoint. An unchanged mismatch still freezes
-// the chain after this window.
-const WALLET_RECONCILIATION_MISMATCH_GRACE_SECS: u64 = 180;
+// maturity event. Mainnet emits maturity events in periodic batches that can
+// leave the wallet ahead of the projected ledger for about five minutes, so
+// allow a bounded ten-minute catch-up window without permitting a payout from
+// a mismatched checkpoint. An unchanged mismatch still freezes the chain after
+// this window.
+const WALLET_RECONCILIATION_MISMATCH_GRACE_SECS: u64 = 10 * 60;
 const EXPIRED_SESSION_CLEANUP_BATCH: u32 = 128;
 const MAX_EXPIRED_SESSION_CLEANUP_BATCH: u32 = 1_024;
 const MIN_PAYOUT_WORKER_LEASE_SECS: u64 = 1;
