@@ -1,6 +1,12 @@
 //! Testnet service composition and ordered process shutdown.
 
-use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(unix)]
 use std::{ffi::OsStr, os::unix::net::UnixDatagram, path::Path};
@@ -11,8 +17,8 @@ use wcash_pool_backend_client::BackendClient;
 use wcash_pool_edge::{JobRouter, ShareRouterError};
 use wcash_pool_portal::{
     serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
-    MinerTelemetrySource, PoolDataSource, PoolOverview, PortalApp, PortalBuildError, PortalConfig,
-    PortalRepository, PortalSecrets, TestnetPayoutBoundary,
+    MinerTelemetrySource, NetworkHashrate, PoolDataSource, PoolHashrate, PoolOverview, PortalApp,
+    PortalBuildError, PortalConfig, PortalRepository, PortalSecrets, TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
     Chain, NonceNamespaceClaim, PostgresEventProjector, PostgresPoolDataSource, PostgresStore,
@@ -45,6 +51,7 @@ use crate::{
 
 const ADDRESS_VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PORTAL_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const NETWORK_HASHRATE_SAMPLE_BLOCKS: u32 = 120;
 // The WEC worker can enter one non-cancellable, bounded wallet sync followed by
 // a crash-safe signer pass. Keep the process alive long enough for every child
 // deadline to fire, be reaped, and persist its journal result before Tokio
@@ -836,6 +843,10 @@ async fn run_started(
 
     let pool_data = PostgresPoolDataSource::new(started.store.as_ref().clone());
     pool_data.refresh().await?;
+    let hashrate_rpc =
+        LoopbackJsonRpc::new(config.wcash_node_rpc, config.wcash_node_cookie_file.clone())
+            .map_err(|_| ServiceError::PayoutAuthorityConfiguration)?;
+    refresh_network_hashrate(&pool_data, &hashrate_rpc, &started.jobs).await;
     let miner_telemetry = Arc::new(LiveMinerTelemetry::default());
     let portal = build_portal(
         config,
@@ -894,9 +905,12 @@ async fn run_started(
     });
 
     let refresh_shutdown = shutdown_rx.clone();
-    tasks.spawn(
-        async move { ServiceTask::Refresh(refresh_portal(pool_data, refresh_shutdown).await) },
-    );
+    let refresh_jobs = started.jobs.clone();
+    tasks.spawn(async move {
+        ServiceTask::Refresh(
+            refresh_portal(pool_data, hashrate_rpc, refresh_jobs, refresh_shutdown).await,
+        )
+    });
 
     let nonce_store = Arc::clone(&started.store);
     let nonce_allocator = Arc::clone(&started.nonces);
@@ -1646,6 +1660,14 @@ impl PoolDataSource for LivePoolDataSource {
         self.projection.overview()
     }
 
+    fn pool_hashrate(&self) -> PoolHashrate {
+        self.projection.pool_hashrate()
+    }
+
+    fn network_hashrate(&self) -> NetworkHashrate {
+        self.projection.network_hashrate()
+    }
+
     fn mining_ready(&self) -> bool {
         self.jobs
             .current_generation()
@@ -1655,6 +1677,8 @@ impl PoolDataSource for LivePoolDataSource {
 
 async fn refresh_portal(
     source: PostgresPoolDataSource,
+    rpc: LoopbackJsonRpc,
+    jobs: JobRouter,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), StoreError> {
     let mut interval = time::interval(PORTAL_REFRESH_INTERVAL);
@@ -1669,9 +1693,49 @@ async fn refresh_portal(
                     return Ok(());
                 }
             }
-            _ = interval.tick() => source.refresh().await?,
+            _ = interval.tick() => {
+                source.refresh().await?;
+                refresh_network_hashrate(&source, &rpc, &jobs).await;
+            },
         }
     }
+}
+
+async fn refresh_network_hashrate(
+    source: &PostgresPoolDataSource,
+    rpc: &LoopbackJsonRpc,
+    jobs: &JobRouter,
+) {
+    let height = jobs
+        .current_generation()
+        .ok()
+        .flatten()
+        .map(|generation| u64::from(generation.descriptor().wcash_height.saturating_sub(1)));
+    let Some(height) = height else {
+        let _ = source.set_network_hashrate(NetworkHashrate::default());
+        return;
+    };
+    let value = rpc
+        .compact_call(
+            "getnetworksolps",
+            serde_json::json!([NETWORK_HASHRATE_SAMPLE_BLOCKS, height]),
+        )
+        .await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs());
+    let snapshot = value.and_then(|value| value.as_u64()).map_or_else(
+        NetworkHashrate::default,
+        |hashrate_sol_s| NetworkHashrate {
+            available: true,
+            hashrate_sol_s: Some(hashrate_sol_s),
+            sample_blocks: NETWORK_HASHRATE_SAMPLE_BLOCKS,
+            height: Some(height),
+            updated_at: now,
+        },
+    );
+    let _ = source.set_network_hashrate(snapshot);
 }
 
 fn retain_first_error(slot: &mut Option<ServiceError>, result: Result<(), ServiceError>) {

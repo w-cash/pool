@@ -472,10 +472,48 @@ pub struct PoolOverview {
     pub fee_policy_revision: Option<u64>,
 }
 
+/// Public estimate of the work currently reaching this pool.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PoolHashrate {
+    /// False when the durable share projection cannot be read.
+    pub available: bool,
+    /// Accepted target-derived work per second, in Equihash solutions/second.
+    pub hashrate_sol_s: Option<u64>,
+    /// Trailing time window used for the estimate.
+    pub window_seconds: u64,
+    /// Database-clock time when this value was calculated.
+    pub updated_at: Option<u64>,
+}
+
+/// Public estimate reported by the Wcash consensus node.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct NetworkHashrate {
+    /// False when the local Wcash node cannot supply a fresh estimate.
+    pub available: bool,
+    /// Node-reported network work rate, in Equihash solutions/second.
+    pub hashrate_sol_s: Option<u64>,
+    /// Number of preceding blocks sampled by the node.
+    pub sample_blocks: u32,
+    /// Wcash tip height used for the estimate.
+    pub height: Option<u64>,
+    /// Wall-clock time when this value was requested from the node.
+    pub updated_at: Option<u64>,
+}
+
 /// Read-only projection consumed by portal overview pages.
 pub trait PoolDataSource: Send + Sync {
     /// Returns aggregate pool telemetry without private miner information.
     fn overview(&self) -> PoolOverview;
+
+    /// Returns a public estimate derived only from accepted durable shares.
+    fn pool_hashrate(&self) -> PoolHashrate {
+        PoolHashrate::default()
+    }
+
+    /// Returns the latest estimate supplied by the local Wcash node.
+    fn network_hashrate(&self) -> NetworkHashrate {
+        NetworkHashrate::default()
+    }
 
     /// Reports whether the live mining authority currently admits work.
     /// Historical telemetry alone cannot establish readiness.

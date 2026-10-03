@@ -176,6 +176,8 @@ impl PortalApp {
             .route("/assets/forms.css", get(form_styles))
             .route("/assets/app.js", get(script))
             .route("/api/v1/overview", get(overview))
+            .route("/api/v1/hashrate/pool", get(pool_hashrate))
+            .route("/api/v1/hashrate/network", get(network_hashrate))
             .route("/api/v1/balances", get(balances))
             .route("/api/v1/telemetry", get(miner_telemetry))
             .route("/api/v1/rewards", get(reward_history))
@@ -352,6 +354,14 @@ fn render_script(config: &PortalConfig) -> String {
 
 async fn overview(State(state): State<Arc<AppState>>) -> Json<crate::PoolOverview> {
     Json(state.pool_data.overview())
+}
+
+async fn pool_hashrate(State(state): State<Arc<AppState>>) -> Json<crate::PoolHashrate> {
+    Json(state.pool_data.pool_hashrate())
+}
+
+async fn network_hashrate(State(state): State<Arc<AppState>>) -> Json<crate::NetworkHashrate> {
+    Json(state.pool_data.network_hashrate())
 }
 
 async fn balances(

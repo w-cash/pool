@@ -19,9 +19,10 @@ pub use config::{ConfigError, PortalConfig, PortalSecrets};
 pub use model::{
     mask_destination, AccountSummary, AddressValidationError, AddressValidator, Asset,
     ChainNetwork, MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, MinerTelemetrySource,
-    MinerTelemetrySummary, Page, PageRequest, PayoutSettingSummary, PoolDataSource, PoolOverview,
-    ReceiverKind, RewardSummary, UnavailableMinerTelemetry, UnavailablePoolData,
-    ValidatedDestination, WorkerSummary, WorkerTelemetrySummary,
+    MinerTelemetrySummary, NetworkHashrate, Page, PageRequest, PayoutSettingSummary,
+    PoolDataSource, PoolHashrate, PoolOverview, ReceiverKind, RewardSummary,
+    UnavailableMinerTelemetry, UnavailablePoolData, ValidatedDestination, WorkerSummary,
+    WorkerTelemetrySummary,
 };
 pub use signer::{
     BroadcastReceipt, DisabledPayoutSigner, IsolatedPayoutSigner, PayoutBatchRequest,

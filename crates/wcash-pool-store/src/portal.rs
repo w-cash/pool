@@ -1,16 +1,21 @@
 //! Concrete miner-portal adapter over the deployment-fenced PostgreSQL store.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    str::FromStr,
+    sync::{Arc, RwLock},
+};
 
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use sqlx::{Postgres, Row, Transaction};
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 use wcash_pool_portal::{
     mask_destination, AccountCredential, Asset, AuthenticatedSession, ChainNetwork,
-    MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, NewSession, Page, PageRequest,
-    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolOverview, PortalRepository,
-    ProvisionedWorker, ReceiverKind as PortalReceiverKind, RepositoryError, RepositoryFuture,
-    RewardSummary, ValidatedDestination, WorkerSummary,
+    MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, NetworkHashrate, NewSession, Page,
+    PageRequest, PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolHashrate,
+    PoolOverview, PortalRepository, ProvisionedWorker, ReceiverKind as PortalReceiverKind,
+    RepositoryError, RepositoryFuture, RewardSummary, ValidatedDestination, WorkerSummary,
 };
 use wcash_pool_protocol::JobDescriptor;
 
@@ -21,6 +26,7 @@ use crate::{
 
 const MAXIMUM_MONEY_ZAT: u64 = 2_100_000_000_000_000;
 const MAXIMUM_WORKERS_PER_ACCOUNT: i64 = 100;
+const POOL_HASHRATE_WINDOW_SECONDS: u64 = 20 * 60;
 
 impl PortalRepository for PostgresStore {
     fn readiness(&self) -> RepositoryFuture<'_, ()> {
@@ -1060,6 +1066,8 @@ fn display_hash(value: Vec<u8>) -> Result<String, RepositoryError> {
 pub struct PostgresPoolDataSource {
     store: PostgresStore,
     snapshot: Arc<RwLock<PoolOverview>>,
+    pool_hashrate: Arc<RwLock<PoolHashrate>>,
+    network_hashrate: Arc<RwLock<NetworkHashrate>>,
 }
 
 impl PostgresPoolDataSource {
@@ -1068,6 +1076,11 @@ impl PostgresPoolDataSource {
         Self {
             store,
             snapshot: Arc::new(RwLock::new(PoolOverview::default())),
+            pool_hashrate: Arc::new(RwLock::new(PoolHashrate {
+                window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+                ..PoolHashrate::default()
+            })),
+            network_hashrate: Arc::new(RwLock::new(NetworkHashrate::default())),
         }
     }
 
@@ -1135,6 +1148,23 @@ impl PostgresPoolDataSource {
             sqlx::query_scalar::<_, i64>("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
                 .fetch_one(&self.store.pool)
                 .await?;
+        let accepted_work = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(SUM(s.work),0)::TEXT FROM shares s \
+             JOIN backend_events e ON e.deployment_id=s.deployment_id AND e.event_seq=s.event_seq \
+             WHERE s.deployment_id=$1 \
+               AND e.recorded_at >= clock_timestamp() - make_interval(secs => $2)",
+        )
+        .bind(self.store.identity.id)
+        .bind(
+            i32::try_from(POOL_HASHRATE_WINDOW_SECONDS)
+                .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate window"))?,
+        )
+        .fetch_one(&self.store.pool)
+        .await?;
+        let hashrate_sol_s = BigUint::from_str(&accepted_work)
+            .ok()
+            .and_then(|work| (work / POOL_HASHRATE_WINDOW_SECONDS).to_u64())
+            .ok_or(StoreError::CorruptDatabaseState("pool hashrate"))?;
         let snapshot = PoolOverview {
             available: true,
             updated_at: Some(unix_u64(updated_at)?),
@@ -1156,6 +1186,24 @@ impl PostgresPoolDataSource {
             .snapshot
             .write()
             .map_err(|_| StoreError::CorruptDatabaseState("portal overview lock"))? = snapshot;
+        *self
+            .pool_hashrate
+            .write()
+            .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate lock"))? = PoolHashrate {
+            available: true,
+            hashrate_sol_s: Some(hashrate_sol_s),
+            window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+            updated_at: Some(unix_u64(updated_at)?),
+        };
+        Ok(())
+    }
+
+    /// Publishes a node-derived estimate without giving the portal RPC access.
+    pub fn set_network_hashrate(&self, snapshot: NetworkHashrate) -> Result<(), StoreError> {
+        *self
+            .network_hashrate
+            .write()
+            .map_err(|_| StoreError::CorruptDatabaseState("network hashrate lock"))? = snapshot;
         Ok(())
     }
 }
@@ -1165,6 +1213,18 @@ impl PoolDataSource for PostgresPoolDataSource {
         self.snapshot
             .read()
             .map_or_else(|_| PoolOverview::default(), |snapshot| snapshot.clone())
+    }
+
+    fn pool_hashrate(&self) -> PoolHashrate {
+        self.pool_hashrate
+            .read()
+            .map_or_else(|_| PoolHashrate::default(), |snapshot| snapshot.clone())
+    }
+
+    fn network_hashrate(&self) -> NetworkHashrate {
+        self.network_hashrate
+            .read()
+            .map_or_else(|_| NetworkHashrate::default(), |snapshot| snapshot.clone())
     }
 }
 

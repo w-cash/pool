@@ -712,6 +712,25 @@ impl PoolDataSource for FixturePoolData {
     fn mining_ready(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+
+    fn pool_hashrate(&self) -> wcash_pool_portal::PoolHashrate {
+        wcash_pool_portal::PoolHashrate {
+            available: true,
+            hashrate_sol_s: Some(456_789),
+            window_seconds: 1_200,
+            updated_at: Some(1_700_000_000),
+        }
+    }
+
+    fn network_hashrate(&self) -> wcash_pool_portal::NetworkHashrate {
+        wcash_pool_portal::NetworkHashrate {
+            available: true,
+            hashrate_sol_s: Some(987_654),
+            sample_blocks: 120,
+            height: Some(12_345),
+            updated_at: Some(1_700_000_001),
+        }
+    }
 }
 
 impl IsolatedPayoutSigner for ReadySigner {
@@ -1378,6 +1397,41 @@ fn unavailable_overview_is_explicit() {
     assert!(public.get("hashrate_sol_s").is_none());
     assert!(public.get("active_workers").is_none());
     assert!(!UnavailablePoolData.mining_ready());
+}
+
+#[tokio::test]
+async fn public_hashrate_endpoints_expose_only_aggregate_snapshots() {
+    let app = portal(Arc::new(FixedClock::default()));
+    let pool = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/hashrate/pool")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("pool hashrate response");
+    assert_eq!(pool.status(), StatusCode::OK);
+    let pool = json_response(pool).await;
+    assert_eq!(pool["hashrate_sol_s"], 456_789);
+    assert_eq!(pool["window_seconds"], 1_200);
+    assert!(pool.get("workers").is_none());
+    assert!(pool.get("accounts").is_none());
+
+    let network = app
+        .oneshot(
+            Request::get("/api/v1/hashrate/network")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("network hashrate response");
+    assert_eq!(network.status(), StatusCode::OK);
+    let network = json_response(network).await;
+    assert_eq!(network["hashrate_sol_s"], 987_654);
+    assert_eq!(network["sample_blocks"], 120);
+    assert_eq!(network["height"], 12_345);
+    assert!(network.get("workers").is_none());
 }
 
 #[tokio::test]

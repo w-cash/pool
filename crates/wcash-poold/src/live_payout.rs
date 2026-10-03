@@ -178,6 +178,13 @@ impl LoopbackJsonRpc {
             Err(_) => Err(RpcFailure::Timeout),
         }
     }
+
+    /// Makes one small, read-only node query for public aggregate telemetry.
+    pub(crate) async fn compact_call(&self, method: &'static str, params: Value) -> Option<Value> {
+        self.execute(method, params, RpcLimits::compact())
+            .await
+            .ok()
+    }
 }
 
 impl fmt::Debug for LoopbackJsonRpc {
