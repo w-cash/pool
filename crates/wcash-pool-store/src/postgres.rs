@@ -5941,6 +5941,27 @@ mod payout_fee_tests {
     }
 
     #[test]
+    fn production_privacy_policy_skips_seventy_percent_and_caps_at_twenty_wec() {
+        const ONE_WEC: u64 = 100_000_000;
+        const TWENTY_WEC: u64 = 2_000_000_000;
+        assert_eq!(
+            payout_cap_from_draws(ONE_WEC, TWENTY_WEC, 7_000, 0, u64::MAX)
+                .expect("valid production payout policy"),
+            None
+        );
+        assert_eq!(
+            payout_cap_from_draws(ONE_WEC, TWENTY_WEC, 7_000, u64::MAX, 0)
+                .expect("valid production payout policy"),
+            Some(ONE_WEC)
+        );
+        assert_eq!(
+            payout_cap_from_draws(ONE_WEC, TWENTY_WEC, 7_000, u64::MAX, u64::MAX)
+                .expect("valid production payout policy"),
+            Some(TWENTY_WEC)
+        );
+    }
+
+    #[test]
     fn payout_privacy_draw_rejects_invalid_policy() {
         assert!(matches!(
             payout_cap_from_draws(0, 400, 5_000, 0, 0),
