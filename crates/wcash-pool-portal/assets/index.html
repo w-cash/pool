@@ -12,7 +12,7 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#top" aria-label="ZecWec pool home"><span class="brand-mark">ZW</span><span>ZecWec</span></a>
+    <a class="brand" href="#top" aria-label="ZecWec pool home"><span class="brand-mark"><span>Z</span><span>W</span></span><span>ZecWec</span></a>
     <span class="network">TESTNET <span>· no monetary value</span></span>
     <nav class="public-nav" aria-label="Public pool navigation">
       <a href="#live">Live</a><a href="#start">Start mining</a><a href="#activity">Blocks + payouts</a><a href="#docs">Docs</a>
@@ -23,19 +23,17 @@
     <section id="auth-view" class="public-shell">
       <div id="top" class="hero">
         <div class="hero-copy">
-          <p class="eyebrow">// ZCASH + WCASH · EQUIHASH 200,9</p>
-          <h1>Mine Zcash.<br><span>Earn Wcash too.</span></h1>
+          <p class="eyebrow">ZecWec merged mining · Equihash 200,9</p>
+          <h1><span class="zec-line">Mine Zcash.</span><br><span class="wec-line">Earn Wcash too.</span></h1>
           <p class="hero-lede">One ASIC connection searches one Equihash space for two independent chains. Zcash is the parent. Wcash is merged-mined through AuxPoW v2. Your hardware keeps doing ordinary Zcash work.</p>
           <div class="hero-actions"><a class="button primary" href="#account" data-auth-intent="register">Create mining account</a><a class="button secondary" href="#start">Configure miner</a></div>
-          <a class="hero-reference" href="https://equihash.com/merged-mining" rel="noreferrer">// Read the merged-mining protocol guide ↗</a>
+          <a class="hero-reference" href="https://equihash.com/merged-mining" rel="noreferrer">Read the merged-mining protocol guide ↗</a>
           <div class="trust-row"><span><strong>0%</strong> pool fee</span><span><strong>2</strong> coins per job</span><span><strong>1</strong> worker login</span></div>
         </div>
-        <aside class="hero-diagram" aria-label="Merged mining flow">
-          <div class="chain-node parent"><span>ZEC</span><strong>Zcash</strong><small>parent target</small></div>
-          <div class="hash-beam"><span>one Equihash search</span></div>
-          <div class="chain-node aux"><span>WEC</span><strong>Wcash</strong><small>auxiliary target</small></div>
-          <p>A submitted solution can qualify for Zcash, Wcash, both, or neither. Work is never divided between the chains.</p>
-        </aside>
+        <figure class="hero-identity" aria-label="A gold zebra representing Zcash and a silver wolf representing Wcash">
+          <img src="/assets/zebra-wolf.png" width="812" height="418" alt="Gold line-art zebra and silver line-art wolf">
+          <figcaption><span><b>Z</b> Zcash target</span><i>one Equihash job</i><span><b>W</b> Wcash target</span></figcaption>
+        </figure>
       </div>
 
       <section id="live" class="public-section live-section" aria-labelledby="live-title">

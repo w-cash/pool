@@ -964,6 +964,25 @@ async fn static_ui_and_health_are_hardened() {
         assert!(html.contains(disclosure));
     }
 
+    let identity = app
+        .clone()
+        .oneshot(
+            Request::get("/assets/zebra-wolf.png")
+                .body(Body::empty())
+                .expect("identity request"),
+        )
+        .await
+        .expect("identity response");
+    assert_eq!(identity.status(), StatusCode::OK);
+    assert_eq!(identity.headers().get("content-type").unwrap(), "image/png");
+    assert!(
+        to_bytes(identity.into_body(), 512 * 1024)
+            .await
+            .expect("identity body")
+            .len()
+            > 200_000
+    );
+
     let script_response = app
         .clone()
         .oneshot(

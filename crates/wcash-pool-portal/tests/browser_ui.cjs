@@ -35,7 +35,8 @@ async function fixture(options = {}) {
     if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: fs.readFileSync(path.join(assets, "index.html"), "utf8") });
     if (url.pathname.startsWith("/assets/")) {
       const name = url.pathname.slice(8);
-      assert.ok(["app.js", "app.css", "forms.css"].includes(name));
+      assert.ok(["app.js", "app.css", "forms.css", "zebra-wolf.png"].includes(name));
+      if (name.endsWith(".png")) return route.fulfill({ contentType: "image/png", body: fs.readFileSync(path.join(assets, name)) });
       return route.fulfill({ contentType: name.endsWith(".js") ? "text/javascript" : "text/css", body: fs.readFileSync(path.join(assets, name), "utf8") });
     }
     if (url.pathname === "/api/v1/auth/register") return reply({ account: { username: payload.username } }, 201);
@@ -82,6 +83,7 @@ test("public landing explains merged mining and renders privacy-safe live activi
   const { page, context, state } = await fixture({ signedIn: false });
   try {
     await page.getByRole("heading", { name: "Mine Zcash. Earn Wcash too." }).waitFor();
+    assert.equal(await page.locator(".hero-identity img").evaluate((image) => image.complete && image.naturalWidth === 812), true);
     assert.match(await page.locator("#public-pool-hashrate").textContent(), /1\.29 MSol\/s/);
     assert.match(await page.locator("#public-network-hashrate").textContent(), /2\.60 MSol\/s/);
     assert.equal(await page.locator("#public-stratum-url").textContent(), "stratum+tcp://testnet-mine.zecwec.com:3333");

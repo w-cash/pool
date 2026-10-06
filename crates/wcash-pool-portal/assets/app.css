@@ -1093,53 +1093,73 @@ body:has(#app-view:not(.hidden)) .network {
   .network { order:3; }
 }
 
-/* Public portal: high-contrast protocol interface */
+/* Public portal: ZecWec zebra-and-wolf identity */
 body:has(#auth-view:not(.hidden)) {
-  --bg:#020403;
-  --surface:#060a07;
-  --surface-2:#0c130d;
-  --line:#29452f;
-  --text:#f2f5ed;
-  --muted:#9aa89b;
-  --green:#76ff53;
-  --on-green:#031004;
-  --amber:#ccff8f;
-  --amber-bg:#111a0e;
-  background-color:var(--bg);
-  background-image:radial-gradient(circle,rgba(118,255,83,.14) .65px,transparent .8px);
-  background-size:24px 24px;
+  --bg:#080808;
+  --surface:#0e0e0e;
+  --surface-2:#171614;
+  --line:#302e29;
+  --text:#f1eee7;
+  --muted:#a29e95;
+  --green:#dcb858;
+  --on-green:#131008;
+  --amber:#dcb858;
+  --amber-bg:#211b0d;
+  --zec:#e0b64f;
+  --wec:#e3e5e8;
+  --live:#72cf9d;
+  color:var(--text);
+  background:
+    radial-gradient(ellipse 52% 30% at 18% 4%,rgba(224,182,79,.07),transparent 72%),
+    radial-gradient(ellipse 50% 26% at 86% 7%,rgba(227,229,232,.055),transparent 74%),
+    var(--bg);
+  font-family:Arial,Helvetica,sans-serif;
 }
 body:has(#auth-view:not(.hidden)) .topbar {
   min-height:72px;
   border-color:var(--line);
-  backdrop-filter:none;
-  background:rgba(2,4,3,.96);
+  backdrop-filter:blur(16px);
+  background:rgba(8,8,8,.93);
 }
 body:has(#auth-view:not(.hidden)) .brand {
   gap:11px;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  font-size:17px;
+  color:var(--text);
+  font-size:18px;
   font-weight:700;
-  letter-spacing:.05em;
-  text-transform:uppercase;
+  letter-spacing:-.02em;
 }
 body:has(#auth-view:not(.hidden)) .brand-mark {
-  width:34px;
-  height:34px;
-  border:1px solid var(--green);
-  border-radius:0;
-  color:var(--green);
-  background:transparent;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  width:38px;
+  height:32px;
+  overflow:hidden;
+  border:1px solid var(--line);
+  border-radius:2px;
+  color:inherit;
+  background:#090909;
   box-shadow:none;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  font:700 12px/30px ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:0;
+}
+body:has(#auth-view:not(.hidden)) .brand-mark span {
+  text-align:center;
+}
+body:has(#auth-view:not(.hidden)) .brand-mark span:first-child {
+  color:var(--zec);
+  border-right:1px solid var(--line);
+}
+body:has(#auth-view:not(.hidden)) .brand-mark span:last-child {
+  color:var(--wec);
 }
 body:has(#auth-view:not(.hidden)) .network {
+  padding:4px 8px;
   border:1px solid var(--line);
-  border-radius:0;
-  color:var(--green);
+  border-radius:2px;
+  color:var(--muted);
   background:transparent;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  letter-spacing:.06em;
+  font:10px/1.35 ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:.055em;
   text-transform:uppercase;
 }
 body:has(#auth-view:not(.hidden)) .public-nav {
@@ -1151,257 +1171,329 @@ body:has(#auth-view:not(.hidden)) .hero-reference,
 body:has(#auth-view:not(.hidden)) .reference-links a,
 body:has(#auth-view:not(.hidden)) .text-link {
   color:var(--muted);
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  font-size:11px;
-  letter-spacing:.06em;
+  font-size:12px;
   text-decoration:none;
-  text-transform:uppercase;
 }
 body:has(#auth-view:not(.hidden)) .public-nav a:hover,
 body:has(#auth-view:not(.hidden)) .top-signin:hover,
 body:has(#auth-view:not(.hidden)) .hero-reference:hover,
 body:has(#auth-view:not(.hidden)) .reference-links a:hover,
 body:has(#auth-view:not(.hidden)) .text-link:hover {
-  color:var(--green);
+  color:var(--zec);
 }
 body:has(#auth-view:not(.hidden)) .top-create {
-  padding:9px 13px;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  font-size:11px;
-  letter-spacing:.05em;
-  text-transform:uppercase;
+  padding:9px 14px;
+  border-radius:2px;
+  font-size:12px;
 }
 body:has(#auth-view:not(.hidden)) .public-shell {
   isolation:isolate;
 }
 body:has(#auth-view:not(.hidden)) .hero {
-  min-height:710px;
+  grid-template-columns:minmax(0,1.02fr) minmax(410px,.98fr);
+  gap:54px;
+  min-height:680px;
+  padding:86px 0 74px;
 }
 body:has(#auth-view:not(.hidden)) .hero::before {
-  width:47%;
-  height:72%;
-  top:14%;
-  right:-7%;
-  border:1px solid rgba(118,255,83,.28);
-  border-radius:0;
-  background:
-    linear-gradient(rgba(118,255,83,.14) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(118,255,83,.14) 1px,transparent 1px);
-  background-size:42px 42px;
-  transform:skewY(-6deg);
+  content:none;
 }
 body:has(#auth-view:not(.hidden)) .eyebrow,
 body:has(#auth-view:not(.hidden)) .section-kicker {
-  color:var(--green);
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  font-weight:650;
-  letter-spacing:.12em;
+  color:var(--zec);
+  font:600 10px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:.1em;
   text-transform:uppercase;
 }
 body:has(#auth-view:not(.hidden)) .hero-copy h1 {
-  margin:17px 0 27px;
-  max-width:800px;
-  font-size:clamp(52px,7.8vw,96px);
-  font-weight:760;
-  letter-spacing:-.065em;
-  line-height:.88;
-  text-transform:uppercase;
+  max-width:760px;
+  margin:17px 0 26px;
+  font-size:clamp(50px,6.6vw,82px);
+  font-weight:700;
+  letter-spacing:-.055em;
+  line-height:.95;
 }
-body:has(#auth-view:not(.hidden)) .hero-copy h1 span {
-  color:var(--green);
+body:has(#auth-view:not(.hidden)) .hero-copy h1 .zec-line {
+  color:var(--zec);
+}
+body:has(#auth-view:not(.hidden)) .hero-copy h1 .wec-line {
+  color:var(--wec);
 }
 body:has(#auth-view:not(.hidden)) .hero-lede {
-  max-width:650px;
-  color:#c4cdc3;
-  font-size:16px;
-  line-height:1.72;
+  max-width:630px;
+  color:#bdb9b0;
+  font-size:17px;
+  line-height:1.68;
 }
 body:has(#auth-view:not(.hidden)) .hero-actions {
-  margin:34px 0 19px;
+  margin:31px 0 18px;
 }
 body:has(#auth-view:not(.hidden)) .button {
-  border-radius:0;
+  border-radius:2px;
 }
 body:has(#auth-view:not(.hidden)) .hero-actions .button {
-  padding:13px 17px;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  font-size:12px;
-  letter-spacing:.035em;
-  text-transform:uppercase;
+  padding:12px 16px;
+  font-size:13px;
+  text-decoration:none;
 }
 body:has(#auth-view:not(.hidden)) .button.secondary,
 body:has(#auth-view:not(.hidden)) .button.quiet {
-  background:#050806;
+  background:#0b0b0b;
 }
 body:has(#auth-view:not(.hidden)) .hero-reference {
   display:inline-block;
-  margin-bottom:27px;
-  color:var(--green);
+  margin-bottom:29px;
 }
 body:has(#auth-view:not(.hidden)) .trust-row {
-  gap:0;
+  gap:18px;
 }
 body:has(#auth-view:not(.hidden)) .trust-row span {
-  border-radius:0;
-  border-right:0;
-  background:rgba(2,4,3,.82);
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  font-size:10px;
-  letter-spacing:.06em;
-  text-transform:uppercase;
-}
-body:has(#auth-view:not(.hidden)) .trust-row span:last-child {
-  border-right:1px solid var(--line);
-}
-body:has(#auth-view:not(.hidden)) .hero-diagram,
-body:has(#auth-view:not(.hidden)) .connection-card,
-body:has(#auth-view:not(.hidden)) .activity-card,
-body:has(#auth-view:not(.hidden)) .docs-grid article,
-body:has(#auth-view:not(.hidden)) .agent-section pre,
-body:has(#auth-view:not(.hidden)) .account-section .auth-panel,
-body:has(#auth-view:not(.hidden)) .chart-card {
-  border-color:var(--line);
-  border-radius:0;
-  background:rgba(6,10,7,.94);
-  box-shadow:none;
-}
-body:has(#auth-view:not(.hidden)) .hero-diagram {
   padding:0;
-  gap:0;
-  border-color:var(--green);
-}
-body:has(#auth-view:not(.hidden)) .chain-node {
-  padding:24px;
   border:0;
-  border-bottom:1px solid var(--line);
   border-radius:0;
-  background:#050806;
-}
-body:has(#auth-view:not(.hidden)) .chain-node>span {
-  border:1px solid var(--green);
-  border-radius:0;
+  color:var(--muted);
   background:transparent;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  font:11px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;
 }
-body:has(#auth-view:not(.hidden)) .chain-node strong {
+body:has(#auth-view:not(.hidden)) .trust-row strong {
+  margin-right:3px;
+  color:var(--text);
+}
+.hero-identity {
+  position:relative;
+  z-index:1;
+  min-width:0;
+  margin:0;
+  padding:26px 12px 0;
+}
+.hero-identity::before {
+  content:"";
+  position:absolute;
+  inset:4% 4% 13%;
+  z-index:-1;
+  background:
+    radial-gradient(circle at 27% 48%,rgba(224,182,79,.12),transparent 42%),
+    radial-gradient(circle at 75% 48%,rgba(227,229,232,.09),transparent 42%);
+  filter:blur(20px);
+}
+.hero-identity img {
+  display:block;
+  width:112%;
+  max-width:none;
+  height:auto;
+  margin-left:-6%;
+  opacity:.92;
+  filter:drop-shadow(0 18px 50px rgba(0,0,0,.65));
+}
+.hero-identity figcaption {
+  display:grid;
+  grid-template-columns:1fr auto 1fr;
+  gap:14px;
+  align-items:center;
+  margin:2px 5% 0;
+  padding:15px 0 0;
+  border-top:1px solid var(--line);
+  color:var(--muted);
+  font:10px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:.04em;
   text-transform:uppercase;
 }
-body:has(#auth-view:not(.hidden)) .hash-beam {
-  height:68px;
-  border-bottom:1px solid var(--line);
+.hero-identity figcaption span:last-child {
+  text-align:right;
 }
-body:has(#auth-view:not(.hidden)) .hash-beam span {
-  border:1px solid var(--line);
-  background:var(--bg);
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+.hero-identity figcaption b {
+  display:inline-grid;
+  place-items:center;
+  width:22px;
+  height:22px;
+  margin-right:6px;
+  border:1px solid currentColor;
+  font-weight:600;
 }
-body:has(#auth-view:not(.hidden)) .hero-diagram>p {
-  margin:0;
-  padding:20px 24px;
+.hero-identity figcaption span:first-child b {
+  color:var(--zec);
+}
+.hero-identity figcaption span:last-child b {
+  color:var(--wec);
+}
+.hero-identity figcaption i {
+  color:#77736b;
+  font-style:normal;
 }
 body:has(#auth-view:not(.hidden)) .public-section {
+  padding:72px 0;
   border-color:var(--line);
+}
+body:has(#auth-view:not(.hidden)) .public-heading {
+  margin-bottom:27px;
 }
 body:has(#auth-view:not(.hidden)) .public-heading h2,
 body:has(#auth-view:not(.hidden)) .account-copy h2,
 body:has(#auth-view:not(.hidden)) .agent-copy h2 {
-  font-weight:720;
+  font-size:clamp(30px,3.7vw,45px);
+  font-weight:700;
   letter-spacing:-.045em;
-  text-transform:uppercase;
+  line-height:1.02;
+}
+body:has(#auth-view:not(.hidden)) .public-heading p {
+  color:var(--muted);
+}
+body:has(#auth-view:not(.hidden)) .live-dot {
+  background:var(--live);
+  box-shadow:0 0 0 4px rgba(114,207,157,.12);
 }
 body:has(#auth-view:not(.hidden)) .public-metrics {
-  border-color:var(--green);
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:12px;
+  overflow:visible;
+  border:0;
   border-radius:0;
-  background:var(--line);
+  background:transparent;
 }
 body:has(#auth-view:not(.hidden)) .public-metrics article {
-  background:#050806;
+  position:relative;
+  padding:22px;
+  border:1px solid var(--line);
+  border-radius:3px;
+  background:rgba(14,14,14,.88);
+}
+body:has(#auth-view:not(.hidden)) .public-metrics article::before {
+  content:"";
+  position:absolute;
+  top:-1px;
+  left:22px;
+  width:36px;
+  height:2px;
+  background:var(--text);
+}
+body:has(#auth-view:not(.hidden)) .public-metrics article:nth-child(2)::before,
+body:has(#auth-view:not(.hidden)) .public-metrics article:nth-child(3)::before {
+  background:var(--wec);
+}
+body:has(#auth-view:not(.hidden)) .public-metrics article:nth-child(4)::before {
+  background:var(--zec);
 }
 body:has(#auth-view:not(.hidden)) .public-metrics span,
 body:has(#auth-view:not(.hidden)) .public-metrics small,
 body:has(#auth-view:not(.hidden)) .connection-step small,
 body:has(#auth-view:not(.hidden)) .activity-card .card-title span {
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  letter-spacing:.04em;
+  font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:.035em;
   text-transform:uppercase;
 }
 body:has(#auth-view:not(.hidden)) .public-metrics strong {
-  color:var(--green);
+  color:var(--text);
   font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  font-weight:500;
+}
+body:has(#auth-view:not(.hidden)) .chart-card,
+body:has(#auth-view:not(.hidden)) .connection-card,
+body:has(#auth-view:not(.hidden)) .activity-card,
+body:has(#auth-view:not(.hidden)) .docs-grid article,
+body:has(#auth-view:not(.hidden)) .agent-section pre,
+body:has(#auth-view:not(.hidden)) .account-section .auth-panel {
+  border-color:var(--line);
+  border-radius:3px;
+  background:rgba(14,14,14,.91);
+  box-shadow:none;
 }
 body:has(#auth-view:not(.hidden)) .chart-line {
+  stroke:var(--zec);
   stroke-width:2;
-  stroke-linecap:square;
-  stroke-linejoin:miter;
+  stroke-linecap:round;
 }
-body:has(#auth-view:not(.hidden)) .zero-fee,
-body:has(#auth-view:not(.hidden)) .asset-pill {
-  border:1px solid var(--green);
-  border-radius:0;
-  color:var(--green);
-  background:transparent;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  text-transform:uppercase;
+body:has(#auth-view:not(.hidden)) .chart-area {
+  fill:rgba(224,182,79,.08);
+}
+body:has(#auth-view:not(.hidden)) .chart-card>.section-head>strong {
+  color:var(--zec);
+}
+body:has(#auth-view:not(.hidden)) .zero-fee {
+  padding:7px 11px;
+  border:1px solid var(--zec);
+  border-radius:2px;
+  color:var(--zec);
+  font:600 11px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;
 }
 body:has(#auth-view:not(.hidden)) .connection-step>span {
-  border:1px solid var(--green);
-  border-radius:0;
-  color:var(--green);
-  background:transparent;
+  border:1px solid var(--line);
+  border-radius:2px;
+  color:var(--zec);
+  background:#0a0a09;
   font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
 }
-body:has(#auth-view:not(.hidden)) .docs-grid {
-  gap:1px;
-  border:1px solid var(--line);
-  background:var(--line);
-}
-body:has(#auth-view:not(.hidden)) .docs-grid article {
-  border:0;
-}
-body:has(#auth-view:not(.hidden)) .docs-grid article>span {
+body:has(#auth-view:not(.hidden)) .connection-step code,
+body:has(#auth-view:not(.hidden)) .agent-section code,
+body:has(#auth-view:not(.hidden)) .compatibility-line {
   font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
 }
 body:has(#auth-view:not(.hidden)) .activity-grid {
-  gap:1px;
-  border:1px solid var(--line);
-  background:var(--line);
+  gap:16px;
 }
-body:has(#auth-view:not(.hidden)) .activity-card {
-  border:0;
+body:has(#auth-view:not(.hidden)) .asset-pill {
+  border:1px solid var(--line);
+  border-radius:2px;
+  color:var(--text);
+  background:#131210;
+  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+body:has(#auth-view:not(.hidden)) .docs-grid {
+  gap:12px;
+}
+body:has(#auth-view:not(.hidden)) .docs-grid article {
+  position:relative;
+  padding:24px;
+}
+body:has(#auth-view:not(.hidden)) .docs-grid article>span {
+  color:var(--zec);
+  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+body:has(#auth-view:not(.hidden)) .docs-grid article:nth-child(even)>span {
+  color:var(--wec);
 }
 body:has(#auth-view:not(.hidden)) .agent-section pre {
-  border-color:var(--green);
+  border-color:#49463d;
+  color:#d8c98e;
 }
 body:has(#auth-view:not(.hidden)) .account-section .auth-panel {
-  border-color:var(--green);
+  border-color:#5c4e2b;
 }
 body:has(#auth-view:not(.hidden)) .segmented {
-  gap:0;
-  padding:0;
+  gap:3px;
+  padding:4px;
   border:1px solid var(--line);
-  border-radius:0;
-  background:var(--bg);
+  border-radius:3px;
+  background:#090909;
 }
 body:has(#auth-view:not(.hidden)) .segment {
-  border-radius:0;
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  text-transform:uppercase;
+  border-radius:2px;
 }
 body:has(#auth-view:not(.hidden)) .segment.active {
   color:var(--on-green);
-  background:var(--green);
+  background:var(--zec);
 }
 body:has(#auth-view:not(.hidden)) .account-section input,
 body:has(#auth-view:not(.hidden)) .account-section select {
-  border-radius:0;
-  background:#030604;
+  border-radius:2px;
+  background:#0a0a0a;
 }
-body:has(#auth-view:not(.hidden)) .account-section label,
-body:has(#auth-view:not(.hidden)) .account-section .field-help,
-body:has(#auth-view:not(.hidden)) .fineprint {
-  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+body:has(#auth-view:not(.hidden)) .fineprint,
+body:has(#auth-view:not(.hidden)) .account-section .field-help {
+  color:#8e8a81;
 }
-
+@media(max-width:920px) {
+  body:has(#auth-view:not(.hidden)) .hero {
+    grid-template-columns:1fr;
+    gap:24px;
+    min-height:0;
+    padding-top:68px;
+  }
+  .hero-identity {
+    width:min(100%,680px);
+    margin:0 auto;
+    padding-top:0;
+  }
+}
 @media(max-width:760px) {
   body:has(#auth-view:not(.hidden)) .topbar {
     gap:10px;
@@ -1419,27 +1511,30 @@ body:has(#auth-view:not(.hidden)) .fineprint {
   body:has(#auth-view:not(.hidden)) .top-create {
     padding:8px 10px;
   }
-  body:has(#auth-view:not(.hidden)) .hero {
-    min-height:0;
+  body:has(#auth-view:not(.hidden)) .hero-copy h1 {
+    font-size:clamp(45px,13vw,66px);
   }
-  body:has(#auth-view:not(.hidden)) .hero::before {
-    width:80%;
-    height:34%;
-    top:2%;
-    right:-30%;
+  body:has(#auth-view:not(.hidden)) .hero-identity figcaption {
+    grid-template-columns:1fr 1fr;
+  }
+  body:has(#auth-view:not(.hidden)) .hero-identity figcaption i {
+    display:none;
   }
 }
-
 @media(max-width:430px) {
   body:has(#auth-view:not(.hidden)) .brand>span:last-child {
     display:none;
   }
   body:has(#auth-view:not(.hidden)) .hero-copy h1 {
-    font-size:clamp(42px,15vw,58px);
+    font-size:clamp(40px,13.5vw,54px);
   }
-  body:has(#auth-view:not(.hidden)) .trust-row span {
-    flex:1 1 33%;
-    padding:8px 6px;
-    text-align:center;
+  body:has(#auth-view:not(.hidden)) .trust-row {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:9px 14px;
+  }
+  body:has(#auth-view:not(.hidden)) .hero-identity {
+    margin-top:8px;
+    padding-inline:0;
   }
 }

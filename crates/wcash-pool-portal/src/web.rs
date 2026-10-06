@@ -175,6 +175,7 @@ impl PortalApp {
             .route("/assets/app.css", get(styles))
             .route("/assets/forms.css", get(form_styles))
             .route("/assets/app.js", get(script))
+            .route("/assets/zebra-wolf.png", get(zebra_wolf))
             .route("/api/v1/overview", get(overview))
             .route("/api/v1/hashrate/pool", get(pool_hashrate))
             .route("/api/v1/hashrate/network", get(network_hashrate))
@@ -319,6 +320,13 @@ async fn form_styles() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../assets/forms.css"),
+    )
+}
+
+async fn zebra_wolf() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "image/png")],
+        include_bytes!("../assets/zebra-wolf.png").as_slice(),
     )
 }
 
