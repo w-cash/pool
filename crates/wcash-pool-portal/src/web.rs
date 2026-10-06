@@ -281,7 +281,7 @@ fn render_index(config: &PortalConfig) -> String {
         .replace("· no monetary value", "· automatic payout")
         .replace("<option value=\"tls\">TLS · preferred</option>", "")
         .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
-        .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3334")
+        .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3336")
         .replace("Use TLS when your ASIC firmware supports it.", "This account pool uses a separate Stratum endpoint. Existing invited workers remain on port 3333.");
     }
     if !config.allow_registration {
@@ -330,8 +330,8 @@ fn render_script(config: &PortalConfig) -> String {
     let mut source = include_str!("../assets/app.js").to_owned();
     if config.network == crate::ChainNetwork::Mainnet {
         source = source
-            .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3334")
-            .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3334")
+            .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3336")
+            .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3336")
             .replace("Testnet", "Mainnet")
             .replace("TWC", "WEC")
             .replace(
@@ -1292,13 +1292,13 @@ mod tests {
 
         assert!(page.contains("ZecWec Pool — Mainnet"));
         assert!(page.contains("· automatic payout"));
-        assert!(page.contains("mainnet.zecwec.com:3334"));
+        assert!(page.contains("mainnet.zecwec.com:3336"));
         assert!(!page.contains("data-auth-mode=\"register\""));
         assert!(!page.contains("<option value=\"tls\">"));
         assert!(!page.contains("testnet-mine.zecwec.com"));
         assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
         assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
-        assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3334"));
+        assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3336"));
         assert!(!script.contains("testnet-mine.zecwec.com"));
 
         config.mining_password_ignored = true;

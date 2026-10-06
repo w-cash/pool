@@ -1322,7 +1322,7 @@ async fn mainnet_staging_reports_chain_specific_payout_policy_and_no_registratio
         .await
         .expect("bounded script");
     let script = std::str::from_utf8(&script).expect("UTF-8 script");
-    assert!(script.contains("mainnet.zecwec.com:3334"));
+    assert!(script.contains("mainnet.zecwec.com:3336"));
     assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
     assert!(!script.contains("testnet-mine.zecwec.com"));
 }

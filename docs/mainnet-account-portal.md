@@ -6,10 +6,13 @@ but does not provide the ordinary accepted-share history needed to calculate a
 per-account PPLNS balance. Neither the current collector balance nor historical
 Wolf shares may be presented as a new account's payable balance.
 
-The account Pool is a separate deployment. Its Stratum listener is port 3334,
-its HTTPS portal belongs at `pool.zecwec.com`, and its Wolf backend, PostgreSQL
-database, journal, nonce namespace, and collector accounting must be isolated
-from the invited-worker service. Port 3333 remains available throughout staging.
+The account Pool is a separate deployment. Its advertised Stratum endpoint is
+`mainnet.zecwec.com:3336`, and its HTTPS portal is `pool.zecwec.com`. Port 3336
+accepts ordinary ZIP-301 miners and adapts short-job-ID GodMiner firmware before
+forwarding submissions to the standard pool implementation. Port 3334 remains
+an unadvertised operational fallback. Both listeners use the same deployment,
+Wolf backend, PostgreSQL share ledger, workers, and payout accounting. They stay
+isolated from the invited-worker service on port 3333.
 
 `registration_open` is false by default on Mainnet. Opening the portal does not
 open registration; the operator sets `registration_open = true` only after all
@@ -17,7 +20,7 @@ of the following have been observed on the isolated deployment:
 
 1. The backend and pool pin the actual Wcash/Zcash Mainnet genesis hashes,
    chain ID, collector commitments, and synchronized authoritative node tips.
-2. A private miner on 3334 successfully authenticates, receives work, submits
+2. A private miner on 3336 successfully authenticates, receives work, submits
    ordinary shares, and sees those exact shares attributed to its account in
    PostgreSQL and in the portal. Rejected and duplicate shares remain distinct.
 3. A Wcash-only winner and a Zcash winner, or deterministic private-network
@@ -40,5 +43,5 @@ of the following have been observed on the isolated deployment:
 The public launch can be split: account registration and share accounting may
 open first with an explicit deferred-payout notice and an operator commitment
 to settle earned balances. Automatic payments require their own release and
-on-chain receipt evidence. No staging page should advertise port 3334 before
+on-chain receipt evidence. No staging page should advertise port 3336 before
 that port accepts and records real shares.
