@@ -91,6 +91,11 @@ test("public landing explains merged mining and renders privacy-safe live activi
     assert.match(text, /0% pool fee/);
     assert.match(text, /password x/);
     assert.doesNotMatch(text, /fixture.*private|account_id|gross_zat|net_zat/i);
+    const topCreate = page.locator(".top-create");
+    assert.equal(await topCreate.isVisible(), true);
+    await topCreate.click();
+    assert.equal(await page.locator('[data-auth-mode="register"]').getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator("#auth-submit").textContent(), "Create account");
     if (process.env.PORTAL_UI_SCREENSHOT_DIR) {
       fs.mkdirSync(process.env.PORTAL_UI_SCREENSHOT_DIR, { recursive: true });
       await page.screenshot({ path: path.join(process.env.PORTAL_UI_SCREENSHOT_DIR, "public-dashboard.png"), fullPage: true });

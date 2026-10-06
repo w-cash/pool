@@ -15,18 +15,19 @@
     <a class="brand" href="#top" aria-label="ZecWec pool home"><span class="brand-mark">ZW</span><span>ZecWec</span></a>
     <span class="network">TESTNET <span>· no monetary value</span></span>
     <nav class="public-nav" aria-label="Public pool navigation">
-      <a href="#live">Live</a><a href="#start">Start mining</a><a href="#activity">Activity</a><a href="#docs">Documentation</a>
+      <a href="#live">Live</a><a href="#start">Start mining</a><a href="#activity">Blocks + payouts</a><a href="#docs">Docs</a>
     </nav>
-    <div class="session-actions"><span id="account-name" class="muted"></span><a class="button quiet account-link" href="#account">Account</a><button id="sign-out" class="button quiet hidden" type="button">Sign out</button></div>
+    <div class="session-actions"><span id="account-name" class="muted"></span><a class="top-signin account-link" href="#account" data-auth-intent="login">Sign in</a><a class="button primary account-link top-create" href="#account" data-auth-intent="register">Create account</a><button id="sign-out" class="button quiet hidden" type="button">Sign out</button></div>
   </header>
   <main>
     <section id="auth-view" class="public-shell">
       <div id="top" class="hero">
         <div class="hero-copy">
-          <p class="eyebrow">ZCASH + WCASH · EQUIHASH 200,9</p>
+          <p class="eyebrow">// ZCASH + WCASH · EQUIHASH 200,9</p>
           <h1>Mine Zcash.<br><span>Earn Wcash too.</span></h1>
           <p class="hero-lede">One ASIC connection searches one Equihash space for two independent chains. Zcash is the parent. Wcash is merged-mined through AuxPoW v2. Your hardware keeps doing ordinary Zcash work.</p>
-          <div class="hero-actions"><a class="button primary" href="#start">Start mining</a><a class="button secondary" href="https://equihash.com/merged-mining" rel="noreferrer">How merged mining works</a></div>
+          <div class="hero-actions"><a class="button primary" href="#account" data-auth-intent="register">Create mining account</a><a class="button secondary" href="#start">Configure miner</a></div>
+          <a class="hero-reference" href="https://equihash.com/merged-mining" rel="noreferrer">// Read the merged-mining protocol guide ↗</a>
           <div class="trust-row"><span><strong>0%</strong> pool fee</span><span><strong>2</strong> coins per job</span><span><strong>1</strong> worker login</span></div>
         </div>
         <aside class="hero-diagram" aria-label="Merged mining flow">

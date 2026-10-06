@@ -746,16 +746,21 @@ async function refreshHistory(kind, append = false, generation = authGeneration)
   }
 }
 
-$$('[data-auth-mode]').forEach((button) => button.addEventListener("click", () => {
+function selectAuthMode(mode) {
   if ($("#auth-form").dataset.busy === "true") return;
-  authMode = button.dataset.authMode;
-  $$('[data-auth-mode]').forEach((item) => { item.classList.toggle("active", item === button); item.setAttribute("aria-pressed", String(item === button)); });
+  const selected = $(`[data-auth-mode="${mode}"]`);
+  if (!selected) return;
+  authMode = mode;
+  $$('[data-auth-mode]').forEach((item) => { item.classList.toggle("active", item === selected); item.setAttribute("aria-pressed", String(item === selected)); });
   setText("#auth-submit", authMode === "login" ? "Sign in" : "Create account");
   $("#totp-login-field").classList.toggle("hidden", authMode !== "login");
   $("#auth-form").elements.password.autocomplete = authMode === "login" ? "current-password" : "new-password";
   $("#auth-form").elements.totp_code.disabled = authMode !== "login";
   $("#auth-error").classList.add("hidden");
-}));
+}
+
+$$('[data-auth-mode]').forEach((button) => button.addEventListener("click", () => selectAuthMode(button.dataset.authMode)));
+$$('[data-auth-intent]').forEach((link) => link.addEventListener("click", () => selectAuthMode(link.dataset.authIntent)));
 
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();

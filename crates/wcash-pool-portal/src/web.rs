@@ -289,6 +289,8 @@ fn render_index(config: &PortalConfig) -> String {
     if !config.allow_registration {
         page = page
             .replace("<li>Create an account</li>", "<li>Sign in to an invited account</li>")
+            .replace("<a class=\"button primary account-link top-create\" href=\"#account\" data-auth-intent=\"register\">Create account</a>", "")
+            .replace("<a class=\"button primary\" href=\"#account\" data-auth-intent=\"register\">Create mining account</a>", "<a class=\"button primary\" href=\"#account\" data-auth-intent=\"login\">Sign in to mine</a>")
             .replace("<button class=\"segment\" data-auth-mode=\"register\" type=\"button\" aria-pressed=\"false\">Create account</button>", "");
     }
     if config.mining_password_ignored {
@@ -1300,6 +1302,7 @@ mod tests {
         assert!(page.contains("· automatic payout"));
         assert!(page.contains("mainnet.zecwec.com:3336"));
         assert!(!page.contains("data-auth-mode=\"register\""));
+        assert!(!page.contains("data-auth-intent=\"register\""));
         assert!(!page.contains("<option value=\"tls\">"));
         assert!(!page.contains("testnet-mine.zecwec.com"));
         assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
