@@ -500,6 +500,60 @@ pub struct NetworkHashrate {
     pub updated_at: Option<u64>,
 }
 
+/// One public-safe pool hashrate sample.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PoolHashratePoint {
+    /// Start of the sample bucket as a Unix timestamp.
+    pub timestamp: u64,
+    /// Accepted target-derived work per second during the bucket.
+    pub hashrate_sol_s: u64,
+}
+
+/// One block found by the pool, without miner or account attribution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PublicBlockSummary {
+    /// Chain on which the solution became a block.
+    pub asset: Asset,
+    /// Public chain height.
+    pub height: u64,
+    /// Conventional display-order block hash.
+    pub block_hash: String,
+    /// Current reversible lifecycle state.
+    pub state: String,
+    /// Time the winning share entered the durable journal.
+    pub found_at: u64,
+}
+
+/// One public payout transaction without amounts, recipients, or balances.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PublicPayoutSummary {
+    /// Independently settled asset.
+    pub asset: Asset,
+    /// Public transaction identifier after signing.
+    pub transaction_id: String,
+    /// Durable payout lifecycle state.
+    pub state: String,
+    /// Confirming block height when final.
+    pub confirmation_height: Option<u64>,
+    /// Last durable update time for the payout batch.
+    pub updated_at: u64,
+}
+
+/// Public activity feed used by the signed-out mining dashboard.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PublicPoolActivity {
+    /// False when the durable projection cannot be read.
+    pub available: bool,
+    /// Database-clock time when this projection was refreshed.
+    pub updated_at: Option<u64>,
+    /// Trailing pool-hashrate history sampled once per ten-minute bucket.
+    pub hashrate: Vec<PoolHashratePoint>,
+    /// Most recently found pool blocks, with no miner attribution.
+    pub blocks: Vec<PublicBlockSummary>,
+    /// Most recent signed payout transactions, without values or recipients.
+    pub payouts: Vec<PublicPayoutSummary>,
+}
+
 /// Read-only projection consumed by portal overview pages.
 pub trait PoolDataSource: Send + Sync {
     /// Returns aggregate pool telemetry without private miner information.
@@ -513,6 +567,11 @@ pub trait PoolDataSource: Send + Sync {
     /// Returns the latest estimate supplied by the local Wcash node.
     fn network_hashrate(&self) -> NetworkHashrate {
         NetworkHashrate::default()
+    }
+
+    /// Returns public-safe history without account, address, or amount data.
+    fn public_activity(&self) -> PublicPoolActivity {
+        PublicPoolActivity::default()
     }
 
     /// Reports whether the live mining authority currently admits work.

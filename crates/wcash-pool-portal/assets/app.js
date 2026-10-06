@@ -13,6 +13,7 @@ let cachedTelemetry = null;
 let authGeneration = 0;
 let currentAccount = null;
 let refreshTimer = null;
+let publicRefreshTimer = null;
 let refreshInFlight = false;
 let cachedSettings = null;
 let payoutHoldSecs = 172800;
@@ -75,6 +76,108 @@ function setText(selector, value) {
 
 function formatCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : "—";
+}
+
+function formatHashrate(value) {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  const units = [[1e9, "GSol/s"], [1e6, "MSol/s"], [1e3, "kSol/s"]];
+  const unit = units.find(([scale]) => value >= scale) || [1, "Sol/s"];
+  const scaled = value / unit[0];
+  return `${scaled >= 100 ? scaled.toFixed(0) : scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)} ${unit[1]}`;
+}
+
+function publicExplorer(asset, kind, value) {
+  const base = asset === "wec" ? "https://wcashexplorer.com" : "https://zecblock.com";
+  return `${base}/${kind}/${encodeURIComponent(value)}`;
+}
+
+function renderHashrateChart(points) {
+  const svg = $("#pool-hashrate-chart");
+  const line = $(".chart-line", svg);
+  const area = $(".chart-area", svg);
+  const grid = $(".chart-grid", svg);
+  grid.replaceChildren();
+  for (const y of [30, 85, 140, 195, 250]) {
+    const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    guide.setAttribute("x1", "0"); guide.setAttribute("x2", "900");
+    guide.setAttribute("y1", String(y)); guide.setAttribute("y2", String(y));
+    grid.append(guide);
+  }
+  const valid = Array.isArray(points)
+    ? points.filter((point) => Number.isSafeInteger(point.timestamp) && Number.isSafeInteger(point.hashrate_sol_s) && point.hashrate_sol_s >= 0)
+    : [];
+  svg.classList.toggle("hidden", valid.length < 2);
+  $("#chart-empty").classList.toggle("hidden", valid.length >= 2);
+  if (valid.length < 2) { line.setAttribute("d", ""); area.setAttribute("d", ""); return; }
+  const start = valid[0].timestamp;
+  const end = valid[valid.length - 1].timestamp;
+  const maximum = Math.max(...valid.map((point) => point.hashrate_sol_s), 1);
+  const coordinates = valid.map((point) => {
+    const x = end === start ? 450 : ((point.timestamp - start) / (end - start)) * 900;
+    const y = 250 - (point.hashrate_sol_s / maximum) * 220;
+    return [x, y];
+  });
+  const path = coordinates.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  line.setAttribute("d", path);
+  area.setAttribute("d", `${path} L900,250 L0,250 Z`);
+  setText("#chart-start", new Date(start * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
+}
+
+function renderPublicBlocks(items) {
+  const target = $("#public-blocks");
+  target.replaceChildren();
+  if (!Array.isArray(items) || !items.length) {
+    const empty = document.createElement("p"); empty.className = "empty-note"; empty.textContent = "No pool blocks recorded yet."; target.append(empty); return;
+  }
+  items.slice(0, 8).forEach((item) => {
+    const row = document.createElement("div"); row.className = "activity-row";
+    const asset = document.createElement("span"); asset.className = "asset-pill"; asset.textContent = assetLabel(item.asset);
+    const detail = document.createElement("div"); detail.className = "activity-detail";
+    const link = document.createElement("a"); link.href = publicExplorer(item.asset, "block", item.height); link.target = "_blank"; link.rel = "noreferrer"; link.textContent = `Block ${formatCount(item.height)}`;
+    const meta = document.createElement("small"); meta.textContent = item.found_at ? formatTime(item.found_at) : (item.block_hash || "").slice(0, 16);
+    const state = document.createElement("span"); state.className = "activity-state"; state.textContent = formatState(item.state);
+    detail.append(link, meta); row.append(asset, detail, state); target.append(row);
+  });
+}
+
+function renderPublicPayouts(items) {
+  const target = $("#public-payouts");
+  target.replaceChildren();
+  if (!Array.isArray(items) || !items.length) {
+    const empty = document.createElement("p"); empty.className = "empty-note"; empty.textContent = "No payout transactions recorded yet."; target.append(empty); return;
+  }
+  items.slice(0, 8).forEach((item) => {
+    const row = document.createElement("div"); row.className = "activity-row";
+    const asset = document.createElement("span"); asset.className = "asset-pill"; asset.textContent = assetLabel(item.asset);
+    const detail = document.createElement("div"); detail.className = "activity-detail";
+    const link = document.createElement("a"); link.href = publicExplorer(item.asset, "tx", item.transaction_id); link.target = "_blank"; link.rel = "noreferrer"; link.textContent = `${item.transaction_id.slice(0, 12)}…${item.transaction_id.slice(-8)}`;
+    const meta = document.createElement("small"); meta.textContent = item.confirmation_height ? `Confirmed in block ${formatCount(item.confirmation_height)}` : formatTime(item.updated_at);
+    const state = document.createElement("span"); state.className = "activity-state"; state.textContent = formatState(item.state);
+    detail.append(link, meta); row.append(asset, detail, state); target.append(row);
+  });
+}
+
+async function refreshPublic() {
+  clearTimeout(publicRefreshTimer);
+  try {
+    const [overview, pool, network, activity] = await Promise.all([
+      api("/api/v1/overview"), api("/api/v1/hashrate/pool"), api("/api/v1/hashrate/network"), api("/api/v1/public/activity"),
+    ]);
+    setText("#public-pool-hashrate", pool.available ? formatHashrate(pool.hashrate_sol_s) : "Unavailable");
+    setText("#public-network-hashrate", network.available ? formatHashrate(network.hashrate_sol_s) : "Unavailable");
+    setText("#public-wcash-height", formatCount(overview.wcash_height));
+    setText("#public-zcash-height", formatCount(overview.zcash_height));
+    setText("#chart-current", pool.available ? formatHashrate(pool.hashrate_sol_s) : "—");
+    setText("#public-updated", overview.updated_at ? `Updated ${formatTime(overview.updated_at)}` : "Update time unavailable");
+    renderHashrateChart(activity.hashrate);
+    renderPublicBlocks(activity.blocks);
+    renderPublicPayouts(activity.payouts);
+  } catch (_) {
+    setText("#public-updated", "Live data temporarily unavailable");
+    for (const id of ["public-pool-hashrate", "public-network-hashrate", "public-wcash-height", "public-zcash-height", "chart-current"]) setText(`#${id}`, "Unavailable");
+  } finally {
+    if (!document.hidden) publicRefreshTimer = setTimeout(refreshPublic, 30000);
+  }
 }
 
 function formatCoin(value, asset) {
@@ -717,8 +820,25 @@ $("#stratum-transport").addEventListener("change", () => {
     : "TCP is unencrypted. Enter the mining-only token, never your account password.");
 });
 $$('[data-copy]').forEach((button) => button.addEventListener("click", () => copyInput(document.getElementById(button.dataset.copy))));
+$$('[data-copy-text]').forEach((button) => button.addEventListener("click", async () => {
+  const source = document.getElementById(button.dataset.copyText);
+  try {
+    await navigator.clipboard.writeText(source.textContent);
+    const previous = button.textContent; button.textContent = "Copied";
+    setTimeout(() => { button.textContent = previous; }, 1200);
+  } catch (_) {
+    setText("#public-updated", "Copy unavailable. Select the pool URL manually.");
+  }
+}));
 $("#zec-address-type").addEventListener("change", updateAddressType);
-document.addEventListener("visibilitychange", () => { clearTimeout(refreshTimer); if (!document.hidden && currentAccount) refreshAll(); });
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(refreshTimer);
+  clearTimeout(publicRefreshTimer);
+  if (!document.hidden) {
+    refreshPublic();
+    if (currentAccount) refreshAll();
+  }
+});
 
 Object.keys(history).forEach((kind) => {
   $(`#${kind}-more`).addEventListener("click", () => refreshHistory(kind, true));
@@ -857,4 +977,5 @@ function restoreSession() {
 // A browser back/forward cache must not preserve a revealed worker or TOTP key.
 window.addEventListener("pagehide", showSignedOut);
 window.addEventListener("pageshow", (event) => { if (event.persisted) restoreSession(); });
+refreshPublic();
 restoreSession();

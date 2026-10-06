@@ -23,3 +23,19 @@ blocks. `available: false` means a fresh node estimate could not be obtained.
 Both responses use integer solutions per second and Unix timestamps in
 seconds. Clients should use the `available` field rather than interpreting a
 missing value as zero.
+
+## Public activity
+
+`GET /api/v1/public/activity`
+
+This endpoint supplies the dashboard with three bounded lists:
+
+- `hashrate`: ten-minute samples of the accepted-work 20-minute pool estimate,
+  retained for up to 24 hours by the running portal process.
+- `blocks`: the latest WEC and ZEC blocks found by the pool, including chain,
+  height, block hash, lifecycle state, and discovery time.
+- `payouts`: the latest broadcast payout transaction IDs and lifecycle state.
+
+The response deliberately excludes account IDs, worker names, payout
+destinations, balances, and transaction amounts. Consumers must treat
+`available: false` as unavailable history rather than an empty pool.

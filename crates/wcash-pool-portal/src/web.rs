@@ -178,6 +178,7 @@ impl PortalApp {
             .route("/api/v1/overview", get(overview))
             .route("/api/v1/hashrate/pool", get(pool_hashrate))
             .route("/api/v1/hashrate/network", get(network_hashrate))
+            .route("/api/v1/public/activity", get(public_activity))
             .route("/api/v1/balances", get(balances))
             .route("/api/v1/telemetry", get(miner_telemetry))
             .route("/api/v1/rewards", get(reward_history))
@@ -282,6 +283,7 @@ fn render_index(config: &PortalConfig) -> String {
         .replace("<option value=\"tls\">TLS · preferred</option>", "")
         .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
         .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3336")
+        .replace("stratum+tcp://testnet-mine.zecwec.com:3333", "stratum+tcp://mainnet.zecwec.com:3336")
         .replace("Use TLS when your ASIC firmware supports it.", "This account pool uses a separate Stratum endpoint. Existing invited workers remain on port 3333.");
     }
     if !config.allow_registration {
@@ -362,6 +364,10 @@ async fn pool_hashrate(State(state): State<Arc<AppState>>) -> Json<crate::PoolHa
 
 async fn network_hashrate(State(state): State<Arc<AppState>>) -> Json<crate::NetworkHashrate> {
     Json(state.pool_data.network_hashrate())
+}
+
+async fn public_activity(State(state): State<Arc<AppState>>) -> Json<crate::PublicPoolActivity> {
+    Json(state.pool_data.public_activity())
 }
 
 async fn balances(
@@ -1302,7 +1308,7 @@ mod tests {
         assert!(!script.contains("testnet-mine.zecwec.com"));
 
         config.mining_password_ignored = true;
-        assert!(render_index(&config).contains("password x"));
+        assert!(render_index(&config).contains("password: x"));
         assert!(render_index(&config).contains(">Create worker</button>"));
         assert!(render_script(&config).contains("const MINING_PASSWORD_IGNORED = true;"));
 

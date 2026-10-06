@@ -25,10 +25,11 @@ use wcash_pool_portal::{
     AuthenticatedSession, BroadcastReceipt, ChainNetwork, Clock, DisabledPayoutSigner,
     IsolatedPayoutSigner, MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary,
     MinerTelemetrySource, MinerTelemetrySummary, NewSession, Page, PageRequest, PayoutBatchRequest,
-    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolOverview, PortalApp,
-    PortalConfig, PortalRepository, PortalSecrets, ProvisionedWorker, ReceiverKind,
-    RepositoryError, RepositoryFuture, RewardSummary, SignerError, TestnetPayoutBoundary,
-    UnavailableMinerTelemetry, UnavailablePoolData, ValidatedDestination, WorkerSummary,
+    PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolHashratePoint, PoolOverview,
+    PortalApp, PortalConfig, PortalRepository, PortalSecrets, ProvisionedWorker,
+    PublicBlockSummary, PublicPayoutSummary, PublicPoolActivity, ReceiverKind, RepositoryError,
+    RepositoryFuture, RewardSummary, SignerError, TestnetPayoutBoundary, UnavailableMinerTelemetry,
+    UnavailablePoolData, ValidatedDestination, WorkerSummary,
 };
 
 const ORIGIN: &str = "https://testnet.zecwec.com";
@@ -729,6 +730,31 @@ impl PoolDataSource for FixturePoolData {
             sample_blocks: 120,
             height: Some(12_345),
             updated_at: Some(1_700_000_001),
+        }
+    }
+
+    fn public_activity(&self) -> PublicPoolActivity {
+        PublicPoolActivity {
+            available: true,
+            updated_at: Some(1_700_000_002),
+            hashrate: vec![PoolHashratePoint {
+                timestamp: 1_700_000_000,
+                hashrate_sol_s: 456_789,
+            }],
+            blocks: vec![PublicBlockSummary {
+                asset: Asset::Wec,
+                height: 12_345,
+                block_hash: "fixture-public-block".to_owned(),
+                state: "mature".to_owned(),
+                found_at: 1_700_000_001,
+            }],
+            payouts: vec![PublicPayoutSummary {
+                asset: Asset::Wec,
+                transaction_id: "fixture-public-payout".to_owned(),
+                state: "confirmed".to_owned(),
+                confirmation_height: Some(12_344),
+                updated_at: 1_700_000_002,
+            }],
         }
     }
 }
@@ -1432,6 +1458,42 @@ async fn public_hashrate_endpoints_expose_only_aggregate_snapshots() {
     assert_eq!(network["sample_blocks"], 120);
     assert_eq!(network["height"], 12_345);
     assert!(network.get("workers").is_none());
+}
+
+#[tokio::test]
+async fn public_activity_exposes_chain_events_without_private_miner_or_payment_data() {
+    let response = portal(Arc::new(FixedClock::default()))
+        .oneshot(
+            Request::get("/api/v1/public/activity")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("public activity response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let activity = json_response(response).await;
+    assert_eq!(activity["hashrate"][0]["hashrate_sol_s"], 456_789);
+    assert_eq!(activity["blocks"][0]["block_hash"], "fixture-public-block");
+    assert_eq!(
+        activity["payouts"][0]["transaction_id"],
+        "fixture-public-payout"
+    );
+    let serialized = activity.to_string();
+    for private_field in [
+        "account_id",
+        "worker",
+        "username",
+        "destination",
+        "address",
+        "amount",
+        "gross_zat",
+        "net_zat",
+    ] {
+        assert!(
+            !serialized.contains(private_field),
+            "leaked {private_field}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -4,23 +4,118 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Mine Zcash and Wcash together with one Equihash ASIC connection, 0% pool fees, and shielded WEC payouts.">
   <title>ZecWec Pool — Testnet</title>
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/forms.css">
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
-  <header class="topbar"><a class="brand" href="#overview" aria-label="ZecWec pool overview">ZecWec</a><span class="network">TESTNET <span>· no monetary value</span></span><div class="session-actions"><span id="account-name" class="muted"></span><button id="sign-out" class="button quiet hidden" type="button">Sign out</button></div></header>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="ZecWec pool home"><span class="brand-mark">ZW</span><span>ZecWec</span></a>
+    <span class="network">TESTNET <span>· no monetary value</span></span>
+    <nav class="public-nav" aria-label="Public pool navigation">
+      <a href="#live">Live</a><a href="#start">Start mining</a><a href="#activity">Activity</a><a href="#docs">Documentation</a>
+    </nav>
+    <div class="session-actions"><span id="account-name" class="muted"></span><a class="button quiet account-link" href="#account">Account</a><button id="sign-out" class="button quiet hidden" type="button">Sign out</button></div>
+  </header>
   <main>
-    <section id="auth-view" class="auth-shell">
-      <div class="auth-copy"><p class="eyebrow">Zcash + Wcash</p><h1>Your miner.<br>Two test networks.</h1><p>Connect one Equihash ASIC to the ZecWec pool. Manage workers and follow each chain’s rewards separately.</p><ol class="setup-intro"><li>Create an account</li><li>Add your payout destinations</li><li>Copy your worker details to the ASIC</li></ol><p class="fineprint">Your account password stays in the portal. Your ASIC uses a separate mining-only token.</p></div>
-      <form id="auth-form" class="panel auth-panel">
-        <div class="segmented" aria-label="Account action"><button class="segment active" data-auth-mode="login" type="button" aria-pressed="true">Sign in</button><button class="segment" data-auth-mode="register" type="button" aria-pressed="false">Create account</button></div>
-        <label for="auth-username">Username<input id="auth-username" name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z][A-Za-z0-9_]{2,31}" required aria-describedby="username-help"></label><p id="username-help" class="field-help">3–32 letters, numbers or underscores. Start with a letter.</p>
-        <label for="auth-password">Password<input id="auth-password" name="password" type="password" autocomplete="current-password" minlength="12" maxlength="256" required aria-describedby="password-help"></label><p id="password-help" class="field-help">At least 12 characters. Keep this separate from your worker token.</p>
-        <label id="totp-login-field" for="auth-totp">Authenticator code <span class="optional">if enabled</span><input id="auth-totp" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
-        <p id="auth-error" class="notice error hidden" role="alert"></p><button id="auth-submit" class="button primary full" type="submit">Sign in</button><p class="fineprint">Two-factor authentication is optional at setup. No wallet keys are needed.</p>
-      </form>
+    <section id="auth-view" class="public-shell">
+      <div id="top" class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">ZCASH + WCASH · EQUIHASH 200,9</p>
+          <h1>Mine Zcash.<br><span>Earn Wcash too.</span></h1>
+          <p class="hero-lede">One ASIC connection searches one Equihash space for two independent chains. Zcash is the parent. Wcash is merged-mined through AuxPoW v2. Your hardware keeps doing ordinary Zcash work.</p>
+          <div class="hero-actions"><a class="button primary" href="#start">Start mining</a><a class="button secondary" href="https://equihash.com/merged-mining" rel="noreferrer">How merged mining works</a></div>
+          <div class="trust-row"><span><strong>0%</strong> pool fee</span><span><strong>2</strong> coins per job</span><span><strong>1</strong> worker login</span></div>
+        </div>
+        <aside class="hero-diagram" aria-label="Merged mining flow">
+          <div class="chain-node parent"><span>ZEC</span><strong>Zcash</strong><small>parent target</small></div>
+          <div class="hash-beam"><span>one Equihash search</span></div>
+          <div class="chain-node aux"><span>WEC</span><strong>Wcash</strong><small>auxiliary target</small></div>
+          <p>A submitted solution can qualify for Zcash, Wcash, both, or neither. Work is never divided between the chains.</p>
+        </aside>
+      </div>
+
+      <section id="live" class="public-section live-section" aria-labelledby="live-title">
+        <div class="section-kicker"><span class="live-dot"></span> TESTNET LIVE</div>
+        <div class="section-head public-heading"><div><h2 id="live-title">Pool at a glance</h2><p>Accepted-work measurements from the pool and node.</p></div><span id="public-updated" class="muted">Loading live data</span></div>
+        <div class="public-metrics">
+          <article><span>Pool hashrate</span><strong id="public-pool-hashrate">—</strong><small>20-minute accepted-work estimate</small></article>
+          <article><span>Wcash network</span><strong id="public-network-hashrate">—</strong><small>120-block node estimate</small></article>
+          <article><span>Wcash height</span><strong id="public-wcash-height">—</strong><small>TWC Testnet</small></article>
+          <article><span>Zcash height</span><strong id="public-zcash-height">—</strong><small>ZEC Testnet</small></article>
+        </div>
+        <div class="chart-card">
+          <div class="section-head"><div><h3>Pool hashrate</h3><p class="muted">Accepted target-derived work · trailing 24 hours</p></div><strong id="chart-current">—</strong></div>
+          <svg id="pool-hashrate-chart" class="hashrate-chart" viewBox="0 0 900 260" role="img" aria-label="Pool hashrate over the last 24 hours"><g class="chart-grid"></g><path class="chart-area" d=""></path><path class="chart-line" d=""></path></svg>
+          <div class="chart-axis"><span id="chart-start">24h ago</span><span>now</span></div>
+          <p id="chart-empty" class="empty-note hidden">Hashrate history is not available yet.</p>
+        </div>
+      </section>
+
+      <section id="start" class="public-section start-section" aria-labelledby="start-title">
+        <div class="section-head public-heading"><div><p class="eyebrow">THREE FIELDS</p><h2 id="start-title">Point your ASIC at ZecWec</h2></div><span class="zero-fee">0% pool fee</span></div>
+        <div class="start-grid">
+          <div class="connection-card">
+            <div class="connection-step"><span>1</span><div><small>Pool URL</small><code id="public-stratum-url">stratum+tcp://testnet-mine.zecwec.com:3333</code></div><button class="button quiet" type="button" data-copy-text="public-stratum-url">Copy</button></div>
+            <div class="connection-step"><span>2</span><div><small>Worker</small><code>&lt;account&gt;.&lt;worker&gt;</code><p>Created after sign-in, for example <code>alice.z15-01</code>.</p></div></div>
+            <div class="connection-step"><span>3</span><div><small>Password</small><code>x</code><p>The Stratum password is ignored. Your portal password never goes into the ASIC.</p></div></div>
+            <p class="compatibility-line"><strong>Algorithm:</strong> Equihash 200,9 · Antminer Z15 Pro, Z15, Z15e, Z15j, Z11 and compatible miners.</p>
+          </div>
+          <div class="start-copy">
+            <h3>One worker, two destinations</h3>
+            <p>Create an account, save a Wcash Unified Address and a Zcash address, then create a worker. Both destinations are bound to that account; every worker under the account contributes to both chain balances.</p>
+            <ol><li>Create or sign in to your pool account.</li><li>Add the two payout destinations in Settings.</li><li>Create a worker and copy the exact mining username.</li><li>Use port <strong>3336</strong> and password <strong>x</strong>.</li></ol>
+            <a class="text-link" href="#account">Create an account or sign in →</a>
+          </div>
+        </div>
+      </section>
+
+      <section id="activity" class="public-section activity-section" aria-labelledby="activity-title">
+        <div class="section-head public-heading"><div><p class="eyebrow">PUBLIC CHAIN ACTIVITY</p><h2 id="activity-title">Recent blocks and payouts</h2></div><p>No worker names, payout addresses, amounts, or balances are published here.</p></div>
+        <div class="activity-grid">
+          <article class="activity-card"><div class="card-title"><h3>Pool blocks</h3><span>both chains</span></div><div id="public-blocks" class="activity-list"><p class="empty-note">Loading recent blocks…</p></div></article>
+          <article class="activity-card"><div class="card-title"><h3>Shielded payout transactions</h3><span>transaction status only</span></div><div id="public-payouts" class="activity-list"><p class="empty-note">Loading recent payouts…</p></div></article>
+        </div>
+      </section>
+
+      <section id="docs" class="public-section docs-section" aria-labelledby="docs-title">
+        <div class="section-head public-heading"><div><p class="eyebrow">DOCUMENTATION</p><h2 id="docs-title">How ZecWec works</h2></div><a class="text-link" href="https://equihash.com/merged-mining" rel="noreferrer">Full merged-mining guide ↗</a></div>
+        <div class="docs-grid">
+          <article><span>01</span><h3>One search, two targets</h3><p>The pool builds an ordinary Zcash Equihash job carrying a Wcash commitment. Every share is checked independently against both network targets. Mining Wcash does not reduce Zcash hashrate or block odds.</p></article>
+          <article><span>02</span><h3>PPLNS accounting</h3><p>Accepted work enters the rolling PPLNS window. When the pool finds a block, that chain’s reward is allocated from the work selected by its policy. ZEC and WEC balances mature independently.</p></article>
+          <article><span>03</span><h3>Zero pool fee</h3><p>The service fee is 0% for both assets. A bounded network transaction fee can be deducted from a payout; unused fee reserve is returned to the miner balance.</p></article>
+          <article><span>04</span><h3>Shielded WEC payouts</h3><p>Wcash coinbase funds mature before settlement. Automatic WEC payouts use Ironwood shielded transactions after the account threshold is reached. The public feed shows the transaction ID without exposing recipients or amounts.</p></article>
+          <article><span>05</span><h3>ZEC settlement</h3><p>Zcash rewards are tracked independently with the configured ZEC destination. ZEC automatic signing is currently paused; earned ZEC remains recorded for manual settlement when a Zcash block is found.</p></article>
+          <article><span>06</span><h3>Account safety</h3><p>The pool never asks for seed phrases or private keys. Portal credentials protect payout settings. ASICs use the public worker name and the ignored password <code>x</code>.</p></article>
+        </div>
+      </section>
+
+      <section class="public-section agent-section" aria-labelledby="agent-title">
+        <div class="agent-copy"><p class="eyebrow">FOR AI AGENTS AND AUTOMATION</p><h2 id="agent-title">Machine-readable mining quick start</h2><p>This is the complete connection contract. An agent can create the account through the portal, save both destinations, create a worker, and configure an Equihash ASIC without handling wallet keys.</p></div>
+        <pre><code>network: Testnet
+algorithm: Equihash 200,9
+pool: stratum+tcp://testnet-mine.zecwec.com:3333
+username: &lt;account&gt;.&lt;worker&gt;
+password: x
+pool_fee: 0%
+rewards: ZEC + WEC
+public_pool_hashrate: /api/v1/hashrate/pool
+public_network_hashrate: /api/v1/hashrate/network
+public_activity: /api/v1/public/activity</code></pre>
+      </section>
+
+      <section id="account" class="public-section account-section" aria-labelledby="account-title">
+        <div class="account-copy"><p class="eyebrow">MINER ACCOUNT</p><h2 id="account-title">Create account. Add two addresses. Mine.</h2><p>No email confirmation and no wallet connection. After signing in, add a shielded Wcash Unified Address and your chosen Zcash payout address, then create the worker login used by the ASIC.</p><div class="reference-links"><a href="https://w.cash/" rel="noreferrer">Wcash protocol</a><a href="https://wcashwallet.com/" rel="noreferrer">Wcash Wallet</a><a href="https://wcashexplorer.com/" rel="noreferrer">Wcash Explorer</a><a href="https://equihash.com/" rel="noreferrer">Equihash pools</a></div></div>
+        <form id="auth-form" class="panel auth-panel">
+          <div class="segmented" aria-label="Account action"><button class="segment active" data-auth-mode="login" type="button" aria-pressed="true">Sign in</button><button class="segment" data-auth-mode="register" type="button" aria-pressed="false">Create account</button></div>
+          <label for="auth-username">Username<input id="auth-username" name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z][A-Za-z0-9_]{2,31}" required aria-describedby="username-help"></label><p id="username-help" class="field-help">3–32 letters, numbers or underscores. Start with a letter.</p>
+          <label for="auth-password">Password<input id="auth-password" name="password" type="password" autocomplete="current-password" minlength="12" maxlength="256" required aria-describedby="password-help"></label><p id="password-help" class="field-help">At least 12 characters. This protects portal access and payout settings.</p>
+          <label id="totp-login-field" for="auth-totp">Authenticator code <span class="optional">if enabled</span><input id="auth-totp" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
+          <p id="auth-error" class="notice error hidden" role="alert"></p><button id="auth-submit" class="button primary full" type="submit">Sign in</button><p class="fineprint">Two-factor authentication is optional. Never enter a seed phrase or private key.</p>
+        </form>
+      </section>
     </section>
     <section id="app-view" class="app-shell hidden">
       <nav class="tabs" aria-label="Pool account"><button data-page="overview" class="tab active" type="button" aria-current="page">Overview</button><button data-page="workers" class="tab" type="button">Workers</button><button data-page="rewards" class="tab" type="button">Rewards</button><button data-page="blocks" class="tab" type="button">Blocks</button><button data-page="payouts" class="tab" type="button">Payouts</button><button data-page="settings" class="tab" type="button">Settings</button><p class="nav-note">Independent balances.<br>One pool connection.</p></nav>

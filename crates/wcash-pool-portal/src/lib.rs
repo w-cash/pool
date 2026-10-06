@@ -20,7 +20,8 @@ pub use model::{
     mask_destination, AccountSummary, AddressValidationError, AddressValidator, Asset,
     ChainNetwork, MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, MinerTelemetrySource,
     MinerTelemetrySummary, NetworkHashrate, Page, PageRequest, PayoutSettingSummary,
-    PoolDataSource, PoolHashrate, PoolOverview, ReceiverKind, RewardSummary,
+    PoolDataSource, PoolHashrate, PoolHashratePoint, PoolOverview, PublicBlockSummary,
+    PublicPayoutSummary, PublicPoolActivity, ReceiverKind, RewardSummary,
     UnavailableMinerTelemetry, UnavailablePoolData, ValidatedDestination, WorkerSummary,
     WorkerTelemetrySummary,
 };

@@ -41,10 +41,13 @@ async function fixture(options = {}) {
     if (url.pathname === "/api/v1/auth/register") return reply({ account: { username: payload.username } }, 201);
     if (url.pathname === "/api/v1/auth/login") { state.signedIn = true; state.username = payload.username; return reply({ csrf_token: "fixture_csrf" }); }
     if (url.pathname === "/api/v1/auth/logout") { state.signedIn = false; return reply({}); }
+    if (url.pathname === "/api/v1/overview") return reply({ available: true, updated_at: 1789344000, hashrate_sol_s: 1290000, active_workers: 2, wcash_height: 48, zcash_height: 4343148, wec_fee_bps: 0, zec_fee_bps: 0, wec_maximum_network_fee_zat: 10000, zec_maximum_network_fee_zat: 10000, wec_maximum_network_fee_bps: 100, zec_maximum_network_fee_bps: 100 });
+    if (url.pathname === "/api/v1/hashrate/pool") return reply({ available: true, updated_at: 1789344000, window_seconds: 1200, hashrate_sol_s: 1290000 });
+    if (url.pathname === "/api/v1/hashrate/network") return reply({ available: true, updated_at: 1789344000, height: 48, sample_blocks: 120, hashrate_sol_s: 2600000 });
+    if (url.pathname === "/api/v1/public/activity") return reply({ available: true, updated_at: 1789344000, hashrate: [{ timestamp: 1789342800, hashrate_sol_s: 1180000 }, { timestamp: 1789343400, hashrate_sol_s: 1230000 }, { timestamp: 1789344000, hashrate_sol_s: 1290000 }], blocks: [{ asset: "wec", height: 48, block_hash: "0000000000000000000000000000000000000000000000000000000000000048", state: "mature", found_at: 1789343980 }, { asset: "zec", height: 4343148, block_hash: "00000000000000000000000000000000000000000000000000000000004343148", state: "accepted", found_at: 1789343500 }], payouts: [{ asset: "wec", transaction_id: "public-fixture-payout-tx", state: "confirmed", confirmation_height: 47, updated_at: 1789343900 }] });
     if (!state.signedIn) return reply({ message: "Not authenticated." }, 401);
     if (url.pathname === "/api/v1/me") return reply({ id: "fixture-account", username: state.username, totp_enabled: false });
     if (url.pathname === "/readyz") return reply({ status: "ok" });
-    if (url.pathname === "/api/v1/overview") return reply({ available: true, updated_at: 1789344000, hashrate_sol_s: null, active_workers: 0, wcash_height: 48, zcash_height: 4343148, wec_fee_bps: 0, zec_fee_bps: 0, wec_maximum_network_fee_zat: 10000, zec_maximum_network_fee_zat: 10000, wec_maximum_network_fee_bps: 100, zec_maximum_network_fee_bps: 100 });
     if (url.pathname === "/api/v1/balances") {
       if (state.balanceFailure) return reply({ message: "Fixture balance unavailable." }, 503);
       return reply({ balances: ["wec", "zec"].map((asset) => ({ asset, total_zat: 0, immature_zat: 0, payable_zat: 0, pending_zat: 0 })) });
@@ -74,6 +77,33 @@ async function fixture(options = {}) {
   else await page.locator("#auth-view").waitFor({ state: "visible" });
   return { page, context, state };
 }
+
+test("public landing explains merged mining and renders privacy-safe live activity", async () => {
+  const { page, context, state } = await fixture({ signedIn: false });
+  try {
+    await page.getByRole("heading", { name: "Mine Zcash. Earn Wcash too." }).waitFor();
+    assert.match(await page.locator("#public-pool-hashrate").textContent(), /1\.29 MSol\/s/);
+    assert.match(await page.locator("#public-network-hashrate").textContent(), /2\.60 MSol\/s/);
+    assert.equal(await page.locator("#public-stratum-url").textContent(), "stratum+tcp://testnet-mine.zecwec.com:3333");
+    assert.match(await page.locator("#public-blocks").textContent(), /Block 48/);
+    assert.match(await page.locator("#public-payouts a").getAttribute("href"), /public-fixture-payout-tx/);
+    const text = await page.locator("#auth-view").textContent();
+    assert.match(text, /0% pool fee/);
+    assert.match(text, /password x/);
+    assert.doesNotMatch(text, /fixture.*private|account_id|gross_zat|net_zat/i);
+    if (process.env.PORTAL_UI_SCREENSHOT_DIR) {
+      fs.mkdirSync(process.env.PORTAL_UI_SCREENSHOT_DIR, { recursive: true });
+      await page.screenshot({ path: path.join(process.env.PORTAL_UI_SCREENSHOT_DIR, "public-dashboard.png"), fullPage: true });
+      await page.setViewportSize({ width: 360, height: 900 });
+      await page.screenshot({ path: path.join(process.env.PORTAL_UI_SCREENSHOT_DIR, "public-dashboard-mobile.png"), fullPage: true });
+    }
+    for (const width of [320, 360, 736, 1024, 1280]) {
+      await page.setViewportSize({ width, height: 1000 });
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `public dashboard overflows at ${width}px`);
+    }
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
 
 test("registration keeps the existing account API and does not require an authenticator", async () => {
   const { page, context, state } = await fixture({ signedIn: false });
@@ -218,7 +248,7 @@ test("untrusted API strings render as text and the shell fits 320px through desk
       await page.setViewportSize({ width, height: 1100 });
       for (const name of ["Overview", "Workers", "Settings"]) {
         await page.getByRole("button", { name, exact: true }).click();
-        assert.equal(await page.locator(".network").isVisible(), true);
+        assert.equal(await page.locator(".brand").isVisible(), true);
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${name} overflows at ${width}px`);
       }
     }

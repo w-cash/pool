@@ -14,8 +14,9 @@ use wcash_pool_portal::{
     mask_destination, AccountCredential, Asset, AuthenticatedSession, ChainNetwork,
     MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, NetworkHashrate, NewSession, Page,
     PageRequest, PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolHashrate,
-    PoolOverview, PortalRepository, ProvisionedWorker, ReceiverKind as PortalReceiverKind,
-    RepositoryError, RepositoryFuture, RewardSummary, ValidatedDestination, WorkerSummary,
+    PoolHashratePoint, PoolOverview, PortalRepository, ProvisionedWorker, PublicBlockSummary,
+    PublicPayoutSummary, PublicPoolActivity, ReceiverKind as PortalReceiverKind, RepositoryError,
+    RepositoryFuture, RewardSummary, ValidatedDestination, WorkerSummary,
 };
 use wcash_pool_protocol::JobDescriptor;
 
@@ -27,6 +28,7 @@ use crate::{
 const MAXIMUM_MONEY_ZAT: u64 = 2_100_000_000_000_000;
 const MAXIMUM_WORKERS_PER_ACCOUNT: i64 = 100;
 const POOL_HASHRATE_WINDOW_SECONDS: u64 = 20 * 60;
+const POOL_HASHRATE_HISTORY_BUCKET_SECONDS: u64 = 10 * 60;
 
 impl PortalRepository for PostgresStore {
     fn readiness(&self) -> RepositoryFuture<'_, ()> {
@@ -1068,6 +1070,7 @@ pub struct PostgresPoolDataSource {
     snapshot: Arc<RwLock<PoolOverview>>,
     pool_hashrate: Arc<RwLock<PoolHashrate>>,
     network_hashrate: Arc<RwLock<NetworkHashrate>>,
+    public_activity: Arc<RwLock<PublicPoolActivity>>,
 }
 
 impl PostgresPoolDataSource {
@@ -1081,6 +1084,7 @@ impl PostgresPoolDataSource {
                 ..PoolHashrate::default()
             })),
             network_hashrate: Arc::new(RwLock::new(NetworkHashrate::default())),
+            public_activity: Arc::new(RwLock::new(PublicPoolActivity::default())),
         }
     }
 
@@ -1165,9 +1169,102 @@ impl PostgresPoolDataSource {
             .ok()
             .and_then(|work| (work / POOL_HASHRATE_WINDOW_SECONDS).to_u64())
             .ok_or(StoreError::CorruptDatabaseState("pool hashrate"))?;
+        // Preserve a bounded process-local chart instead of rescanning a full
+        // day of durable shares every 15 seconds. The authoritative current
+        // estimate above remains target-derived from the durable projection.
+        let updated_at_u64 = unix_u64(updated_at)?;
+        let sampled_at = updated_at_u64 - (updated_at_u64 % POOL_HASHRATE_HISTORY_BUCKET_SECONDS);
+        let cutoff = updated_at_u64.saturating_sub(24 * 60 * 60);
+        let mut hashrate = self
+            .public_activity
+            .read()
+            .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))?
+            .hashrate
+            .clone();
+        hashrate.retain(|sample| sample.timestamp >= cutoff);
+        if let Some(latest) = hashrate
+            .last_mut()
+            .filter(|sample| sample.timestamp == sampled_at)
+        {
+            latest.hashrate_sol_s = hashrate_sol_s;
+        } else {
+            hashrate.push(PoolHashratePoint {
+                timestamp: sampled_at,
+                hashrate_sol_s,
+            });
+        }
+        let block_rows = sqlx::query(
+            "SELECT w.chain,w.height,w.block_hash_le,w.state, \
+                    EXTRACT(EPOCH FROM e.recorded_at)::BIGINT AS found_at \
+             FROM winners w JOIN shares s \
+               ON (s.deployment_id,s.share_id)=(w.deployment_id,w.share_id) \
+             JOIN backend_events e \
+               ON (e.deployment_id,e.event_seq)=(s.deployment_id,s.event_seq) \
+             WHERE w.deployment_id=$1 \
+             ORDER BY w.portal_sequence DESC LIMIT 12",
+        )
+        .bind(self.store.identity.id)
+        .fetch_all(&self.store.pool)
+        .await?;
+        let blocks = block_rows
+            .into_iter()
+            .map(|row| {
+                let asset = match Chain::parse(&row.try_get::<String, _>("chain")?)? {
+                    Chain::Wcash => Asset::Wec,
+                    Chain::Zcash => Asset::Zec,
+                };
+                let mut hash = row.try_get::<Vec<u8>, _>("block_hash_le")?;
+                if hash.len() != 32 {
+                    return Err(StoreError::CorruptDatabaseState("public block hash"));
+                }
+                hash.reverse();
+                Ok(PublicBlockSummary {
+                    asset,
+                    height: unix_u64(row.try_get::<i64, _>("height")?)?,
+                    block_hash: hex::encode(hash),
+                    state: row.try_get("state")?,
+                    found_at: unix_u64(row.try_get::<i64, _>("found_at")?)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let payout_rows = sqlx::query(
+            "SELECT chain,transaction_id,state,confirmation_height, \
+                    EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at \
+             FROM payout_batches \
+             WHERE deployment_id=$1 AND transaction_id IS NOT NULL \
+             ORDER BY portal_sequence DESC LIMIT 12",
+        )
+        .bind(self.store.identity.id)
+        .fetch_all(&self.store.pool)
+        .await?;
+        let payouts = payout_rows
+            .into_iter()
+            .map(|row| {
+                let asset = match Chain::parse(&row.try_get::<String, _>("chain")?)? {
+                    Chain::Wcash => Asset::Wec,
+                    Chain::Zcash => Asset::Zec,
+                };
+                let transaction_id = row.try_get::<Vec<u8>, _>("transaction_id")?;
+                if transaction_id.len() != 32 {
+                    return Err(StoreError::CorruptDatabaseState(
+                        "public payout transaction",
+                    ));
+                }
+                Ok(PublicPayoutSummary {
+                    asset,
+                    transaction_id: hex::encode(transaction_id),
+                    state: row.try_get("state")?,
+                    confirmation_height: row
+                        .try_get::<Option<i64>, _>("confirmation_height")?
+                        .map(unix_u64)
+                        .transpose()?,
+                    updated_at: unix_u64(row.try_get::<i64, _>("updated_at")?)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
         let snapshot = PoolOverview {
             available: true,
-            updated_at: Some(unix_u64(updated_at)?),
+            updated_at: Some(updated_at_u64),
             wcash_height: latest_job
                 .as_ref()
                 .map(|job| u64::from(job.wcash_height.saturating_sub(1))),
@@ -1193,8 +1290,19 @@ impl PostgresPoolDataSource {
             available: true,
             hashrate_sol_s: Some(hashrate_sol_s),
             window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
-            updated_at: Some(unix_u64(updated_at)?),
+            updated_at: Some(updated_at_u64),
         };
+        *self
+            .public_activity
+            .write()
+            .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))? =
+            PublicPoolActivity {
+                available: true,
+                updated_at: Some(updated_at_u64),
+                hashrate,
+                blocks,
+                payouts,
+            };
         Ok(())
     }
 
@@ -1225,6 +1333,13 @@ impl PoolDataSource for PostgresPoolDataSource {
         self.network_hashrate
             .read()
             .map_or_else(|_| NetworkHashrate::default(), |snapshot| snapshot.clone())
+    }
+
+    fn public_activity(&self) -> PublicPoolActivity {
+        self.public_activity.read().map_or_else(
+            |_| PublicPoolActivity::default(),
+            |snapshot| snapshot.clone(),
+        )
     }
 }
 
