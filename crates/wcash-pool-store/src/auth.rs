@@ -29,7 +29,7 @@ const MAX_ARGON2_PARALLELISM: usize = 32;
 pub enum MiningAuthenticationMode {
     /// Require the generated mining-only token.
     Token,
-    /// Authorize an enabled, registered `account.worker`; ignore Stratum's password field.
+    /// Authorize an enabled account and bind its claimed worker alias; ignore the password field.
     UsernameOnly,
 }
 
@@ -122,6 +122,26 @@ fn valid_login(login: &str) -> bool {
         && !worker.contains('.')
         && account.bytes().all(valid_login_byte)
         && worker.bytes().all(valid_login_byte)
+}
+
+fn claimed_account(login: &str) -> Option<&str> {
+    if login.is_empty() || login.len() > 128 {
+        return None;
+    }
+    let mut fields = login.split('.');
+    let account = fields.next()?;
+    let worker = fields.next();
+    if fields.next().is_some()
+        || account.is_empty()
+        || account.len() > 64
+        || !account.bytes().all(valid_login_byte)
+        || worker.is_some_and(|worker| {
+            worker.is_empty() || worker.len() > 63 || !worker.bytes().all(valid_login_byte)
+        })
+    {
+        return None;
+    }
+    Some(account)
 }
 
 const fn valid_login_byte(byte: u8) -> bool {
@@ -229,26 +249,51 @@ impl PostgresAuthenticationProvider {
         grant: &AuthenticationGrant,
     ) -> Result<(), AuthenticationError> {
         let worker = grant.worker();
-        let live = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS( \
-               SELECT 1 FROM workers w \
-               JOIN accounts a \
-                 ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
-               WHERE w.deployment_id=$1 AND w.id=$2 AND w.account_id=$3 \
-                 AND w.canonical_login=$4 AND w.enabled AND a.enabled \
-                 AND EXISTS (SELECT 1 FROM mining_tokens t \
-                     WHERE t.deployment_id=w.deployment_id AND t.worker_id=w.id AND t.id=$5 \
-                       AND t.revoked_at IS NULL \
-                       AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())) \
-             )",
-        )
-        .bind(self.deployment_id)
-        .bind(worker.worker_id())
-        .bind(worker.account_id())
-        .bind(worker.canonical_login())
-        .bind(grant.credential_id())
-        .fetch_one(&self.pool)
-        .await
+        let live = match self.mode {
+            MiningAuthenticationMode::Token => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS( \
+                   SELECT 1 FROM workers w \
+                   JOIN accounts a \
+                     ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
+                   WHERE w.deployment_id=$1 AND w.id=$2 AND w.account_id=$3 \
+                     AND w.canonical_login=$4 AND w.enabled AND a.enabled \
+                     AND EXISTS (SELECT 1 FROM mining_tokens t \
+                         WHERE t.deployment_id=w.deployment_id AND t.worker_id=w.id AND t.id=$5 \
+                           AND t.revoked_at IS NULL \
+                           AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())) \
+                 )",
+                )
+                .bind(self.deployment_id)
+                .bind(worker.worker_id())
+                .bind(worker.account_id())
+                .bind(worker.canonical_login())
+                .bind(grant.credential_id())
+                .fetch_one(&self.pool)
+                .await
+            }
+            MiningAuthenticationMode::UsernameOnly => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS( \
+                   SELECT 1 FROM workers w \
+                   JOIN accounts a \
+                     ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
+                   WHERE w.deployment_id=$1 AND w.id=$2 AND w.account_id=$3 \
+                     AND w.enabled AND a.enabled \
+                     AND EXISTS (SELECT 1 FROM mining_tokens t \
+                         WHERE t.deployment_id=w.deployment_id AND t.worker_id=w.id AND t.id=$4 \
+                           AND t.revoked_at IS NULL \
+                           AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())) \
+                 )",
+                )
+                .bind(self.deployment_id)
+                .bind(worker.worker_id())
+                .bind(worker.account_id())
+                .bind(grant.credential_id())
+                .fetch_one(&self.pool)
+                .await
+            }
+        }
         .map_err(|_| AuthenticationError::Unavailable)?;
         if live {
             Ok(())
@@ -262,11 +307,9 @@ async fn authenticate_username(
     provider: &PostgresAuthenticationProvider,
     login: &str,
 ) -> Result<AuthenticationGrant, AuthenticationError> {
-    if !valid_login(login) {
-        return Err(AuthenticationError::Denied);
-    }
+    let account = claimed_account(login).ok_or(AuthenticationError::Denied)?;
     let row = sqlx::query(
-        "SELECT a.id AS account_id, w.id AS worker_id, w.canonical_login, \
+        "SELECT a.id AS account_id, w.id AS worker_id, \
                 t.id AS credential_id \
          FROM workers w \
          JOIN accounts a ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
@@ -277,10 +320,13 @@ async fn authenticate_username(
                AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
              ORDER BY created_at DESC, id DESC LIMIT 1 \
          ) t ON TRUE \
-         WHERE w.deployment_id=$1 AND w.canonical_login=$2 \
-           AND w.enabled AND a.enabled",
+         WHERE w.deployment_id=$1 AND a.login=$2 \
+           AND w.enabled AND a.enabled \
+         ORDER BY (w.canonical_login=$3) DESC, w.created_at, w.id \
+         LIMIT 1",
     )
     .bind(provider.deployment_id)
+    .bind(account)
     .bind(login)
     .fetch_optional(&provider.pool)
     .await
@@ -292,13 +338,12 @@ async fn authenticate_username(
     let worker_id = row
         .try_get::<Uuid, _>("worker_id")
         .map_err(|_| AuthenticationError::Unavailable)?;
-    let canonical_login = row
-        .try_get::<String, _>("canonical_login")
-        .map_err(|_| AuthenticationError::Unavailable)?;
     let credential_id = row
         .try_get::<Uuid, _>("credential_id")
         .map_err(|_| AuthenticationError::Unavailable)?;
-    let worker = AuthenticatedWorker::new(account_id, worker_id, canonical_login)
+    // Bind the exact miner-supplied login to this session. ZIP-301 repeats it
+    // on every share, while the stable worker/account IDs retain attribution.
+    let worker = AuthenticatedWorker::new(account_id, worker_id, login)
         .map_err(|_| AuthenticationError::Unavailable)?;
     AuthenticationGrant::new(worker, credential_id)
 }
@@ -468,6 +513,12 @@ mod tests {
         assert!(!valid_login("Account.z15-01"));
         assert!(!valid_login("account.worker.extra"));
         assert!(!valid_login("account."));
+        assert_eq!(claimed_account("account.z15-01"), Some("account"));
+        assert_eq!(claimed_account("account.typo"), Some("account"));
+        assert_eq!(claimed_account("account"), Some("account"));
+        assert_eq!(claimed_account("Account.worker"), None);
+        assert_eq!(claimed_account("account.worker.extra"), None);
+        assert_eq!(claimed_account("account."), None);
     }
 
     #[test]

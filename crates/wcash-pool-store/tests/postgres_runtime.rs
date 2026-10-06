@@ -2970,9 +2970,26 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .authenticate_credentials("alice.z15", "any-password-is-ignored")
         .await
         .is_ok());
+    let alias_grant = username_auth
+        .authenticate_credentials("alice.unknown", "x")
+        .await
+        .expect("unknown worker suffix maps to the registered account worker");
+    assert_eq!(alias_grant.worker().account_id(), account_id);
+    assert_eq!(alias_grant.worker().worker_id(), worker_id);
+    assert_eq!(alias_grant.worker().canonical_login(), "alice.unknown");
+    username_auth
+        .revalidate_worker(&alias_grant)
+        .await
+        .expect("username alias survives periodic revalidation");
+    let account_only_grant = username_auth
+        .authenticate_credentials("alice", "x")
+        .await
+        .expect("account-only username maps to the registered account worker");
+    assert_eq!(account_only_grant.worker().worker_id(), worker_id);
+    assert_eq!(account_only_grant.worker().canonical_login(), "alice");
     assert!(matches!(
         username_auth
-            .authenticate_credentials("alice.unknown", "x")
+            .authenticate_credentials("unknown.z15", "x")
             .await,
         Err(AuthenticationError::Denied)
     ));
@@ -2999,6 +3016,10 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     ));
     assert!(matches!(
         username_auth.revalidate_worker(&username_grant).await,
+        Err(AuthenticationError::Denied)
+    ));
+    assert!(matches!(
+        username_auth.revalidate_worker(&alias_grant).await,
         Err(AuthenticationError::Denied)
     ));
     assert!(auth

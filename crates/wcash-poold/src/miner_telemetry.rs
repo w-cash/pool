@@ -16,9 +16,10 @@ use wcash_pool_core::AuthenticatedWorker;
 use wcash_pool_edge::{MinerTelemetrySink, ShareOutcome};
 use wcash_pool_portal::{MinerTelemetrySource, MinerTelemetrySummary, WorkerTelemetrySummary};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct WorkerCounters {
     connections: u64,
+    active_logins: HashMap<String, u64>,
     accepted: u64,
     stale: u64,
     invalid: u64,
@@ -87,6 +88,11 @@ impl MinerTelemetrySink for LiveMinerTelemetry {
                 self.tracked_worker(&mut workers, (worker.account_id(), worker.worker_id()))
             {
                 entry.connections = entry.connections.saturating_add(1);
+                let login_count = entry
+                    .active_logins
+                    .entry(worker.canonical_login().to_owned())
+                    .or_default();
+                *login_count = login_count.saturating_add(1);
             }
         }
     }
@@ -95,6 +101,12 @@ impl MinerTelemetrySink for LiveMinerTelemetry {
         if let Ok(mut workers) = self.workers.lock() {
             if let Some(entry) = workers.get_mut(&(worker.account_id(), worker.worker_id())) {
                 entry.connections = entry.connections.saturating_sub(1);
+                if let Some(login_count) = entry.active_logins.get_mut(worker.canonical_login()) {
+                    *login_count = login_count.saturating_sub(1);
+                    if *login_count == 0 {
+                        entry.active_logins.remove(worker.canonical_login());
+                    }
+                }
                 entry.last_activity_sequence = self.next_activity_sequence();
             }
         }
@@ -125,14 +137,19 @@ impl MinerTelemetrySource for LiveMinerTelemetry {
         let mut summaries = workers
             .iter()
             .filter(|((owner, _), _)| *owner == account_id)
-            .map(|((_, worker_id), counters)| WorkerTelemetrySummary {
-                worker_id: *worker_id,
-                connections: counters.connections,
-                accepted: counters.accepted,
-                stale: counters.stale,
-                invalid: counters.invalid,
-                duplicate: counters.duplicate,
-                last_share_at: counters.last_share_at,
+            .map(|((_, worker_id), counters)| {
+                let mut active_logins = counters.active_logins.keys().cloned().collect::<Vec<_>>();
+                active_logins.sort();
+                WorkerTelemetrySummary {
+                    worker_id: *worker_id,
+                    connections: counters.connections,
+                    active_logins,
+                    accepted: counters.accepted,
+                    stale: counters.stale,
+                    invalid: counters.invalid,
+                    duplicate: counters.duplicate,
+                    last_share_at: counters.last_share_at,
+                }
             })
             .collect::<Vec<_>>();
         summaries.sort_by_key(|summary| *summary.worker_id.as_bytes());
@@ -192,6 +209,7 @@ mod tests {
         assert_eq!(snapshot.invalid, 0);
         assert_eq!(snapshot.workers.len(), 1);
         assert_eq!(snapshot.workers[0].worker_id, first.worker_id());
+        assert_eq!(snapshot.workers[0].active_logins, ["first.rig"]);
         Ok(())
     }
 
@@ -212,6 +230,31 @@ mod tests {
         assert_eq!(snapshot.stale, 1);
         assert_eq!(snapshot.duplicate, 1);
         assert!(snapshot.workers[0].last_share_at.is_some());
+        assert_eq!(snapshot.workers[0].active_logins, ["miner.rig"]);
+        Ok(())
+    }
+
+    #[test]
+    fn active_logins_follow_each_exact_connected_alias() -> Result<(), SessionError> {
+        let telemetry = LiveMinerTelemetry::default();
+        let canonical =
+            AuthenticatedWorker::new(Uuid::from_u128(4), Uuid::from_u128(44), "miner.rig")?;
+        let alias =
+            AuthenticatedWorker::new(Uuid::from_u128(4), Uuid::from_u128(44), "miner.typo")?;
+        telemetry.worker_connected(&canonical);
+        telemetry.worker_connected(&alias);
+
+        let snapshot = telemetry.account_snapshot(canonical.account_id());
+        assert_eq!(snapshot.workers[0].connections, 2);
+        assert_eq!(
+            snapshot.workers[0].active_logins,
+            ["miner.rig", "miner.typo"]
+        );
+
+        telemetry.worker_disconnected(&alias);
+        let snapshot = telemetry.account_snapshot(canonical.account_id());
+        assert_eq!(snapshot.workers[0].connections, 1);
+        assert_eq!(snapshot.workers[0].active_logins, ["miner.rig"]);
         Ok(())
     }
 

@@ -533,7 +533,23 @@ function renderWorkerTelemetry() {
     appendCell(row, worker.label);
     appendCell(row, worker.mining_username, "mono");
     const status = worker.revoked_at ? "Revoked" : !cachedTelemetry?.available ? "Unknown" : telemetry?.connections > 0 ? "Online" : "Offline";
-    appendCell(row, status, status === "Online" ? "ok-text" : "");
+    const statusCell = appendCell(row, status, status === "Online" ? "ok-text" : "");
+    const activeLogins = Array.isArray(telemetry?.active_logins)
+      ? telemetry.active_logins.filter((login) => typeof login === "string")
+      : [];
+    const mismatchedLogins = activeLogins.filter((login) => login !== worker.mining_username);
+    let warning = "";
+    if (telemetry?.connections > 0 && mismatchedLogins.length) {
+      warning = `ASIC username differs: ${mismatchedLogins.join(", ")}. Set it exactly to ${worker.mining_username}. Shares are credited to this account.`;
+    } else if (telemetry?.connections > 0 && telemetry.accepted === 0) {
+      warning = `Connected, but no accepted shares yet. Check that the ASIC username is exactly ${worker.mining_username}.`;
+    }
+    if (warning) {
+      const message = document.createElement("small");
+      message.className = "worker-warning";
+      message.textContent = warning;
+      statusCell.append(message);
+    }
     appendCell(row, formatCount(telemetry?.accepted ?? (cachedTelemetry?.available ? 0 : null)));
     appendCell(row, formatCount(telemetry?.stale ?? (cachedTelemetry?.available ? 0 : null)));
     appendCell(row, formatCount(telemetry?.invalid ?? (cachedTelemetry?.available ? 0 : null)));

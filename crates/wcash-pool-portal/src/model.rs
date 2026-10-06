@@ -383,6 +383,8 @@ pub struct WorkerTelemetrySummary {
     pub worker_id: Uuid,
     /// Number of currently authorized Stratum connections for this worker.
     pub connections: u64,
+    /// Exact miner-supplied usernames on currently authorized connections.
+    pub active_logins: Vec<String>,
     /// Shares accepted during the current service process lifetime.
     pub accepted: u64,
     /// Shares rejected because their job was stale.

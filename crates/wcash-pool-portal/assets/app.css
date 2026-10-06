@@ -443,6 +443,15 @@ th {
 tbody tr:last-child td {
   border-bottom:0;
 }
+.worker-warning {
+  display:block;
+  min-width:220px;
+  max-width:340px;
+  margin-top:5px;
+  color:var(--amber);
+  font-weight:400;
+  line-height:1.45;
+}
 .empty {
   padding:38px 20px;
   color:var(--muted);

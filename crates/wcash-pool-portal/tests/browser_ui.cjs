@@ -22,7 +22,7 @@ async function fixture(options = {}) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
   await context.addCookies([{ name: "__Host-zecwec_csrf", value: "fixture_csrf", url: origin, secure: true, sameSite: "Strict" }]);
   const page = await context.newPage();
-  const state = { signedIn: options.signedIn ?? true, username: "fixture_miner", workers: [], settings: [], requests: [], errors: [], telemetryAvailable: true, balanceFailure: false, holdWorker: null, ...options };
+  const state = { signedIn: options.signedIn ?? true, username: "fixture_miner", workers: [], settings: [], requests: [], errors: [], telemetryAvailable: true, telemetry: null, balanceFailure: false, holdWorker: null, ...options };
   page.on("pageerror", (error) => state.errors.push(error.message));
   await context.route("**/*", async (route) => {
     const request = route.request();
@@ -53,7 +53,7 @@ async function fixture(options = {}) {
       if (state.balanceFailure) return reply({ message: "Fixture balance unavailable." }, 503);
       return reply({ balances: ["wec", "zec"].map((asset) => ({ asset, total_zat: 0, immature_zat: 0, payable_zat: 0, pending_zat: 0 })) });
     }
-    if (url.pathname === "/api/v1/telemetry") return reply({ available: state.telemetryAvailable, updated_at: 1789344000, active_workers: 0, accepted: 0, stale: 0, invalid: 0, duplicate: 0, workers: [] });
+    if (url.pathname === "/api/v1/telemetry") return reply(state.telemetry || { available: state.telemetryAvailable, updated_at: 1789344000, active_workers: 0, accepted: 0, stale: 0, invalid: 0, duplicate: 0, workers: [] });
     if (url.pathname === "/api/v1/workers") {
       if (method === "POST") {
         if (state.holdWorker) await state.holdWorker;
@@ -206,6 +206,37 @@ test("missing telemetry and failed balances stay unavailable rather than becomin
     await page.locator("#workers-body").filter({ hasText: "Unknown" }).waitFor();
     const cells = await page.locator("#workers-body tr").first().locator("td").allTextContents();
     assert.deepEqual(cells.slice(3, 7), ["—", "—", "—", "—"]);
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+test("worker page warns about a connected username mismatch and a connection with no shares", async () => {
+  const workers = [
+    { id: "fixture-worker", label: "rig-01", mining_username: "fixture_miner.rig-01", revoked_at: null },
+    { id: "idle-worker", label: "rig-02", mining_username: "fixture_miner.rig-02", revoked_at: null },
+  ];
+  const telemetry = {
+    available: true,
+    updated_at: 1789344000,
+    active_workers: 2,
+    accepted: 8,
+    stale: 0,
+    invalid: 0,
+    duplicate: 0,
+    workers: [
+      { worker_id: "fixture-worker", connections: 1, active_logins: ["fixture_miner.typo"], accepted: 8, stale: 0, invalid: 0, duplicate: 0, last_share_at: 1789343990 },
+      { worker_id: "idle-worker", connections: 1, active_logins: ["fixture_miner.rig-02"], accepted: 0, stale: 0, invalid: 0, duplicate: 0, last_share_at: null },
+    ],
+  };
+  const { page, context, state } = await fixture({ workers, telemetry });
+  try {
+    await page.getByRole("button", { name: "Workers", exact: true }).click();
+    const rows = page.locator("#workers-body tr");
+    await rows.nth(0).getByText("ASIC username differs:").waitFor();
+    assert.match(await rows.nth(0).textContent(), /fixture_miner\.typo/);
+    assert.match(await rows.nth(0).textContent(), /Shares are credited to this account/);
+    assert.match(await rows.nth(1).textContent(), /Connected, but no accepted shares yet/);
+    assert.match(await rows.nth(1).textContent(), /fixture_miner\.rig-02/);
     assert.deepEqual(state.errors, []);
   } finally { await context.close(); }
 });
