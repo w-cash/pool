@@ -18,7 +18,8 @@ use wcash_pool_edge::{JobRouter, ShareRouterError};
 use wcash_pool_portal::{
     serve_until_shutdown, AddressValidator, Asset, ChainNetwork, IsolatedPayoutSigner,
     MinerTelemetrySource, NetworkHashrate, PoolDataSource, PoolHashrate, PoolOverview, PortalApp,
-    PortalBuildError, PortalConfig, PortalRepository, PortalSecrets, TestnetPayoutBoundary,
+    PortalBuildError, PortalConfig, PortalRepository, PortalSecrets, PublicPoolActivity,
+    TestnetPayoutBoundary,
 };
 use wcash_pool_store::{
     Chain, NonceNamespaceClaim, PostgresEventProjector, PostgresPoolDataSource, PostgresStore,
@@ -1666,6 +1667,10 @@ impl PoolDataSource for LivePoolDataSource {
 
     fn network_hashrate(&self) -> NetworkHashrate {
         self.projection.network_hashrate()
+    }
+
+    fn public_activity(&self) -> PublicPoolActivity {
+        self.projection.public_activity()
     }
 
     fn mining_ready(&self) -> bool {
