@@ -2004,9 +2004,11 @@ impl PostgresStore {
         let mut outputs = Vec::with_capacity(rows.len());
         let mut total = 0u64;
         for row in rows {
-            let amount_zat = u64::try_from(row.try_get::<i64, _>("amount_zat")?)
-                .map_err(|_| StoreError::MoneyOverflow)?
-                .min(payout_cap_zat);
+            let amount_zat = payout_amount_for_liability(
+                u64::try_from(row.try_get::<i64, _>("amount_zat")?)
+                    .map_err(|_| StoreError::MoneyOverflow)?,
+                payout_cap_zat,
+            );
             total = total
                 .checked_add(amount_zat)
                 .ok_or(StoreError::MoneyOverflow)?;
@@ -3827,6 +3829,14 @@ fn random_payout_cap(
             .map_err(|_| StoreError::PayoutRandomnessUnavailable)?,
     );
     payout_cap_from_draws(minimum_zat, maximum_zat, skip_bps, skip_draw, amount_draw)
+}
+
+const fn payout_amount_for_liability(mature_unpaid_zat: u64, payout_cap_zat: u64) -> u64 {
+    if mature_unpaid_zat < payout_cap_zat {
+        mature_unpaid_zat
+    } else {
+        payout_cap_zat
+    }
 }
 
 fn payout_cap_from_draws(
@@ -5941,23 +5951,38 @@ mod payout_fee_tests {
     }
 
     #[test]
-    fn production_privacy_policy_skips_thirty_five_percent_and_caps_at_twenty_wec() {
+    fn production_privacy_policy_skips_twenty_percent_and_caps_at_one_hundred_wec() {
         const ONE_WEC: u64 = 100_000_000;
-        const TWENTY_WEC: u64 = 2_000_000_000;
+        const ONE_HUNDRED_WEC: u64 = 10_000_000_000;
         assert_eq!(
-            payout_cap_from_draws(ONE_WEC, TWENTY_WEC, 3_500, 0, u64::MAX)
+            payout_cap_from_draws(ONE_WEC, ONE_HUNDRED_WEC, 2_000, 0, u64::MAX)
                 .expect("valid production payout policy"),
             None
         );
         assert_eq!(
-            payout_cap_from_draws(ONE_WEC, TWENTY_WEC, 3_500, u64::MAX, 0)
+            payout_cap_from_draws(ONE_WEC, ONE_HUNDRED_WEC, 2_000, u64::MAX, 0)
                 .expect("valid production payout policy"),
             Some(ONE_WEC)
         );
         assert_eq!(
-            payout_cap_from_draws(ONE_WEC, TWENTY_WEC, 3_500, u64::MAX, u64::MAX)
+            payout_cap_from_draws(ONE_WEC, ONE_HUNDRED_WEC, 2_000, u64::MAX, u64::MAX,)
                 .expect("valid production payout policy"),
-            Some(TWENTY_WEC)
+            Some(ONE_HUNDRED_WEC)
+        );
+    }
+
+    #[test]
+    fn payout_amount_never_exceeds_mature_unpaid_liability() {
+        const ONE_WEC: u64 = 100_000_000;
+        const ONE_HUNDRED_WEC: u64 = 10_000_000_000;
+
+        assert_eq!(
+            payout_amount_for_liability(7 * ONE_WEC, ONE_HUNDRED_WEC),
+            7 * ONE_WEC
+        );
+        assert_eq!(
+            payout_amount_for_liability(250 * ONE_WEC, ONE_HUNDRED_WEC),
+            ONE_HUNDRED_WEC
         );
     }
 
