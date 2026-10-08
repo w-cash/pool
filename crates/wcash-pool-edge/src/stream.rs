@@ -29,6 +29,7 @@ use crate::{
 
 const READ_BUFFER_BYTES: usize = 4 * 1024;
 const AUTHORIZATION_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
+const VARDIFF_TICK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Asynchronous boundary used by the stream driver for already prepared shares.
 ///
@@ -79,6 +80,7 @@ struct AcceptedStreamDriver {
     clock_origin_ms: u64,
     frame_started_at: Option<Instant>,
     idle_deadline: Instant,
+    vardiff_tick_deadline: Instant,
     authorization_revalidation_deadline: Option<Instant>,
 }
 
@@ -132,6 +134,7 @@ impl AcceptedStreamDriver {
             clock_origin_ms,
             frame_started_at: None,
             idle_deadline,
+            vardiff_tick_deadline: clock_origin + VARDIFF_TICK_INTERVAL,
             authorization_revalidation_deadline: None,
         })
     }
@@ -182,6 +185,8 @@ impl AcceptedStreamDriver {
             let authorization_revalidation_sleep =
                 time::sleep_until(authorization_revalidation_deadline);
             tokio::pin!(authorization_revalidation_sleep);
+            let vardiff_tick_sleep = time::sleep_until(self.vardiff_tick_deadline);
+            tokio::pin!(vardiff_tick_sleep);
 
             let event = tokio::select! {
                 biased;
@@ -193,6 +198,7 @@ impl AcceptedStreamDriver {
                     if self.authorization_revalidation_deadline.is_some() => {
                     WaitEvent::AuthorizationRevalidation
                 }
+                _ = &mut vardiff_tick_sleep => WaitEvent::VardiffTick,
                 _ = &mut idle_sleep => WaitEvent::IdleTimeout,
                 update = self.job_updates.receive() => WaitEvent::JobUpdate(update),
                 read = self.stream.read(&mut read_buffer) => WaitEvent::Read(read),
@@ -206,6 +212,10 @@ impl AcceptedStreamDriver {
                     if let Some(termination) = self.revalidate_authorization(shutdown).await? {
                         return Ok(termination);
                     }
+                }
+                WaitEvent::VardiffTick => {
+                    self.actor.tick_vardiff(self.monotonic_now_ms()?)?;
+                    self.vardiff_tick_deadline = Instant::now() + VARDIFF_TICK_INTERVAL;
                 }
                 WaitEvent::JobUpdate(update) => {
                     self.apply_job_update(update?)?;
@@ -542,6 +552,7 @@ enum WaitEvent {
     IdleTimeout,
     FrameTimeout,
     AuthorizationRevalidation,
+    VardiffTick,
     JobUpdate(Result<crate::JobUpdate, JobRouterError>),
     Read(io::Result<usize>),
 }

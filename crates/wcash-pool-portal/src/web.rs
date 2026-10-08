@@ -281,11 +281,31 @@ fn render_index(config: &PortalConfig) -> String {
         .replace("TWC", "WEC")
         .replace("Two test networks.", "Two main networks.")
         .replace("· no monetary value", "· automatic payout")
-        .replace("<option value=\"tls\">TLS · preferred</option>", "")
-        .replace("<option value=\"tcp\">TCP · hardware compatibility</option>", "<option value=\"tcp\">TCP · ASIC compatible</option>")
+        .replace(
+            "<option value=\"tls\">TLS · preferred</option><option value=\"tcp\">TCP · hardware compatibility</option>",
+            "<option value=\"asic\">ASIC · 100 kSol/s and above</option><option value=\"gpu\">GPU / CPU · below 100 kSol/s</option>",
+        )
+        .replace("for=\"stratum-transport\">Connection", "for=\"stratum-transport\">Miner class")
         .replace("stratum+ssl://testnet-mine.zecwec.com:3443", "stratum+tcp://mainnet.zecwec.com:3336")
         .replace("stratum+tcp://testnet-mine.zecwec.com:3333", "stratum+tcp://mainnet.zecwec.com:3336")
-        .replace("Use TLS when your ASIC firmware supports it.", "This account pool uses a separate Stratum endpoint. Existing invited workers remain on port 3333.");
+        .replace("Use TLS when your ASIC firmware supports it.", "ASICs use port 3336. GPU and CPU miners use the lower-difficulty port 3338. Both endpoints credit exact target-weighted work to the same account.")
+        .replace("Point your ASIC at ZecWec", "Choose the right mining port")
+        .replace(
+            "<code id=\"public-stratum-url\">stratum+tcp://mainnet.zecwec.com:3336</code>",
+            "<code id=\"public-stratum-url\">stratum+tcp://mainnet.zecwec.com:3336</code><p><strong>GPU / CPU:</strong> <code>stratum+tcp://mainnet.zecwec.com:3338</code></p>",
+        )
+        .replace(
+            "Use port <strong>3336</strong> and password <strong>x</strong>.",
+            "Use port <strong>3336</strong> for ASICs or <strong>3338</strong> for GPU / CPU miners, with password <strong>x</strong>.",
+        )
+        .replace(
+            "Antminer Z15 Pro, Z15, Z15e, Z15j, Z11 and compatible miners.",
+            "ASICs use port 3336. GPU and CPU software uses low-difficulty port 3338.",
+        )
+        .replace(
+            "pool: stratum+tcp://mainnet.zecwec.com:3336",
+            "asic_pool: stratum+tcp://mainnet.zecwec.com:3336\ngpu_cpu_pool: stratum+tcp://mainnet.zecwec.com:3338",
+        );
     }
     if !config.allow_registration {
         page = page
@@ -344,6 +364,10 @@ fn render_script(config: &PortalConfig) -> String {
         source = source
             .replace("testnet-mine.zecwec.com:3443", "mainnet.zecwec.com:3336")
             .replace("testnet-mine.zecwec.com:3333", "mainnet.zecwec.com:3336")
+            .replace(
+                "const STRATUM_ENDPOINTS = {\n  tls: \"stratum+ssl://mainnet.zecwec.com:3336\",\n  tcp: \"stratum+tcp://mainnet.zecwec.com:3336\",\n};",
+                "const STRATUM_ENDPOINTS = {\n  asic: \"stratum+tcp://mainnet.zecwec.com:3336\",\n  gpu: \"stratum+tcp://mainnet.zecwec.com:3338\",\n};",
+            )
             .replace("Testnet", "Mainnet")
             .replace("TWC", "WEC")
             .replace(
@@ -1309,13 +1333,17 @@ mod tests {
         assert!(page.contains("ZecWec Pool — Mainnet"));
         assert!(page.contains("· automatic payout"));
         assert!(page.contains("mainnet.zecwec.com:3336"));
+        assert!(page.contains("mainnet.zecwec.com:3338"));
         assert!(!page.contains("data-auth-mode=\"register\""));
         assert!(!page.contains("data-auth-intent=\"register\""));
         assert!(!page.contains("<option value=\"tls\">"));
+        assert!(page.contains("<option value=\"asic\">"));
+        assert!(page.contains("<option value=\"gpu\">"));
         assert!(!page.contains("testnet-mine.zecwec.com"));
         assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
         assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3336"));
+        assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3338"));
         assert!(!script.contains("testnet-mine.zecwec.com"));
 
         config.mining_password_ignored = true;

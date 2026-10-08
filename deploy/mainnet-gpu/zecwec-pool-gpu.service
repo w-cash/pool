@@ -1,0 +1,26 @@
+[Unit]
+Description=ZecWec Mainnet GPU/CPU low-difficulty Stratum listener
+After=network-online.target postgresql.service zecwec-pool-staging-backend.service zecwec-pool-staging-projector.service
+Requires=zecwec-pool-staging-backend.service zecwec-pool-staging-projector.service
+
+[Service]
+Type=simple
+User=zecwec-pool
+Group=zecwec-pool
+SupplementaryGroups=zecwec-pool-socket
+ExecStart=/opt/zecwec-pool-staging/bin/wcash-poold serve --config /etc/zecwec-pool-staging/pool-gpu.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+LimitNOFILE=8192
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+CPUQuota=35%
+MemoryHigh=512M
+MemoryMax=1G
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

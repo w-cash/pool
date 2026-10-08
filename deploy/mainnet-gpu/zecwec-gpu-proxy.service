@@ -1,0 +1,23 @@
+[Unit]
+Description=ZecWec GPU/CPU ZIP-301 compatibility adapter
+After=network-online.target zecwec-pool-gpu.service
+Requires=zecwec-pool-gpu.service
+
+[Service]
+Type=simple
+User=zecwec-pool
+Group=zecwec-pool
+ExecStart=/usr/bin/python3 -B /opt/zecwec-pool-staging/bin/godminer_zip301_proxy.py --listen 0.0.0.0:3338 --upstream 127.0.0.1:3339
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+CPUQuota=20%
+MemoryHigh=64M
+MemoryMax=128M
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

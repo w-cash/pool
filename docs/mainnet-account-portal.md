@@ -6,13 +6,15 @@ but does not provide the ordinary accepted-share history needed to calculate a
 per-account PPLNS balance. Neither the current collector balance nor historical
 Wolf shares may be presented as a new account's payable balance.
 
-The account Pool is a separate deployment. Its advertised Stratum endpoint is
-`mainnet.zecwec.com:3336`, and its HTTPS portal is `pool.zecwec.com`. Port 3336
-accepts ordinary ZIP-301 miners and adapts short-job-ID GodMiner firmware before
-forwarding submissions to the standard pool implementation. Port 3334 remains
-an unadvertised operational fallback. Both listeners use the same deployment,
-Wolf backend, PostgreSQL share ledger, workers, and payout accounting. They stay
-isolated from the invited-worker service on port 3333.
+The account Pool is a separate deployment. Its HTTPS portal is
+`pool.zecwec.com`. ASICs use `mainnet.zecwec.com:3336`; GPU and CPU miners use
+the lower-difficulty endpoint `mainnet.zecwec.com:3338`. Both adapt short-job-ID
+firmware before forwarding submissions to isolated internal listeners. Port
+3334 remains an unadvertised operational fallback. All three account-pool
+listeners use the same deployment, Wolf backend, PostgreSQL share ledger,
+workers, and payout accounting. Exact target-derived work prevents an easier
+GPU share from being over-credited. They stay isolated from the direct Wolf
+service on port 3333.
 
 `registration_open` is false by default on Mainnet. Opening the portal does not
 open registration; the operator sets `registration_open = true` only after all

@@ -9,6 +9,9 @@ before forwarding `mining.submit` to the normal `wcash-poold` listener on
 loopback port 3337. Accounting, worker identities, share validation, merged
 mining, and payouts remain in the shared Mainnet backend.
 
+This remains the ASIC endpoint. GPU and CPU miners use the separate
+low-difficulty listener on public port 3338 documented in `../mainnet-gpu/`.
+
 ## Files
 
 - `pool-z15pro-compat.toml` is the deployed non-secret pool configuration.

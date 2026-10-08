@@ -616,6 +616,18 @@ impl ConnectionActor {
         Ok(())
     }
 
+    /// Advances the no-share variable-difficulty clock for an authorized miner.
+    ///
+    /// A changed binding is deliberately retained for the next job generation.
+    /// Existing advertised jobs keep their immutable target and nonce assignment.
+    pub fn tick_vardiff(&mut self, now_ms: u64) -> Result<(), ConnectionActorError> {
+        self.require_open()?;
+        if let Some(vardiff) = self.vardiff.as_mut() {
+            let _ = vardiff.tick(now_ms)?;
+        }
+        Ok(())
+    }
+
     /// Removes assignments no longer admitted by Wolf's exact local lifetime.
     pub fn reconcile_jobs(&mut self) -> Result<(), ConnectionActorError> {
         self.require_open()?;
@@ -1463,6 +1475,22 @@ mod tests {
             .expect("duplicate activation is harmless");
         assert!(actor.pop_outbound().is_none());
         assert_eq!(actor.assignments.get(&generation.id()), Some(&original));
+    }
+
+    #[test]
+    fn connection_tick_eases_an_idle_authorized_worker_for_the_next_generation() {
+        let mut actor = actor(8);
+        authorize(&mut actor);
+        while actor.pop_outbound().is_some() {}
+        let original = actor.binding().expect("vardiff exists");
+
+        actor.tick_vardiff(0).expect("clock starts");
+        actor.tick_vardiff(120_001).expect("idle window advances");
+
+        let eased = actor.binding().expect("vardiff remains available");
+        assert!(eased.target() > original.target());
+        assert_eq!(actor.assignments.values().next(), Some(&original));
+        assert!(actor.pop_outbound().is_none());
     }
 
     #[test]

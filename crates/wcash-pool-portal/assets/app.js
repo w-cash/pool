@@ -25,6 +25,19 @@ const STRATUM_ENDPOINTS = {
   tcp: "stratum+tcp://testnet-mine.zecwec.com:3333",
 };
 
+function connectionHelp(profile) {
+  if (MINING_PASSWORD_IGNORED) {
+    const hardware = profile === "gpu"
+      ? "GPU / CPU uses the low-difficulty port so small miners submit shares regularly."
+      : "ASIC uses the standard target for high-throughput hardware.";
+    return `${hardware} Use the exact mining username shown below and set the password to x.`;
+  }
+  if (profile === "tls") return "Use TLS when your ASIC firmware supports it.";
+  return TLS_STRATUM_AVAILABLE
+    ? "TCP is unencrypted. Use it only when your ASIC cannot use TLS. Enter the mining-only token, never your account password."
+    : "TCP is unencrypted. Enter the mining-only token, never your account password.";
+}
+
 const history = {
   rewards: { cursor: null, columns: 5, request: 0 },
   blocks: { cursor: null, columns: 5, request: 0 },
@@ -836,9 +849,7 @@ $("#refresh-data").addEventListener("click", () => refreshAll());
 $("#stratum-transport").addEventListener("change", () => {
   const transport = $("#stratum-transport").value;
   $("#stratum-url").value = STRATUM_ENDPOINTS[transport];
-  setText("#transport-help", MINING_PASSWORD_IGNORED ? "Use the exact mining username shown below. Set the ASIC password to x." : transport === "tls" ? "Use TLS when your ASIC firmware supports it." : TLS_STRATUM_AVAILABLE
-    ? "TCP is unencrypted. Use it only when your ASIC cannot use TLS. Enter the mining-only token, never your account password."
-    : "TCP is unencrypted. Enter the mining-only token, never your account password.");
+  setText("#transport-help", connectionHelp(transport));
 });
 $$('[data-copy]').forEach((button) => button.addEventListener("click", () => copyInput(document.getElementById(button.dataset.copy))));
 $$('[data-copy-text]').forEach((button) => button.addEventListener("click", async () => {
