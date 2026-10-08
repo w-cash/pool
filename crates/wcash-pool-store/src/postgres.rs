@@ -739,6 +739,7 @@ pub enum ProjectionResult {
 pub struct PostgresStore {
     pub(crate) pool: PgPool,
     pub(crate) identity: DeploymentIdentity,
+    wcash_transparent_payouts_enabled: bool,
 }
 
 /// Explicit write capability used only by the non-listening backend projector.
@@ -766,7 +767,17 @@ impl PostgresStore {
             .max_connections(maximum_connections)
             .connect(database_url)
             .await?;
-        Ok(Self { pool, identity })
+        Ok(Self {
+            pool,
+            identity,
+            wcash_transparent_payouts_enabled: false,
+        })
+    }
+
+    /// Uses the same default-off public payout policy as the portal and signer.
+    pub fn with_wcash_transparent_payouts(mut self, enabled: bool) -> Self {
+        self.wcash_transparent_payouts_enabled = enabled;
+        self
     }
 
     /// Applies embedded, append-only schema migrations.
@@ -1953,9 +1964,12 @@ impl PostgresStore {
                 .map_err(|_| StoreError::CorruptDatabaseState("maximum network fee rate"))?;
         let policy_version = u64::try_from(policy.try_get::<i64, _>("policy_version")?)
             .map_err(|_| StoreError::CorruptDatabaseState("policy version"))?;
+        // Choose the oldest eligible receiver kind before applying the output
+        // limit, so interleaved kinds cannot leave a batch unnecessarily short.
         let rows = sqlx::query(
-            "SELECT e.account_id,(-SUM(e.amount_zat))::BIGINT AS amount_zat, \
-                    d.id AS destination_id,d.address,d.receiver_kind \
+            "WITH eligible AS ( \
+             SELECT e.account_id,(-SUM(e.amount_zat))::BIGINT AS amount_zat, \
+                    d.id AS destination_id,d.address,d.receiver_kind,paid.last_payout_at \
              FROM ledger_entries e \
              JOIN ledger_transactions t \
                ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
@@ -1971,18 +1985,25 @@ impl PostgresStore {
              ) paid ON paid.account_id=e.account_id \
              WHERE e.deployment_id=$1 AND t.chain=$2 \
                AND e.ledger_account='miner_payable' \
+               AND ($2 <> 'wcash' OR $5 OR d.receiver_kind='ironwood') \
                AND NOT EXISTS (SELECT 1 FROM payout_destinations pending \
                    WHERE pending.deployment_id=e.deployment_id \
                      AND pending.account_id=e.account_id AND pending.chain=$2 \
                      AND pending.state='pending') \
              GROUP BY e.account_id,d.id,d.address,d.receiver_kind,d.payout_threshold_zat,paid.last_payout_at \
              HAVING -SUM(e.amount_zat) >= GREATEST(d.payout_threshold_zat,$4) \
-             ORDER BY paid.last_payout_at ASC NULLS FIRST,e.account_id LIMIT $3",
+             ) SELECT account_id,amount_zat,destination_id,address,receiver_kind \
+             FROM eligible \
+             WHERE $2 <> 'wcash' OR receiver_kind=( \
+                 SELECT receiver_kind FROM eligible \
+                 ORDER BY last_payout_at ASC NULLS FIRST,account_id LIMIT 1) \
+             ORDER BY last_payout_at ASC NULLS FIRST,account_id LIMIT $3",
         )
         .bind(self.identity.id)
         .bind(chain.as_str())
         .bind(maximum_outputs)
         .bind(as_i64(minimum_payout_zat)?)
+        .bind(self.wcash_transparent_payouts_enabled)
         .fetch_all(&mut *transaction)
         .await?;
         if rows.is_empty() {
@@ -5937,15 +5958,16 @@ mod payout_fee_tests {
     #[test]
     fn payout_privacy_draw_skips_or_selects_one_persistable_cap() {
         assert_eq!(
-            payout_cap_from_draws(100, 400, 5_000, 0, u64::MAX).unwrap(),
+            payout_cap_from_draws(100, 400, 5_000, 0, u64::MAX).expect("valid payout draw bounds"),
             None
         );
         assert_eq!(
-            payout_cap_from_draws(100, 400, 5_000, u64::MAX, 0).unwrap(),
+            payout_cap_from_draws(100, 400, 5_000, u64::MAX, 0).expect("valid payout draw bounds"),
             Some(100)
         );
         assert_eq!(
-            payout_cap_from_draws(100, 400, 5_000, u64::MAX, u64::MAX).unwrap(),
+            payout_cap_from_draws(100, 400, 5_000, u64::MAX, u64::MAX)
+                .expect("valid payout draw bounds"),
             Some(400)
         );
     }

@@ -1,3 +1,6 @@
+# Enable only after installing a compatible wallet and passing preflight.
+wcash_transparent_payouts_enabled = false
+
 network = "testnet"
 deployment_id = "@DEPLOYMENT_ID@"
 pool_instance = "@POOL_INSTANCE@"

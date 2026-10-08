@@ -1019,7 +1019,8 @@ fn build_address_validator(
         ADDRESS_VALIDATION_TIMEOUT,
     )
     .map_err(|_| ServiceError::AddressAuthorityUnavailable)?;
-    let validator = TestnetAddressValidator::new(command);
+    let validator = TestnetAddressValidator::new(command)
+        .with_wcash_transparent_payouts(config.wcash_transparent_payouts_enabled);
     let validator = if config.network == ChainNetwork::Mainnet {
         validator.with_mainnet_network()
     } else {
@@ -1186,6 +1187,11 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
         .probe_readonly_boundary()
         .map_err(|_| ServiceError::SignerConfiguration)?;
 
+    if config.wcash_transparent_payouts_enabled {
+        wallet
+            .probe_transparent_payout_capability()
+            .map_err(|_| ServiceError::SignerConfiguration)?;
+    }
     let seed =
         SeedSource::protected_file(payout.wcash_wallet_seed_file.clone(), payout.wcash_seed_uid);
     seed.validate_protected_metadata()
@@ -1212,6 +1218,7 @@ fn validate_probe_only_payout_configuration(config: &RuntimeConfig) -> Result<()
     .and_then(|configured| {
         configured.with_max_outputs(config.wcash_policy.maximum_payout_outputs as usize)
     })
+    .map(|configured| configured.with_transparent_payouts(config.wcash_transparent_payouts_enabled))
     .and_then(|configured| configured.with_max_fee_zat(config.wcash_policy.maximum_network_fee_zat))
     .map_err(|_| ServiceError::SignerConfiguration)?;
 
@@ -1260,6 +1267,11 @@ async fn build_payout_services(
         })
         .map_err(|_| ServiceError::SignerConfiguration)?,
     );
+    if config.wcash_transparent_payouts_enabled {
+        wallet
+            .probe_transparent_payout_capability()
+            .map_err(|_| ServiceError::SignerConfiguration)?;
+    }
     let wec_config = WecSignerConfig::new(
         payout.wcash_signer_journal_directory.clone(),
         payout.wcash_signer_account,
@@ -1282,6 +1294,7 @@ async fn build_payout_services(
     .and_then(|configured| {
         configured.with_max_outputs(config.wcash_policy.maximum_payout_outputs as usize)
     })
+    .map(|configured| configured.with_transparent_payouts(config.wcash_transparent_payouts_enabled))
     .and_then(|configured| configured.with_max_fee_zat(config.wcash_policy.maximum_network_fee_zat))
     .map_err(|_| ServiceError::SignerConfiguration)?;
     let wec = Arc::new(
@@ -1623,6 +1636,7 @@ fn build_preflight_portal(
         portal_config.allow_registration = config.registration_open;
     }
     portal_config.payout_change_hold_secs = config.payout_change_hold_secs;
+    portal_config.wcash_transparent_payouts_enabled = config.wcash_transparent_payouts_enabled;
     portal_config.mining_password_ignored = matches!(
         config.mining_authentication,
         wcash_pool_store::MiningAuthenticationMode::UsernameOnly
@@ -2558,6 +2572,7 @@ mod tests {
             portal_listen: SocketAddr::from_str("127.0.0.1:8080").expect("portal address"),
             portal_origin: "https://testnet.zecwec.com".to_owned(),
             registration_open: true,
+            wcash_transparent_payouts_enabled: false,
             payout_change_hold_secs: 172800,
             nonce_namespace: 1,
             nonce_reservation: 1_000_000,
@@ -2616,6 +2631,23 @@ mod tests {
             b"probe-only"
         );
         assert_eq!(fs::read(seed).expect("seed credential"), seed_bytes);
+
+        // Enabling W1 must exercise the actual executable capability boundary.
+        // This wallet exits 97 for every command, modelling an old/incompatible
+        // deployment; the default-off checks above intentionally never invoke it.
+        let mut transparent = config;
+        transparent.wcash_transparent_payouts_enabled = true;
+        assert!(matches!(
+            validate_probe_only_payout_configuration(&transparent),
+            Err(ServiceError::SignerConfiguration)
+        ));
+        assert!(marker.exists(), "enabled W1 must probe wallet capabilities");
+        assert!(
+            !wec_journal.exists(),
+            "failed preflight must not create a journal"
+        );
+        assert!(!root.join("wallet.sqlite-wal").exists());
+        assert!(!root.join("wallet.sqlite-shm").exists());
     }
 
     #[cfg(unix)]

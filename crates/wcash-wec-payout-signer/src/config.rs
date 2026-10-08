@@ -120,6 +120,7 @@ pub struct WecSignerConfig {
     max_outputs: usize,
     max_fee_zat: u64,
     limits: NativeCallLimits,
+    pub(crate) transparent_payouts_enabled: bool,
 }
 
 impl WecSignerConfig {
@@ -140,9 +141,20 @@ impl WecSignerConfig {
             max_outputs: DEFAULT_MAX_OUTPUTS,
             max_fee_zat: 5_000_000,
             limits: NativeCallLimits::default(),
+            transparent_payouts_enabled: false,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Allows admission of new homogeneous public P2PKH batches.
+    ///
+    /// Previously journaled exact batches remain authorized when disabled,
+    /// including a durable reservation interrupted before signing. Recovery
+    /// still requires a wallet compatible with the stored recipient kind.
+    pub fn with_transparent_payouts(mut self, enabled: bool) -> Self {
+        self.transparent_payouts_enabled = enabled;
+        self
     }
 
     /// Selects isolated Regtest in an explicitly enabled integration build.
@@ -299,6 +311,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn mainnet_selects_the_frozen_wallet_identity() {
         let config = WecSignerConfig::new(
             "/var/lib/zecwec/mainnet-payout-journal",

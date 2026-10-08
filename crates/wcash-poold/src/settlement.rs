@@ -1706,7 +1706,10 @@ mod tests {
                 .await?,
             ReconciliationGate::Safe
         );
-        assert_eq!(fixture.wec_signer.recovery_calls(), [request.clone()]);
+        assert_eq!(
+            fixture.wec_signer.recovery_calls(),
+            std::slice::from_ref(&request)
+        );
         assert_eq!(fixture.wec_signer.calls(), [request]);
         assert!(fixture.wec_broadcaster.calls().is_empty());
         let state = fixture
@@ -1809,13 +1812,7 @@ mod tests {
         }
         let outcome = fixture
             .orchestrator
-            .resume_signed(
-                stale,
-                fixture
-                    .orchestrator
-                    .boundary(Chain::Wcash)
-                    .expect("Wcash boundary is configured"),
-            )
+            .resume_signed(stale, fixture.orchestrator.boundary(Chain::Wcash)?)
             .await?;
         assert!(matches!(
             outcome,

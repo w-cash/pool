@@ -314,6 +314,7 @@ function resetPrivateViews() {
     $(".setting-result", form).textContent = "";
     $(".setting-summary", form).textContent = "Checking saved destination";
   });
+  setWecTransparentAdmission(false);
   $("#totp-form").reset();
   $("#totp-secret").textContent = "";
   $("#totp-secret").classList.add("hidden");
@@ -596,15 +597,17 @@ function renderWorkerTelemetry() {
 async function refreshPayoutSettings(generation = authGeneration) {
   const request = ++settingsRequest;
   try {
-    const { settings, payout_change_hold_secs } = await api("/api/v1/settings/payouts");
+    const { settings, payout_change_hold_secs, wcash_transparent_payouts_enabled } = await api("/api/v1/settings/payouts");
     if (!currentGeneration(generation) || request !== settingsRequest) return;
     if (!Array.isArray(settings)) throw new Error("Payout settings are unavailable.");
     if (Number.isSafeInteger(payout_change_hold_secs) && payout_change_hold_secs > 0) payoutHoldSecs = payout_change_hold_secs;
+    setWecTransparentAdmission(wcash_transparent_payouts_enabled === true);
     cachedSettings = settings.filter((setting) => ["wec", "zec"].includes(setting.asset));
     for (const asset of ["wec", "zec"]) renderPayoutSetting(asset, cachedSettings.find((setting) => setting.asset === asset));
     updateSetupGuide();
   } catch (reason) {
     if (!currentGeneration(generation) || request !== settingsRequest) return;
+    setWecTransparentAdmission(false);
     cachedSettings = null;
     $$(".setting-summary").forEach((result) => { result.textContent = "Saved settings unavailable. Refresh before making a change."; });
     for (const asset of ["wec", "zec"]) setText(`#${asset}-payout-status`, "Payout settings unavailable");
@@ -645,14 +648,28 @@ function renderPayoutSetting(asset, setting) {
     form.elements.automatic.checked = AUTOMATIC_PAYOUT_ENABLED[asset]
       && (setting.pending_automatic ?? setting.automatic);
     form.elements.automatic.disabled = !AUTOMATIC_PAYOUT_ENABLED[asset];
-    if (asset === "zec" && !setting.pending_destination) {
-      form.elements.address_type.value = setting.active_receiver === "transparent" ? "transparent" : "shielded";
+    if (!setting.pending_destination) {
+      form.elements.address_type.value = setting.active_receiver === "transparent"
+        && (asset !== "wec" || !$("#wec-address-type option[value=transparent]").disabled)
+        ? "transparent" : "shielded";
       updateAddressType();
     }
   }
 }
 
+function setWecTransparentAdmission(enabled) {
+  $("#wec-address-type option[value=transparent]").disabled = !enabled;
+  if (!enabled && $("#wec-address-type").value === "transparent") {
+    $("#wec-address-type").value = "shielded";
+    updateAddressType();
+  }
+}
+
 function updateAddressType() {
+  const publicWec = $("#wec-address-type").value === "transparent";
+  setText("#wec-address-help", publicWec
+    ? "Transparent W1 payouts expose your destination and transferred amount. Use a P2PKH address for this pool’s Wcash network. No memo is included."
+    : "Use a shielded Wcash Unified Address with an Ironwood receiver for this pool’s network. Recommended for privacy.");
   const transparent = $("#zec-address-type").value === "transparent";
   setText("#zec-address-help", transparent
     ? "Use a Zcash Testnet transparent address. Its payout amount and destination are public on the chain."
@@ -863,6 +880,7 @@ $$('[data-copy-text]').forEach((button) => button.addEventListener("click", asyn
   }
 }));
 $("#zec-address-type").addEventListener("change", updateAddressType);
+$("#wec-address-type").addEventListener("change", updateAddressType);
 document.addEventListener("visibilitychange", () => {
   clearTimeout(refreshTimer);
   clearTimeout(publicRefreshTimer);

@@ -14,6 +14,9 @@ mod miner_telemetry;
 #[cfg(test)]
 mod payout;
 pub mod payout_runtime;
+#[cfg(all(test, feature = "regtest", unix))]
+#[path = "../tests/settlement/regtest_w1_lifecycle.rs"]
+mod regtest_w1_lifecycle;
 mod service;
 pub mod settlement;
 pub mod wcash_observation;

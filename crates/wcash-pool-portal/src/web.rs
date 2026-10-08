@@ -800,6 +800,7 @@ async fn list_payout_settings(
     }
     Ok(Json(json!({
         "settings": settings,
+        "wcash_transparent_payouts_enabled": state.config.wcash_transparent_payouts_enabled,
         "payout_change_hold_secs": state.config.payout_change_hold_secs,
     })))
 }

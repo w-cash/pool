@@ -39,6 +39,7 @@ const MAX_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct TestnetAddressValidator {
     wcash: Arc<WcashCommandValidator>,
     network: ChainNetwork,
+    wcash_transparent_payouts_enabled: bool,
 }
 
 impl TestnetAddressValidator {
@@ -47,7 +48,14 @@ impl TestnetAddressValidator {
         Self {
             wcash: Arc::new(wcash),
             network: ChainNetwork::Testnet,
+            wcash_transparent_payouts_enabled: false,
         }
+    }
+
+    /// Enables public Wcash P2PKH destinations after wallet preflight.
+    pub fn with_wcash_transparent_payouts(mut self, enabled: bool) -> Self {
+        self.wcash_transparent_payouts_enabled = enabled;
+        self
     }
 
     /// Selects the distinct Wcash and Zcash Mainnet address namespaces.
@@ -92,9 +100,9 @@ impl TestnetAddressValidator {
         match self.wcash.validate_for(self.wcash_network(), candidate) {
             Ok(validated) => {
                 let destination = validated.into_portal(candidate, self.network)?;
-                // Launch payouts are Ironwood-only. Accepting a transparent
-                // WEC destination would let one account poison a whole batch.
-                if destination.receiver_kind() != ReceiverKind::Ironwood {
+                if destination.receiver_kind() == ReceiverKind::Transparent
+                    && !self.wcash_transparent_payouts_enabled
+                {
                     return Err(AddressValidationError::UnsupportedReceiver);
                 }
                 Ok(destination)
@@ -364,7 +372,8 @@ impl WcashCommandResponse {
         }
         let receiver_kind = match self.receiver_kind.as_str() {
             "ironwood" => ReceiverKind::Ironwood,
-            "transparent_p2pkh" | "transparent_p2sh" => ReceiverKind::Transparent,
+            "transparent_p2pkh" => ReceiverKind::Transparent,
+            "transparent_p2sh" => return Err(AddressValidationError::UnsupportedReceiver),
             "tex" => return Err(AddressValidationError::UnsupportedReceiver),
             _ => return Err(AddressValidationError::AuthorityUnavailable),
         };
@@ -814,6 +823,36 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn public_wcash_requires_opt_in_and_p2pkh_authority() {
+        let (_directory, command) = command_fixture();
+        let validator = TestnetAddressValidator::new(command).with_wcash_transparent_payouts(true);
+        assert_eq!(
+            validator
+                .validate(Asset::Wec, ChainNetwork::Testnet, "WTtestfixture")
+                .unwrap()
+                .receiver_kind(),
+            ReceiverKind::Transparent
+        );
+        for kind in ["transparent_p2sh", "tex"] {
+            assert!(matches!(
+                WcashCommandResponse {
+                    network: "testnet".to_owned(),
+                    receiver_kind: kind.to_owned(),
+                    canonical: "fixture-address".to_owned(),
+                }
+                .into_portal("fixture-address", ChainNetwork::Testnet),
+                Err(AddressValidationError::UnsupportedReceiver)
+            ));
+        }
+        assert!(validator
+            .validate(Asset::Wec, ChainNetwork::Testnet, &testnet_transparent())
+            .is_err());
+        assert!(validator
+            .validate(Asset::Wec, ChainNetwork::Testnet, "WRtestfixture")
+            .is_err());
+    }
+
     #[test]
     fn mainnet_validator_requires_explicit_selection() {
         let (_directory, command) = command_fixture();

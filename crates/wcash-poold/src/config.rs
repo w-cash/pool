@@ -65,6 +65,8 @@ pub struct RuntimeConfig {
     pub portal_origin: String,
     /// Explicit Mainnet self-service registration gate; closed by default.
     pub registration_open: bool,
+    /// Opt-in public Wcash P2PKH payouts; requires a compatible pinned wallet.
+    pub wcash_transparent_payouts_enabled: bool,
     /// Safety hold applied to every initial or replacement payout destination.
     pub payout_change_hold_secs: u64,
     /// Non-zero, deployment-exclusive nonce namespace.
@@ -225,6 +227,8 @@ struct RawConfig {
     portal_origin: String,
     #[serde(default)]
     registration_open: bool,
+    #[serde(default)]
+    wcash_transparent_payouts_enabled: bool,
     payout_change_hold_secs: u64,
     nonce_namespace: u8,
     nonce_reservation: u64,
@@ -454,6 +458,7 @@ impl TryFrom<RawConfig> for RuntimeConfig {
             portal_listen: raw.portal_listen,
             portal_origin: raw.portal_origin,
             registration_open: raw.registration_open,
+            wcash_transparent_payouts_enabled: raw.wcash_transparent_payouts_enabled,
             payout_change_hold_secs: raw.payout_change_hold_secs,
             nonce_namespace: raw.nonce_namespace,
             nonce_reservation: raw.nonce_reservation,

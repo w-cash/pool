@@ -198,11 +198,186 @@ async fn authority_for(
     authority
 }
 
+async fn assert_public_payout_selection_is_opt_in_and_homogeneous(
+    database_url: &str,
+    admin: &sqlx::PgPool,
+) {
+    let store = PostgresStore::connect(database_url, 2, identity(105))
+        .await
+        .unwrap();
+    store.bind_deployment().await.unwrap();
+    let mut wec = policy(Chain::Wcash);
+    wec.maximum_payout_outputs = 4;
+    wec.minimum_payout_zat = 100;
+    wec.maximum_payout_zat = 100;
+    store
+        .bind_zero_fee_launch_policies(&wec, &policy(Chain::Zcash))
+        .await
+        .unwrap();
+    for index in 1..=8 {
+        let account = Uuid::from_u128(index);
+        sqlx::query("INSERT INTO accounts (deployment_id,id,login) VALUES ($1,$2,$3)")
+            .bind(store.deployment_id())
+            .bind(account)
+            .bind(format!("kind_{index}"))
+            .execute(admin)
+            .await
+            .unwrap();
+        insert_destination_with_kind(
+            &store,
+            admin,
+            account,
+            Chain::Wcash,
+            if index % 2 == 1 {
+                "transparent"
+            } else {
+                "ironwood"
+            },
+        )
+        .await
+        .unwrap();
+        credit_payable(&store, admin, account, Chain::Wcash, 100)
+            .await
+            .unwrap();
+    }
+    let checkpoint = reconcile_wallet(&store, admin, Chain::Wcash).await.unwrap();
+    let private = store
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(private.outputs.len(), 4);
+    assert!(private
+        .outputs
+        .iter()
+        .all(|o| o.receiver_kind == wcash_pool_store::ReceiverKind::Ironwood));
+    assert_eq!(private.miner_total_zat, 400);
+    let checkpoint = reconcile_wallet(&store, admin, Chain::Wcash).await.unwrap();
+    assert!(matches!(
+        store
+            .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+            .await,
+        Err(StoreError::NoPayableBalances)
+    ));
+    let enabled = store.with_wcash_transparent_payouts(true);
+    let public = enabled
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(public.outputs.len(), 4);
+    assert!(public
+        .outputs
+        .iter()
+        .all(|o| o.receiver_kind == wcash_pool_store::ReceiverKind::Transparent));
+    assert_eq!(public.miner_total_zat, 400);
+    assert_eq!(
+        private.payout_total_zat
+            + private.maximum_network_fee_zat
+            + public.payout_total_zat
+            + public.maximum_network_fee_zat,
+        800
+    );
+    // Fresh unpaid accounts of both kinds interleave above the output limit.
+    // Account 9 chooses transparent; all four transparent recipients must fit
+    // even though only two appear among the first four eligible accounts.
+    for index in 9..=16 {
+        let account = Uuid::from_u128(index);
+        sqlx::query("INSERT INTO accounts (deployment_id,id,login) VALUES ($1,$2,$3)")
+            .bind(enabled.deployment_id())
+            .bind(account)
+            .bind(format!("kind_{index}"))
+            .execute(admin)
+            .await
+            .unwrap();
+        insert_destination_with_kind(
+            &enabled,
+            admin,
+            account,
+            Chain::Wcash,
+            if index % 2 == 1 {
+                "transparent"
+            } else {
+                "ironwood"
+            },
+        )
+        .await
+        .unwrap();
+        credit_payable(&enabled, admin, account, Chain::Wcash, 100)
+            .await
+            .unwrap();
+    }
+    let checkpoint = reconcile_wallet(&enabled, admin, Chain::Wcash)
+        .await
+        .unwrap();
+    let mixed_candidates = enabled
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(mixed_candidates.outputs.len(), 4);
+    assert_eq!(
+        mixed_candidates
+            .outputs
+            .iter()
+            .map(|output| output.account_id)
+            .collect::<Vec<_>>(),
+        [9, 11, 13, 15].map(Uuid::from_u128),
+    );
+    assert!(mixed_candidates
+        .outputs
+        .iter()
+        .all(|o| o.receiver_kind == wcash_pool_store::ReceiverKind::Transparent));
+    let checkpoint = reconcile_wallet(&enabled, admin, Chain::Wcash)
+        .await
+        .unwrap();
+    let next = enabled
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.outputs
+            .iter()
+            .map(|output| output.account_id)
+            .collect::<Vec<_>>(),
+        [10, 12, 14, 16].map(Uuid::from_u128)
+    );
+    assert!(next
+        .outputs
+        .iter()
+        .all(|output| output.receiver_kind == wcash_pool_store::ReceiverKind::Ironwood));
+    assert_eq!(
+        mixed_candidates.payout_total_zat
+            + mixed_candidates.maximum_network_fee_zat
+            + next.payout_total_zat
+            + next.maximum_network_fee_zat,
+        800
+    );
+}
+
 async fn insert_destination(
     store: &PostgresStore,
     pool: &sqlx::PgPool,
     account_id: Uuid,
     chain: Chain,
+) -> Result<(), sqlx::Error> {
+    insert_destination_with_kind(
+        store,
+        pool,
+        account_id,
+        chain,
+        if chain == Chain::Wcash {
+            "ironwood"
+        } else {
+            "transparent"
+        },
+    )
+    .await
+}
+
+async fn insert_destination_with_kind(
+    store: &PostgresStore,
+    pool: &sqlx::PgPool,
+    account_id: Uuid,
+    chain: Chain,
+    kind: &str,
 ) -> Result<(), sqlx::Error> {
     let destination_id = Uuid::new_v4();
     let suffix = match chain {
@@ -213,7 +388,7 @@ async fn insert_destination(
         "INSERT INTO payout_destinations \
          (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by,validated_at, \
           active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
-         VALUES ($1,$2,$3,$4,'testnet',$5,'transparent','integration-authority-v1', \
+         VALUES ($1,$2,$3,$4,'testnet',$5,$7,'integration-authority-v1', \
                  clock_timestamp(),clock_timestamp(),$6,1,true,'active',1)",
     )
     .bind(store.deployment_id())
@@ -222,6 +397,7 @@ async fn insert_destination(
     .bind(chain.as_str())
     .bind(format!("integration-{suffix}-address"))
     .bind([0x44u8; 32].as_slice())
+    .bind(kind)
     .execute(pool)
     .await?;
     Ok(())
@@ -388,7 +564,7 @@ async fn assert_due_preferences_survive_empty_payout_selection(
             "INSERT INTO payout_destinations \
              (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by, \
               validated_at,active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
-             VALUES ($1,$2,$3,$4,'testnet','integration-due-preference','transparent', \
+             VALUES ($1,$2,$3,$4,'testnet','integration-due-preference',CASE WHEN $4='wcash' THEN 'ironwood' ELSE 'transparent' END, \
                      'integration-authority-v1',clock_timestamp(), \
                      clock_timestamp()-INTERVAL '1 second',$5,$6,$7,'pending',2)",
         )
@@ -2477,6 +2653,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_full_balance_payout_is_miner_fee_funded(&database_url, &admin, Chain::Zcash, 82).await;
     assert_due_preferences_survive_empty_payout_selection(&database_url, &admin).await;
     assert_pool_minimum_overrides_destination_threshold(&database_url, &admin).await;
+    assert_public_payout_selection_is_opt_in_and_homogeneous(&database_url, &admin).await;
     assert_database_privilege_boundaries(&admin, &database_url).await;
     assert_winner_depth_regression_is_reversible(&admin, &database_url).await;
     let mut mismatched_identity = store_identity.clone();
@@ -4169,7 +4346,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         "INSERT INTO payout_destinations \
          (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by,validated_at, \
           active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
-         VALUES ($1,$2,$3,'wcash','testnet','integration-wcash-address','transparent', \
+         VALUES ($1,$2,$3,'wcash','testnet','integration-wcash-address','ironwood', \
                  'integration-authority-v1',clock_timestamp(), \
                  clock_timestamp()+INTERVAL '48 hours',$4,2,false,'pending',2)",
     )
@@ -4229,7 +4406,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         "INSERT INTO payout_destinations \
          (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by,validated_at, \
           active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
-         VALUES ($1,$2,$3,'wcash','testnet',$4,'transparent','integration-authority-v1', \
+         VALUES ($1,$2,$3,'wcash','testnet',$4,'ironwood','integration-authority-v1', \
                  clock_timestamp()-INTERVAL '2 seconds',clock_timestamp()-INTERVAL '1 second', \
                  $5,1,true,'pending',2)",
     )

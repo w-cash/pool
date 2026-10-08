@@ -394,6 +394,15 @@ impl WecPayoutSigner {
                 Ok(record)
             }
             None => {
+                // The gate controls admission, not recovery. A Reserved record is
+                // durable authorization of these exact facts, even if signing had
+                // not started when the worker stopped. Preserve that authorization
+                // across rollback; never create a new one while W1 is disabled.
+                if request.batch.outputs[0].receiver_kind == ReceiverKind::Transparent
+                    && !self.config.transparent_payouts_enabled
+                {
+                    return Err(WecPayoutError::InvalidRequest);
+                }
                 let record = JournalRecord {
                     batch_id: request.batch.batch_id,
                     pipeline_commitment: validated.pipeline_commitment,
@@ -560,7 +569,7 @@ impl WecPayoutSigner {
                 .batch
                 .outputs
                 .iter()
-                .any(|output| output.receiver_kind != ReceiverKind::Ironwood)
+                .any(|output| output.receiver_kind != request.batch.outputs[0].receiver_kind)
         {
             return Err(WecPayoutError::InvalidRequest);
         }
@@ -580,12 +589,16 @@ impl WecPayoutSigner {
                     canonical_address: output.canonical_address.clone(),
                     receiver_kind: output.receiver_kind,
                     amount_zat: output.amount_zat,
-                    memo: output_memo(
-                        request.batch.batch_id,
-                        portal_commitment,
-                        output.allocation_id,
-                        ordinal,
-                    )?,
+                    memo: if output.receiver_kind == ReceiverKind::Transparent {
+                        Vec::new()
+                    } else {
+                        output_memo(
+                            request.batch.batch_id,
+                            portal_commitment,
+                            output.allocation_id,
+                            ordinal,
+                        )?
+                    },
                 })
             })
             .collect::<Result<Vec<_>, WecPayoutError>>()?;
