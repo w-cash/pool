@@ -1066,7 +1066,7 @@ authority.write_text(
             "journal_stream": "66666666-6666-4666-8666-666666666666",
             "event_seq": 0,
             "chain_id": 1464025427,
-            "listener_workers": 4,
+            "listener_workers": 6,
             "wcash_genesis": bytes.fromhex(wcash_display)[::-1].hex(),
             "zcash_genesis": bytes.fromhex(zcash_display)[::-1].hex(),
             "wcash_payout_commitment": bytes(range(65, 97)).hex(),
@@ -3099,7 +3099,7 @@ python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
     --output "$temporary/ironwood-output" \
     --pool-uid 12345 \
     --payout-uid 12346
-for insufficient_listeners in 1 2 3; do
+for insufficient_listeners in 1 2 3 4 5; do
     sed "s/^BACKEND_LISTENERS=[0-9][0-9]*$/BACKEND_LISTENERS=$insufficient_listeners/" \
         "$temporary/deployment.env" >"$temporary/insufficient-listeners.env"
     if python3 "$repo_root/scripts/deploy/render_deployment.py" bootstrap \
@@ -3112,7 +3112,7 @@ for insufficient_listeners in 1 2 3; do
         printf 'deployment-package-test: renderer accepted insufficient backend listener capacity\n' >&2
         exit 1
     fi
-    grep -Fq 'BACKEND_LISTENERS must reserve public, projector, and both payout snapshot connections' \
+    grep -Fq 'BACKEND_LISTENERS must reserve three public, projector, and both payout snapshot connections' \
         "$temporary/insufficient-listeners.log"
     [[ ! -e $temporary/insufficient-listeners-output ]] || {
         printf 'deployment-package-test: insufficient listener capacity produced deployment output\n' >&2

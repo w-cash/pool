@@ -24,7 +24,7 @@ from urllib.parse import urlsplit, unquote
 WEC_GENESIS = '70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c'
 ZEC_GENESIS = '029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327'
 TARGET = '7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
-BACKEND_LISTENERS = 4
+BACKEND_LISTENERS = 6
 
 
 def private(path, value):
