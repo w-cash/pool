@@ -5,10 +5,10 @@ GPU and CPU miners. It uses the same accounts, workers, PPLNS accounting,
 merged-mining jobs, and payout ledger as the ASIC listener on port 3336.
 
 The public adapter maps bounded short job IDs to the firewall-isolated pool on
-port 3339. The internal listener starts at target `000f…` (about one share per
-4,096 Equihash solutions) and permits Vardiff to ease as far as `003f…`. Share
-credit is calculated from the exact target stored with each accepted share, so
-lower-difficulty shares do not receive the same weight as ASIC shares.
+port 3339. The internal listener starts at the backend-enforced `0007…` ceiling
+(about one share per 8,192 Equihash solutions, or roughly 55 seconds at
+150 Sol/s). Share credit is calculated from the exact target stored with each
+accepted share, so lower-difficulty shares do not receive ASIC share weight.
 
 The listener has its own pool instance and nonce namespace (`4`). This prevents
 nonce-prefix overlap with the base listener (`2`) and ASIC listener (`3`).

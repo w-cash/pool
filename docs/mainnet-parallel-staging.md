@@ -18,8 +18,8 @@ forwarding a share to `wcash-poold` on firewall-restricted port 3337.
 
 Port 3338 uses the same bounded adapter and forwards to an independent
 `wcash-poold` listener on firewall-restricted port 3339. Its initial target is
-about one accepted share per 4,096 Equihash solutions, with bounded Vardiff for
-low-power miners. Every accepted share stores its exact target and is credited
+the backend-enforced `0007…` ceiling, about one accepted share per 8,192
+Equihash solutions. Every accepted share stores its exact target and is credited
 by target-derived work. A GPU share therefore cannot receive ASIC share weight.
 
 Port 3334 runs the original standard listener as an unadvertised operational

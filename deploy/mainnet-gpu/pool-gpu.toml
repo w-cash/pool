@@ -32,8 +32,8 @@ zcash_node_rpc = "127.0.0.1:18232"
 zcash_node_cookie_file = "/etc/zecwec-pool-staging/zcash-node.cookie"
 portal_token_pepper_file = "/etc/zecwec-pool-staging/portal-pepper"
 portal_totp_key_file = "/etc/zecwec-pool-staging/portal-totp"
-initial_share_target_be = "000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-easiest_share_target_be = "003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+initial_share_target_be = "0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+easiest_share_target_be = "0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 
 [wcash_policy]
 pplns_window_work = "100000000"
