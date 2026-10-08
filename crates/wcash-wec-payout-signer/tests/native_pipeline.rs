@@ -78,6 +78,8 @@ enum Tamper {
     OutputAmount,
     OutputAddress,
     OutputOrder,
+    OutputKind,
+    OutputAllocation,
     Network,
     Account,
     PayoutCommitment,
@@ -302,6 +304,16 @@ impl NativeWalletTransport for MockWallet {
             Tamper::OutputAmount => intent.ordered_outputs[0].amount_zat += 1,
             Tamper::OutputAddress => intent.ordered_outputs[0].canonical_address.push('x'),
             Tamper::OutputOrder => intent.ordered_outputs.swap(0, 1),
+            Tamper::OutputKind => {
+                intent.ordered_outputs[0].receiver_kind =
+                    match intent.ordered_outputs[0].receiver_kind {
+                        ReceiverKind::Ironwood => ReceiverKind::Transparent,
+                        ReceiverKind::Transparent => ReceiverKind::Ironwood,
+                    }
+            }
+            Tamper::OutputAllocation => {
+                intent.ordered_outputs[0].allocation_id = Uuid::from_u128(999)
+            }
             Tamper::Network => intent.identity.network = WalletNetwork::Regtest,
             Tamper::Account => intent.identity.account_id = Uuid::from_u128(0x999),
             Tamper::PayoutCommitment => {
@@ -678,6 +690,8 @@ fn every_tampered_inspection_fact_fails_before_broadcast() {
         Tamper::OutputAmount,
         Tamper::OutputAddress,
         Tamper::OutputOrder,
+        Tamper::OutputKind,
+        Tamper::OutputAllocation,
         Tamper::Network,
         Tamper::Account,
         Tamper::PayoutCommitment,
@@ -687,17 +701,175 @@ fn every_tampered_inspection_fact_fails_before_broadcast() {
         Tamper::Stored,
         Tamper::TransactionId,
     ];
-    for tamper in tampers {
+    for kind in [ReceiverKind::Ironwood, ReceiverKind::Transparent] {
+        for tamper in tampers {
+            let fixture = Fixture::new();
+            let wallet = Arc::new(MockWallet::new(fixture.account));
+            wallet.tamper(tamper);
+            let signer = WecPayoutSigner::new(
+                fixture.config().with_transparent_payouts(true),
+                wallet.clone(),
+            )
+            .unwrap();
+            let mut payout = request(fixture.account);
+            for output in &mut payout.batch.outputs {
+                output.receiver_kind = kind;
+            }
+            assert_eq!(
+                signer.execute(&payout).unwrap_err(),
+                WecPayoutError::WalletProtocolViolation
+            );
+            assert_eq!(wallet.counts().3, 0);
+        }
+    }
+}
+
+#[test]
+fn public_batches_are_opt_in_homogeneous_and_memo_free() {
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    let mut payout = request(fixture.account);
+    for output in &mut payout.batch.outputs {
+        output.receiver_kind = ReceiverKind::Transparent;
+    }
+    let disabled = make_signer(&fixture, wallet.clone());
+    assert_eq!(
+        disabled.execute(&payout).unwrap_err(),
+        WecPayoutError::InvalidRequest
+    );
+    drop(disabled);
+    let signer = WecPayoutSigner::new(
+        fixture.config().with_transparent_payouts(true),
+        wallet.clone(),
+    )
+    .unwrap();
+    let mut mixed = payout.clone();
+    mixed.batch.outputs[0].receiver_kind = ReceiverKind::Ironwood;
+    assert_eq!(
+        signer.execute(&mixed).unwrap_err(),
+        WecPayoutError::InvalidRequest
+    );
+    signer.execute(&payout).unwrap();
+    assert!(wallet
+        .last_outputs()
+        .iter()
+        .all(|output| output.receiver_kind == ReceiverKind::Transparent && output.memo.is_empty()));
+}
+
+#[test]
+fn disabling_public_admission_preserves_every_authorized_crash_boundary() {
+    for checkpoint in [
+        Checkpoint::StagePersisted(WecPipelineStage::Reserved),
+        Checkpoint::IdentityReturned,
+        Checkpoint::RecoveryReturned,
+        Checkpoint::SigningReturned,
+        Checkpoint::InspectionReturned,
+        Checkpoint::StagePersisted(WecPipelineStage::Signed),
+        Checkpoint::StagePersisted(WecPipelineStage::BroadcastUnresolved),
+        Checkpoint::BroadcastReturned(WecPipelineStage::Completed),
+        Checkpoint::StagePersisted(WecPipelineStage::Completed),
+    ] {
         let fixture = Fixture::new();
         let wallet = Arc::new(MockWallet::new(fixture.account));
-        wallet.tamper(tamper);
+        let mut payout = request(fixture.account);
+        for output in &mut payout.batch.outputs {
+            output.receiver_kind = ReceiverKind::Transparent;
+        }
+        let interrupted = WecPayoutSigner::new(
+            fixture.config().with_transparent_payouts(true),
+            wallet.clone(),
+        )
+        .unwrap()
+        .with_checkpoint_hook(Arc::new(InterruptOnce::new(checkpoint)));
         assert_eq!(
-            make_signer(&fixture, wallet.clone())
-                .execute(&request(fixture.account))
-                .unwrap_err(),
-            WecPayoutError::WalletProtocolViolation
+            interrupted.execute(&payout),
+            Err(WecPayoutError::Interrupted),
+            "checkpoint {checkpoint:?}"
         );
-        assert_eq!(wallet.counts().3, 0);
+        drop(interrupted);
+        let restarted = make_signer(&fixture, wallet.clone());
+        let before = wallet.counts();
+        let recovered = restarted.recover_prepared(&payout).unwrap();
+        assert_eq!(wallet.counts().1, before.1, "inspection cannot sign");
+        assert_eq!(wallet.counts().3, before.3, "inspection cannot broadcast");
+        assert_eq!(recovered.is_some(), before.1 == 1);
+
+        let mut changed = payout.clone();
+        changed.batch.outputs[0].amount_zat += 1;
+        assert_eq!(
+            restarted.prepare(&changed),
+            Err(WecPayoutError::IdempotencyConflict)
+        );
+        let prepared = restarted.prepare(&payout).unwrap();
+        assert_eq!(prepared.receipt.transaction_id, TXID);
+        assert_eq!(wallet.counts().1, 1, "authorized intent signs at most once");
+        let executed = restarted.execute(&payout).unwrap();
+        assert_eq!(executed.receipt.transaction_id, TXID);
+        let broadcasts = wallet.broadcasts();
+        assert!(broadcasts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(wallet
+            .last_outputs()
+            .iter()
+            .all(|output| output.memo.is_empty()));
+
+        let mut new_batch = payout.clone();
+        new_batch.batch.batch_id = Uuid::from_u128(999);
+        let counts = wallet.counts();
+        assert!(restarted.recover_prepared(&new_batch).unwrap().is_none());
+        assert_eq!(
+            restarted.prepare(&new_batch),
+            Err(WecPayoutError::InvalidRequest)
+        );
+        assert_eq!(
+            restarted.execute(&new_batch),
+            Err(WecPayoutError::InvalidRequest)
+        );
+        assert_eq!(
+            wallet.counts(),
+            counts,
+            "new disabled batches cannot call wallet"
+        );
+    }
+}
+
+#[test]
+fn disabled_public_recovery_preserves_ambiguous_and_rejected_outcomes() {
+    for failure in [BroadcastFailure::Timeout, BroadcastFailure::Rejected] {
+        let fixture = Fixture::new();
+        let wallet = Arc::new(MockWallet::new(fixture.account));
+        let mut payout = request(fixture.account);
+        for output in &mut payout.batch.outputs {
+            output.receiver_kind = ReceiverKind::Transparent;
+        }
+        wallet.push_broadcast(Err(failure));
+        let signer = WecPayoutSigner::new(
+            fixture.config().with_transparent_payouts(true),
+            wallet.clone(),
+        )
+        .unwrap();
+        assert!(signer.execute(&payout).is_err());
+        drop(signer);
+        let restarted = make_signer(&fixture, wallet.clone());
+        let before = wallet.counts();
+        if failure == BroadcastFailure::Rejected {
+            assert_eq!(
+                restarted.recover_prepared(&payout),
+                Err(WecPayoutError::BroadcastRejected)
+            );
+            assert_eq!(
+                restarted.execute(&payout),
+                Err(WecPayoutError::BroadcastRejected)
+            );
+            assert_eq!(wallet.counts(), before);
+        } else {
+            assert!(restarted.recover_prepared(&payout).unwrap().is_some());
+            assert_eq!(wallet.counts(), before);
+            restarted.execute(&payout).unwrap();
+            let broadcasts = wallet.broadcasts();
+            assert_eq!(broadcasts.len(), 2);
+            assert_eq!(broadcasts[0], broadcasts[1]);
+            assert_eq!(wallet.counts().1, 1);
+        }
     }
 }
 

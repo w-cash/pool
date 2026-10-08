@@ -477,6 +477,7 @@ async fn connect_store(config: &RuntimeConfig) -> Result<PostgresStore, Bootstra
         deployment_identity(config),
     )
     .await
+    .map(|store| store.with_wcash_transparent_payouts(config.wcash_transparent_payouts_enabled))
     .map_err(BootstrapError::from)
 }
 

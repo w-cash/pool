@@ -152,6 +152,14 @@ jobs:
         env:
           WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
 
+      - name: Run historical upgrade and winner-proof lifecycle regression
+        run: >-
+          cargo test --locked -p wcash-pool-store --test winner_proof_lifecycle
+          exact_auxpow_proofs_share_one_reward_and_preserve_original_allocations
+          -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
   deployment-package:
     name: Deployment package
     runs-on: ubuntu-24.04

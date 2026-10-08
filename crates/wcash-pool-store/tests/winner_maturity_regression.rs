@@ -217,8 +217,8 @@ fn policy(chain: Chain) -> ChainPolicy {
         required_confirmations: 100,
         payout_confirmations: 3,
         maximum_payout_outputs: 1,
-        minimum_payout_zat: 1_000_000_000_000,
-        maximum_payout_zat: 1_000_000_000_000,
+        minimum_payout_zat: 100,
+        maximum_payout_zat: 100,
         payout_skip_bps: 0,
         maximum_network_fee_zat: 1_000_000,
         maximum_network_fee_bps: 1_000,
@@ -240,7 +240,7 @@ async fn seed_payable(
         "INSERT INTO payout_destinations \
          (deployment_id,id,account_id,chain,network,address,receiver_kind,validated_by, \
           validated_at,active_after,address_digest,payout_threshold_zat,automatic,state,revision) \
-         VALUES ($1,$2,$3,'wcash','testnet','integration-wcash-lock-address','transparent', \
+         VALUES ($1,$2,$3,'wcash','testnet','integration-wcash-lock-address','ironwood', \
                  'integration-authority-v1',clock_timestamp(),clock_timestamp(),$4,1,true, \
                  'active',1)",
     )

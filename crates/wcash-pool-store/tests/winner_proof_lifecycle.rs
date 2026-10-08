@@ -328,10 +328,25 @@ async fn assert_existing_schema_upgrade(pool: &sqlx::PgPool, database_url: &str)
         .await
         .unwrap();
     store.bind_deployment().await.unwrap();
-    store
-        .bind_zero_fee_launch_policies(&policy(Chain::Wcash), &policy(Chain::Zcash))
-        .await
-        .unwrap();
+    // This fixture deliberately represents the v0011 schema. Seed only the
+    // columns available to that release, then exercise the actual upgrade
+    // before calling the current policy API.
+    for chain in [Chain::Wcash, Chain::Zcash] {
+        sqlx::query("INSERT INTO chain_policies (deployment_id,chain,pplns_window_work,fee_bps,payout_threshold_zat,required_confirmations,maximum_payout_outputs,maximum_network_fee_zat,maximum_network_fee_bps,policy_version) VALUES ($1,$2,1000000,0,1,100,1,1000000,1000,1)")
+            .bind(deployment.id).bind(chain.as_str()).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO chain_safety_state (deployment_id,chain) VALUES ($1,$2)")
+            .bind(deployment.id)
+            .bind(chain.as_str())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO payout_watch_cursors (deployment_id,chain) VALUES ($1,$2)")
+            .bind(deployment.id)
+            .bind(chain.as_str())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
     let worker = Proof::new(0x90, &job()).worker;
     sqlx::query("SELECT public.ensure_projected_worker_v1($1,$2,$3,$4)")
         .bind(deployment.id)
@@ -495,6 +510,45 @@ async fn assert_existing_schema_upgrade(pool: &sqlx::PgPool, database_url: &str)
             row.get::<Option<Vec<u8>>, _>("active_proof_share_id"),
             matches!(state.as_str(), "observed" | "matured").then_some(share)
         );
+    }
+    // Continue through every later embedded migration. This checks the full
+    // historical upgrade path, including the separate payout confirmations,
+    // without requiring the historical schema to expose today's columns.
+    for migration in sqlx::migrate!()
+        .iter()
+        .filter(|migration| migration.version > 12)
+    {
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::raw_sql(&migration.sql)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    }
+    assert_eq!(
+        migration_snapshot(pool).await,
+        before,
+        "later migrations preserve historical winner and ledger facts"
+    );
+    for chain in [Chain::Wcash, Chain::Zcash] {
+        let upgraded = store.chain_policy(chain).await.unwrap().unwrap();
+        assert_eq!(upgraded.required_confirmations, 100);
+        assert_eq!(upgraded.payout_confirmations, 3);
+        assert_eq!(upgraded.minimum_payout_zat, 100_000_000);
+        assert_eq!(upgraded.maximum_payout_outputs, 1);
+        assert_eq!(
+            upgraded.maximum_payout_zat,
+            if chain == Chain::Wcash {
+                10_000_000_000
+            } else {
+                100_000_000
+            }
+        );
+        assert_eq!(
+            upgraded.payout_skip_bps,
+            if chain == Chain::Wcash { 2000 } else { 0 }
+        );
+        store.bind_chain_policy(&upgraded).await.unwrap();
     }
 }
 

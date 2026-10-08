@@ -211,6 +211,32 @@ impl WolfWalletTransport {
         probe_readonly_database(&self.wallet_database)
     }
 
+    /// Requires explicit support before operators enable public Wcash outputs.
+    pub(super) fn probe_transparent_payout_capability(&self) -> Result<(), NativeWalletError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Capabilities {
+            protocol_version: u32,
+            receiver_kinds: Vec<String>,
+        }
+        let output = self
+            .invoke_wallet(
+                "payout-capabilities",
+                false,
+                Zeroizing::new(Vec::new()),
+                Duration::from_secs(10),
+                4096,
+            )
+            .map_err(map_readonly_invoke_error)?;
+        let capabilities: Capabilities = parse_json(&output)?;
+        if capabilities.protocol_version != WCASH_WALLET_SUCCESS_PROTOCOL_VERSION
+            || capabilities.receiver_kinds != ["ironwood", "transparent_p2pkh"]
+        {
+            return Err(NativeWalletError::ProtocolViolation);
+        }
+        Ok(())
+    }
+
     fn invoke_wallet(
         &self,
         subcommand: &'static str,
@@ -418,6 +444,11 @@ impl NativeWalletTransport for WolfWalletTransport {
         call: &WalletSignCall,
         seed: &SecretSeed,
     ) -> Result<WalletSignedTransaction, NativeWalletError> {
+        if call.outputs.iter().any(|output| {
+            output.receiver_kind == ReceiverKind::Transparent && !output.memo.is_empty()
+        }) {
+            return Err(NativeWalletError::ProtocolViolation);
+        }
         let request = WireSignRequest::from(call);
         let request_json = Zeroizing::new(
             serde_json::to_vec(&request).map_err(|_| NativeWalletError::ProtocolViolation)?,
@@ -637,7 +668,7 @@ impl<'a> From<&'a WalletOutput> for WireOutputRef<'a> {
             allocation_id: output.allocation_id.to_string(),
             canonical_address: &output.canonical_address,
             receiver_kind: match output.receiver_kind {
-                ReceiverKind::Transparent => "transparent",
+                ReceiverKind::Transparent => "transparent_p2pkh",
                 ReceiverKind::Ironwood => "ironwood",
             },
             amount_zat: output.amount_zat,
@@ -839,8 +870,12 @@ fn parse_signed_payout(
 }
 
 fn parse_output(output: WireOutput) -> Result<WalletOutput, NativeWalletError> {
-    if output.receiver_kind != "ironwood"
-        || output.canonical_address.len() < 8
+    let receiver_kind = match output.receiver_kind.as_str() {
+        "ironwood" => ReceiverKind::Ironwood,
+        "transparent_p2pkh" if output.memo_hex.is_empty() => ReceiverKind::Transparent,
+        _ => return Err(NativeWalletError::ProtocolViolation),
+    };
+    if output.canonical_address.len() < 8
         || output.canonical_address.len() > 512
         || output.canonical_address.chars().any(char::is_whitespace)
     {
@@ -849,7 +884,7 @@ fn parse_output(output: WireOutput) -> Result<WalletOutput, NativeWalletError> {
     Ok(WalletOutput {
         allocation_id: parse_uuid(&output.allocation_id)?,
         canonical_address: output.canonical_address,
-        receiver_kind: ReceiverKind::Ironwood,
+        receiver_kind,
         amount_zat: output.amount_zat,
         memo: validate_lower_hex_bounded(&output.memo_hex, 0, 512)?.to_vec(),
     })
@@ -1231,6 +1266,46 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    #[test]
+    fn w1_output_wire_roundtrip_is_p2pkh_and_memo_free() {
+        for receiver_kind in [ReceiverKind::Ironwood, ReceiverKind::Transparent] {
+            let output = WalletOutput {
+                allocation_id: Uuid::from_u128(1),
+                canonical_address: "fixture-canonical-address".to_owned(),
+                receiver_kind,
+                amount_zat: 123,
+                memo: if receiver_kind == ReceiverKind::Ironwood {
+                    vec![1, 2]
+                } else {
+                    vec![]
+                },
+            };
+            let wire = serde_json::to_value(WireOutputRef::from(&output)).unwrap();
+            assert_eq!(
+                wire["receiver_kind"],
+                if receiver_kind == ReceiverKind::Ironwood {
+                    "ironwood"
+                } else {
+                    "transparent_p2pkh"
+                }
+            );
+            assert_eq!(
+                parse_output(serde_json::from_value(wire.clone()).unwrap()).unwrap(),
+                output
+            );
+            for bad_kind in ["transparent", "transparent_p2sh", "tex"] {
+                let mut bad = wire.clone();
+                bad["receiver_kind"] = bad_kind.into();
+                assert!(parse_output(serde_json::from_value(bad).unwrap()).is_err());
+            }
+            if receiver_kind == ReceiverKind::Transparent {
+                let mut bad = wire;
+                bad["memo_hex"] = "00".into();
+                assert!(parse_output(serde_json::from_value(bad).unwrap()).is_err());
+            }
+        }
+    }
+
     const TEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
@@ -1423,6 +1498,47 @@ mod tests {
         )
         .unwrap();
         (directory, program_path, transport)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transparent_capability_probe_requires_compatible_seedless_executable() {
+        let capabilities = serde_json::json!({
+            "protocol_version": WCASH_WALLET_SUCCESS_PROTOCOL_VERSION,
+            "receiver_kinds": ["ironwood", "transparent_p2pkh"]
+        });
+        let script = format!(
+            "case \" $* \" in\n  *\" --seed-stdin \"*|*\" --endpoint \"*) exit 99 ;;\n  *\" payout-capabilities \"*) [ -z \"$(/bin/cat)\" ] || exit 98; printf '%s' '{capabilities}' ;;\n  *) exit 64 ;;\nesac"
+        );
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert_eq!(transport.probe_transparent_payout_capability(), Ok(()));
+        assert!(
+            !transport.wallet_database.exists(),
+            "probe must not create a wallet database"
+        );
+
+        for response in [
+            serde_json::json!({"protocol_version": 1, "receiver_kinds": ["ironwood", "transparent_p2pkh"]}),
+            serde_json::json!({"protocol_version": 2, "receiver_kinds": ["ironwood"]}),
+            serde_json::json!({"protocol_version": 2, "receiver_kinds": ["ironwood", "transparent_p2sh"]}),
+            serde_json::json!({"protocol_version": 2, "receiver_kinds": ["ironwood", "transparent_p2pkh"], "unknown": true}),
+        ] {
+            let (_directory, _program, transport) =
+                fixture_transport(&format!("printf '%s' '{response}'"));
+            assert_eq!(
+                transport.probe_transparent_payout_capability(),
+                Err(NativeWalletError::ProtocolViolation),
+                "incompatible capability response: {response}"
+            );
+        }
+        for script in [
+            "exit 64",
+            "printf '%s' 'not-json'",
+            "printf '%s' '{}' >&2; exit 1",
+        ] {
+            let (_directory, _program, transport) = fixture_transport(script);
+            assert!(transport.probe_transparent_payout_capability().is_err());
+        }
     }
 
     #[cfg(unix)]

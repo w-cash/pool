@@ -2,12 +2,19 @@
  * Run with an externally provided Playwright installation:
  * NODE_PATH=<node_modules> node --test crates/wcash-pool-portal/tests/browser_ui.cjs
  * Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH when using an existing browser.
- * All HTTP responses below are explicit test fixtures; no live service is used.
+ * HTTP/auth/persistence use explicit fixtures. Set PORTAL_ADDRESS_AUTHORITY to the
+ * built browser_address_authority example and WCASH_WALLET_EXECUTABLE to a real
+ * Wolf wallet to also run rejection tests through the production Rust validator
+ * and Wolf codec. These tests are seedless and never contact a node.
+ * Build the bridge with optimized hashing for large debug wallet binaries:
+ * cargo build -p wcash-pool-address --example browser_address_authority \
+ *   --config 'profile.dev.package.sha2.opt-level=3'
  */
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const { chromium } = require("playwright");
 
 const origin = "https://portal.example.test";
@@ -63,9 +70,23 @@ async function fixture(options = {}) {
       }
       return reply({ workers: state.workers });
     }
-    if (url.pathname === "/api/v1/settings/payouts") return reply({ settings: state.settings });
+    if (url.pathname === "/api/v1/settings/payouts") {
+      if (state.settingsFailure) return reply({ message: "Payout settings unavailable." }, 503);
+      return reply({ settings: state.settings, wcash_transparent_payouts_enabled: state.transparentEnabled });
+    }
     if (url.pathname.startsWith("/api/v1/settings/payouts/")) {
       const asset = url.pathname.split("/").pop();
+      if (asset === "wec" && state.realAddressAuthority) {
+        const child = spawnSync(process.env.PORTAL_ADDRESS_AUTHORITY, [process.env.WCASH_WALLET_EXECUTABLE], {
+          input: JSON.stringify({ destination: payload.destination, enabled: state.transparentEnabled === true, mainnet: state.mainnet === true }),
+          encoding: "utf8", timeout: 30000,
+        });
+        assert.equal(child.status, 0, child.stderr || String(child.error));
+        const validation = JSON.parse(child.stdout);
+        state.validations ??= [];
+        state.validations.push(validation);
+        if (!validation.accepted) return reply({ message: "invalid payout destination" }, 422);
+      }
       const setting = { asset, network: "testnet", active_destination: null, active_receiver: null, threshold_zat: 0, automatic: false, revision: 0, pending_destination: "fixture…masked", pending_threshold_zat: payload.threshold_zat, pending_automatic: payload.automatic, pending_effective_at: 1789516800, pending_revision: 1 };
       state.settings = [...state.settings.filter((item) => item.asset !== asset), setting];
       return reply(setting);
@@ -110,6 +131,104 @@ test("public landing explains merged mining and renders privacy-safe live activi
     }
     assert.deepEqual(state.errors, []);
   } finally { await context.close(); }
+});
+
+test("W1 admission is default-off and requires a boolean server opt-in", async () => {
+  for (const transparentEnabled of [undefined, false, "true", 1]) {
+    const { page, context, state } = await fixture({ transparentEnabled });
+    try {
+      await page.getByRole("button", { name: "Settings", exact: true }).click();
+      assert.equal(await page.locator("#wec-address-type").inputValue(), "shielded");
+      assert.equal(await page.locator("#wec-address-type option[value=transparent]").evaluate((option) => option.disabled), true);
+      assert.deepEqual(state.errors, []);
+    } finally { await context.close(); }
+  }
+});
+
+test("enabled W1 selection explains public amount/destination and submits exact amounts", async () => {
+  const { page, context, state } = await fixture({ transparentEnabled: true });
+  try {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.locator("#wec-address-type").selectOption("transparent");
+    const help = await page.locator("#wec-address-help").textContent();
+    assert.match(help, /expose your destination and transferred amount/);
+    assert.match(help, /P2PKH/);
+    assert.match(help, /No memo is included/);
+    await page.locator("#wec-destination").fill("WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq");
+    await page.locator("#wec-threshold").fill("0.12345678");
+    await page.locator("#wec-password").fill("fixture-password-only");
+    await page.getByRole("button", { name: "Save TWC destination", exact: true }).click();
+    await page.locator('.payout-form[data-asset="wec"] .setting-result').filter({ hasText: "Saved." }).waitFor();
+    const saved = state.requests.find((item) => item.path.endsWith("/payouts/wec") && item.method === "PUT");
+    assert.equal(saved.payload.threshold_zat, 12345678);
+    assert.deepEqual(Object.keys(saved.payload).sort(), ["automatic", "destination", "password", "threshold_zat"]);
+    assert.equal(saved.csrf, "fixture_csrf");
+    assert.equal(await page.locator("#wec-password").inputValue(), "");
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+test("W1 selection fails closed when settings refresh fails or admission is disabled", async () => {
+  const { page, context, state } = await fixture({ transparentEnabled: true });
+  try {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.locator("#wec-address-type").selectOption("transparent");
+    state.settingsFailure = true;
+    await page.evaluate(() => refreshPayoutSettings());
+    await page.locator('[data-setting-summary="wec"]').filter({ hasText: "Saved settings unavailable" }).waitFor();
+    assert.equal(await page.locator("#wec-address-type option[value=transparent]").evaluate((option) => option.disabled), true);
+    assert.equal(await page.locator("#wec-address-type").inputValue(), "shielded");
+    state.settingsFailure = false;
+    state.transparentEnabled = false;
+    await page.evaluate(() => refreshPayoutSettings());
+    await page.locator('[data-setting-summary="wec"]').filter({ hasText: "No payout destination" }).waitFor();
+    assert.equal(await page.locator("#wec-address-type option[value=transparent]").evaluate((option) => option.disabled), true);
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+// Golden vectors from Wolf zebra-chain/src/primitives/wcash_address.rs.
+const w1Vectors = {
+  testnet: "WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq",
+  mainnet: "W1M7uk1EZYGQGJCwCL5cWTE1FU5CuVSL6bU",
+  w3: "W3MovfYj16AiePNddTBH6srNBcbVd5oHSZQ",
+  tex: "wtex1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkxpljy",
+};
+test("production authority accepts W1 and rejects disabled W1, wrong network, W3 and TEX through browser saves", {
+  skip: !process.env.PORTAL_ADDRESS_AUTHORITY || !process.env.WCASH_WALLET_EXECUTABLE
+    ? "requires built Rust browser_address_authority and real Wolf wallet executable" : false,
+}, async () => {
+  for (const [name, transparentEnabled, destination, expected] of [
+    ["W1 enabled", true, w1Vectors.mainnet, null],
+    ["W1 disabled", false, w1Vectors.mainnet, "UnsupportedReceiver"],
+    ["wrong network", true, w1Vectors.testnet, "WrongNetwork"],
+    ["W3", true, w1Vectors.w3, "UnsupportedReceiver"],
+    ["TEX", true, w1Vectors.tex, "UnsupportedReceiver"],
+  ]) {
+    // Asset labels use the embedded Testnet shell; the authority is explicitly
+    // Mainnet to exercise literal W1/W3 vectors. No network RPC is performed.
+    const { page, context, state } = await fixture({ transparentEnabled, mainnet: true, realAddressAuthority: true });
+    try {
+      await page.getByRole("button", { name: "Settings", exact: true }).click();
+      if (transparentEnabled) await page.locator("#wec-address-type").selectOption("transparent");
+      await page.locator("#wec-destination").fill(destination);
+      await page.locator("#wec-threshold").fill("0.10000000");
+      await page.locator("#wec-password").fill("fixture-password-only");
+      await page.getByRole("button", { name: "Save TWC destination", exact: true }).click();
+      await page.locator('.payout-form[data-asset="wec"] .setting-result').filter({ hasText: expected ? "invalid payout destination" : "Saved." }).waitFor();
+      assert.equal(state.validations.length, 1, name);
+      if (expected) {
+        assert.equal(state.validations[0].reason, expected, name);
+        assert.deepEqual(state.settings, [], "rejected destination must not be persisted");
+        assert.equal(await page.locator("#wec-destination").inputValue(), destination);
+      } else {
+        assert.equal(state.validations[0].receiver, "transparent");
+        assert.equal(state.validations[0].canonical, destination);
+      }
+      assert.equal(await page.locator("#wec-password").inputValue(), "");
+      assert.deepEqual(state.errors, []);
+    } finally { await context.close(); }
+  }
 });
 
 test("registration keeps the existing account API and does not require an authenticator", async () => {

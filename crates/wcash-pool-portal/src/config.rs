@@ -26,6 +26,8 @@ pub struct PortalConfig {
     pub login_lock_secs: u64,
     /// Permit self-service account registration.
     pub allow_registration: bool,
+    /// Whether this pool accepts public Wcash P2PKH destinations.
+    pub wcash_transparent_payouts_enabled: bool,
     /// Whether Stratum authorizes by registered username and ignores its password field.
     pub mining_password_ignored: bool,
     /// Process-wide limit for memory-hard portal credential operations.
@@ -44,6 +46,7 @@ impl PortalConfig {
             max_login_attempts: 5,
             login_lock_secs: 15 * 60,
             allow_registration: true,
+            wcash_transparent_payouts_enabled: false,
             mining_password_ignored: false,
             argon2_operation_slots: 2,
         }

@@ -1131,9 +1131,9 @@ impl ZalletObservationSource {
         })
     }
 
-    /// Uses Regtest collector address encoding only in an explicitly enabled build.
-    #[cfg(feature = "regtest")]
-    pub(crate) fn with_regtest_network(mut self) -> Self {
+    /// Exercises Regtest collector address encoding in explicitly enabled tests.
+    #[cfg(all(test, feature = "regtest"))]
+    fn with_regtest_network(mut self) -> Self {
         self.network = ChainNetwork::Regtest;
         self
     }
