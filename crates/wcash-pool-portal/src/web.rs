@@ -276,11 +276,31 @@ async fn production_manifest(State(state): State<Arc<AppState>>) -> Response {
     if state.config.network != crate::ChainNetwork::Mainnet {
         return StatusCode::NOT_FOUND.into_response();
     }
-    (
-        [(CONTENT_TYPE, "application/json; charset=utf-8")],
-        PRODUCTION_MANIFEST,
-    )
-        .into_response()
+    let Ok(mut manifest) = serde_json::from_str::<Value>(PRODUCTION_MANIFEST) else {
+        return AppError::Internal.into_response();
+    };
+    let wec_worker_live =
+        tokio::time::timeout(READINESS_TIMEOUT, state.store.payout_worker_is_live())
+            .await
+            .ok()
+            .and_then(Result::ok);
+    manifest["runtime"] = json!({
+        "sampled_at_unix": state.clock.now(),
+        "registration_open": state.config.allow_registration,
+        "mining_ready": state.pool_data.mining_ready(),
+        "portal": {
+            "payout_execution": state.payout.execution().as_str()
+        },
+        "wec": {
+            "policy": "automatic",
+            "worker_live": wec_worker_live
+        },
+        "zec": {
+            "policy": "manual",
+            "worker_live": null
+        }
+    });
+    Json(manifest).into_response()
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -295,7 +315,10 @@ fn render_index(config: &PortalConfig) -> String {
             .replace("TESTNET", "MAINNET")
             .replace("TWC", "WEC")
             .replace("Two test networks.", "Two main networks.")
-            .replace("· no monetary value", "· WEC automatic · ZEC manual")
+            .replace(
+                "<span>· no monetary value</span>",
+                "<span id=\"network-payout-state\">· payout status loading</span>",
+            )
             .replace(
                 "</head>",
                 "  <link rel=\"alternate\" type=\"application/json\" href=\"/api/v1/production-manifest\" title=\"ZecWec production manifest\">\n</head>",
@@ -327,7 +350,7 @@ fn render_index(config: &PortalConfig) -> String {
         )
         .replace(
             "pool: stratum+tcp://mainnet.zecwec.com:3336",
-            "legacy_direct_wolf: stratum+tcp://mainnet.zecwec.com:3333\nasic_account_pool: stratum+tcp://mainnet.zecwec.com:3336\ngpu_cpu_account_pool: stratum+tcp://mainnet.zecwec.com:3338\nproduction_manifest: /api/v1/production-manifest\nportal_payout_execution: deferred\nwec_payout_execution: automatic\nzec_payout_execution: manual",
+            "legacy_direct_wolf: stratum+tcp://mainnet.zecwec.com:3333\nasic_account_pool: stratum+tcp://mainnet.zecwec.com:3336\ngpu_cpu_account_pool: stratum+tcp://mainnet.zecwec.com:3338\nproduction_manifest: /api/v1/production-manifest\nportal_payout_execution: deferred\nwec_payout_policy: automatic\nzec_payout_policy: manual",
         );
     }
     if !config.allow_registration {
@@ -394,8 +417,12 @@ fn render_script(config: &PortalConfig) -> String {
             .replace("Testnet", "Mainnet")
             .replace("TWC", "WEC")
             .replace(
-                "const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: true };",
-                "const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };",
+                "const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: true };",
+                "const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: false };",
+            )
+            .replace(
+                "const PRODUCTION_MANIFEST_AVAILABLE = false;",
+                "const PRODUCTION_MANIFEST_AVAILABLE = true;",
             )
             .replace(
                 "const TLS_STRATUM_AVAILABLE = true;",
@@ -1355,7 +1382,7 @@ mod tests {
         let script = render_script(&config);
 
         assert!(page.contains("ZecWec Pool — Mainnet"));
-        assert!(page.contains("· WEC automatic · ZEC manual"));
+        assert!(page.contains("id=\"network-payout-state\">· payout status loading"));
         assert!(!page.contains("· automatic payout"));
         assert!(page.contains("Legacy direct Wolf:"));
         assert!(page.contains("port 3333 does not use Pool accounts"));
@@ -1368,7 +1395,8 @@ mod tests {
         assert!(page.contains("<option value=\"asic\">"));
         assert!(page.contains("<option value=\"gpu\">"));
         assert!(!page.contains("testnet-mine.zecwec.com"));
-        assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
+        assert!(script.contains("const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: false };"));
+        assert!(script.contains("const PRODUCTION_MANIFEST_AVAILABLE = true;"));
         assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3336"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3338"));

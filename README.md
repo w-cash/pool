@@ -7,12 +7,14 @@ independent WEC and ZEC accounting and chain-specific payout destinations.
 > **Current status:** ZecWec is live on Mainnet. The canonical portal and API
 > are at <https://pool.zecwec.com/>. Account registration, ASIC mining on port
 > `3336`, GPU/CPU mining on port `3338`, PostgreSQL accounting, PPLNS reward
-> allocation, and automatic WEC payouts are active. ZEC rewards are accounted
-> separately and settled manually; automatic ZEC payout execution is not
+> allocation are active. WEC uses an automatic payout policy; the public
+> production-manifest endpoint reports the isolated worker's live lease
+> separately from that policy. ZEC rewards are accounted and settled manually;
+> automatic ZEC payout execution is not
 > advertised or enabled. The portal's `/readyz` response reports
 > `payout_execution=deferred` because the public portal process has no spending
 > authority. Automatic WEC execution belongs to a separate isolated worker.
-> The observed deployment evidence is recorded in
+> The timestamped observed deployment evidence is recorded in
 > [`production-manifest.json`](production-manifest.json) and is exposed at
 > `/api/v1/production-manifest` by releases containing that endpoint.
 

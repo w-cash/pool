@@ -8,12 +8,25 @@ or credentials.
 
 `GET /api/v1/production-manifest`
 
-This endpoint returns the repository-tracked production evidence in
-[`production-manifest.json`](../production-manifest.json). It identifies the
-observed Pool and Wolf artifacts, deployment/configuration revision, chain
-genesis values, public routes, registration and mining states, chain-specific
-payout modes, and known limitations. `recorded_at` is the evidence timestamp;
-clients must not treat it as a live heartbeat.
+This endpoint combines the repository-tracked production evidence in
+[`production-manifest.json`](../production-manifest.json) with a `runtime`
+object sampled for the request. The static evidence identifies the observed
+Pool and Wolf artifacts, deployment/configuration revision, chain genesis
+values, public routes, payout policy, and known limitations. `recorded_at` is
+the evidence timestamp; clients must not treat `observed_deployment` or
+`observed_runtime` as a live heartbeat.
+
+`runtime.registration_open` comes from portal configuration,
+`runtime.mining_ready` comes from the current pool-data authority, and
+`runtime.wec.worker_live` comes from the database-clock payout-worker lease.
+An unavailable worker query is returned as `null`, not as a successful
+heartbeat. ZEC has a manual settlement policy and therefore has no automatic
+worker state.
+
+`manifest_server` is separate from `observed_deployment`. It remains
+`not_deployed` with null build fields until release packaging and
+post-deployment attestation record the exact source, build, and binary serving
+the endpoint.
 
 ## Readiness
 
@@ -22,9 +35,8 @@ clients must not treat it as a live heartbeat.
 Readiness covers the public portal's database, mining view, address validators,
 and configured payout boundary. `payout_execution` is scoped to the portal
 process. Mainnet returns `deferred` because that process has no spending
-authority. The production manifest reports the separate WEC and ZEC settlement
-modes; it currently records automatic WEC execution by the isolated worker and
-manual ZEC settlement.
+authority. The production manifest separates the automatic WEC policy from the
+isolated worker's live lease and reports manual ZEC settlement independently.
 
 ## Pool hashrate
 

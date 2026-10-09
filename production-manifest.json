@@ -1,9 +1,16 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "service": "ZecWec Mainnet",
   "recorded_at": "2026-10-09T13:43:51Z",
   "evidence_scope": "observed production snapshot; not a live heartbeat",
-  "deployment": {
+  "manifest_server": {
+    "state": "not_deployed",
+    "source_commit": null,
+    "build_id": null,
+    "binary_sha256": null,
+    "identity_source": "release packaging and post-deployment attestation"
+  },
+  "observed_deployment": {
     "deployment_id": "af99f42c-f66d-4332-acd2-8eebbe154da0",
     "configuration_revision": "af99f42c-f66d-4332-acd2-8eebbe154da0",
     "configuration_revision_kind": "deployment_id",
@@ -51,12 +58,7 @@
     "account_pool_asic": "stratum+tcp://mainnet.zecwec.com:3336",
     "account_pool_gpu_cpu": "stratum+tcp://mainnet.zecwec.com:3338"
   },
-  "registration": {
-    "state": "open",
-    "account_pool_only": true
-  },
-  "mining": {
-    "state": "enabled",
+  "mining_routes": {
     "legacy_direct_wolf": {
       "port": 3333,
       "account_ledger": false,
@@ -64,31 +66,41 @@
       "pool_payouts": false
     },
     "account_pool": {
-      "state": "enabled",
       "asic_port": 3336,
       "gpu_cpu_port": 3338,
       "account_ledger": true,
       "pplns": true
     }
   },
-  "payouts": {
-    "portal": {
-      "execution": "deferred",
-      "reason": "the public portal process has no Mainnet spending authority"
-    },
+  "payout_policy": {
     "wec": {
-      "execution": "automatic",
+      "mode": "automatic",
       "executor": "isolated payout worker"
     },
     "zec": {
-      "execution": "manual",
+      "mode": "manual",
       "executor": "operator settlement after an accepted Zcash block"
+    }
+  },
+  "observed_runtime": {
+    "kind": "snapshot",
+    "observed_at": "2026-10-09T13:43:51Z",
+    "registration_open": true,
+    "mining_ready": true,
+    "portal": {
+      "payout_execution": "deferred"
+    },
+    "wec": {
+      "worker_live": true
+    },
+    "zec": {
+      "worker_live": null
     }
   },
   "known_limitations": [
     {
       "id": "manifest-publication",
-      "description": "The observed pool release predates this endpoint. The endpoint becomes public only after a release containing this contract is deployed and the snapshot is refreshed against that release."
+      "description": "The observed pool release predates this endpoint. manifest_server remains not_deployed until release packaging and post-deployment attestation record the exact source, build, and binary serving the endpoint."
     },
     {
       "id": "wcash-node-source-provenance",
