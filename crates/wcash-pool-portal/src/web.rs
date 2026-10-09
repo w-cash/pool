@@ -44,6 +44,7 @@ const ADDRESS_DIGEST_DOMAIN: &[u8] = b"zecwec/payout/address/v1";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const TOTP_ENROLLMENT_TTL_SECS: u64 = 10 * 60;
 const READINESS_TIMEOUT: Duration = Duration::from_millis(500);
+const PRODUCTION_MANIFEST: &str = include_str!("../../../production-manifest.json");
 
 /// Complete dependency set for the portal router.
 #[derive(Clone)]
@@ -176,6 +177,7 @@ impl PortalApp {
             .route("/assets/forms.css", get(form_styles))
             .route("/assets/app.js", get(script))
             .route("/assets/zebra-wolf.png", get(zebra_wolf))
+            .route("/api/v1/production-manifest", get(production_manifest))
             .route("/api/v1/overview", get(overview))
             .route("/api/v1/hashrate/pool", get(pool_hashrate))
             .route("/api/v1/hashrate/network", get(network_hashrate))
@@ -264,8 +266,41 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppEr
         "ready": true,
         "component": "miner-portal",
         "network": state.config.network,
-        "payout_execution": state.payout.execution().as_str()
+        "payout_execution": state.payout.execution().as_str(),
+        "payout_execution_scope": "portal_process",
+        "production_manifest": "/api/v1/production-manifest"
     })))
+}
+
+async fn production_manifest(State(state): State<Arc<AppState>>) -> Response {
+    if state.config.network != crate::ChainNetwork::Mainnet {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(mut manifest) = serde_json::from_str::<Value>(PRODUCTION_MANIFEST) else {
+        return AppError::Internal.into_response();
+    };
+    let wec_worker_live =
+        tokio::time::timeout(READINESS_TIMEOUT, state.store.payout_worker_is_live())
+            .await
+            .ok()
+            .and_then(Result::ok);
+    manifest["runtime"] = json!({
+        "sampled_at_unix": state.clock.now(),
+        "registration_open": state.config.allow_registration,
+        "mining_ready": state.pool_data.mining_ready(),
+        "portal": {
+            "payout_execution": state.payout.execution().as_str()
+        },
+        "wec": {
+            "policy": "automatic",
+            "worker_live": wec_worker_live
+        },
+        "zec": {
+            "policy": "manual",
+            "worker_live": null
+        }
+    });
+    Json(manifest).into_response()
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -276,11 +311,18 @@ fn render_index(config: &PortalConfig) -> String {
     let mut page = include_str!("../assets/index.html").to_owned();
     if config.network == crate::ChainNetwork::Mainnet {
         page = page
-        .replace("Testnet", "Mainnet")
-        .replace("TESTNET", "MAINNET")
-        .replace("TWC", "WEC")
-        .replace("Two test networks.", "Two main networks.")
-        .replace("· no monetary value", "· automatic payout")
+            .replace("Testnet", "Mainnet")
+            .replace("TESTNET", "MAINNET")
+            .replace("TWC", "WEC")
+            .replace("Two test networks.", "Two main networks.")
+            .replace(
+                "<span>· no monetary value</span>",
+                "<span id=\"network-payout-state\">· payout status loading</span>",
+            )
+            .replace(
+                "</head>",
+                "  <link rel=\"alternate\" type=\"application/json\" href=\"/api/v1/production-manifest\" title=\"ZecWec production manifest\">\n</head>",
+            )
         .replace(
             "<option value=\"tls\">TLS · preferred</option><option value=\"tcp\">TCP · hardware compatibility</option>",
             "<option value=\"asic\">ASIC · 100 kSol/s and above</option><option value=\"gpu\">GPU / CPU · below 100 kSol/s</option>",
@@ -303,8 +345,12 @@ fn render_index(config: &PortalConfig) -> String {
             "ASICs use port 3336. GPU and CPU software uses low-difficulty port 3338.",
         )
         .replace(
+            "<p class=\"compatibility-line\"><strong>Algorithm:</strong> Equihash 200,9 · ASICs use port 3336. GPU and CPU software uses low-difficulty port 3338.</p>",
+            "<p class=\"compatibility-line\"><strong>Algorithm:</strong> Equihash 200,9 · ASICs use port 3336. GPU and CPU software uses low-difficulty port 3338.</p><p class=\"fineprint\"><strong>Legacy direct Wolf:</strong> port 3333 does not use Pool accounts, PPLNS accounting, or Pool payouts. Account miners must use port 3336 or 3338.</p>",
+        )
+        .replace(
             "pool: stratum+tcp://mainnet.zecwec.com:3336",
-            "asic_pool: stratum+tcp://mainnet.zecwec.com:3336\ngpu_cpu_pool: stratum+tcp://mainnet.zecwec.com:3338",
+            "legacy_direct_wolf: stratum+tcp://mainnet.zecwec.com:3333\nasic_account_pool: stratum+tcp://mainnet.zecwec.com:3336\ngpu_cpu_account_pool: stratum+tcp://mainnet.zecwec.com:3338\nproduction_manifest: /api/v1/production-manifest\nportal_payout_execution: deferred\nwec_payout_policy: automatic\nzec_payout_policy: manual",
         );
     }
     if !config.allow_registration {
@@ -371,8 +417,12 @@ fn render_script(config: &PortalConfig) -> String {
             .replace("Testnet", "Mainnet")
             .replace("TWC", "WEC")
             .replace(
-                "const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: true };",
-                "const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };",
+                "const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: true };",
+                "const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: false };",
+            )
+            .replace(
+                "const PRODUCTION_MANIFEST_AVAILABLE = false;",
+                "const PRODUCTION_MANIFEST_AVAILABLE = true;",
             )
             .replace(
                 "const TLS_STRATUM_AVAILABLE = true;",
@@ -1332,7 +1382,11 @@ mod tests {
         let script = render_script(&config);
 
         assert!(page.contains("ZecWec Pool — Mainnet"));
-        assert!(page.contains("· automatic payout"));
+        assert!(page.contains("id=\"network-payout-state\">· payout status loading"));
+        assert!(!page.contains("· automatic payout"));
+        assert!(page.contains("Legacy direct Wolf:"));
+        assert!(page.contains("port 3333 does not use Pool accounts"));
+        assert!(page.contains("production_manifest: /api/v1/production-manifest"));
         assert!(page.contains("mainnet.zecwec.com:3336"));
         assert!(page.contains("mainnet.zecwec.com:3338"));
         assert!(!page.contains("data-auth-mode=\"register\""));
@@ -1341,7 +1395,8 @@ mod tests {
         assert!(page.contains("<option value=\"asic\">"));
         assert!(page.contains("<option value=\"gpu\">"));
         assert!(!page.contains("testnet-mine.zecwec.com"));
-        assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
+        assert!(script.contains("const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: false };"));
+        assert!(script.contains("const PRODUCTION_MANIFEST_AVAILABLE = true;"));
         assert!(script.contains("const TLS_STRATUM_AVAILABLE = false;"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3336"));
         assert!(script.contains("stratum+tcp://mainnet.zecwec.com:3338"));

@@ -4,7 +4,8 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const ATOMIC_UNITS = 100_000_000;
 const MAX_PAYOUT_THRESHOLD_ZAT = 2_100_000_000_000_000n;
-const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: true };
+const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: true };
+const PRODUCTION_MANIFEST_AVAILABLE = false;
 const TLS_STRATUM_AVAILABLE = true;
 const MINING_PASSWORD_IGNORED = false;
 let authMode = "login";
@@ -173,8 +174,12 @@ function renderPublicPayouts(items) {
 async function refreshPublic() {
   clearTimeout(publicRefreshTimer);
   try {
-    const [overview, pool, network, activity] = await Promise.all([
+    const manifestRequest = PRODUCTION_MANIFEST_AVAILABLE
+      ? api("/api/v1/production-manifest").catch(() => null)
+      : Promise.resolve(null);
+    const [overview, pool, network, activity, manifest] = await Promise.all([
       api("/api/v1/overview"), api("/api/v1/hashrate/pool"), api("/api/v1/hashrate/network"), api("/api/v1/public/activity"),
+      manifestRequest,
     ]);
     setText("#public-pool-hashrate", pool.available ? formatHashrate(pool.hashrate_sol_s) : "Unavailable");
     setText("#public-network-hashrate", network.available ? formatHashrate(network.hashrate_sol_s) : "Unavailable");
@@ -185,12 +190,30 @@ async function refreshPublic() {
     renderHashrateChart(activity.hashrate);
     renderPublicBlocks(activity.blocks);
     renderPublicPayouts(activity.payouts);
+    renderProductionStatus(manifest);
   } catch (_) {
     setText("#public-updated", "Live data temporarily unavailable");
     for (const id of ["public-pool-hashrate", "public-network-hashrate", "public-wcash-height", "public-zcash-height", "chart-current"]) setText(`#${id}`, "Unavailable");
   } finally {
     if (!document.hidden) publicRefreshTimer = setTimeout(refreshPublic, 30000);
   }
+}
+
+function renderProductionStatus(manifest) {
+  if (!PRODUCTION_MANIFEST_AVAILABLE) return;
+  const status = $("#network-payout-state");
+  if (!status) return;
+  const runtime = manifest && manifest.runtime;
+  if (!runtime || !runtime.wec) {
+    status.textContent = "· payout status unavailable";
+    return;
+  }
+  const wec = runtime.wec.worker_live === true
+    ? "WEC policy automatic · worker live"
+    : runtime.wec.worker_live === false
+      ? "WEC policy automatic · worker offline"
+      : "WEC policy automatic · worker unknown";
+  status.textContent = `· ${wec} · ZEC manual`;
 }
 
 function formatCoin(value, asset) {
@@ -628,26 +651,26 @@ function renderPayoutSetting(asset, setting) {
   if (setting.active_destination) {
     const receiver = setting.active_receiver === "transparent" ? "Transparent address" : "Shielded Unified Address";
     line(`${receiver}: ${setting.active_destination}`);
-    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${AUTOMATIC_PAYOUT_ENABLED[asset] ? (setting.automatic ? "automatic" : "paused") : "payouts paused"}`);
+    line(`Current threshold: ${formatCoin(setting.threshold_zat, asset)} · ${AUTOMATIC_PAYOUT_POLICY[asset] ? (setting.automatic ? "automatic" : "paused") : "manual settlement"}`);
   }
   if (setting.pending_destination) {
     line(`Pending destination: ${setting.pending_destination}`);
-    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). ${AUTOMATIC_PAYOUT_ENABLED[asset] ? "Payouts remain paused until the change is active." : "Automatic payout execution remains paused after the hold."}`);
-    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${AUTOMATIC_PAYOUT_ENABLED[asset] ? (setting.pending_automatic ? "automatic" : "paused") : "payouts paused"}`);
-    setText(`#${asset}-payout-status`, AUTOMATIC_PAYOUT_ENABLED[asset]
+    line(`Safety hold until ${formatTime(setting.pending_effective_at)} (${formatDuration(payoutHoldSecs)}). ${AUTOMATIC_PAYOUT_POLICY[asset] ? "Payouts remain paused until the change is active." : "Manual settlement remains in effect after the hold."}`);
+    line(`After the hold: ${formatCoin(setting.pending_threshold_zat, asset)} minimum · ${AUTOMATIC_PAYOUT_POLICY[asset] ? (setting.pending_automatic ? "automatic" : "paused") : "manual settlement"}`);
+    setText(`#${asset}-payout-status`, AUTOMATIC_PAYOUT_POLICY[asset]
       ? `Payouts on hold until ${formatTime(setting.pending_effective_at)}. Rewards continue accumulating.`
-      : "Automatic payouts are paused. Rewards continue accumulating.");
+      : "Manual settlement policy. Rewards continue accumulating.");
   } else {
-    setText(`#${asset}-payout-status`, !AUTOMATIC_PAYOUT_ENABLED[asset]
-      ? "Automatic payouts are paused. Earned rewards remain in this balance."
+    setText(`#${asset}-payout-status`, !AUTOMATIC_PAYOUT_POLICY[asset]
+      ? "Manual settlement policy. Earned rewards remain in this balance until settlement."
       : setting.automatic ? `Automatic payouts after maturity and ${formatCoin(setting.threshold_zat, asset)} threshold.` : "Automatic payouts paused. Earned rewards remain in this balance.");
   }
   // Never refill a masked destination or replace an in-progress edit with a poll.
   if (form.dataset.dirty !== "true") {
     form.elements.threshold_coin.value = coinInputValue(setting.pending_threshold_zat ?? setting.threshold_zat);
-    form.elements.automatic.checked = AUTOMATIC_PAYOUT_ENABLED[asset]
+    form.elements.automatic.checked = AUTOMATIC_PAYOUT_POLICY[asset]
       && (setting.pending_automatic ?? setting.automatic);
-    form.elements.automatic.disabled = !AUTOMATIC_PAYOUT_ENABLED[asset];
+    form.elements.automatic.disabled = !AUTOMATIC_PAYOUT_POLICY[asset];
     if (!setting.pending_destination) {
       form.elements.address_type.value = setting.active_receiver === "transparent"
         && (asset !== "wec" || !$("#wec-address-type option[value=transparent]").disabled)
@@ -935,7 +958,7 @@ $$('.payout-form').forEach((form) => form.addEventListener("submit", async (even
     const payload = {
       destination: form.elements.destination.value,
       threshold_zat: parseCoinInput(form.elements.threshold_coin.value),
-      automatic: AUTOMATIC_PAYOUT_ENABLED[form.dataset.asset] && form.elements.automatic.checked,
+      automatic: AUTOMATIC_PAYOUT_POLICY[form.dataset.asset] && form.elements.automatic.checked,
       password: form.elements.password.value,
     };
     if (form.elements.totp_code.value) payload.totp_code = form.elements.totp_code.value;

@@ -37,13 +37,16 @@ of the following have been observed on the isolated deployment:
    login/logout, worker creation/revocation, separate WEC/ZEC payout settings,
    account-isolated share/reward histories, and request limits verified against
    the live staging database. The ASIC token grants mining access only.
-6. Actual WEC and ZEC payout transactions reach independent recipients and
-   reconcile with the ledger through maturity, restart, fee, and reorg cases
-   before automatic payout execution is enabled. Mainnet currently permits
-   only deferred payouts; the UI must say that execution is paused.
+6. Actual payout transactions reach independent recipients and reconcile with
+   the relevant chain ledger through maturity, restart, fee, and reorg cases
+   before automatic execution is enabled for that chain. WEC automatic
+   execution belongs to the isolated payout worker. ZEC remains manual until
+   its independent acceptance evidence is complete.
 
 The public launch can be split: account registration and share accounting may
-open first with an explicit deferred-payout notice and an operator commitment
-to settle earned balances. Automatic payments require their own release and
-on-chain receipt evidence. No staging page should advertise port 3336 before
-that port accepts and records real shares.
+open independently from chain-specific payout execution. The public portal
+process always remains deferred and without spending authority, so its
+`/readyz` value does not describe the isolated WEC worker. The UI and
+production manifest must state each chain's payout mode separately. No page
+should advertise a mining route before that route accepts and records real
+shares.

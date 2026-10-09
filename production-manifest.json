@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "service": "ZecWec Mainnet",
+  "recorded_at": "2026-10-09T13:43:51Z",
+  "evidence_scope": "observed production snapshot; not a live heartbeat",
+  "manifest_server": {
+    "state": "not_deployed",
+    "source_commit": null,
+    "build_id": null,
+    "binary_sha256": null,
+    "identity_source": "release packaging and post-deployment attestation"
+  },
+  "observed_deployment": {
+    "deployment_id": "af99f42c-f66d-4332-acd2-8eebbe154da0",
+    "configuration_revision": "af99f42c-f66d-4332-acd2-8eebbe154da0",
+    "configuration_revision_kind": "deployment_id",
+    "pool": {
+      "repository": "https://github.com/w-cash/pool",
+      "source_commit": "49bcc0570a4b9eabf0134d8a3b47cfdef7edf8f8",
+      "source_tree": "bed40f1e03dd19d34313db3c86366d2c7113a8ec",
+      "binary_sha256": "e25ca32aa086fab945f3171e5ff5976cedf55871a7f13b0478a307464bf2dcfd"
+    },
+    "wolf": {
+      "repository": "https://github.com/w-cash/wolf",
+      "merged_mining_backend": {
+        "source_commit": "1ecc5a4d611ad0cc4aa97e8cf1417345a4368e15",
+        "source_tree": "7610768fc48bd2421dcd8061e7a2312d29bbc8e4",
+        "binary_sha256": "7a195ff9b1262162959942869bde7410e1a5b12dab4d7d46fbd138ba220f1339"
+      },
+      "wcash_node": {
+        "source_commit": null,
+        "source_base_commit": "89ddd34cf1a4ec7b841130829c6b3b971099bb6e",
+        "source_tree": "7bbf7936ae3cc32cf5a9655f578029f0efd41ba7",
+        "source_tree_sha256": "615897da3027199d5b965bd951690e1f81286c7e20432c01e0c3c61a53d5d91e",
+        "binary_sha256": "7aed40427d7165d3af561af5c462df41dbced0895075be3b10702c253bc17b88",
+        "provenance": "source copy without Git metadata; base commit and exact source-tree digests are recorded"
+      }
+    }
+  },
+  "networks": {
+    "wcash": {
+      "network": "mainnet",
+      "genesis_hash": "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48",
+      "auxpow_chain_id": "0x57434153",
+      "branch_id": "0xd9c6a7ee"
+    },
+    "zcash": {
+      "network": "mainnet",
+      "genesis_hash": "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08",
+      "branch_id": "0x37a5165b"
+    }
+  },
+  "public_endpoints": {
+    "portal": "https://pool.zecwec.com/",
+    "readiness": "https://pool.zecwec.com/readyz",
+    "production_manifest": "https://pool.zecwec.com/api/v1/production-manifest",
+    "legacy_direct_wolf": "stratum+tcp://mainnet.zecwec.com:3333",
+    "account_pool_asic": "stratum+tcp://mainnet.zecwec.com:3336",
+    "account_pool_gpu_cpu": "stratum+tcp://mainnet.zecwec.com:3338"
+  },
+  "mining_routes": {
+    "legacy_direct_wolf": {
+      "port": 3333,
+      "account_ledger": false,
+      "pplns": false,
+      "pool_payouts": false
+    },
+    "account_pool": {
+      "asic_port": 3336,
+      "gpu_cpu_port": 3338,
+      "account_ledger": true,
+      "pplns": true
+    }
+  },
+  "payout_policy": {
+    "wec": {
+      "mode": "automatic",
+      "executor": "isolated payout worker"
+    },
+    "zec": {
+      "mode": "manual",
+      "executor": "operator settlement after an accepted Zcash block"
+    }
+  },
+  "observed_runtime": {
+    "kind": "snapshot",
+    "observed_at": "2026-10-09T13:43:51Z",
+    "registration_open": true,
+    "mining_ready": true,
+    "portal": {
+      "payout_execution": "deferred"
+    },
+    "wec": {
+      "worker_live": true
+    },
+    "zec": {
+      "worker_live": null
+    }
+  },
+  "known_limitations": [
+    {
+      "id": "manifest-publication",
+      "description": "The observed pool release predates this endpoint. manifest_server remains not_deployed until release packaging and post-deployment attestation record the exact source, build, and binary serving the endpoint."
+    },
+    {
+      "id": "wcash-node-source-provenance",
+      "description": "The running Wcash node was built from a source copy without Git metadata. The base commit, exact source-tree digests, and binary digest are recorded, but a clean source commit cannot be proven for that binary."
+    },
+    {
+      "id": "payout-acceptance-certificate",
+      "description": "The full two-account, two-chain payout, restart, replay, and reorganization acceptance certificate is not complete. ZEC settlement remains manual."
+    },
+    {
+      "id": "mainnet-web-certificate",
+      "description": "mainnet.zecwec.com is the mining hostname, not the canonical HTTPS portal; its current certificate does not cover that hostname."
+    },
+    {
+      "id": "mine-dns-redirect",
+      "description": "mine.zecwec.com currently redirects to an unrelated external page. DNS or forwarding must be changed to the canonical portal or removed by the domain operator."
+    },
+    {
+      "id": "release-tag",
+      "description": "The observed production pool and Wolf artifacts do not have a shared signed release tag."
+    }
+  ]
+}

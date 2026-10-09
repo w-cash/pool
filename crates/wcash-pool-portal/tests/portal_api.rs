@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body},
-    http::{header::SET_COOKIE, Request, StatusCode},
+    http::{header::SET_COOKIE, HeaderValue, Request, StatusCode},
 };
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
@@ -1333,12 +1333,59 @@ async fn mainnet_staging_reports_chain_specific_payout_policy_and_no_registratio
         .await
         .expect("readiness response");
     assert_eq!(ready.status(), StatusCode::OK);
-    let body = to_bytes(ready.into_body(), 1024)
+    let body = to_bytes(ready.into_body(), 2048)
         .await
         .expect("bounded body");
+    let readiness = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(readiness["payout_execution"], "deferred");
+    assert_eq!(readiness["payout_execution_scope"], "portal_process");
     assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap()["payout_execution"],
-        "deferred"
+        readiness["production_manifest"],
+        "/api/v1/production-manifest"
+    );
+
+    let manifest = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/production-manifest")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("production manifest response");
+    assert_eq!(manifest.status(), StatusCode::OK);
+    assert_eq!(
+        manifest.headers().get("content-type"),
+        Some(&HeaderValue::from_static("application/json"))
+    );
+    let manifest = json_response(manifest).await;
+    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["networks"]["wcash"]["network"], "mainnet");
+    assert_eq!(
+        manifest["runtime"]["portal"]["payout_execution"],
+        readiness["payout_execution"]
+    );
+    assert_eq!(manifest["runtime"]["registration_open"], false);
+    assert_eq!(manifest["runtime"]["mining_ready"], true);
+    assert_eq!(manifest["runtime"]["wec"]["policy"], "automatic");
+    assert_eq!(manifest["runtime"]["wec"]["worker_live"], false);
+    assert_eq!(manifest["runtime"]["zec"]["policy"], "manual");
+    assert!(manifest["runtime"]["zec"]["worker_live"].is_null());
+    assert_eq!(manifest["payout_policy"]["wec"]["mode"], "automatic");
+    assert_eq!(manifest["payout_policy"]["zec"]["mode"], "manual");
+    assert_eq!(manifest["observed_runtime"]["registration_open"], true);
+    assert_eq!(manifest["manifest_server"]["state"], "not_deployed");
+    assert_eq!(
+        manifest["public_endpoints"]["legacy_direct_wolf"],
+        "stratum+tcp://mainnet.zecwec.com:3333"
+    );
+    assert_eq!(
+        manifest["public_endpoints"]["account_pool_asic"],
+        "stratum+tcp://mainnet.zecwec.com:3336"
+    );
+    assert_eq!(
+        manifest["public_endpoints"]["account_pool_gpu_cpu"],
+        "stratum+tcp://mainnet.zecwec.com:3338"
     );
 
     let page = app
@@ -1351,7 +1398,10 @@ async fn mainnet_staging_reports_chain_specific_payout_policy_and_no_registratio
         .expect("bounded page");
     let html = std::str::from_utf8(&html).expect("UTF-8 page");
     assert!(html.contains("Wcash Mainnet"));
-    assert!(html.contains("· automatic payout"));
+    assert!(html.contains("id=\"network-payout-state\">· payout status loading"));
+    assert!(!html.contains("· automatic payout"));
+    assert!(html.contains("port 3333 does not use Pool accounts"));
+    assert!(html.contains("/api/v1/production-manifest"));
     assert!(!html.contains("Create account</button>"));
     assert!(!html.contains("Zcash Testnet"));
 
@@ -1368,7 +1418,8 @@ async fn mainnet_staging_reports_chain_specific_payout_policy_and_no_registratio
         .expect("bounded script");
     let script = std::str::from_utf8(&script).expect("UTF-8 script");
     assert!(script.contains("mainnet.zecwec.com:3336"));
-    assert!(script.contains("const AUTOMATIC_PAYOUT_ENABLED = { wec: true, zec: false };"));
+    assert!(script.contains("const AUTOMATIC_PAYOUT_POLICY = { wec: true, zec: false };"));
+    assert!(script.contains("const PRODUCTION_MANIFEST_AVAILABLE = true;"));
     assert!(!script.contains("testnet-mine.zecwec.com"));
 }
 
@@ -1462,6 +1513,17 @@ async fn public_hashrate_endpoints_expose_only_aggregate_snapshots() {
     assert_eq!(pool["window_seconds"], 1_200);
     assert!(pool.get("workers").is_none());
     assert!(pool.get("accounts").is_none());
+
+    let manifest = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/production-manifest")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("production manifest response");
+    assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
 
     let network = app
         .oneshot(

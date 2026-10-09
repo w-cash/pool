@@ -1,66 +1,70 @@
 # Wcash Pool
 
-This repository is the Rust engineering foundation for ZecWec, a planned
-account-based Equihash pool that will merge-mine Wcash and Zcash from one ASIC
-connection. Miners will configure one worker and receive independently
-accounted WEC and ZEC rewards at two chain-specific payout destinations.
+This repository implements ZecWec, the account-based Equihash pool that
+merge-mines Wcash and Zcash from one miner connection. Each account has
+independent WEC and ZEC accounting and chain-specific payout destinations.
 
-> **Current status:** composed private-Testnet deployment candidate, not a
-> public launch. `wcash-poold serve` combines the bounded ZIP-301 edge,
-> shared PostgreSQL account/accounting truth, authoritative address adapters,
-> account-isolated portal, and independently fenced WEC/ZEC payout services.
-> The `feat/mainnet-parallel-pool` branch adds a separate Mainnet accounting-only
-> staging mode. Mainnet signing is rejected, self-registration is closed, and
-> no current Wolf shares are imported. Public miners and automatic payouts
-> remain blocked until the exact Wolf/pool release pair passes the independent
-> custody, ASIC, restart, reorg, and HTTPS gates in
-> [Mainnet parallel staging](docs/mainnet-parallel-staging.md).
-> The account-portal activation boundary is in
-> [Mainnet account portal cutover](docs/mainnet-account-portal.md).
+> **Current status:** ZecWec is live on Mainnet. The canonical portal and API
+> are at <https://pool.zecwec.com/>. Account registration, ASIC mining on port
+> `3336`, GPU/CPU mining on port `3338`, PostgreSQL accounting, PPLNS reward
+> allocation are active. WEC uses an automatic payout policy; the public
+> production-manifest endpoint reports the isolated worker's live lease
+> separately from that policy. ZEC rewards are accounted and settled manually;
+> automatic ZEC payout execution is not
+> advertised or enabled. The portal's `/readyz` response reports
+> `payout_execution=deferred` because the public portal process has no spending
+> authority. Automatic WEC execution belongs to a separate isolated worker.
+> The timestamped observed deployment evidence is recorded in
+> [`production-manifest.json`](production-manifest.json) and is exposed at
+> `/api/v1/production-manifest` by releases containing that endpoint.
 
 ## Product decision
 
-ZecWec will use the familiar `account.worker` pool model with a generated,
-mining-only token. The ASIC receives one ZIP-301 job stream. Wolf classifies
+ZecWec uses the familiar `account.worker` pool model. The miner receives one
+ZIP-301 job stream. Wolf classifies
 each accepted Equihash proof independently as an ordinary share, a Wcash
 winner, a Zcash winner, or a winner on both chains.
 
-The private portal will hold two independent payout settings: one Wcash
-destination and one Zcash destination. It will never ask miners to put two
+The portal holds two independent payout settings: one Wcash destination and
+one Zcash destination. It never asks miners to put two
 addresses in an ASIC, derive one chain's address from the other, or provide a
 seed or private key.
 
-Planned Testnet setup:
+## Mainnet mining routes
 
-```text
-Preferred URL:     stratum+ssl://testnet-mine.zecwec.com:3443
-Compatibility URL: stratum+tcp://testnet-mine.zecwec.com:3333
-Worker:             <account>.<worker>
-Password:           <generated mining-only token>
-```
+| Route | Purpose | Account/PPLNS ledger | Pool payouts |
+| --- | --- | --- | --- |
+| `stratum+tcp://mainnet.zecwec.com:3333` | Legacy direct Wolf Stratum | No | No |
+| `stratum+tcp://mainnet.zecwec.com:3336` | Account pool for ASICs | Yes | Automatic WEC; manual ZEC |
+| `stratum+tcp://mainnet.zecwec.com:3338` | Lower-difficulty account pool for GPU/CPU miners | Yes | Automatic WEC; manual ZEC |
 
-This endpoint is a design target and is **not live**. ASIC Pool 2 and Pool 3
-will be independent regional failovers, not separate WEC/ZEC connections. TLS
-is preferred; the compatibility port is plaintext for legacy ASICs, so its
-revocable token has mining-only authority and is never a portal credential.
+Account-pool miners use `<account>.<worker>` with password `x`. Ports `3336`
+and `3338` share the same deployment, worker registry, accepted-share ledger,
+PPLNS accounting, and payout ledger. Port `3333` is a separate legacy Wolf
+service. Its shares and collector funds are not Pool balances and must not be
+imported or represented as account earnings.
+
+All public Stratum routes are currently plaintext TCP. Never place a portal
+password, wallet key, seed phrase, or payout address in the Stratum password
+field.
 
 ## Reward and privacy model
 
-Launch settlement will use independent PPLNS windows and ledgers for WEC and
+Settlement uses independent PPLNS windows and ledgers for WEC and
 ZEC. Accepted shares create accounting evidence, not coins. A collector wallet
 receives value only when this pool finds and the relevant chain accepts a
 block. The resulting collector asset is matched by miner liabilities; it is
 not automatically pool profit. Wcash's absence of a consensus developer tax is
 separate from any disclosed pool service fee.
 
-The Testnet launch policy charges a 0% pool service fee. Miners fund only the
+The Mainnet policy charges a 0% pool service fee. Miners fund only the
 actual network transaction fee for their own payout: each batch reserves a
 published policy-bounded maximum, pays a net output, and returns every unused
 reserved atomic unit after confirmation. The portal publishes both fee caps
 and shows each account's gross amount, reserve, actual charge, refund, and net
 output without exposing another miner's settlement data.
 
-The target collector policy is:
+The collector policy is:
 
 - **WEC:** a pool-owned private Wcash Ironwood coinbase receiver. Wcash hides
   the recipient from Zcash's all-zero outgoing-viewing-key recovery while
@@ -94,17 +98,17 @@ is unavailable or its identity is inconsistent.
 
 ## Implementation status
 
-| Area | Current private-Testnet candidate state |
+| Area | Current repository and Mainnet state |
 | --- | --- |
 | Wire protocol | Strict, bounded backend-v2 and ZIP-301 codecs; jobs bind the Wcash candidate hash and both chains' coinbase transaction IDs; canonical parent-header and stable share-ID derivations, exact dual-chain reward facts, and reversible winner-lifecycle events—including Wcash witness quarantine and requeue—have deterministic positive and negative tests |
 | Pool policy | In-memory session ordering with exact authorized-login reuse, externally namespaced nonce-prefix allocation, backend-generation lifetime separated from per-session target assignment, bounded non-resurrectable generation tombstones, retirement fences, endian-typed targets, and integer vardiff that excludes idempotently replayed receipts |
 | Backend client | Timeout-bounded Unix-socket client, identity/capability handshake, event replay, transport-branded lifetimes, submitted-header-time preservation, canonical proof/receipt/attribution binding, live response-watermark flush enforcement, bounded all-event sequence and share-identity evidence, and a fenced core-to-backend share path tested against local mock peers |
-| Miner edge | Source-restricted public TCP listener behind nginx TLS, bounded ZIP-301 actors, PostgreSQL worker authentication, durable cross-process nonce leases, strict framing/deadlines/backpressure, and account-scoped process telemetry; real ASIC certification remains a launch gate |
+| Miner edge | Public Mainnet ASIC and GPU/CPU routes through bounded ZIP-301 compatibility adapters, PostgreSQL worker authentication, durable cross-process nonce leases, strict framing/deadlines/backpressure, and account-scoped process telemetry |
 | Miner portal | Responsive six-page UI; bounded Argon2id work, encrypted TOTP, digest-only sessions, CSRF/origin controls, authoritative address adapters, account-isolated balances/rewards/blocks/payouts, one-time worker tokens, and separate WEC/ZEC settings |
-| Service process | `config-check`, listener-free `preflight`, migration/authority commands, and composed Testnet-only `serve`; readiness fails before wallet, backend, identity, or signer authority can be proven |
-| Persistence and money | Deployment-fenced PostgreSQL PPLNS/ledger projection, maturity/reorg/idempotency handling, durable payout artifacts and recovery, and exact wallet-to-ledger reconciliation for independent WEC and ZEC collectors |
-| Wolf integration | Backend-v2 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling are composed; exact artifact pairing and live recovery evidence remain launch gates |
-| Operations | Immutable release renderer, protected systemd credentials, private preflight/start/rollback paths, explicitly public or exact-host Testnet Stratum, Cloudflare-AOP portal staging, and explicit publication gates; no public launch is claimed |
+| Service process | `config-check`, listener-free `preflight`, migration/authority commands, composed `serve`, projector, and isolated payout worker; readiness fails when required database, backend, identity, or address-validation authority is unavailable |
+| Persistence and money | Deployment-fenced PostgreSQL PPLNS/ledger projection, maturity/reorg/idempotency handling, durable payout artifacts and recovery, automatic WEC execution by the isolated worker, and manual ZEC settlement |
+| Wolf integration | Backend-v2 client/server contract, journal replay, exact authority identity, private-WEC recipient commitment/attestation boundary, and dual winner handling; the observed backend commit and binary are recorded in the production manifest |
+| Operations | Immutable release renderer, protected systemd credentials, preflight/start/rollback paths, public Mainnet Stratum on ports 3333/3336/3338, and a public portal/API; the production manifest records the observed artifact and configuration identities plus known limitations |
 
 The PostgreSQL CI job runs an authenticated payout-lifecycle test through the
 production backend authority check, share and winner projector, PPLNS ledger,
@@ -117,14 +121,17 @@ not duplicated by this WEC test. Live Equihash submission, Ironwood scanning,
 real transaction acceptance, and an ASIC remain separate private-Testnet
 release gates.
 
-The final miner, reward, privacy, account, UI, and deployment decisions are in
-the [product design](docs/product-design.md). The remaining backend integration
-contract is described in [the architecture](docs/architecture.md), and the
-staged evidence required before any public endpoint is listed is in the
+The miner, reward, privacy, account, UI, and deployment decisions are in the
+[product design](docs/product-design.md). The backend integration contract is
+described in [the architecture](docs/architecture.md). Testnet acceptance work
+and historical launch gates remain documented in the
 [Testnet roadmap](docs/testnet-roadmap.md).
 
 ## Documentation
 
+- [Production manifest](production-manifest.json)
+- [Mainnet account portal and route boundary](docs/mainnet-account-portal.md)
+- [Mainnet Pool listeners](docs/mainnet-parallel-staging.md)
 - [Miner and API onboarding](docs/pool-onboarding.md)
 - [Product and miner experience](docs/product-design.md)
 - [Miner portal and payout boundary](docs/miner-portal.md)
@@ -133,9 +140,9 @@ staged evidence required before any public endpoint is listed is in the
 - [Testnet roadmap](docs/testnet-roadmap.md)
 - [Security reporting policy](SECURITY.md)
 
-See [SECURITY.md](SECURITY.md) before reporting a vulnerability. Follow the
-runbook's private-Testnet gates; this repository does not authorize a public or
-Mainnet deployment.
+See [SECURITY.md](SECURITY.md) before reporting a vulnerability. Production
+changes still require the deployment, rollback, custody, accounting, and
+chain-specific acceptance gates in the Mainnet runbooks.
 
 ## License
 
