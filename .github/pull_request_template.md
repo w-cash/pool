@@ -30,6 +30,7 @@ not depend on a live network, real funds, wall-clock races, or Equihash solving.
 
 ## Deployment declaration
 
-- [ ] This change does **not** claim that the current foundation is deployable or testnet-ready
-- [ ] No credential, RPC cookie, payout key, production endpoint, or real-funds configuration is included
+- [ ] Production, Testnet, and local-only behavior are identified explicitly
+- [ ] Any changed production fact is reflected in `production-manifest.json`
+- [ ] No credential, RPC cookie, payout key, seed, token, address, or database URL is included
 - [ ] The PR title follows `type(scope): concise description`

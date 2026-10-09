@@ -1,7 +1,30 @@
 # Public pool API
 
-The public API exposes aggregate Wcash mining rates without accounts, workers,
-addresses, or credentials.
+The public API exposes production identity, service readiness, aggregate Wcash
+mining rates, and bounded public activity without accounts, workers, addresses,
+or credentials.
+
+## Production manifest
+
+`GET /api/v1/production-manifest`
+
+This endpoint returns the repository-tracked production evidence in
+[`production-manifest.json`](../production-manifest.json). It identifies the
+observed Pool and Wolf artifacts, deployment/configuration revision, chain
+genesis values, public routes, registration and mining states, chain-specific
+payout modes, and known limitations. `recorded_at` is the evidence timestamp;
+clients must not treat it as a live heartbeat.
+
+## Readiness
+
+`GET /readyz`
+
+Readiness covers the public portal's database, mining view, address validators,
+and configured payout boundary. `payout_execution` is scoped to the portal
+process. Mainnet returns `deferred` because that process has no spending
+authority. The production manifest reports the separate WEC and ZEC settlement
+modes; it currently records automatic WEC execution by the isolated worker and
+manual ZEC settlement.
 
 ## Pool hashrate
 
