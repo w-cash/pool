@@ -2210,6 +2210,7 @@ mod tests {
             BackendCapability::WinnerLifecycleV1,
             BackendCapability::WinnerSideChainV1,
             BackendCapability::WcashWinnerSideChainV1,
+            BackendCapability::WcashWinnerSideChainRequeueV1,
         ]
     }
 

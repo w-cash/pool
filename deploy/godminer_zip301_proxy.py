@@ -15,6 +15,7 @@ MAX_CONNECTIONS = 64
 MAX_CONNECTIONS_PER_IP = 8
 MAX_CONFIGURED_CONNECTIONS = 65_535
 MAX_JOB_ALIASES = 32
+WRITER_CLOSE_TIMEOUT = 1
 
 
 class ConnectionLimits:
@@ -151,7 +152,14 @@ async def relay_server(reader, writer, aliases):
 async def close_writer(writer):
     writer.close()
     try:
-        await writer.wait_closed()
+        await asyncio.wait_for(writer.wait_closed(), timeout=WRITER_CLOSE_TIMEOUT)
+    except asyncio.TimeoutError:
+        # close() tries to flush buffered data. A peer that stops reading must
+        # not retain a connection quota indefinitely while that flush waits.
+        writer.transport.abort()
+    except asyncio.CancelledError:
+        writer.transport.abort()
+        raise
     except (ConnectionError, BrokenPipeError):
         pass
 

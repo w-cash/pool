@@ -450,6 +450,132 @@ async fn assert_projection_clock_hashrate_gates(database_url: &str, admin: &sqlx
     .unwrap();
     source.refresh().await.unwrap();
     assert!(source.pool_hashrate().available);
+    // A blocked database read must not keep serving the last ready value.
+    // Its heartbeat has only two seconds of freshness remaining at publication.
+    sqlx::query(
+        "UPDATE backend_cursors SET live_observed_at=clock_timestamp()-INTERVAL '28 seconds' \
+         WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    source.refresh().await.unwrap();
+    assert!(source.pool_hashrate().available);
+    let mut blocked_read = admin.begin().await.unwrap();
+    sqlx::query("LOCK TABLE chain_policies IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocked_read)
+        .await
+        .unwrap();
+    let blocked_source = source.clone();
+    let blocked_refresh = tokio::spawn(async move { blocked_source.refresh().await });
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+    assert!(!blocked_refresh.is_finished());
+    let timed_out = tokio::time::timeout(Duration::from_secs(20), blocked_refresh)
+        .await
+        .expect("blocked refresh must have a finite deadline")
+        .unwrap();
+    assert!(matches!(timed_out, Err(StoreError::PublicRefreshTimeout)));
+    assert!(!source.public_activity().available);
+    blocked_read.rollback().await.unwrap();
+
+    // Shutdown invalidation uses the same bounded measurement path even when
+    // an accounting transaction currently owns the cursor row lock.
+    let mut blocked_write = admin.begin().await.unwrap();
+    sqlx::query("SELECT last_event_seq FROM backend_cursors WHERE deployment_id=$1 FOR UPDATE")
+        .bind(store.deployment_id())
+        .fetch_one(&mut *blocked_write)
+        .await
+        .unwrap();
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(10),
+        restarted_projector.invalidate_live_measurement(),
+    )
+    .await
+    .expect("measurement cleanup must have a finite deadline");
+    assert!(matches!(
+        cleanup,
+        Err(StoreError::ProjectionMeasurementTimeout)
+    ));
+    blocked_write.rollback().await.unwrap();
+
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    // A sample that was fresh when queried can expire while a later refresh
+    // query waits. Successful completion must not publish it or add a chart point.
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp()-INTERVAL '28 seconds' WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    let delayed_source = PostgresPoolDataSource::new(store.clone());
+    // The harness admin pool has one connection, held by the locking
+    // transaction. Use an independent connection to observe its waiter.
+    let observer = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .unwrap();
+    let mut delayed_read = admin.begin().await.unwrap();
+    sqlx::query("LOCK TABLE winners IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *delayed_read)
+        .await
+        .unwrap();
+    let delayed_refresh_source = delayed_source.clone();
+    let delayed_refresh = tokio::spawn(async move { delayed_refresh_source.refresh().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                 WHERE datname=current_database() AND wait_event_type='Lock')",
+            )
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("refresh reaches the query after sampling measurement freshness");
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    delayed_read.rollback().await.unwrap();
+    delayed_refresh.await.unwrap().unwrap();
+    observer.close().await;
+    assert_eq!(
+        delayed_source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    assert_eq!(delayed_source.pool_hashrate().hashrate_sol_s, None);
+    assert!(delayed_source.public_activity().hashrate.is_empty());
+
+    // Reestablish fresh evidence before the existing immediate-failure check.
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp() WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    source.refresh().await.unwrap();
+    assert!(source.pool_hashrate().available);
     sqlx::query("DELETE FROM backend_cursors WHERE deployment_id=$1")
         .bind(store.deployment_id())
         .execute(admin)

@@ -55,7 +55,11 @@ resets this evidence before historical replay; unhealthy backend state, known
 projection lag, or a stale heartbeat suppresses the estimate and requires a
 new complete clean window. Work projected before that window began is excluded.
 A portal-only restart can reuse fresh durable measurement evidence, but its
-chart history starts empty.
+chart history starts empty. Cached estimates expire on a monotonic deadline
+derived from the heartbeat's remaining freshness, even while a database refresh
+is blocked. Refreshes have a 15-second deadline; measurement writes, including
+projector cleanup, have a five-second deadline. Delayed refresh completion cannot
+renew the freshness of an old sample.
 
 `status` is `ready`, `warming_up`, `catching_up`, or `unavailable`. When a clean
 window is missing, `available` is false and `hashrate_sol_s` is null. A quiet

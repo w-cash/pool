@@ -364,12 +364,14 @@ pub enum BackendCapability {
     WinnerLifecycleV1,
     /// Valid noncanonical Zcash proofs are durably monitored without reward credit.
     WinnerSideChainV1,
-    /// Noncanonical or overtaken Wcash proofs are monitored without resubmission.
+    /// Exact node-known noncanonical Wcash proofs are monitored without reward credit.
     WcashWinnerSideChainV1,
+    /// Retained Wcash proofs can be requeued when their exact predecessor returns.
+    WcashWinnerSideChainRequeueV1,
 }
 
 /// Capabilities every current-protocol backend must advertise exactly once.
-pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 7] = [
+pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 8] = [
     BackendCapability::JobStreamV1,
     BackendCapability::DurableShareReceiptsV1,
     BackendCapability::EventReplayV1,
@@ -377,6 +379,7 @@ pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 7] = [
     BackendCapability::WinnerLifecycleV1,
     BackendCapability::WinnerSideChainV1,
     BackendCapability::WcashWinnerSideChainV1,
+    BackendCapability::WcashWinnerSideChainRequeueV1,
 ];
 
 /// One of the independently submitted merged-mining chains.
@@ -622,8 +625,8 @@ pub enum BackendEvent {
     },
     /// A proof requires status-only monitoring without reward credit. For Zcash,
     /// every pinned parent node committed the exact noncanonical proof. For
-    /// Wcash, the exact proof is noncanonical or a stable competing tip has
-    /// overtaken its candidate lineage. This does not assert node acceptance. The
+    /// Wcash, the node reports the exact proof as noncanonical. This does not
+    /// assert best-chain membership or reward maturity. The
     /// durable record survives branch eviction and backend restart.
     WinnerSideChain {
         /// Monotonic backend journal sequence.
@@ -668,8 +671,9 @@ pub enum BackendEvent {
         /// Exact best-chain tip sampled when the witness conflict was found.
         tip: ChainTip,
     },
-    /// A quarantined Wcash winner is absent from the current best chain and its
-    /// exact retained bytes are eligible for backend-controlled resubmission.
+    /// A quarantined or retired side-chain Wcash proof is authoritatively absent
+    /// while its exact predecessor is current. Its retained bytes are eligible
+    /// for backend-controlled resubmission, without reward credit.
     WinnerRequeued {
         /// Monotonic backend journal sequence.
         event_seq: u64,
@@ -679,7 +683,7 @@ pub enum BackendEvent {
         job_id: Hex32,
         /// Immutable winning-block and reward facts.
         winner: WinnerDescriptor,
-        /// Exact best-chain tip sampled before releasing the quarantine.
+        /// Exact predecessor tip sampled before releasing the retained proof.
         tip: ChainTip,
     },
     /// An observed winner reached its chain-specific spendability threshold.

@@ -1724,7 +1724,14 @@ async fn refresh_portal(
                 }
             }
             _ = interval.tick() => {
-                source.refresh().await?;
+                match source.refresh().await {
+                    Ok(()) => {}
+                    // A bounded dashboard read does not revoke independently
+                    // verified mining authority. Its cached rate is already
+                    // unavailable; retry the read on the next refresh tick.
+                    Err(StoreError::PublicRefreshTimeout) => continue,
+                    Err(error) => return Err(error),
+                }
                 refresh_network_hashrate(&source, &rpc, &jobs).await;
             },
         }

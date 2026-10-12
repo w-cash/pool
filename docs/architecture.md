@@ -248,8 +248,10 @@ incompatible wire change requires a newly negotiated protocol version.
   another proof cannot reverse the currently selected positive proof's reward.
   Quarantining the selected proof or orphaning the block reverses its active
   credit; only fresh positive evidence can restore that original allocation.
-  `WinnerRequeued` records authoritative absence and releases quarantined Wcash
-  bytes for backend-only resubmission. These witness transitions are invalid for
+  `WinnerRequeued` records authoritative absence with the exact predecessor
+  current and releases quarantined or retired side-chain Wcash bytes for
+  backend-only resubmission. Requeue creates no credit and preserves another
+  canonical proof's reward. These witness transitions are invalid for
   Zcash. A never-canonical Zcash proof verified as committed on a side chain by
   every pinned parent node emits `WinnerSideChain`, with no reward or allocation.
   Durable status-only monitoring then survives node eviction and backend restart;
@@ -261,10 +263,13 @@ incompatible wire change requires a newly negotiated protocol version.
   closes share admission only and is never block acceptance, reward maturity,
   or payout evidence.
 - Wcash `WinnerSideChain` also retains a pending or requeued exact proof when
-  the node verifies it as noncanonical or a stable competing tip overtakes its
-  candidate lineage. This status does not assert node acceptance or create
-  credit. The required `wcash_winner_side_chain_v1` capability fences older pool/backend
-  pairs before mining. Migration `0023` permits this proof state for Wcash;
+  the node reports that exact proof as noncanonical. A competing tip's height
+  or hash alone cannot retire undelivered work. Unknown proofs retain paced
+  delivery attempts; an unknown retained proof can requeue when its exact
+  predecessor returns. These transitions create no credit. The required
+  `wcash_winner_side_chain_v1` and `wcash_winner_side_chain_requeue_v1` capabilities
+  fence incompatible pool/backend pairs before mining. Migration `0023` permits
+  this proof state for Wcash;
   another proof's active reward and the original PPLNS allocation are preserved.
   Fresh exact canonical evidence still uses the ordinary observation lifecycle.
 - Crash recovery, torn-tail handling, fsync ordering, journal locking, bounded

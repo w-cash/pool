@@ -296,6 +296,20 @@ impl Proof {
             winner,
         }
     }
+
+    fn requeued(&self, seq: u64) -> BackendEvent {
+        let winner = winner(MergedChain::Wcash);
+        BackendEvent::WinnerRequeued {
+            event_seq: seq,
+            share_id: self.share.clone(),
+            job_id: self.job.job_id.clone(),
+            tip: ChainTip {
+                block_hash_le: self.job.wcash_previous_hash_le.clone(),
+                height: winner.height - 1,
+            },
+            winner,
+        }
+    }
 }
 
 struct Fixture {
@@ -761,11 +775,28 @@ async fn exact_auxpow_proofs_share_one_reward_and_preserve_original_allocations(
         f.reject(a.positive(f.next, 100, true)).await,
         StoreError::InvalidWinnerTransition
     ));
+    f.apply(a.requeued(f.next)).await;
+    f.assert_economics("requeued", None, 0, 0).await;
+    assert!(matches!(
+        f.reject(a.requeued(f.next)).await,
+        StoreError::InvalidWinnerTransition
+    ));
+    assert!(matches!(
+        f.reject(a.positive(f.next, 100, true)).await,
+        StoreError::InvalidWinnerTransition
+    ));
+    assert_eq!(f.ledger_count("winner_observed").await, 0);
+    f.apply(a.side_chain(f.next)).await;
     f.apply(a.positive(f.next, 1, false)).await;
     f.assert_economics("observed", Some(&a), -reward, 0).await;
     f.apply(b.committed(f.next, vec![win.clone()])).await;
     // Monitoring another AuxPoW witness must preserve the canonical witness's
     // economic state, selected proof and original PPLNS cutoff.
+    f.apply(b.side_chain(f.next)).await;
+    f.apply(b.requeued(f.next)).await;
+    f.assert_economics("observed", Some(&a), -reward, 0).await;
+    assert_eq!(f.ledger_count("winner_observed").await, 1);
+    f.reject(b.positive(f.next, 100, true)).await;
     f.apply(b.side_chain(f.next)).await;
     assert_eq!(f.ledger_count("winner_observed").await, 1);
     f.assert_economics("observed", Some(&a), -reward, 0).await;

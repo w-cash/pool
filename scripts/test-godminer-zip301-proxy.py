@@ -26,6 +26,8 @@ class FakeWriter:
         self.closed = False
         self.close_error = close_error
         self.written = []
+        self.transport = self
+        self.aborted = False
 
     def get_extra_info(self, name):
         return self.peer if name == "peername" else None
@@ -37,6 +39,10 @@ class FakeWriter:
         pass
 
     def close(self):
+        self.closed = True
+
+    def abort(self):
+        self.aborted = True
         self.closed = True
 
     async def wait_closed(self):
@@ -105,6 +111,34 @@ class AdmissionTests(unittest.TestCase):
 
 
 class ConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stalled_writer_close_aborts_after_deadline(self):
+        class StalledWriter(FakeWriter):
+            async def wait_closed(self):
+                await asyncio.Future()
+
+        writer = StalledWriter()
+        with patch.object(PROXY, "WRITER_CLOSE_TIMEOUT", 0.01):
+            await asyncio.wait_for(PROXY.close_writer(writer), 1)
+        self.assertTrue(writer.closed)
+        self.assertTrue(writer.aborted)
+
+    async def test_cancellation_during_writer_close_aborts_and_propagates(self):
+        started = asyncio.Event()
+
+        class StalledWriter(FakeWriter):
+            async def wait_closed(self):
+                started.set()
+                await asyncio.Future()
+
+        writer = StalledWriter()
+        closing = asyncio.create_task(PROXY.close_writer(writer))
+        await started.wait()
+        closing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await closing
+        self.assertTrue(writer.closed)
+        self.assertTrue(writer.aborted)
+
     async def test_excess_connection_closes_before_upstream_and_cannot_spoof_its_source(self):
         limits = PROXY.ConnectionLimits(64, 1)
         address = PROXY.peer_address(("198.51.100.1", 1000))
@@ -160,6 +194,41 @@ class ConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await connection
         self.assertTrue(writer.closed)
+        self.assertEqual(limits.active, 0)
+        self.assertEqual(limits.sources, {})
+
+    async def test_active_relay_cancellation_releases_limits_despite_stalled_close(self):
+        started = asyncio.Event()
+
+        class ActiveReader(asyncio.StreamReader):
+            async def readline(self):
+                started.set()
+                return await super().readline()
+
+        class StalledWriter(FakeWriter):
+            async def wait_closed(self):
+                await asyncio.Future()
+
+        limits = PROXY.ConnectionLimits(1, 1)
+        client_writer = StalledWriter()
+        upstream_writer = StalledWriter()
+        with patch.object(PROXY.asyncio, "open_connection", new_callable=AsyncMock) as upstream:
+            upstream.return_value = asyncio.StreamReader(), upstream_writer
+            with patch.object(PROXY, "WRITER_CLOSE_TIMEOUT", 0.01):
+                connection = asyncio.create_task(
+                    PROXY.serve_connection(
+                        ActiveReader(), client_writer, "127.0.0.1", 3337, limits
+                    )
+                )
+                await started.wait()
+                self.assertEqual(limits.active, 1)
+                connection.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(connection, 1)
+        self.assertTrue(client_writer.closed)
+        self.assertTrue(upstream_writer.closed)
+        self.assertTrue(client_writer.aborted)
+        self.assertTrue(upstream_writer.aborted)
         self.assertEqual(limits.active, 0)
         self.assertEqual(limits.sources, {})
 

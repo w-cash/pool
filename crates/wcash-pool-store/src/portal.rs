@@ -1,14 +1,16 @@
 //! Concrete miner-portal adapter over the deployment-fenced PostgreSQL store.
 
 use std::{
+    future::Future,
     str::FromStr,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use sqlx::{Postgres, Row, Transaction};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use uuid::Uuid;
 use wcash_pool_portal::{
     mask_destination, AccountCredential, Asset, AuthenticatedSession, ChainNetwork,
@@ -30,6 +32,45 @@ const MAXIMUM_MONEY_ZAT: u64 = 2_100_000_000_000_000;
 const MAXIMUM_WORKERS_PER_ACCOUNT: i64 = 100;
 const POOL_HASHRATE_WINDOW_SECONDS: u64 = 20 * 60;
 const POOL_HASHRATE_HISTORY_BUCKET_SECONDS: u64 = 10 * 60;
+const PUBLIC_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+const PUBLIC_CACHE_MAXIMUM_AGE: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
+struct CachedPublicSnapshot<T> {
+    value: T,
+    valid_until: Instant,
+}
+
+impl<T> CachedPublicSnapshot<T> {
+    fn is_fresh(&self) -> bool {
+        Instant::now() < self.valid_until
+    }
+}
+
+impl CachedPublicSnapshot<PoolHashrate> {
+    fn current_hashrate(&self) -> PoolHashrate {
+        let mut value = self.value.clone();
+        if !self.is_fresh() {
+            expire_pool_hashrate(&mut value);
+        }
+        value
+    }
+}
+
+async fn bounded_public_refresh<F>(refresh: F) -> Result<(), StoreError>
+where
+    F: Future<Output = Result<(), StoreError>>,
+{
+    tokio::time::timeout(PUBLIC_REFRESH_TIMEOUT, refresh)
+        .await
+        .map_err(|_| StoreError::PublicRefreshTimeout)?
+}
+
+fn expire_pool_hashrate(snapshot: &mut PoolHashrate) {
+    snapshot.available = false;
+    snapshot.status = PoolHashrateStatus::Unavailable;
+    snapshot.hashrate_sol_s = None;
+}
 
 impl PortalRepository for PostgresStore {
     fn readiness(&self) -> RepositoryFuture<'_, ()> {
@@ -1069,9 +1110,9 @@ fn display_hash(value: Vec<u8>) -> Result<String, RepositoryError> {
 pub struct PostgresPoolDataSource {
     store: PostgresStore,
     snapshot: Arc<RwLock<PoolOverview>>,
-    pool_hashrate: Arc<RwLock<PoolHashrate>>,
+    pool_hashrate: Arc<RwLock<CachedPublicSnapshot<PoolHashrate>>>,
     network_hashrate: Arc<RwLock<NetworkHashrate>>,
-    public_activity: Arc<RwLock<PublicPoolActivity>>,
+    public_activity: Arc<RwLock<CachedPublicSnapshot<PublicPoolActivity>>>,
 }
 
 impl PostgresPoolDataSource {
@@ -1080,30 +1121,40 @@ impl PostgresPoolDataSource {
         Self {
             store,
             snapshot: Arc::new(RwLock::new(PoolOverview::default())),
-            pool_hashrate: Arc::new(RwLock::new(PoolHashrate {
-                window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
-                ..PoolHashrate::default()
+            pool_hashrate: Arc::new(RwLock::new(CachedPublicSnapshot {
+                value: PoolHashrate {
+                    window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+                    ..PoolHashrate::default()
+                },
+                valid_until: Instant::now(),
             })),
             network_hashrate: Arc::new(RwLock::new(NetworkHashrate::default())),
-            public_activity: Arc::new(RwLock::new(PublicPoolActivity::default())),
+            public_activity: Arc::new(RwLock::new(CachedPublicSnapshot {
+                value: PublicPoolActivity::default(),
+                valid_until: Instant::now(),
+            })),
         }
     }
 
     /// Refreshes public chain, worker, and immutable fee-policy state.
     pub async fn refresh(&self) -> Result<(), StoreError> {
-        let result = self.refresh_inner().await;
+        let result = bounded_public_refresh(self.refresh_inner()).await;
         if result.is_err() {
             *self
                 .pool_hashrate
                 .write()
                 .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate lock"))? =
-                PoolHashrate {
-                    window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
-                    ..PoolHashrate::default()
+                CachedPublicSnapshot {
+                    value: PoolHashrate {
+                        window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+                        ..PoolHashrate::default()
+                    },
+                    valid_until: Instant::now(),
                 };
             self.public_activity
                 .write()
                 .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))?
+                .value
                 .available = false;
         }
         result
@@ -1171,6 +1222,9 @@ impl PostgresPoolDataSource {
         // The protocol has no acceptance timestamp. A replayed share's insertion
         // clock must not masquerade as fresh mining work. Only sample after a
         // full clean window, and exclude everything projected before it began.
+        // Anchor expiry before acquiring a connection or running the query.
+        // Query and subsequent refresh delays consume its remaining validity.
+        let measurement_started_at = Instant::now();
         let measurement = sqlx::query(
             "WITH sample AS (SELECT clock_timestamp() AS now), \
              measurement AS ( \
@@ -1183,6 +1237,9 @@ impl PostgresPoolDataSource {
                  FROM backend_cursors c CROSS JOIN sample WHERE c.deployment_id=$1 \
              ) SELECT EXTRACT(EPOCH FROM now)::BIGINT AS updated_at, \
                  fresh,caught_up,complete_window, \
+                 GREATEST(0,FLOOR(EXTRACT(EPOCH FROM \
+                     (live_observed_at + make_interval(secs => $3) - now)) \
+                     * 1000000))::BIGINT AS fresh_for_microseconds, \
                  CASE WHEN fresh AND caught_up AND complete_window THEN ( \
                      SELECT COALESCE(SUM(s.work),0)::TEXT FROM shares s \
                      JOIN backend_events e \
@@ -1201,7 +1258,7 @@ impl PostgresPoolDataSource {
         .bind(LIVE_PROJECTION_MAXIMUM_GAP_SECONDS)
         .fetch_one(&self.store.pool)
         .await?;
-        let status = if !measurement.try_get::<bool, _>("fresh")? {
+        let mut status = if !measurement.try_get::<bool, _>("fresh")? {
             PoolHashrateStatus::Unavailable
         } else if !measurement.try_get::<bool, _>("caught_up")? {
             PoolHashrateStatus::CatchingUp
@@ -1210,7 +1267,7 @@ impl PostgresPoolDataSource {
         } else {
             PoolHashrateStatus::Ready
         };
-        let hashrate_sol_s = measurement
+        let mut hashrate_sol_s = measurement
             .try_get::<Option<String>, _>("accepted_work")?
             .map(|work| {
                 BigUint::from_str(&work)
@@ -1226,26 +1283,12 @@ impl PostgresPoolDataSource {
         let updated_at_u64 = unix_u64(measurement.try_get::<i64, _>("updated_at")?)?;
         let sampled_at = updated_at_u64 - (updated_at_u64 % POOL_HASHRATE_HISTORY_BUCKET_SECONDS);
         let cutoff = updated_at_u64.saturating_sub(24 * 60 * 60);
-        let mut hashrate = self
-            .public_activity
-            .read()
-            .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))?
-            .hashrate
-            .clone();
-        hashrate.retain(|sample| sample.timestamp >= cutoff);
-        if let Some(hashrate_sol_s) = hashrate_sol_s {
-            if let Some(latest) = hashrate
-                .last_mut()
-                .filter(|sample| sample.timestamp == sampled_at)
-            {
-                latest.hashrate_sol_s = hashrate_sol_s;
-            } else {
-                hashrate.push(PoolHashratePoint {
-                    timestamp: sampled_at,
-                    hashrate_sol_s,
-                });
-            }
-        }
+        let remaining_freshness = Duration::from_micros(unix_u64(
+            measurement.try_get::<i64, _>("fresh_for_microseconds")?,
+        )?);
+        let hashrate_valid_until =
+            measurement_started_at + remaining_freshness.min(PUBLIC_CACHE_MAXIMUM_AGE);
+        let activity_valid_until = measurement_started_at + PUBLIC_CACHE_MAXIMUM_AGE;
         let block_rows = sqlx::query(
             "SELECT w.chain,w.height,w.block_hash_le,w.state, \
                     EXTRACT(EPOCH FROM e.recorded_at)::BIGINT AS found_at \
@@ -1315,6 +1358,31 @@ impl PostgresPoolDataSource {
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
+        if Instant::now() >= hashrate_valid_until {
+            status = PoolHashrateStatus::Unavailable;
+            hashrate_sol_s = None;
+        }
+        let mut hashrate = self
+            .public_activity
+            .read()
+            .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))?
+            .value
+            .hashrate
+            .clone();
+        hashrate.retain(|sample| sample.timestamp >= cutoff);
+        if let Some(hashrate_sol_s) = hashrate_sol_s {
+            if let Some(latest) = hashrate
+                .last_mut()
+                .filter(|sample| sample.timestamp == sampled_at)
+            {
+                latest.hashrate_sol_s = hashrate_sol_s;
+            } else {
+                hashrate.push(PoolHashratePoint {
+                    timestamp: sampled_at,
+                    hashrate_sol_s,
+                });
+            }
+        }
         let snapshot = PoolOverview {
             available: true,
             updated_at: Some(updated_at_u64),
@@ -1339,23 +1407,30 @@ impl PostgresPoolDataSource {
         *self
             .pool_hashrate
             .write()
-            .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate lock"))? = PoolHashrate {
-            available: hashrate_sol_s.is_some(),
-            status,
-            hashrate_sol_s,
-            window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
-            updated_at: Some(updated_at_u64),
-        };
+            .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate lock"))? =
+            CachedPublicSnapshot {
+                value: PoolHashrate {
+                    available: hashrate_sol_s.is_some(),
+                    status,
+                    hashrate_sol_s,
+                    window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+                    updated_at: Some(updated_at_u64),
+                },
+                valid_until: hashrate_valid_until,
+            };
         *self
             .public_activity
             .write()
             .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))? =
-            PublicPoolActivity {
-                available: true,
-                updated_at: Some(updated_at_u64),
-                hashrate,
-                blocks,
-                payouts,
+            CachedPublicSnapshot {
+                value: PublicPoolActivity {
+                    available: true,
+                    updated_at: Some(updated_at_u64),
+                    hashrate,
+                    blocks,
+                    payouts,
+                },
+                valid_until: activity_valid_until,
             };
         Ok(())
     }
@@ -1378,9 +1453,10 @@ impl PoolDataSource for PostgresPoolDataSource {
     }
 
     fn pool_hashrate(&self) -> PoolHashrate {
-        self.pool_hashrate
-            .read()
-            .map_or_else(|_| PoolHashrate::default(), |snapshot| snapshot.clone())
+        self.pool_hashrate.read().map_or_else(
+            |_| PoolHashrate::default(),
+            |snapshot| snapshot.current_hashrate(),
+        )
     }
 
     fn network_hashrate(&self) -> NetworkHashrate {
@@ -1392,7 +1468,11 @@ impl PoolDataSource for PostgresPoolDataSource {
     fn public_activity(&self) -> PublicPoolActivity {
         self.public_activity.read().map_or_else(
             |_| PublicPoolActivity::default(),
-            |snapshot| snapshot.clone(),
+            |snapshot| {
+                let mut value = snapshot.value.clone();
+                value.available &= snapshot.is_fresh();
+                value
+            },
         )
     }
 }
@@ -1468,6 +1548,55 @@ mod tests {
     use tokio::sync::{oneshot, Semaphore};
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_ready_telemetry_expires_while_refresh_is_blocked() {
+        let cached = CachedPublicSnapshot {
+            value: PoolHashrate {
+                available: true,
+                status: PoolHashrateStatus::Ready,
+                hashrate_sol_s: Some(42),
+                window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+                updated_at: Some(100),
+            },
+            // The database heartbeat was already 28 seconds old when sampled.
+            valid_until: Instant::now() + Duration::from_secs(2),
+        };
+        let refresh = tokio::spawn(bounded_public_refresh(std::future::pending()));
+        tokio::task::yield_now().await;
+        assert_eq!(cached.current_hashrate().hashrate_sol_s, Some(42));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let expired = cached.current_hashrate();
+        assert_eq!(expired.status, PoolHashrateStatus::Unavailable);
+        assert_eq!(expired.hashrate_sol_s, None);
+        assert!(!expired.available);
+        assert!(
+            !refresh.is_finished(),
+            "expiry does not require a refresh result"
+        );
+        tokio::time::advance(PUBLIC_REFRESH_TIMEOUT).await;
+        assert!(matches!(
+            refresh.await,
+            Ok(Err(StoreError::PublicRefreshTimeout))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_query_cannot_restart_cached_heartbeat_freshness() {
+        let query_started_at = Instant::now();
+        let remaining_freshness = Duration::from_secs(2);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let cached = CachedPublicSnapshot {
+            value: PoolHashrate {
+                available: true,
+                status: PoolHashrateStatus::Ready,
+                hashrate_sol_s: Some(42),
+                ..PoolHashrate::default()
+            },
+            valid_until: query_started_at + remaining_freshness,
+        };
+        assert_eq!(cached.current_hashrate().hashrate_sol_s, None);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_waiter_does_not_release_running_credential_work() -> Result<(), &'static str>

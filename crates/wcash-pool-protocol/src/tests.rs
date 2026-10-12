@@ -1207,6 +1207,10 @@ fn side_chain_evidence_requires_distinct_valid_identity_on_each_chain() -> TestR
         serde_json::to_value(BackendCapability::WcashWinnerSideChainV1)?,
         "wcash_winner_side_chain_v1"
     );
+    assert_eq!(
+        serde_json::to_value(BackendCapability::WcashWinnerSideChainRequeueV1)?,
+        "wcash_winner_side_chain_requeue_v1"
+    );
     let mut wcash = encoded;
     wcash["winner"]["chain"] = serde_json::json!("wcash");
     let wcash: BackendEvent = serde_json::from_value(wcash)?;
@@ -1382,15 +1386,18 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
         *backend_session = uuid(2);
     }
     assert!(encode_backend_message(&duplicate_identity).is_err());
-    let mut missing_capability = valid;
-    if let BackendMessage::HelloOk { capabilities, .. } = &mut missing_capability {
-        capabilities.pop();
+    // Both the deployed six-capability backend and the earlier seven-capability
+    // side-chain implementation lack the safe retained-proof requeue contract.
+    // Reject their actual version-2 wire frames before replay or mining begins.
+    for missing_count in [1, 2] {
+        let mut missing_capability = valid.clone();
+        if let BackendMessage::HelloOk { capabilities, .. } = &mut missing_capability {
+            capabilities.truncate(capabilities.len() - missing_count);
+        }
+        assert!(encode_backend_message(&missing_capability).is_err());
+        let legacy_payload = serde_json::to_vec(&missing_capability)?;
+        assert!(decode_backend_message(&raw_backend_frame(&legacy_payload)).is_err());
     }
-    assert!(encode_backend_message(&missing_capability).is_err());
-    // A legacy backend can emit a syntactically valid hello under version 2.
-    // Reject its actual wire frame before replay or mining can begin.
-    let legacy_payload = serde_json::to_vec(&missing_capability)?;
-    assert!(decode_backend_message(&raw_backend_frame(&legacy_payload)).is_err());
     Ok(())
 }
 
