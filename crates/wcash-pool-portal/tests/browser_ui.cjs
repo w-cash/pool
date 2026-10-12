@@ -50,9 +50,9 @@ async function fixture(options = {}) {
     if (url.pathname === "/api/v1/auth/login") { state.signedIn = true; state.username = payload.username; return reply({ csrf_token: "fixture_csrf" }); }
     if (url.pathname === "/api/v1/auth/logout") { state.signedIn = false; return reply({}); }
     if (url.pathname === "/api/v1/overview") return reply({ available: true, updated_at: 1789344000, hashrate_sol_s: 1290000, active_workers: 2, wcash_height: 48, zcash_height: 4343148, wec_fee_bps: 0, zec_fee_bps: 0, wec_maximum_network_fee_zat: 10000, zec_maximum_network_fee_zat: 10000, wec_maximum_network_fee_bps: 100, zec_maximum_network_fee_bps: 100 });
-    if (url.pathname === "/api/v1/hashrate/pool") return reply({ available: true, updated_at: 1789344000, window_seconds: 1200, hashrate_sol_s: 1290000 });
+    if (url.pathname === "/api/v1/hashrate/pool") return reply(state.poolHashrate || { available: true, status: "ready", updated_at: 1789344000, window_seconds: 1200, hashrate_sol_s: 1290000 });
     if (url.pathname === "/api/v1/hashrate/network") return reply({ available: true, updated_at: 1789344000, height: 48, sample_blocks: 120, hashrate_sol_s: 2600000 });
-    if (url.pathname === "/api/v1/public/activity") return reply({ available: true, updated_at: 1789344000, hashrate: [{ timestamp: 1789342800, hashrate_sol_s: 1180000 }, { timestamp: 1789343400, hashrate_sol_s: 1230000 }, { timestamp: 1789344000, hashrate_sol_s: 1290000 }], blocks: [{ asset: "wec", height: 48, block_hash: "0000000000000000000000000000000000000000000000000000000000000048", state: "mature", found_at: 1789343980 }, { asset: "zec", height: 4343148, block_hash: "00000000000000000000000000000000000000000000000000000000004343148", state: "accepted", found_at: 1789343500 }], payouts: [{ asset: "wec", transaction_id: "public-fixture-payout-tx", state: "confirmed", confirmation_height: 47, updated_at: 1789343900 }] });
+    if (url.pathname === "/api/v1/public/activity") return reply({ available: true, updated_at: 1789344000, hashrate: state.hashrateHistory || [{ timestamp: 1789342800, hashrate_sol_s: 1180000 }, { timestamp: 1789343400, hashrate_sol_s: 1230000 }, { timestamp: 1789344000, hashrate_sol_s: 1290000 }], blocks: [{ asset: "wec", height: 48, block_hash: "0000000000000000000000000000000000000000000000000000000000000048", state: "mature", found_at: 1789343980 }, { asset: "zec", height: 4343148, block_hash: "00000000000000000000000000000000000000000000000000000000000000004343148", state: "accepted", found_at: 1789343500 }], payouts: [{ asset: "wec", transaction_id: "public-fixture-payout-tx", state: "confirmed", confirmation_height: 47, updated_at: 1789343900 }] });
     if (!state.signedIn) return reply({ message: "Not authenticated." }, 401);
     if (url.pathname === "/api/v1/me") return reply({ id: "fixture-account", username: state.username, totp_enabled: false });
     if (url.pathname === "/readyz") return reply({ status: "ok" });
@@ -129,6 +129,30 @@ test("public landing explains merged mining and renders privacy-safe live activi
       await page.setViewportSize({ width, height: 1000 });
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `public dashboard overflows at ${width}px`);
     }
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+test("public hashrate reports missing clean windows without a false zero", async () => {
+  for (const [status, available, expected] of [["warming_up", false, "Warming up"], ["catching_up", false, "Catching up"], ["unavailable", false, "Unavailable"], ["ready", true, "Unavailable"]]) {
+    const { page, context, state } = await fixture({ signedIn: false, poolHashrate: { available, status, hashrate_sol_s: null }, hashrateHistory: [null, { timestamp: 1789344000, hashrate_sol_s: null }] });
+    try {
+      await page.locator("#public-pool-hashrate").filter({ hasText: expected }).waitFor();
+      assert.equal(await page.locator("#chart-current").textContent(), expected);
+      assert.equal(await page.locator("#chart-empty").isVisible(), true);
+      assert.equal(await page.locator(".chart-line").getAttribute("d"), "");
+      assert.deepEqual(state.errors, []);
+    } finally { await context.close(); }
+  }
+});
+
+test("pool chart preserves gaps while projection is unavailable", async () => {
+  const { page, context, state } = await fixture({ signedIn: false, hashrateHistory: [{ timestamp: 1789341600, hashrate_sol_s: 1 }, { timestamp: 1789342200, hashrate_sol_s: 2 }, { timestamp: 1789344000, hashrate_sol_s: 3 }, { timestamp: 1789344600, hashrate_sol_s: 4 }] });
+  try {
+    await page.locator("#public-pool-hashrate").filter({ hasText: "1.29 MSol/s" }).waitFor();
+    const path = await page.locator(".chart-line").getAttribute("d");
+    assert.equal((path.match(/M/g) || []).length, 2, "a missing interval starts a new line segment");
+    assert.equal((await page.locator(".chart-area").getAttribute("d")).match(/Z/g).length, 2);
     assert.deepEqual(state.errors, []);
   } finally { await context.close(); }
 });

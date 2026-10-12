@@ -36,5 +36,8 @@ wcash-pool-portal = { path = "../wcash-pool-portal" }
 wcash-pool-protocol = { path = "../wcash-pool-protocol" }
 zeroize.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

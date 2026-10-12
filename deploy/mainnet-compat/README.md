@@ -25,6 +25,22 @@ not stored in this repository.
 
 ## Install or recover
 
+Before release, verify that the selected node binary's `getblockhash 0` equals
+the expected public genesis for each chain. Preserve the exact source revisions,
+build inputs, and binary digests; a copied source tree alone does not establish
+the running binary's provenance.
+
+For an existing installation, upgrade the adapter script and its service units
+first. Run `systemctl daemon-reload`, then restart every installed public adapter
+(`zecwec-godminer-proxy.service` and, if installed, `zecwec-gpu-proxy.service`).
+Confirm that each running adapter enforces 64 total connections and 8 per peer
+before installing the new internal pool TOML or restarting the internal pool
+services with `maximum_miners_per_ip = 64`. Raising that internal limit while an
+old adapter is running removes the previous eight-session protection. Verify
+that the firewall and NAT rules isolate internal ports 3337 and 3339 before
+raising the limit. `systemctl enable --now` below does not restart an already
+running service.
+
 Install the adapter and configuration using the paths embedded in the units:
 
 ```sh
@@ -47,11 +63,21 @@ Expose TCP 3336 to miners. Port 3337 is an upstream implementation detail and
 must remain blocked by the host firewall. The base Mainnet listener on 3334
 continues independently.
 
+The public adapter admits at most 64 connections, with at most 8 from each
+TCP peer IP. Excess connections close immediately without opening an upstream
+connection. Miner messages cannot change the source quota. The internal pool
+allows all 64 adapter connections from loopback; it has no knowledge of the
+external peer IP. Keep port 3337 inaccessible to external clients, including
+through NAT forwarding, so clients cannot bypass the public adapter's limits.
+Miners behind the same NAT share the eight-connection peer limit. A forwarding
+proxy that replaces their TCP source address also combines them into one bucket.
+
 ## Verify
 
 ```sh
 python3 deploy/godminer_zip301_proxy.py \
   --listen 127.0.0.1:3336 --upstream 127.0.0.1:3337 --self-test
+python3 -B scripts/test-godminer-zip301-proxy.py
 systemctl is-active \
   zecwec-pool-z15pro-compat.service \
   zecwec-godminer-proxy.service

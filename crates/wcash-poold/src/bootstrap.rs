@@ -296,6 +296,7 @@ pub async fn projector(config: &RuntimeConfig) -> Result<ProjectorBootstrap, Boo
 
     let last_event_seq = store.last_event_seq().await?;
     let projector = store.event_projector();
+    projector.begin_live_measurement().await?;
     let backend_config = backend_config(config)?;
     let mut client = BackendClient::connect(
         backend_config.clone(),

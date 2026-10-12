@@ -1127,6 +1127,19 @@ and the negotiated capability together; the epoch-2 marker alone does not
 establish compatibility. Keep the upgraded node services and durable journals
 when selecting a reviewed compatible application release.
 
+The Wcash reconciliation release adds the required
+`wcash_winner_side_chain_v1` and `wcash_winner_side_chain_requeue_v1`
+capabilities and migration
+`0023_wcash_side_chain_monitoring.sql`. Upgrade the pool protocol/projector and
+Wolf backend together; either mismatched pair fails the startup handshake.
+Stop all old authorities before migration and reapply the runtime grants.
+Migration `0022` also adds projection freshness telemetry: current hashrate
+remains unavailable until a complete clean 20-minute measurement window exists.
+After a Wcash `winner_side_chain` record is written, rollback requires both a
+journal reader and a projector that understand both capabilities. Do not roll back
+to a reader that restricts these records to Zcash, even within epoch 2. Retain
+the upgraded database and journal; there is no automatic schema downgrade.
+
 Epoch 1 is intentionally not rollback-compatible. Those packages predate the
 separate projector and migrator identities and can reinstall broad public
 database grants. The rollback script reads the immutable epoch marker and uses

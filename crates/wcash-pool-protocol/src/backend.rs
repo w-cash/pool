@@ -364,16 +364,22 @@ pub enum BackendCapability {
     WinnerLifecycleV1,
     /// Valid noncanonical Zcash proofs are durably monitored without reward credit.
     WinnerSideChainV1,
+    /// Exact node-known noncanonical Wcash proofs are monitored without reward credit.
+    WcashWinnerSideChainV1,
+    /// Retained Wcash proofs can be requeued when their exact predecessor returns.
+    WcashWinnerSideChainRequeueV1,
 }
 
 /// Capabilities every current-protocol backend must advertise exactly once.
-pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 6] = [
+pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 8] = [
     BackendCapability::JobStreamV1,
     BackendCapability::DurableShareReceiptsV1,
     BackendCapability::EventReplayV1,
     BackendCapability::DualTargetV1,
     BackendCapability::WinnerLifecycleV1,
     BackendCapability::WinnerSideChainV1,
+    BackendCapability::WcashWinnerSideChainV1,
+    BackendCapability::WcashWinnerSideChainRequeueV1,
 ];
 
 /// One of the independently submitted merged-mining chains.
@@ -617,10 +623,11 @@ pub enum BackendEvent {
         /// Confirmation count computed from the same state snapshot as `tip`.
         confirmations: u32,
     },
-    /// An exact Zcash proof was committed on a noncanonical chain by every
-    /// pinned parent node. It has never been observed on the best chain and
-    /// creates no reward credit. The durable record permits status-only
-    /// monitoring after the nodes evict the side branch or the backend restarts.
+    /// A proof requires status-only monitoring without reward credit. For Zcash,
+    /// every pinned parent node committed the exact noncanonical proof. For
+    /// Wcash, the node reports the exact proof as noncanonical. This does not
+    /// assert best-chain membership or reward maturity. The
+    /// durable record survives branch eviction and backend restart.
     WinnerSideChain {
         /// Monotonic backend journal sequence.
         event_seq: u64,
@@ -664,8 +671,9 @@ pub enum BackendEvent {
         /// Exact best-chain tip sampled when the witness conflict was found.
         tip: ChainTip,
     },
-    /// A quarantined Wcash winner is absent from the current best chain and its
-    /// exact retained bytes are eligible for backend-controlled resubmission.
+    /// A quarantined or retired side-chain Wcash proof is authoritatively absent
+    /// while its exact predecessor is current. Its retained bytes are eligible
+    /// for backend-controlled resubmission, without reward credit.
     WinnerRequeued {
         /// Monotonic backend journal sequence.
         event_seq: u64,
@@ -675,7 +683,7 @@ pub enum BackendEvent {
         job_id: Hex32,
         /// Immutable winning-block and reward facts.
         winner: WinnerDescriptor,
-        /// Exact best-chain tip sampled before releasing the quarantine.
+        /// Exact predecessor tip sampled before releasing the retained proof.
         tip: ChainTip,
     },
     /// An observed winner reached its chain-specific spendability threshold.
@@ -922,7 +930,7 @@ impl BackendEvent {
                 winner,
                 tip,
                 ..
-            } => validate_zcash_winner_side_chain(share_id, job_id, winner, tip),
+            } => validate_winner_side_chain(share_id, job_id, winner, tip),
             Self::WinnerOrphaned {
                 share_id,
                 job_id,
@@ -1928,7 +1936,7 @@ fn validate_winner_observation(
     Ok(())
 }
 
-fn validate_zcash_winner_side_chain(
+fn validate_winner_side_chain(
     share_id: &Hex32,
     job_id: &Hex32,
     winner: &WinnerDescriptor,
@@ -1936,12 +1944,6 @@ fn validate_zcash_winner_side_chain(
 ) -> Result<(), ProtocolError> {
     validate_winner_reference(share_id, job_id, winner)?;
     tip.validate()?;
-    if winner.chain != MergedChain::Zcash {
-        return Err(invalid(
-            "winner_event.chain",
-            "side-chain monitoring requires Zcash",
-        ));
-    }
     if tip.block_hash_le == winner.block_hash_le {
         return Err(invalid(
             "winner_event.tip",

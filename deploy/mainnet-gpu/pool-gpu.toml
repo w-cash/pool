@@ -19,7 +19,9 @@ nonce_namespace = 4
 nonce_reservation = 65536
 database_connections = 4
 maximum_miners = 64
-maximum_miners_per_ip = 8
+# The firewall-isolated adapter supplies every connection from loopback. Its
+# public listener enforces the external per-IP limit before opening upstreams.
+maximum_miners_per_ip = 64
 authentication_parallelism = 4
 mining_authentication = "username_only"
 wcash_wallet_program = "/opt/zecwec-pool-staging/wcash-wallet"

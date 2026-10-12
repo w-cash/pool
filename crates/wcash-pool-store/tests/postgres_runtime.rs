@@ -19,8 +19,8 @@ use uuid::Uuid;
 use wcash_pool_backend_client::{BackendClient, BackendClientConfig, ExpectedBackend};
 use wcash_pool_edge::AuthenticationError;
 use wcash_pool_portal::{
-    Asset, ChainNetwork, PageRequest, PayoutPreferenceChange, PoolDataSource, PortalRepository,
-    ReceiverKind as PortalReceiverKind, ValidatedDestination,
+    Asset, ChainNetwork, PageRequest, PayoutPreferenceChange, PoolDataSource, PoolHashrateStatus,
+    PortalRepository, ReceiverKind as PortalReceiverKind, ValidatedDestination,
 };
 use wcash_pool_protocol::{
     canonical_attribution_id, decode_backend_request, encode_backend_message, BackendEvent,
@@ -196,6 +196,398 @@ async fn authority_for(
     server.await.expect("server task completes");
     std::fs::remove_file(socket_path).expect("test socket removes");
     authority
+}
+
+async fn assert_projection_clock_hashrate_gates(database_url: &str, admin: &sqlx::PgPool) {
+    let measurement_identity = identity(0x67);
+    let store = PostgresStore::connect(database_url, 2, measurement_identity.clone())
+        .await
+        .expect("measurement store connects");
+    store.bind_deployment().await.unwrap();
+    store
+        .bind_zero_fee_launch_policies(&policy(Chain::Wcash), &policy(Chain::Zcash))
+        .await
+        .unwrap();
+    let authority = authority_for(&measurement_identity).await;
+    let projector = store.event_projector();
+    let source = PostgresPoolDataSource::new(store.clone());
+    source.refresh().await.unwrap();
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    projector.begin_live_measurement().await.unwrap();
+    let descriptor = job();
+    let worker = WorkerIdentity {
+        account_id: CanonicalUuid::new(Uuid::new_v4()),
+        worker_id: CanonicalUuid::new(Uuid::new_v4()),
+        label: "measurement.worker".to_owned(),
+    };
+    let mut target_bytes = [0; 32];
+    target_bytes[30] = 1;
+    let target = TargetLe::new(target_bytes);
+    let share = |event_seq: u8| BackendEvent::ShareCommitted {
+        receipt: ShareReceipt {
+            event_seq: u64::from(event_seq),
+            job_id: descriptor.job_id.clone(),
+            share_id: Hex32::new([event_seq; 32]),
+            attribution_id: canonical_attribution_id(&worker, &target).unwrap(),
+            parent_hash_le: Hex32::new([0x68; 32]),
+            winners: Vec::new(),
+        },
+        job_id: descriptor.job_id.clone(),
+        identity: worker.clone(),
+        target_le: target.clone(),
+    };
+    let historical = share(2);
+    projector
+        .project_replay_page(
+            &authority,
+            &[
+                BackendEvent::JobActivated {
+                    event_seq: 1,
+                    job: descriptor.clone(),
+                },
+                historical.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+    assert!(source.public_activity().hashrate.is_empty());
+    let inserted_at = sqlx::query_scalar::<_, String>(
+        "SELECT recorded_at::TEXT FROM backend_events WHERE deployment_id=$1 AND event_seq=2",
+    )
+    .bind(store.deployment_id())
+    .fetch_one(admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        projector
+            .project_event(&authority, &historical)
+            .await
+            .unwrap(),
+        ProjectionResult::Replayed
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT recorded_at::TEXT FROM backend_events WHERE deployment_id=$1 AND event_seq=2",
+        )
+        .bind(store.deployment_id())
+        .fetch_one(admin)
+        .await
+        .unwrap(),
+        inserted_at,
+        "an exact replay never refreshes the insertion timestamp"
+    );
+    projector
+        .observe_live_measurement(&authority, 2, true)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(source.pool_hashrate().status, PoolHashrateStatus::WarmingUp);
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+
+    // Advance fixture time without a 20-minute wall-clock wait. Only the test
+    // migrator bypasses the append-only timestamp trigger, inside a transaction.
+    let mut clock_fixture = admin.begin().await.unwrap();
+    sqlx::query("ALTER TABLE backend_events DISABLE TRIGGER backend_events_append_only")
+        .execute(&mut *clock_fixture)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE backend_events SET recorded_at=clock_timestamp()-INTERVAL '1202 seconds' \
+         WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(&mut *clock_fixture)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE backend_events ENABLE TRIGGER backend_events_append_only")
+        .execute(&mut *clock_fixture)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp() WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(&mut *clock_fixture)
+    .await
+    .unwrap();
+    clock_fixture.commit().await.unwrap();
+
+    source.refresh().await.unwrap();
+    assert_eq!(source.pool_hashrate().status, PoolHashrateStatus::Ready);
+    assert_eq!(
+        source.pool_hashrate().hashrate_sol_s,
+        Some(0),
+        "a complete quiet window is zero, while a missing window is null"
+    );
+
+    projector
+        .project_event(&authority, &share(3))
+        .await
+        .unwrap();
+    projector
+        .observe_live_measurement(&authority, 3, true)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    let live_rate = (wcash_pool_store::target_work(&target).unwrap() / 1_200u64)
+        .to_string()
+        .parse::<u64>()
+        .unwrap();
+    assert!(live_rate > 0);
+    assert_eq!(source.pool_hashrate().status, PoolHashrateStatus::Ready);
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, Some(live_rate));
+    assert_eq!(source.public_activity().hashrate.len(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT SUM(work)::TEXT FROM shares WHERE deployment_id=$1"
+        )
+        .bind(store.deployment_id())
+        .fetch_one(admin)
+        .await
+        .unwrap(),
+        (wcash_pool_store::target_work(&target).unwrap() * 2u64).to_string(),
+        "measurement gating preserves cumulative share work"
+    );
+    let restarted_portal = PostgresPoolDataSource::new(store.clone());
+    restarted_portal.refresh().await.unwrap();
+    assert_eq!(
+        restarted_portal.pool_hashrate().hashrate_sol_s,
+        Some(live_rate)
+    );
+
+    let restarted_projector = store.event_projector();
+    restarted_projector.begin_live_measurement().await.unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+    assert!(matches!(
+        projector
+            .observe_live_measurement(&authority, 3, true)
+            .await,
+        Err(StoreError::ProjectionMeasurementFenced)
+    ));
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::CatchingUp
+    );
+    restarted_projector
+        .project_replay_page(&authority, &[share(4)])
+        .await
+        .unwrap();
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(source.pool_hashrate().status, PoolHashrateStatus::WarmingUp);
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+    assert_eq!(
+        source.public_activity().hashrate.len(),
+        1,
+        "catch-up creates no rate sample"
+    );
+    assert_eq!(
+        source.public_activity().hashrate[0].hashrate_sol_s,
+        live_rate,
+        "an unavailable sample must not overwrite history with a false zero"
+    );
+    restarted_projector
+        .observe_live_measurement(&authority, 4, false)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(source.pool_hashrate().status, PoolHashrateStatus::WarmingUp);
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp()-INTERVAL '31 seconds' WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    source.refresh().await.unwrap();
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::WarmingUp,
+        "resuming after a heartbeat gap must start a new complete window"
+    );
+
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp() WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    source.refresh().await.unwrap();
+    assert!(source.pool_hashrate().available);
+    // A blocked database read must not keep serving the last ready value.
+    // Its heartbeat has only two seconds of freshness remaining at publication.
+    sqlx::query(
+        "UPDATE backend_cursors SET live_observed_at=clock_timestamp()-INTERVAL '28 seconds' \
+         WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    source.refresh().await.unwrap();
+    assert!(source.pool_hashrate().available);
+    let mut blocked_read = admin.begin().await.unwrap();
+    sqlx::query("LOCK TABLE chain_policies IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocked_read)
+        .await
+        .unwrap();
+    let blocked_source = source.clone();
+    let blocked_refresh = tokio::spawn(async move { blocked_source.refresh().await });
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(
+        source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+    assert!(!blocked_refresh.is_finished());
+    let timed_out = tokio::time::timeout(Duration::from_secs(20), blocked_refresh)
+        .await
+        .expect("blocked refresh must have a finite deadline")
+        .unwrap();
+    assert!(matches!(timed_out, Err(StoreError::PublicRefreshTimeout)));
+    assert!(!source.public_activity().available);
+    blocked_read.rollback().await.unwrap();
+
+    // Shutdown invalidation uses the same bounded measurement path even when
+    // an accounting transaction currently owns the cursor row lock.
+    let mut blocked_write = admin.begin().await.unwrap();
+    sqlx::query("SELECT last_event_seq FROM backend_cursors WHERE deployment_id=$1 FOR UPDATE")
+        .bind(store.deployment_id())
+        .fetch_one(&mut *blocked_write)
+        .await
+        .unwrap();
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(10),
+        restarted_projector.invalidate_live_measurement(),
+    )
+    .await
+    .expect("measurement cleanup must have a finite deadline");
+    assert!(matches!(
+        cleanup,
+        Err(StoreError::ProjectionMeasurementTimeout)
+    ));
+    blocked_write.rollback().await.unwrap();
+
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    // A sample that was fresh when queried can expire while a later refresh
+    // query waits. Successful completion must not publish it or add a chart point.
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp()-INTERVAL '28 seconds' WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    let delayed_source = PostgresPoolDataSource::new(store.clone());
+    // The harness admin pool has one connection, held by the locking
+    // transaction. Use an independent connection to observe its waiter.
+    let observer = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .unwrap();
+    let mut delayed_read = admin.begin().await.unwrap();
+    sqlx::query("LOCK TABLE winners IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *delayed_read)
+        .await
+        .unwrap();
+    let delayed_refresh_source = delayed_source.clone();
+    let delayed_refresh = tokio::spawn(async move { delayed_refresh_source.refresh().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                 WHERE datname=current_database() AND wait_event_type='Lock')",
+            )
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("refresh reaches the query after sampling measurement freshness");
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    delayed_read.rollback().await.unwrap();
+    delayed_refresh.await.unwrap().unwrap();
+    observer.close().await;
+    assert_eq!(
+        delayed_source.pool_hashrate().status,
+        PoolHashrateStatus::Unavailable
+    );
+    assert_eq!(delayed_source.pool_hashrate().hashrate_sol_s, None);
+    assert!(delayed_source.public_activity().hashrate.is_empty());
+
+    // Reestablish fresh evidence before the existing immediate-failure check.
+    restarted_projector
+        .observe_live_measurement(&authority, 4, true)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE backend_cursors SET live_clean_since=clock_timestamp()-INTERVAL '1201 seconds', \
+             live_observed_at=clock_timestamp() WHERE deployment_id=$1",
+    )
+    .bind(store.deployment_id())
+    .execute(admin)
+    .await
+    .unwrap();
+    source.refresh().await.unwrap();
+    assert!(source.pool_hashrate().available);
+    sqlx::query("DELETE FROM backend_cursors WHERE deployment_id=$1")
+        .bind(store.deployment_id())
+        .execute(admin)
+        .await
+        .unwrap();
+    assert!(source.refresh().await.is_err());
+    assert_eq!(source.pool_hashrate().hashrate_sol_s, None);
+    assert!(
+        !source.pool_hashrate().available,
+        "refresh failure clears the cached rate"
+    );
+    assert!(!source.public_activity().available);
 }
 
 async fn assert_public_payout_selection_is_opt_in_and_homogeneous(
@@ -1172,6 +1564,8 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
          GRANT INSERT ON backend_events,jobs,shares,winners,winner_proofs,winner_allocations, \
              ledger_transactions,ledger_entries TO {projector_role}; \
          GRANT UPDATE(last_event_seq,updated_at) ON backend_cursors TO {projector_role}; \
+         GRANT UPDATE(measurement_epoch,live_observed_event_seq,live_observed_at,live_clean_since,live_healthy) \
+             ON backend_cursors TO {projector_role}; \
          GRANT UPDATE(state,active_observation_event_seq,active_maturity_event_seq,active_proof_share_id) \
              ON winners TO {projector_role}; \
          GRANT UPDATE(state) ON winner_proofs TO {projector_role}; \
@@ -1334,6 +1728,27 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
             true,
         ),
         (&public_role, "accounts", "id", "UPDATE", false),
+        (
+            &public_role,
+            "backend_cursors",
+            "live_clean_since",
+            "UPDATE",
+            false,
+        ),
+        (
+            &projector_role,
+            "backend_cursors",
+            "live_clean_since",
+            "UPDATE",
+            true,
+        ),
+        (
+            &payout_role,
+            "backend_cursors",
+            "live_clean_since",
+            "UPDATE",
+            false,
+        ),
         (&public_role, "accounts", "login", "UPDATE", false),
         (
             &public_role,
@@ -1704,6 +2119,10 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         },
     ];
     let role_projector = projector_store.event_projector();
+    role_projector
+        .begin_live_measurement()
+        .await
+        .expect("projector role resets live measurement before replay");
     for event in &role_events {
         assert_eq!(
             role_projector
@@ -1720,6 +2139,31 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
             ProjectionResult::Replayed
         );
     }
+    role_projector
+        .observe_live_measurement(&role_authority, 3, true)
+        .await
+        .expect("projector role persists a live watermark without broad cursor privileges");
+    let public_measurement = PostgresPoolDataSource::new(public_store.clone());
+    public_measurement
+        .refresh()
+        .await
+        .expect("public role reads measurement evidence");
+    assert_eq!(
+        public_measurement.pool_hashrate().status,
+        PoolHashrateStatus::WarmingUp
+    );
+    assert!(
+        public_store
+            .event_projector()
+            .begin_live_measurement()
+            .await
+            .is_err(),
+        "public role cannot fabricate live measurement evidence"
+    );
+    role_projector
+        .invalidate_live_measurement()
+        .await
+        .expect("projector role clears live measurement on failure");
     assert!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM ledger_transactions WHERE deployment_id=$1",
@@ -2655,6 +3099,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_pool_minimum_overrides_destination_threshold(&database_url, &admin).await;
     assert_public_payout_selection_is_opt_in_and_homogeneous(&database_url, &admin).await;
     assert_database_privilege_boundaries(&admin, &database_url).await;
+    assert_projection_clock_hashrate_gates(&database_url, &admin).await;
     assert_winner_depth_regression_is_reversible(&admin, &database_url).await;
     let mut mismatched_identity = store_identity.clone();
     mismatched_identity.chain_id = mismatched_identity

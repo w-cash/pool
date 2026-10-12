@@ -717,6 +717,7 @@ impl PoolDataSource for FixturePoolData {
     fn pool_hashrate(&self) -> wcash_pool_portal::PoolHashrate {
         wcash_pool_portal::PoolHashrate {
             available: true,
+            status: wcash_pool_portal::PoolHashrateStatus::Ready,
             hashrate_sol_s: Some(456_789),
             window_seconds: 1_200,
             updated_at: Some(1_700_000_000),

@@ -44,8 +44,27 @@ isolated worker's live lease and reports manual ZEC settlement independently.
 
 `hashrate_sol_s` is the accepted target-derived work recorded during the
 trailing `window_seconds`, divided by that window. The production window is
-1,200 seconds. A quiet pool returns zero; `available: false` means the durable
-projection is unavailable.
+1,200 seconds. The backend protocol supplies no mining acceptance timestamps:
+this remains a **projection-clock estimate**, not a reconstruction of historical
+mining time.
+
+The estimate is available only after the projector has observed a full
+1,200-second clean live window. A validated healthy backend watermark must be
+fully projected, with no heartbeat gap longer than 30 seconds. Projector startup
+resets this evidence before historical replay; unhealthy backend state, known
+projection lag, or a stale heartbeat suppresses the estimate and requires a
+new complete clean window. Work projected before that window began is excluded.
+A portal-only restart can reuse fresh durable measurement evidence, but its
+chart history starts empty. Cached estimates expire on a monotonic deadline
+derived from the heartbeat's remaining freshness, even while a database refresh
+is blocked. Refreshes have a 15-second deadline; measurement writes, including
+projector cleanup, have a five-second deadline. Delayed refresh completion cannot
+renew the freshness of an old sample.
+
+`status` is `ready`, `warming_up`, `catching_up`, or `unavailable`. When a clean
+window is missing, `available` is false and `hashrate_sol_s` is null. A quiet
+pool returns zero only when the complete clean window is established. These
+measurement gates do not change share accounting, PPLNS work, or payouts.
 
 ## Network hashrate
 
@@ -66,9 +85,11 @@ missing value as zero.
 This endpoint supplies the dashboard with three bounded lists:
 
 - `hashrate`: ten-minute samples of the accepted-work 20-minute pool estimate,
-  retained for up to 24 hours by the running portal process.
+  retained for up to 24 hours by the running portal process. Unavailable windows
+  produce gaps rather than synthetic zeros or catch-up spikes.
 - `blocks`: the latest WEC and ZEC blocks found by the pool, including chain,
-  height, block hash, lifecycle state, and discovery time.
+  height, block hash, lifecycle state, and pool projection time (`found_at`).
+  Historical replay can make this later than the actual discovery time.
 - `payouts`: the latest broadcast payout transaction IDs and lifecycle state.
 
 The response deliberately excludes account IDs, worker names, payout

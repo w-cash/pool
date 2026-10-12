@@ -329,11 +329,15 @@ async fn run_submission_actor(
     let mut heartbeat = interval_at(first_heartbeat_deadline, config.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut health_deadline = None;
+    let mut command_after_heartbeat = false;
 
     loop {
+        // A slow healthy exchange can leave the next tick ready immediately.
+        // Give at most one queued command a turn after each completed heartbeat,
+        // then restore heartbeat priority. Every exchange and event drain stays
+        // bounded, and the absolute unhealthy deadline always takes precedence.
+        let command_ready = command_after_heartbeat && !receiver.is_empty();
         let work = tokio::select! {
-            // Once due, one health exchange wins over an already-ready submission.
-            // This bounds event lag while the submission queue remains non-empty.
             biased;
             _ = async {
                 match health_deadline {
@@ -341,9 +345,12 @@ async fn run_submission_actor(
                     None => std::future::pending::<()>().await,
                 }
             } => ActorWork::HealthDeadline,
-            _ = heartbeat.tick() => ActorWork::Heartbeat,
+            _ = heartbeat.tick(), if !command_ready => ActorWork::Heartbeat,
             command = receiver.recv() => ActorWork::Command(command),
         };
+        if matches!(&work, ActorWork::Command(_)) {
+            command_after_heartbeat = false;
+        }
         match work {
             ActorWork::Heartbeat => {
                 let health = pump_health(
@@ -387,6 +394,7 @@ async fn run_submission_actor(
                     fail_pending(&mut receiver).await;
                     return Err(error);
                 }
+                command_after_heartbeat = true;
             }
             ActorWork::HealthDeadline => {
                 suspension.suspend();
@@ -936,6 +944,39 @@ mod tests {
                     consumed.extend(events.iter().map(|event| event.event().clone()));
                 });
             Box::pin(future::ready(result))
+        }
+    }
+
+    struct GatedHealthEventConsumer {
+        recording: Arc<RecordingEventConsumer>,
+        started: mpsc::UnboundedSender<Instant>,
+        allowed: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+    }
+
+    impl BackendEventConsumer for GatedHealthEventConsumer {
+        fn consume<'a>(
+            &'a self,
+            authority: &'a BackendAuthority,
+            events: &'a [DeliveredBackendEvent],
+        ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if events
+                    .iter()
+                    .any(|event| matches!(event.event(), BackendEvent::JobActivated { .. }))
+                {
+                    self.started
+                        .send(Instant::now())
+                        .map_err(|_| BackendEventConsumerError)?;
+                    self.allowed
+                        .lock()
+                        .await
+                        .recv()
+                        .await
+                        .ok_or(BackendEventConsumerError)?;
+                }
+                self.recording.consume(authority, events).await
+            })
         }
     }
 
@@ -2343,6 +2384,169 @@ mod tests {
         service.shutdown().await?;
         drop(handle);
         server_result?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_healthy_heartbeats_allow_one_queued_share_before_next_heartbeat() -> TestResult {
+        assert_slow_healthy_heartbeat_progress(false).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_healthy_heartbeat_projection_allows_bounded_share_progress() -> TestResult {
+        assert_slow_healthy_heartbeat_progress(true).await
+    }
+
+    async fn assert_slow_healthy_heartbeat_progress(delay_projection: bool) -> TestResult {
+        let socket = TestSocket::new()?;
+        let listener = UnixListener::bind(&socket.path)?;
+        let job = descriptor(0x36);
+        let server_job = job.clone();
+        let (health_started, mut health_observed) = mpsc::unbounded_channel();
+        let (allow_reply, mut reply_allowed) = mpsc::unbounded_channel();
+        let (projection_started, mut projection_observed) = mpsc::unbounded_channel();
+        let (allow_projection, projection_allowed) = mpsc::unbounded_channel();
+        let (finish_server, server_finished) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            establish_live_stream(&mut stream, server_job.clone()).await?;
+            for event_seq in [11, 13, 15] {
+                let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                    return TestResult::Err("queued shares bypassed an overdue heartbeat".into());
+                };
+                health_started.send(Instant::now())?;
+                if !delay_projection {
+                    reply_allowed
+                        .recv()
+                        .await
+                        .ok_or("health reply not released")?;
+                }
+                write_message(
+                    &mut stream,
+                    &BackendMessage::Event {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        event: BackendEvent::JobActivated {
+                            event_seq,
+                            job: descriptor(event_seq as u8),
+                        },
+                    },
+                )
+                .await?;
+                reply_health(&mut stream, id, event_seq, true).await?;
+
+                // The next request must make share progress even though another
+                // heartbeat is already due. The following loop iteration then
+                // requires a heartbeat before a second queued share can pass.
+                let share = read_request(&mut stream).await?;
+                commit_share(&mut stream, share, &server_job, event_seq + 1).await?;
+            }
+            let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+                return TestResult::Err("heartbeats stopped after queued shares completed".into());
+            };
+            health_started.send(Instant::now())?;
+            reply_health(&mut stream, id, 16, true).await?;
+            server_finished.await?;
+            TestResult::Ok(())
+        });
+
+        // Keep socket readiness from automatically advancing the paused clock.
+        let (stop_guard, mut guard_stopped) = oneshot::channel();
+        let guard = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut guard_stopped => break,
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        });
+        let timeline = MonotonicTimeline::new();
+        let mut client = BackendClient::connect(client_config(&socket.path)?, uuid(9), 10).await?;
+        let snapshot = client.subscribe_jobs(10).await?;
+        let router =
+            JobRouter::from_snapshot(&snapshot, GenerationRegistryConfig::new(4, 8)?, timeline, 8)?;
+        let contexts = [
+            prepared_context(&router, 0x51)?,
+            prepared_context(&router, 0x52)?,
+            prepared_context(&router, 0x53)?,
+        ];
+        let consumer = Arc::new(RecordingEventConsumer::default());
+        let event_consumer: Arc<dyn BackendEventConsumer> = if delay_projection {
+            Arc::new(GatedHealthEventConsumer {
+                recording: consumer.clone(),
+                started: projection_started,
+                allowed: tokio::sync::Mutex::new(projection_allowed),
+            })
+        } else {
+            consumer.clone()
+        };
+        let started_at = Instant::now();
+        let service = ShareRouter::spawn(
+            client,
+            router,
+            ShareRouterConfig::new(3, Duration::from_millis(50), Duration::from_secs(1))?,
+            event_consumer,
+        )
+        .await?;
+        let handle = service.handle();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(
+            health_observed
+                .recv()
+                .await
+                .ok_or("initial heartbeat missing")?,
+            started_at + Duration::from_millis(50)
+        );
+        let mut results = Vec::new();
+        for context in contexts {
+            let (response, result) = oneshot::channel();
+            handle
+                .sender
+                .try_send(SubmitCommand::Share { context, response })
+                .map_err(|_| "could not enqueue test submission")?;
+            results.push(result);
+        }
+
+        for (index, result) in results.into_iter().enumerate() {
+            // Each successful health path exceeds the configured 50ms interval.
+            if delay_projection {
+                assert_eq!(
+                    projection_observed
+                        .recv()
+                        .await
+                        .ok_or("health projection missing")?,
+                    Instant::now()
+                );
+            }
+            tokio::time::advance(Duration::from_millis(75)).await;
+            if delay_projection {
+                allow_projection.send(())?;
+            } else {
+                allow_reply.send(())?;
+            }
+            assert_eq!(result.await??.receipt().event_seq, 12 + 2 * index as u64);
+            assert_eq!(
+                health_observed
+                    .recv()
+                    .await
+                    .ok_or("following heartbeat missing")?,
+                started_at + Duration::from_millis(50 + 75 * (index as u64 + 1))
+            );
+        }
+        assert_eq!(
+            consumer
+                .events()?
+                .iter()
+                .map(BackendEvent::event_seq)
+                .collect::<Vec<_>>(),
+            vec![11, 12, 13, 14, 15, 16]
+        );
+        assert!(!service.is_finished());
+        service.shutdown().await?;
+        let _ = finish_server.send(());
+        let _ = stop_guard.send(());
+        guard.await?;
+        server.await??;
         Ok(())
     }
 

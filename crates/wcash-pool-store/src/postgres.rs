@@ -32,6 +32,8 @@ const MAX_DATABASE_CONNECTIONS: u32 = 64;
 const MAX_REPLAY_BATCH: usize = 1_024;
 const PUBLIC_PROJECTION_WAIT: Duration = Duration::from_secs(5);
 const PUBLIC_PROJECTION_POLL: Duration = Duration::from_millis(25);
+pub(crate) const LIVE_PROJECTION_MAXIMUM_GAP_SECONDS: i32 = 30;
+const LIVE_MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PPLNS_SHARES: i64 = 100_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
@@ -749,6 +751,7 @@ pub struct PostgresStore {
 #[derive(Clone, Debug)]
 pub struct PostgresEventProjector {
     store: PostgresStore,
+    measurement_epoch: Uuid,
 }
 
 impl PostgresStore {
@@ -3281,6 +3284,7 @@ impl PostgresStore {
     pub fn event_projector(&self) -> PostgresEventProjector {
         PostgresEventProjector {
             store: self.clone(),
+            measurement_epoch: Uuid::new_v4(),
         }
     }
 
@@ -3332,7 +3336,94 @@ impl PostgresStore {
     }
 }
 
+async fn bounded_live_measurement<T, F>(query: F) -> Result<T, StoreError>
+where
+    F: Future<Output = Result<T, sqlx::Error>>,
+{
+    tokio::time::timeout(LIVE_MEASUREMENT_TIMEOUT, query)
+        .await
+        .map_err(|_| StoreError::ProjectionMeasurementTimeout)?
+        .map_err(StoreError::from)
+}
+
 impl PostgresEventProjector {
+    /// Invalidates rate measurement before any startup journal replay. Each
+    /// projector instance fences old heartbeat writers with a fresh epoch.
+    pub async fn begin_live_measurement(&self) -> Result<(), StoreError> {
+        let changed = bounded_live_measurement(
+            sqlx::query(
+                "UPDATE backend_cursors SET measurement_epoch=$2, \
+                 live_observed_event_seq=NULL,live_observed_at=NULL, \
+                 live_clean_since=NULL,live_healthy=FALSE WHERE deployment_id=$1",
+            )
+            .bind(self.store.identity.id)
+            .bind(self.measurement_epoch)
+            .execute(&self.store.pool),
+        )
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(StoreError::DeploymentIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Records a validated live health watermark only after its queued events
+    /// have been projected. This evidence measures timely projection, not the
+    /// unknown mining acceptance times of historical events.
+    pub async fn observe_live_measurement(
+        &self,
+        authority: &BackendAuthority,
+        event_seq: u64,
+        healthy: bool,
+    ) -> Result<(), StoreError> {
+        self.store.verify_authority(authority)?;
+        let event_seq = i64::try_from(event_seq).map_err(|_| StoreError::EventSeqOverflow)?;
+        let changed = bounded_live_measurement(
+            sqlx::query(
+                "WITH sample AS (SELECT clock_timestamp() AS now) \
+             UPDATE backend_cursors c SET \
+                 live_clean_since=CASE WHEN $4 AND c.last_event_seq >= $3 THEN \
+                     CASE WHEN c.live_healthy AND c.live_clean_since IS NOT NULL \
+                         AND c.live_observed_at >= sample.now - make_interval(secs => $5) \
+                         AND c.live_observed_at <= sample.now \
+                         AND c.live_observed_event_seq <= $3 \
+                     THEN c.live_clean_since ELSE sample.now END \
+                 ELSE NULL END, \
+                 live_observed_event_seq=$3,live_observed_at=sample.now,live_healthy=$4 \
+             FROM sample WHERE c.deployment_id=$1 AND c.measurement_epoch=$2",
+            )
+            .bind(self.store.identity.id)
+            .bind(self.measurement_epoch)
+            .bind(event_seq)
+            .bind(healthy)
+            .bind(LIVE_PROJECTION_MAXIMUM_GAP_SECONDS)
+            .execute(&self.store.pool),
+        )
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(StoreError::ProjectionMeasurementFenced);
+        }
+        Ok(())
+    }
+
+    /// Stops estimates immediately when the live stream or projection fails.
+    pub async fn invalidate_live_measurement(&self) -> Result<(), StoreError> {
+        let changed = bounded_live_measurement(
+            sqlx::query(
+                "UPDATE backend_cursors SET live_clean_since=NULL,live_healthy=FALSE \
+             WHERE deployment_id=$1 AND measurement_epoch=$2",
+            )
+            .bind(self.store.identity.id)
+            .bind(self.measurement_epoch)
+            .execute(&self.store.pool),
+        )
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(StoreError::ProjectionMeasurementFenced);
+        }
+        Ok(())
+    }
+
     /// Projects one validated authoritative backend event and all accounting
     /// effects in a single transaction.
     pub async fn project_event(
@@ -4584,13 +4675,17 @@ async fn project_one(
                 winner,
             )
             .await?;
-            if winner.chain != MergedChain::Zcash
-                || row.proof_state != "submitted"
-                || row.state != "submitted"
-                || row.observation_event_seq.is_some()
-                || row.maturity_event_seq.is_some()
-                || row.active_proof_share_id.is_some()
-            {
+            let allowed = match winner.chain {
+                MergedChain::Zcash => {
+                    row.proof_state == "submitted"
+                        && row.state == "submitted"
+                        && row.observation_event_seq.is_none()
+                        && row.maturity_event_seq.is_none()
+                        && row.active_proof_share_id.is_none()
+                }
+                MergedChain::Wcash => matches!(row.proof_state.as_str(), "submitted" | "requeued"),
+            };
+            if !allowed {
                 return Err(StoreError::InvalidWinnerTransition);
             }
             update_winner_proof_state(
@@ -4601,15 +4696,22 @@ async fn project_one(
                 "side_chain",
             )
             .await?;
-            update_winner_state(
-                &mut transaction,
-                identity.id,
-                winner,
-                "side_chain",
-                None,
-                None,
-            )
-            .await?;
+            // A Wcash candidate may have another canonical witness. Retiring
+            // this proof must not reverse that witness's economic observation.
+            if row.active_proof_share_id.is_none()
+                && row.observation_event_seq.is_none()
+                && row.maturity_event_seq.is_none()
+            {
+                update_winner_state(
+                    &mut transaction,
+                    identity.id,
+                    winner,
+                    "side_chain",
+                    None,
+                    None,
+                )
+                .await?;
+            }
         }
         BackendEvent::WinnerObserved {
             share_id,
@@ -4708,7 +4810,9 @@ async fn project_one(
                 winner,
             )
             .await?;
-            if row.proof_state != "quarantined" {
+            if winner.chain != MergedChain::Wcash
+                || !matches!(row.proof_state.as_str(), "quarantined" | "side_chain")
+            {
                 return Err(StoreError::InvalidWinnerTransition);
             }
             update_winner_proof_state(
@@ -4719,7 +4823,11 @@ async fn project_one(
                 "requeued",
             )
             .await?;
-            if row.active_proof_share_id.is_none() && row.state == "quarantined" {
+            if row.active_proof_share_id.is_none()
+                && row.observation_event_seq.is_none()
+                && row.maturity_event_seq.is_none()
+                && matches!(row.state.as_str(), "quarantined" | "side_chain")
+            {
                 update_winner_state(
                     &mut transaction,
                     identity.id,
@@ -5723,6 +5831,15 @@ pub enum StoreError {
     /// Event sequence exceeded PostgreSQL's signed cursor representation.
     #[error("backend event sequence exceeds durable cursor capacity")]
     EventSeqOverflow,
+    /// Another projector replaced this instance's live measurement epoch.
+    #[error("live projection measurement epoch was replaced")]
+    ProjectionMeasurementFenced,
+    /// A measurement query could not complete within its finite deadline.
+    #[error("live projection measurement update timed out")]
+    ProjectionMeasurementTimeout,
+    /// A public read-model refresh could not complete within its finite deadline.
+    #[error("public projection refresh timed out")]
+    PublicRefreshTimeout,
     /// The projector observed a non-contiguous authoritative event.
     #[error("backend event sequence gap: expected {expected}, received {actual}")]
     EventSequenceGap {
@@ -5942,6 +6059,20 @@ pub enum StoreError {
 #[allow(clippy::expect_used)]
 mod payout_fee_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_measurement_write_has_a_finite_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = bounded_live_measurement::<(), _>(std::future::pending()).await;
+        assert!(matches!(
+            result,
+            Err(StoreError::ProjectionMeasurementTimeout)
+        ));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            LIVE_MEASUREMENT_TIMEOUT
+        );
+    }
 
     fn output(account: u128, amount_zat: u64) -> PayoutInstruction {
         PayoutInstruction {

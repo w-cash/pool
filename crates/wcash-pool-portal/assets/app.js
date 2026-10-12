@@ -100,6 +100,13 @@ function formatHashrate(value) {
   return `${scaled >= 100 ? scaled.toFixed(0) : scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)} ${unit[1]}`;
 }
 
+function formatPoolHashrate(pool) {
+  if (pool.available && Number.isFinite(pool.hashrate_sol_s) && pool.hashrate_sol_s >= 0) return formatHashrate(pool.hashrate_sol_s);
+  if (pool.status === "warming_up") return "Warming up";
+  if (pool.status === "catching_up") return "Catching up";
+  return "Unavailable";
+}
+
 function publicExplorer(asset, kind, value) {
   const base = asset === "wec" ? "https://wcashexplorer.com" : "https://zecblock.com";
   return `${base}/${kind}/${encodeURIComponent(value)}`;
@@ -118,7 +125,7 @@ function renderHashrateChart(points) {
     grid.append(guide);
   }
   const valid = Array.isArray(points)
-    ? points.filter((point) => Number.isSafeInteger(point.timestamp) && Number.isSafeInteger(point.hashrate_sol_s) && point.hashrate_sol_s >= 0)
+    ? points.filter((point) => point && Number.isSafeInteger(point.timestamp) && Number.isSafeInteger(point.hashrate_sol_s) && point.hashrate_sol_s >= 0)
     : [];
   svg.classList.toggle("hidden", valid.length < 2);
   $("#chart-empty").classList.toggle("hidden", valid.length >= 2);
@@ -131,9 +138,17 @@ function renderHashrateChart(points) {
     const y = 250 - (point.hashrate_sol_s / maximum) * 220;
     return [x, y];
   });
-  const path = coordinates.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
-  line.setAttribute("d", path);
-  area.setAttribute("d", `${path} L900,250 L0,250 Z`);
+  const segments = [];
+  coordinates.forEach((coordinate, index) => {
+    if (!index || valid[index].timestamp - valid[index - 1].timestamp !== 600) segments.push([]);
+    segments[segments.length - 1].push(coordinate);
+  });
+  const paths = segments.map((segment) => segment.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" "));
+  line.setAttribute("d", paths.join(" "));
+  area.setAttribute("d", paths.map((path, index) => {
+    const segment = segments[index];
+    return `${path} L${segment[segment.length - 1][0].toFixed(1)},250 L${segment[0][0].toFixed(1)},250 Z`;
+  }).join(" "));
   setText("#chart-start", new Date(start * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
 }
 
@@ -181,13 +196,13 @@ async function refreshPublic() {
       api("/api/v1/overview"), api("/api/v1/hashrate/pool"), api("/api/v1/hashrate/network"), api("/api/v1/public/activity"),
       manifestRequest,
     ]);
-    setText("#public-pool-hashrate", pool.available ? formatHashrate(pool.hashrate_sol_s) : "Unavailable");
+    setText("#public-pool-hashrate", formatPoolHashrate(pool));
     setText("#public-network-hashrate", network.available ? formatHashrate(network.hashrate_sol_s) : "Unavailable");
     setText("#public-wcash-height", formatCount(overview.wcash_height));
     setText("#public-zcash-height", formatCount(overview.zcash_height));
-    setText("#chart-current", pool.available ? formatHashrate(pool.hashrate_sol_s) : "—");
+    setText("#chart-current", formatPoolHashrate(pool));
     setText("#public-updated", overview.updated_at ? `Updated ${formatTime(overview.updated_at)}` : "Update time unavailable");
-    renderHashrateChart(activity.hashrate);
+    renderHashrateChart(activity.available ? activity.hashrate : []);
     renderPublicBlocks(activity.blocks);
     renderPublicPayouts(activity.payouts);
     renderProductionStatus(manifest);

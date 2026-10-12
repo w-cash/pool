@@ -179,6 +179,9 @@ GRANT INSERT ON TABLE
     ledger_entries
 TO :"projector_role";
 GRANT UPDATE (last_event_seq, updated_at) ON TABLE backend_cursors TO :"projector_role";
+GRANT UPDATE (measurement_epoch, live_observed_event_seq, live_observed_at,
+              live_clean_since, live_healthy)
+ON TABLE backend_cursors TO :"projector_role";
 GRANT UPDATE (state, active_observation_event_seq, active_maturity_event_seq, active_proof_share_id)
 ON TABLE winners TO :"projector_role";
 GRANT UPDATE (state) ON TABLE winner_proofs TO :"projector_role";
