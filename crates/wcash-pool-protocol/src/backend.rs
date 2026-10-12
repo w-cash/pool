@@ -364,16 +364,19 @@ pub enum BackendCapability {
     WinnerLifecycleV1,
     /// Valid noncanonical Zcash proofs are durably monitored without reward credit.
     WinnerSideChainV1,
+    /// Noncanonical or overtaken Wcash proofs are monitored without resubmission.
+    WcashWinnerSideChainV1,
 }
 
 /// Capabilities every current-protocol backend must advertise exactly once.
-pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 6] = [
+pub const REQUIRED_BACKEND_CAPABILITIES: [BackendCapability; 7] = [
     BackendCapability::JobStreamV1,
     BackendCapability::DurableShareReceiptsV1,
     BackendCapability::EventReplayV1,
     BackendCapability::DualTargetV1,
     BackendCapability::WinnerLifecycleV1,
     BackendCapability::WinnerSideChainV1,
+    BackendCapability::WcashWinnerSideChainV1,
 ];
 
 /// One of the independently submitted merged-mining chains.
@@ -617,10 +620,11 @@ pub enum BackendEvent {
         /// Confirmation count computed from the same state snapshot as `tip`.
         confirmations: u32,
     },
-    /// An exact Zcash proof was committed on a noncanonical chain by every
-    /// pinned parent node. It has never been observed on the best chain and
-    /// creates no reward credit. The durable record permits status-only
-    /// monitoring after the nodes evict the side branch or the backend restarts.
+    /// A proof requires status-only monitoring without reward credit. For Zcash,
+    /// every pinned parent node committed the exact noncanonical proof. For
+    /// Wcash, the exact proof is noncanonical or a stable competing tip has
+    /// overtaken its candidate lineage. This does not assert node acceptance. The
+    /// durable record survives branch eviction and backend restart.
     WinnerSideChain {
         /// Monotonic backend journal sequence.
         event_seq: u64,
@@ -922,7 +926,7 @@ impl BackendEvent {
                 winner,
                 tip,
                 ..
-            } => validate_zcash_winner_side_chain(share_id, job_id, winner, tip),
+            } => validate_winner_side_chain(share_id, job_id, winner, tip),
             Self::WinnerOrphaned {
                 share_id,
                 job_id,
@@ -1928,7 +1932,7 @@ fn validate_winner_observation(
     Ok(())
 }
 
-fn validate_zcash_winner_side_chain(
+fn validate_winner_side_chain(
     share_id: &Hex32,
     job_id: &Hex32,
     winner: &WinnerDescriptor,
@@ -1936,12 +1940,6 @@ fn validate_zcash_winner_side_chain(
 ) -> Result<(), ProtocolError> {
     validate_winner_reference(share_id, job_id, winner)?;
     tip.validate()?;
-    if winner.chain != MergedChain::Zcash {
-        return Err(invalid(
-            "winner_event.chain",
-            "side-chain monitoring requires Zcash",
-        ));
-    }
     if tip.block_hash_le == winner.block_hash_le {
         return Err(invalid(
             "winner_event.tip",

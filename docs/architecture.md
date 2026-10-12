@@ -260,6 +260,13 @@ incompatible wire change requires a newly negotiated protocol version.
   durable journal rather than crossing the pool protocol. `GenerationClosed`
   closes share admission only and is never block acceptance, reward maturity,
   or payout evidence.
+- Wcash `WinnerSideChain` also retains a pending or requeued exact proof when
+  the node verifies it as noncanonical or a stable competing tip overtakes its
+  candidate lineage. This status does not assert node acceptance or create
+  credit. The required `wcash_winner_side_chain_v1` capability fences older pool/backend
+  pairs before mining. Migration `0023` permits this proof state for Wcash;
+  another proof's active reward and the original PPLNS allocation are preserved.
+  Fresh exact canonical evidence still uses the ordinary observation lifecycle.
 - Crash recovery, torn-tail handling, fsync ordering, journal locking, bounded
   growth or explicit rotation, and exact-retry behavior need deterministic
   wolf tests. Cross-repository golden frames must pin the pool and wolf to the

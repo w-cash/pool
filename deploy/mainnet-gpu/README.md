@@ -15,6 +15,11 @@ nonce-prefix overlap with the base listener (`2`) and ASIC listener (`3`).
 
 ## Install
 
+Before release, verify that the selected node binary's `getblockhash 0` equals
+the expected public genesis for each chain. Preserve the exact source revisions,
+build inputs, and binary digests; a copied source tree alone does not establish
+the running binary's provenance.
+
 ```sh
 install -o root -g zecwec-pool -m 0640 \
   deploy/mainnet-gpu/pool-gpu.toml \
@@ -30,9 +35,17 @@ systemctl enable --now zecwec-pool-gpu.service zecwec-gpu-proxy.service
 Expose TCP 3338 to miners. The runtime binds internal port 3339 as required by
 Mainnet policy; keep it and portal port 18082 blocked from the public Internet.
 
+The public adapter admits at most 64 connections, with at most 8 from each
+TCP peer IP. Excess connections close immediately without opening an upstream
+connection. Miner messages cannot change the source quota. The internal pool
+allows all 64 adapter connections from loopback; it has no knowledge of the
+external peer IP. Keep port 3339 inaccessible to external clients, including
+through NAT forwarding, so clients cannot bypass the public adapter's limits.
+
 ## Verify
 
 ```sh
+python3 -B scripts/test-godminer-zip301-proxy.py
 systemctl is-active zecwec-pool-gpu.service zecwec-gpu-proxy.service
 ss -ltn '( sport = :3338 or sport = :3339 or sport = :18082 )'
 journalctl -u zecwec-pool-gpu.service -u zecwec-gpu-proxy.service --since '10 minutes ago'

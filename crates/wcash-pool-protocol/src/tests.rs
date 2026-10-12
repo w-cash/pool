@@ -1170,7 +1170,7 @@ fn wcash_witness_quarantine_has_an_explicit_requeue_transition() {
 }
 
 #[test]
-fn side_chain_evidence_requires_zcash_and_distinct_valid_identity() -> TestResult {
+fn side_chain_evidence_requires_distinct_valid_identity_on_each_chain() -> TestResult {
     let valid = BackendEvent::WinnerSideChain {
         event_seq: 1,
         share_id: fixed(0x51),
@@ -1184,7 +1184,6 @@ fn side_chain_evidence_requires_zcash_and_distinct_valid_identity() -> TestResul
     valid.validate()?;
     let encoded = serde_json::to_value(&valid)?;
     for (pointer, value) in [
-        ("/winner/chain", serde_json::json!("wcash")),
         ("/tip/block_hash_le", serde_json::json!("61".repeat(32))),
         ("/share_id", serde_json::json!("00".repeat(32))),
         ("/job_id", serde_json::json!("00".repeat(32))),
@@ -1203,6 +1202,18 @@ fn side_chain_evidence_requires_zcash_and_distinct_valid_identity() -> TestResul
     assert_eq!(
         serde_json::to_value(BackendCapability::WinnerSideChainV1)?,
         "winner_side_chain_v1"
+    );
+    assert_eq!(
+        serde_json::to_value(BackendCapability::WcashWinnerSideChainV1)?,
+        "wcash_winner_side_chain_v1"
+    );
+    let mut wcash = encoded;
+    wcash["winner"]["chain"] = serde_json::json!("wcash");
+    let wcash: BackendEvent = serde_json::from_value(wcash)?;
+    wcash.validate()?;
+    assert_eq!(
+        serde_json::from_value::<BackendEvent>(serde_json::to_value(&wcash)?)?,
+        wcash
     );
     Ok(())
 }
@@ -1376,6 +1387,10 @@ fn hello_requires_distinct_identities_and_complete_capabilities() -> TestResult 
         capabilities.pop();
     }
     assert!(encode_backend_message(&missing_capability).is_err());
+    // A legacy backend can emit a syntactically valid hello under version 2.
+    // Reject its actual wire frame before replay or mining can begin.
+    let legacy_payload = serde_json::to_vec(&missing_capability)?;
+    assert!(decode_backend_message(&raw_backend_frame(&legacy_payload)).is_err());
     Ok(())
 }
 

@@ -53,6 +53,15 @@ canonical stream, operators must archive them and start an explicitly new
 journal epoch with new deployment/backend identities. Historical UI totals may
 be labelled as archival telemetry, but they are not accounting entries.
 
+The public pool rate uses projection-clock share work, because the backend
+protocol does not supply authoritative acceptance timestamps. Projector startup
+invalidates live measurement before replay. The rate remains unavailable until
+a healthy backend watermark has been fully projected throughout a complete
+20-minute window, with no heartbeat gap over 30 seconds. Work inserted before
+the clean window began is excluded. Restart, catch-up, unhealthy authority, and
+stale heartbeat cannot turn historical work into a fresh rate; these measurement
+gates do not alter durable share or payout accounting.
+
 ## Deliberate readiness gates
 
 This crate is not a standalone public-pool launch. It supplies the concrete

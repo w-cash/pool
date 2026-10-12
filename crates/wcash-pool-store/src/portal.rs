@@ -14,14 +14,15 @@ use wcash_pool_portal::{
     mask_destination, AccountCredential, Asset, AuthenticatedSession, ChainNetwork,
     MinerBalanceSummary, MinerBlockSummary, MinerPayoutSummary, NetworkHashrate, NewSession, Page,
     PageRequest, PayoutPreferenceChange, PayoutSettingSummary, PoolDataSource, PoolHashrate,
-    PoolHashratePoint, PoolOverview, PortalRepository, ProvisionedWorker, PublicBlockSummary,
-    PublicPayoutSummary, PublicPoolActivity, ReceiverKind as PortalReceiverKind, RepositoryError,
-    RepositoryFuture, RewardSummary, ValidatedDestination, WorkerSummary,
+    PoolHashratePoint, PoolHashrateStatus, PoolOverview, PortalRepository, ProvisionedWorker,
+    PublicBlockSummary, PublicPayoutSummary, PublicPoolActivity,
+    ReceiverKind as PortalReceiverKind, RepositoryError, RepositoryFuture, RewardSummary,
+    ValidatedDestination, WorkerSummary,
 };
 use wcash_pool_protocol::JobDescriptor;
 
 use crate::{
-    postgres::{unix_i64, unix_u64},
+    postgres::{unix_i64, unix_u64, LIVE_PROJECTION_MAXIMUM_GAP_SECONDS},
     Chain, NewPortalSessionRecord, PostgresStore, StoreError,
 };
 
@@ -1090,6 +1091,25 @@ impl PostgresPoolDataSource {
 
     /// Refreshes public chain, worker, and immutable fee-policy state.
     pub async fn refresh(&self) -> Result<(), StoreError> {
+        let result = self.refresh_inner().await;
+        if result.is_err() {
+            *self
+                .pool_hashrate
+                .write()
+                .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate lock"))? =
+                PoolHashrate {
+                    window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
+                    ..PoolHashrate::default()
+                };
+            self.public_activity
+                .write()
+                .map_err(|_| StoreError::CorruptDatabaseState("public activity lock"))?
+                .available = false;
+        }
+        result
+    }
+
+    async fn refresh_inner(&self) -> Result<(), StoreError> {
         let policies = sqlx::query(
             "SELECT chain,fee_bps,maximum_network_fee_zat,maximum_network_fee_bps,policy_version \
              FROM chain_policies \
@@ -1148,31 +1168,62 @@ impl PostgresPoolDataSource {
         .map(serde_json::from_value::<JobDescriptor>)
         .transpose()
         .map_err(|_| StoreError::CorruptDatabaseState("portal latest job"))?;
-        let updated_at =
-            sqlx::query_scalar::<_, i64>("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
-                .fetch_one(&self.store.pool)
-                .await?;
-        let accepted_work = sqlx::query_scalar::<_, String>(
-            "SELECT COALESCE(SUM(s.work),0)::TEXT FROM shares s \
-             JOIN backend_events e ON e.deployment_id=s.deployment_id AND e.event_seq=s.event_seq \
-             WHERE s.deployment_id=$1 \
-               AND e.recorded_at >= clock_timestamp() - make_interval(secs => $2)",
+        // The protocol has no acceptance timestamp. A replayed share's insertion
+        // clock must not masquerade as fresh mining work. Only sample after a
+        // full clean window, and exclude everything projected before it began.
+        let measurement = sqlx::query(
+            "WITH sample AS (SELECT clock_timestamp() AS now), \
+             measurement AS ( \
+                 SELECT c.*,sample.now, \
+                     COALESCE(c.live_healthy AND c.live_observed_at BETWEEN \
+                         sample.now - make_interval(secs => $3) AND sample.now,FALSE) AS fresh, \
+                     COALESCE(c.last_event_seq >= c.live_observed_event_seq,FALSE) AS caught_up, \
+                     COALESCE(c.live_clean_since <= \
+                         sample.now - make_interval(secs => $2),FALSE) AS complete_window \
+                 FROM backend_cursors c CROSS JOIN sample WHERE c.deployment_id=$1 \
+             ) SELECT EXTRACT(EPOCH FROM now)::BIGINT AS updated_at, \
+                 fresh,caught_up,complete_window, \
+                 CASE WHEN fresh AND caught_up AND complete_window THEN ( \
+                     SELECT COALESCE(SUM(s.work),0)::TEXT FROM shares s \
+                     JOIN backend_events e \
+                         ON e.deployment_id=s.deployment_id AND e.event_seq=s.event_seq \
+                     WHERE s.deployment_id=$1 \
+                         AND e.recorded_at > measurement.live_clean_since \
+                         AND e.recorded_at >= measurement.now - make_interval(secs => $2) \
+                         AND e.recorded_at <= measurement.now \
+                 ) ELSE NULL END AS accepted_work FROM measurement",
         )
         .bind(self.store.identity.id)
         .bind(
             i32::try_from(POOL_HASHRATE_WINDOW_SECONDS)
                 .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate window"))?,
         )
+        .bind(LIVE_PROJECTION_MAXIMUM_GAP_SECONDS)
         .fetch_one(&self.store.pool)
         .await?;
-        let hashrate_sol_s = BigUint::from_str(&accepted_work)
-            .ok()
-            .and_then(|work| (work / POOL_HASHRATE_WINDOW_SECONDS).to_u64())
-            .ok_or(StoreError::CorruptDatabaseState("pool hashrate"))?;
+        let status = if !measurement.try_get::<bool, _>("fresh")? {
+            PoolHashrateStatus::Unavailable
+        } else if !measurement.try_get::<bool, _>("caught_up")? {
+            PoolHashrateStatus::CatchingUp
+        } else if !measurement.try_get::<bool, _>("complete_window")? {
+            PoolHashrateStatus::WarmingUp
+        } else {
+            PoolHashrateStatus::Ready
+        };
+        let hashrate_sol_s = measurement
+            .try_get::<Option<String>, _>("accepted_work")?
+            .map(|work| {
+                BigUint::from_str(&work)
+                    .ok()
+                    .and_then(|work| (work / POOL_HASHRATE_WINDOW_SECONDS).to_u64())
+                    .ok_or(StoreError::CorruptDatabaseState("pool hashrate"))
+            })
+            .transpose()?;
         // Preserve a bounded process-local chart instead of rescanning a full
         // day of durable shares every 15 seconds. The authoritative current
         // estimate above remains target-derived from the durable projection.
-        let updated_at_u64 = unix_u64(updated_at)?;
+        // Unavailable intervals create no artificial zero or replay spike.
+        let updated_at_u64 = unix_u64(measurement.try_get::<i64, _>("updated_at")?)?;
         let sampled_at = updated_at_u64 - (updated_at_u64 % POOL_HASHRATE_HISTORY_BUCKET_SECONDS);
         let cutoff = updated_at_u64.saturating_sub(24 * 60 * 60);
         let mut hashrate = self
@@ -1182,16 +1233,18 @@ impl PostgresPoolDataSource {
             .hashrate
             .clone();
         hashrate.retain(|sample| sample.timestamp >= cutoff);
-        if let Some(latest) = hashrate
-            .last_mut()
-            .filter(|sample| sample.timestamp == sampled_at)
-        {
-            latest.hashrate_sol_s = hashrate_sol_s;
-        } else {
-            hashrate.push(PoolHashratePoint {
-                timestamp: sampled_at,
-                hashrate_sol_s,
-            });
+        if let Some(hashrate_sol_s) = hashrate_sol_s {
+            if let Some(latest) = hashrate
+                .last_mut()
+                .filter(|sample| sample.timestamp == sampled_at)
+            {
+                latest.hashrate_sol_s = hashrate_sol_s;
+            } else {
+                hashrate.push(PoolHashratePoint {
+                    timestamp: sampled_at,
+                    hashrate_sol_s,
+                });
+            }
         }
         let block_rows = sqlx::query(
             "SELECT w.chain,w.height,w.block_hash_le,w.state, \
@@ -1287,8 +1340,9 @@ impl PostgresPoolDataSource {
             .pool_hashrate
             .write()
             .map_err(|_| StoreError::CorruptDatabaseState("pool hashrate lock"))? = PoolHashrate {
-            available: true,
-            hashrate_sol_s: Some(hashrate_sol_s),
+            available: hashrate_sol_s.is_some(),
+            status,
+            hashrate_sol_s,
             window_seconds: POOL_HASHRATE_WINDOW_SECONDS,
             updated_at: Some(updated_at_u64),
         };

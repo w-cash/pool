@@ -282,6 +282,20 @@ impl Proof {
             }
         }
     }
+
+    fn side_chain(&self, seq: u64) -> BackendEvent {
+        let winner = winner(MergedChain::Wcash);
+        BackendEvent::WinnerSideChain {
+            event_seq: seq,
+            share_id: self.share.clone(),
+            job_id: self.job.job_id.clone(),
+            tip: ChainTip {
+                block_hash_le: Hex32::new([0xe3; 32]),
+                height: winner.height + 1,
+            },
+            winner,
+        }
+    }
 }
 
 struct Fixture {
@@ -725,9 +739,34 @@ async fn exact_auxpow_proofs_share_one_reward_and_preserve_original_allocations(
     })
     .await;
     f.apply(a.committed(f.next, vec![win.clone()])).await;
+    // A never-canonical exact Wcash proof survives replay/restart without
+    // creating credit, allocations, or permitting premature maturity.
+    f.apply(a.side_chain(f.next)).await;
+    f.assert_economics("side_chain", None, 0, 0).await;
+    assert_eq!(f.ledger_count("winner_observed").await, 0);
+    let allocations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM winner_allocations")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(allocations, 0);
+    f.store = PostgresStore::connect(&database_url, 2, identity.clone())
+        .await
+        .unwrap();
+    f.store.verify_deployment().await.unwrap();
+    assert!(matches!(
+        f.reject(a.side_chain(f.next)).await,
+        StoreError::InvalidWinnerTransition
+    ));
+    assert!(matches!(
+        f.reject(a.positive(f.next, 100, true)).await,
+        StoreError::InvalidWinnerTransition
+    ));
     f.apply(a.positive(f.next, 1, false)).await;
     f.assert_economics("observed", Some(&a), -reward, 0).await;
     f.apply(b.committed(f.next, vec![win.clone()])).await;
+    // Monitoring another AuxPoW witness must preserve the canonical witness's
+    // economic state, selected proof and original PPLNS cutoff.
+    f.apply(b.side_chain(f.next)).await;
     assert_eq!(f.ledger_count("winner_observed").await, 1);
     f.assert_economics("observed", Some(&a), -reward, 0).await;
     f.reject(b.positive(f.next, 100, true)).await;
@@ -756,6 +795,23 @@ async fn exact_auxpow_proofs_share_one_reward_and_preserve_original_allocations(
 
     f.apply(a.negative(f.next, false)).await;
     f.assert_economics("quarantined", None, 0, 0).await;
+    assert!(matches!(
+        f.reject(a.side_chain(f.next)).await,
+        StoreError::InvalidWinnerTransition
+    ));
+    f.apply(BackendEvent::WinnerRequeued {
+        event_seq: f.next,
+        share_id: a.share.clone(),
+        job_id: a.job.job_id.clone(),
+        winner: win.clone(),
+        tip: ChainTip {
+            block_hash_le: descriptor.wcash_previous_hash_le.clone(),
+            height: win.height - 1,
+        },
+    })
+    .await;
+    f.apply(a.side_chain(f.next)).await;
+    f.assert_economics("side_chain", None, 0, 0).await;
     f.reject(b.positive(f.next, 100, false)).await;
     f.apply(b.positive(f.next, 50, false)).await;
     f.assert_economics("observed", Some(&b), -reward, 0).await;

@@ -474,12 +474,30 @@ pub struct PoolOverview {
     pub fee_policy_revision: Option<u64>,
 }
 
+/// Availability of the pool's projection-clock work estimate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolHashrateStatus {
+    /// No fresh healthy projector heartbeat is available.
+    #[default]
+    Unavailable,
+    /// The projection has not reached the observed backend watermark.
+    CatchingUp,
+    /// Healthy projection has not covered a complete measurement window.
+    WarmingUp,
+    /// A complete clean projection window can supply an estimate.
+    Ready,
+}
+
 /// Public estimate of the work currently reaching this pool.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PoolHashrate {
-    /// False when the durable share projection cannot be read.
+    /// True only after a complete window of fresh, healthy live projection.
     pub available: bool,
-    /// Accepted target-derived work per second, in Equihash solutions/second.
+    /// Explains an absent estimate without treating it as zero work.
+    pub status: PoolHashrateStatus,
+    /// Target-derived work per projection-clock second, in Equihash
+    /// solutions/second. Historical mining acceptance times are unknown.
     pub hashrate_sol_s: Option<u64>,
     /// Trailing time window used for the estimate.
     pub window_seconds: u64,
@@ -522,7 +540,8 @@ pub struct PublicBlockSummary {
     pub block_hash: String,
     /// Current reversible lifecycle state.
     pub state: String,
-    /// Time the winning share entered the durable journal.
+    /// Time the winning share entered the pool's durable projection. Historical
+    /// replay can make this later than the backend's actual discovery time.
     pub found_at: u64,
 }
 

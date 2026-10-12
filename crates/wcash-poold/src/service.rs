@@ -141,6 +141,11 @@ pub async fn run_projector(config: RuntimeConfig) -> Result<(), ServiceError> {
         projector,
     } = bootstrap::projector(&config).await?;
     let service_result = run_projector_loop(&mut client, &projector, shutdown_signal()).await;
+    let measurement_cleanup = projector
+        .invalidate_live_measurement()
+        .await
+        .map_err(ServiceError::from);
+    let service_result = combine_service_and_cleanup(service_result, measurement_cleanup);
     let cleanup_result = client
         .shutdown()
         .await
@@ -204,8 +209,14 @@ where
             .await
             .map_err(BootstrapError::from)
             .map_err(ServiceError::from);
+        if !health.as_ref().is_ok_and(|snapshot| snapshot.healthy) {
+            projector.invalidate_live_measurement().await?;
+        }
         drain_projector_events(client, projector).await?;
         let health = health?;
+        projector
+            .observe_live_measurement(&client.authority(), health.event_seq, health.healthy)
+            .await?;
         if backend_health.observe(health.healthy, time::Instant::now())
             == ProjectorBackendHealth::GraceExpired
         {
