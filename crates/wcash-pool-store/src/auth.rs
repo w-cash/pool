@@ -309,7 +309,7 @@ async fn authenticate_username(
 ) -> Result<AuthenticationGrant, AuthenticationError> {
     let account = claimed_account(login).ok_or(AuthenticationError::Denied)?;
     let row = sqlx::query(
-        "SELECT a.id AS account_id, w.id AS worker_id, \
+        "SELECT a.id AS account_id, w.id AS worker_id, w.canonical_login, \
                 t.id AS credential_id \
          FROM workers w \
          JOIN accounts a ON (a.deployment_id,a.id)=(w.deployment_id,w.account_id) \
@@ -341,9 +341,13 @@ async fn authenticate_username(
     let credential_id = row
         .try_get::<Uuid, _>("credential_id")
         .map_err(|_| AuthenticationError::Unavailable)?;
-    // Bind the exact miner-supplied login to this session. ZIP-301 repeats it
-    // on every share, while the stable worker/account IDs retain attribution.
-    let worker = AuthenticatedWorker::new(account_id, worker_id, login)
+    let canonical_login = row
+        .try_get::<String, _>("canonical_login")
+        .map_err(|_| AuthenticationError::Unavailable)?;
+    // ZIP-301 repeats the wire login on submissions, but the backend and
+    // projector must receive the registered label for these stable IDs.
+    let worker = AuthenticatedWorker::new(account_id, worker_id, canonical_login)
+        .and_then(|worker| worker.with_submission_login(login))
         .map_err(|_| AuthenticationError::Unavailable)?;
     AuthenticationGrant::new(worker, credential_id)
 }

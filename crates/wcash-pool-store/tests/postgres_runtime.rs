@@ -3154,6 +3154,16 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_eq!(alias_grant.worker().account_id(), account_id);
     assert_eq!(alias_grant.worker().worker_id(), worker_id);
     assert_eq!(alias_grant.worker().canonical_login(), "alice.unknown");
+    assert_eq!(alias_grant.worker().backend_identity().label, "alice.z15");
+    let projected_alias = alias_grant.worker().backend_identity();
+    sqlx::query("SELECT public.ensure_projected_worker_v1($1,$2,$3,$4)")
+        .bind(store.deployment_id())
+        .bind(account_id)
+        .bind(worker_id)
+        .bind(&projected_alias.label)
+        .execute(&admin)
+        .await
+        .expect("wire alias must pass the unchanged projector identity boundary");
     username_auth
         .revalidate_worker(&alias_grant)
         .await
@@ -3164,6 +3174,10 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
         .expect("account-only username maps to the registered account worker");
     assert_eq!(account_only_grant.worker().worker_id(), worker_id);
     assert_eq!(account_only_grant.worker().canonical_login(), "alice");
+    assert_eq!(
+        account_only_grant.worker().backend_identity().label,
+        "alice.z15"
+    );
     assert!(matches!(
         username_auth
             .authenticate_credentials("unknown.z15", "x")

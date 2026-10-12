@@ -23,6 +23,7 @@ pub struct AuthenticatedWorker {
     account_id: Uuid,
     worker_id: Uuid,
     canonical_login: String,
+    attribution_login: String,
 }
 
 impl fmt::Debug for AuthenticatedWorker {
@@ -56,7 +57,17 @@ impl AuthenticatedWorker {
         Ok(Self {
             account_id,
             worker_id,
+            attribution_login: canonical_login.clone(),
             canonical_login,
+        })
+    }
+
+    /// Uses an authorized wire alias while preserving the registered accounting identity.
+    pub fn with_submission_login(self, login: impl Into<String>) -> Result<Self, SessionError> {
+        let validated = Self::new(self.account_id, self.worker_id, login)?;
+        Ok(Self {
+            canonical_login: validated.canonical_login,
+            ..self
         })
     }
 
@@ -75,11 +86,12 @@ impl AuthenticatedWorker {
         &self.canonical_login
     }
 
-    fn backend_identity(&self) -> WorkerIdentity {
+    /// Returns the registered identity used for durable share accounting.
+    pub fn backend_identity(&self) -> WorkerIdentity {
         WorkerIdentity {
             account_id: CanonicalUuid::new(self.account_id),
             worker_id: CanonicalUuid::new(self.worker_id),
-            label: self.canonical_login.clone(),
+            label: self.attribution_login.clone(),
         }
     }
 }
@@ -596,6 +608,46 @@ mod tests {
         session
             .announce_job(assignment(&second, 1, false))
             .expect("explicit retirement frees capacity");
+    }
+
+    #[test]
+    fn wire_alias_preserves_registered_backend_attribution() {
+        for login in ["account.nicehash01", "account"] {
+            let registered = worker(1, "account.worker");
+            let aliased = registered
+                .clone()
+                .with_submission_login(login)
+                .expect("trusted authorization can bind a valid alias");
+            assert_eq!(aliased.canonical_login(), login);
+            assert_eq!(aliased.backend_identity(), registered.backend_identity());
+            let generation = generation(1);
+            let mut session = MiningSession::new(Uuid::from_u128(1), 2).expect("session is valid");
+            session
+                .subscribe(&allocator(NonceProfile::FourByte, 7))
+                .expect("nonce prefix is allocated");
+            session
+                .complete_authorization(aliased)
+                .expect("alias is authorized");
+            session
+                .announce_job(assignment(&generation, 1, false))
+                .expect("job is announced");
+            let mut registry = live_registry(1);
+            let context = session
+                .prepare_submission(
+                    login,
+                    generation.id(),
+                    generation.header_time(),
+                    NonceSuffix::TwentyEight(Hex28::new([0xa5; 28])),
+                    Box::new(Hex1344::new([0x5a; 1_344])),
+                    &mut registry,
+                    1,
+                )
+                .expect("wire alias remains valid on share submission");
+            assert_eq!(context.identity(), &registered.backend_identity());
+        }
+        assert!(worker(1, "account.worker")
+            .with_submission_login("invalid login")
+            .is_err());
     }
 
     #[test]
