@@ -32,7 +32,7 @@ const MAX_DATABASE_CONNECTIONS: u32 = 64;
 const MAX_REPLAY_BATCH: usize = 1_024;
 const PUBLIC_PROJECTION_WAIT: Duration = Duration::from_secs(5);
 const PUBLIC_PROJECTION_POLL: Duration = Duration::from_millis(25);
-const MAX_PPLNS_SHARES: i64 = 100_001;
+const MAX_PPLNS_SHARES: i64 = 1_000_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
 // The wallet observes newly matured coinbase outputs at the chain tip before
