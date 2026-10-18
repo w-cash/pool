@@ -704,7 +704,7 @@ impl NodePayoutAuthority {
     async fn exact_raw_transaction(
         &self,
         transaction_id: [u8; 32],
-    ) -> Result<Option<Vec<u8>>, RpcFailure> {
+    ) -> Result<Option<ExactTransaction>, RpcFailure> {
         let response = self
             .rpc
             .call(
@@ -731,10 +731,43 @@ impl NodePayoutAuthority {
             .get("hex")
             .and_then(Value::as_str)
             .ok_or(RpcFailure::Protocol)?;
-        parse_canonical_transaction(raw)
-            .map(Some)
-            .ok_or(RpcFailure::Protocol)
+        let raw = parse_canonical_transaction(raw).ok_or(RpcFailure::Protocol)?;
+        // A node can retain exact transaction bytes from an orphaned block
+        // without retaining the transaction in its mempool. Historical lookup
+        // alone must not suppress rebroadcast of the already-signed bytes.
+        let live = match object.get("in_active_chain") {
+            Some(Value::Bool(false)) => {
+                if !matches!(
+                    parse_verbose_transaction(&value, transaction_id),
+                    Ok(ObservedTransaction::Orphan)
+                ) {
+                    return Err(RpcFailure::Protocol);
+                }
+                let mempool = self
+                    .rpc
+                    .call("getrawmempool", json!([]), RpcLimits::ordinary())
+                    .await?;
+                let ids = mempool.as_array().ok_or(RpcFailure::Protocol)?;
+                let mut present = false;
+                for id in ids {
+                    let id = id
+                        .as_str()
+                        .and_then(parse_canonical_hex32)
+                        .ok_or(RpcFailure::Protocol)?;
+                    present |= id == transaction_id;
+                }
+                present
+            }
+            None | Some(Value::Bool(true)) => true,
+            Some(_) => return Err(RpcFailure::Protocol),
+        };
+        Ok(Some(ExactTransaction { raw, live }))
     }
+}
+
+struct ExactTransaction {
+    raw: Vec<u8>,
+    live: bool,
 }
 
 impl PayoutConfirmationAuthority for NodePayoutAuthority {
@@ -976,7 +1009,7 @@ impl RpcExactBroadcaster {
             .exact_raw_transaction(artifact.transaction_id)
             .await
         {
-            Ok(Some(raw)) if raw == artifact.signed_transaction => {
+            Ok(Some(exact)) if exact.raw == artifact.signed_transaction && exact.live => {
                 let second_tip = self
                     .authority
                     .verified_tip()
@@ -988,8 +1021,10 @@ impl RpcExactBroadcaster {
                     Err(BoundaryFailure::Retryable)
                 };
             }
-            Ok(Some(_)) => return Err(BoundaryFailure::Invariant),
-            Ok(None) => {}
+            Ok(Some(exact)) if exact.raw != artifact.signed_transaction => {
+                return Err(BoundaryFailure::Invariant);
+            }
+            Ok(Some(_)) | Ok(None) => {}
             Err(failure) => return Err(map_prebroadcast_failure(failure)),
         }
 
@@ -1018,8 +1053,10 @@ impl RpcExactBroadcaster {
             .authority
             .exact_raw_transaction(artifact.transaction_id)
             .await;
-        let exact =
-            matches!(exact_lookup, Ok(Some(ref raw)) if *raw == artifact.signed_transaction);
+        let exact = matches!(
+            exact_lookup,
+            Ok(Some(ref exact)) if exact.raw == artifact.signed_transaction && exact.live
+        );
         if exact {
             let second_tip = self
                 .authority
@@ -1032,7 +1069,7 @@ impl RpcExactBroadcaster {
                 Err(BoundaryFailure::Retryable)
             };
         }
-        if matches!(exact_lookup, Ok(Some(_))) {
+        if matches!(exact_lookup, Ok(Some(ref exact)) if exact.raw != artifact.signed_transaction) {
             return Err(BoundaryFailure::Invariant);
         }
         match disposition {
@@ -2293,6 +2330,115 @@ mod tests {
             .rebroadcast_exact(&artifact)
             .await
             .expect("exact existing bytes are authoritative");
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn orphan_broadcast_recovery_requires_mempool_admission() {
+        for admitted in [true, false] {
+            let mut artifact = signed_artifact();
+            artifact.state = PayoutBatchState::Broadcast;
+            let orphan = json!({
+                "txid": hex::encode(TRANSACTION), "hex": "0102",
+                "height": -1, "confirmations": 0,
+                "blockhash": display_hash(BLOCK), "in_active_chain": false,
+            });
+            let mut steps = Vec::new();
+            push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+            steps.push(ok(
+                "getrawtransaction",
+                json!([hex::encode(TRANSACTION), 1]),
+                orphan.clone(),
+            ));
+            steps.push(ok("getrawmempool", json!([]), json!([])));
+            steps.push(ok(
+                "sendrawtransaction",
+                json!(["0102"]),
+                json!(hex::encode(TRANSACTION)),
+            ));
+            steps.push(ok(
+                "getrawtransaction",
+                json!([hex::encode(TRANSACTION), 1]),
+                orphan,
+            ));
+            steps.push(ok(
+                "getrawmempool",
+                json!([]),
+                if admitted {
+                    json!([hex::encode(TRANSACTION)])
+                } else {
+                    json!([])
+                },
+            ));
+            if admitted {
+                push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+            }
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let broadcaster =
+                RpcExactBroadcaster::new(Arc::new(authority(Chain::Wcash, Arc::clone(&rpc))));
+            assert_eq!(
+                broadcaster.rebroadcast_exact(&artifact).await,
+                if admitted {
+                    Ok(())
+                } else {
+                    Err(BoundaryFailure::Ambiguous)
+                }
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_already_in_mempool_is_not_resubmitted() {
+        let mut artifact = signed_artifact();
+        artifact.state = PayoutBatchState::Broadcast;
+        let mut steps = Vec::new();
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        steps.push(ok(
+            "getrawtransaction",
+            json!([hex::encode(TRANSACTION), 1]),
+            json!({
+                "txid": hex::encode(TRANSACTION), "hex": "0102",
+                "height": -1, "confirmations": 0,
+                "blockhash": display_hash(BLOCK), "in_active_chain": false,
+            }),
+        ));
+        steps.push(ok(
+            "getrawmempool",
+            json!([]),
+            json!([hex::encode(TRANSACTION)]),
+        ));
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+        let broadcaster =
+            RpcExactBroadcaster::new(Arc::new(authority(Chain::Wcash, Arc::clone(&rpc))));
+        assert_eq!(broadcaster.rebroadcast_exact(&artifact).await, Ok(()));
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn orphan_lookup_byte_mismatch_never_broadcasts() {
+        let mut artifact = signed_artifact();
+        artifact.state = PayoutBatchState::Broadcast;
+        let mut steps = Vec::new();
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        steps.push(ok(
+            "getrawtransaction",
+            json!([hex::encode(TRANSACTION), 1]),
+            json!({
+                "txid": hex::encode(TRANSACTION), "hex": "0304",
+                "height": -1, "confirmations": 0,
+                "blockhash": display_hash(BLOCK), "in_active_chain": false,
+            }),
+        ));
+        steps.push(ok("getrawmempool", json!([]), json!([])));
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+        let broadcaster =
+            RpcExactBroadcaster::new(Arc::new(authority(Chain::Wcash, Arc::clone(&rpc))));
+        assert_eq!(
+            broadcaster.rebroadcast_exact(&artifact).await,
+            Err(BoundaryFailure::Invariant)
+        );
         rpc.assert_drained();
     }
 
