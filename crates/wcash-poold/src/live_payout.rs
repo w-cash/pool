@@ -737,11 +737,12 @@ impl NodePayoutAuthority {
         // alone must not suppress rebroadcast of the already-signed bytes.
         let live = match object.get("in_active_chain") {
             Some(Value::Bool(false)) => {
-                if !matches!(
-                    parse_verbose_transaction(&value, transaction_id),
-                    Ok(ObservedTransaction::Orphan)
-                ) {
-                    return Err(RpcFailure::Protocol);
+                match parse_verbose_transaction(&value, transaction_id) {
+                    Ok(ObservedTransaction::Mempool) => {
+                        return Ok(Some(ExactTransaction { raw, live: true }));
+                    }
+                    Ok(ObservedTransaction::Orphan) => {}
+                    _ => return Err(RpcFailure::Protocol),
                 }
                 let mempool = self
                     .rpc
@@ -2330,6 +2331,28 @@ mod tests {
             .rebroadcast_exact(&artifact)
             .await
             .expect("exact existing bytes are authoritative");
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn committed_broadcast_recognizes_zebra_mempool_false_without_resubmission() {
+        let mut artifact = signed_artifact();
+        artifact.state = PayoutBatchState::Broadcast;
+        let mut steps = Vec::new();
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        steps.push(ok(
+            "getrawtransaction",
+            json!([hex::encode(TRANSACTION), 1]),
+            json!({
+                "txid": hex::encode(TRANSACTION), "hex": "0102",
+                "in_active_chain": false,
+            }),
+        ));
+        push_tip(&mut steps, WCASH_TESTNET_BRANCH_ID, TIP, 100);
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+        let broadcaster =
+            RpcExactBroadcaster::new(Arc::new(authority(Chain::Wcash, Arc::clone(&rpc))));
+        assert_eq!(broadcaster.rebroadcast_exact(&artifact).await, Ok(()));
         rpc.assert_drained();
     }
 
