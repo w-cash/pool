@@ -561,6 +561,13 @@ impl AutomaticPayoutRuntime {
             ResumeOutcome::Broadcast {
                 batch_id, chain, ..
             } => *batch_id == batch.id && *chain == self.chain,
+            // A definitive signer rejection has already cancelled this exact
+            // batch and released its liabilities. Retry on a later poll without
+            // treating that safe terminal transition as a worker invariant.
+            ResumeOutcome::Terminal {
+                batch_id,
+                state: PayoutBatchState::Cancelled,
+            } => *batch_id == batch.id,
             ResumeOutcome::Idle
             | ResumeOutcome::AwaitingConfirmation { .. }
             | ResumeOutcome::FrozenAfterReorg { .. }
@@ -1358,6 +1365,95 @@ mod tests {
             &reconciliation(chain, &observation(chain)),
         );
         assert_eq!(state.created_keys[0], (chain, expected, RECONCILIATION_ID));
+    }
+
+    #[tokio::test]
+    async fn rejected_created_batch_keeps_worker_available_for_the_next_poll() {
+        let chain = Chain::Wcash;
+        let store = Arc::new(FakeStore::default());
+        let wallet = Arc::new(FakeWallet {
+            chain,
+            observation: Ok(observation(chain)),
+            calls: AtomicUsize::new(0),
+        });
+        let authority = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Ok(snapshot(chain, Vec::new())),
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, settlement) = runtime(
+            chain,
+            store.clone(),
+            wallet.clone(),
+            authority,
+            [
+                Ok(ResumeOutcome::Idle),
+                Ok(ResumeOutcome::Terminal {
+                    batch_id: BATCH_ID,
+                    state: PayoutBatchState::Cancelled,
+                }),
+                Ok(ResumeOutcome::Idle),
+            ],
+        )
+        .unwrap();
+
+        let cancelled = runtime.tick().await.unwrap();
+        assert_eq!(cancelled.batch_created, Some(BATCH_ID));
+        assert_eq!(
+            cancelled.settlement,
+            ResumeOutcome::Terminal {
+                batch_id: BATCH_ID,
+                state: PayoutBatchState::Cancelled,
+            }
+        );
+        // The next poll must obtain a fresh wallet observation instead of
+        // requiring service-manager recovery or reusing the rejected request.
+        store.state.lock().unwrap().create_failure = Some(LifecycleStoreFailure::NoPayableBalances);
+        let next = runtime.tick().await.unwrap();
+        assert_eq!(next.batch_created, None);
+        assert_eq!(next.settlement, ResumeOutcome::Idle);
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*settlement.calls.lock().unwrap(), [chain, chain, chain]);
+    }
+
+    #[tokio::test]
+    async fn created_batch_cancellation_cannot_hide_a_substituted_or_invalid_terminal_result() {
+        let chain = Chain::Wcash;
+        for (batch_id, state) in [
+            (Uuid::from_u128(0x9999), PayoutBatchState::Cancelled),
+            (BATCH_ID, PayoutBatchState::Confirmed),
+            (BATCH_ID, PayoutBatchState::Draft),
+        ] {
+            let store = Arc::new(FakeStore::default());
+            let wallet = Arc::new(FakeWallet {
+                chain,
+                observation: Ok(observation(chain)),
+                calls: AtomicUsize::new(0),
+            });
+            let authority = Arc::new(FakeAuthority {
+                chain,
+                snapshot: Ok(snapshot(chain, Vec::new())),
+                calls: AtomicUsize::new(0),
+            });
+            let (runtime, _) = runtime(
+                chain,
+                store,
+                wallet,
+                authority,
+                [
+                    Ok(ResumeOutcome::Idle),
+                    Ok(ResumeOutcome::Terminal { batch_id, state }),
+                ],
+            )
+            .unwrap();
+            assert!(matches!(
+                runtime.tick().await,
+                Err(PayoutRuntimeError::Invariant {
+                    operation: "created_batch_resume_binding",
+                    ..
+                })
+            ));
+        }
     }
 
     #[tokio::test]
