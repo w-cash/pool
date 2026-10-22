@@ -7,7 +7,10 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, TryLockError,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -167,6 +170,43 @@ pub struct WolfWalletTransport {
     wallet_database: PathBuf,
     lightwalletd_endpoint: String,
     invocation_lock: Arc<Mutex<()>>,
+    payout_sign_rejection_metrics: Arc<PayoutSignRejectionMetrics>,
+}
+
+/// Process-lifetime, non-sensitive payout-sign rejection counters.
+///
+/// These are intentionally distinct from durable accounting: they are only
+/// operational observability for an already rejected native-wallet request.
+#[derive(Default)]
+struct PayoutSignRejectionMetrics {
+    unknown: AtomicU64,
+    fee_limit: AtomicU64,
+    active_pending_transaction: AtomicU64,
+}
+
+impl PayoutSignRejectionMetrics {
+    fn record(&self, reason_code: WirePayoutSignRejectionReasonCode) -> u64 {
+        let counter = match reason_code {
+            WirePayoutSignRejectionReasonCode::Unknown => &self.unknown,
+            WirePayoutSignRejectionReasonCode::FeeLimit => &self.fee_limit,
+            WirePayoutSignRejectionReasonCode::ActivePendingTransaction => {
+                &self.active_pending_transaction
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    #[cfg(test)]
+    fn count(&self, reason_code: WirePayoutSignRejectionReasonCode) -> u64 {
+        let counter = match reason_code {
+            WirePayoutSignRejectionReasonCode::Unknown => &self.unknown,
+            WirePayoutSignRejectionReasonCode::FeeLimit => &self.fee_limit,
+            WirePayoutSignRejectionReasonCode::ActivePendingTransaction => {
+                &self.active_pending_transaction
+            }
+        };
+        counter.load(Ordering::Relaxed)
+    }
 }
 
 impl WolfWalletTransport {
@@ -187,6 +227,7 @@ impl WolfWalletTransport {
             wallet_database,
             lightwalletd_endpoint,
             invocation_lock: Arc::new(Mutex::new(())),
+            payout_sign_rejection_metrics: Arc::new(PayoutSignRejectionMetrics::default()),
             network: WalletNetwork::Testnet,
         })
     }
@@ -301,13 +342,21 @@ impl WolfWalletTransport {
         if subcommand == "payout-sign" {
             arguments.push(OsString::from("--seed-stdin"));
         }
+        let payout_sign_metrics =
+            (subcommand == "payout-sign").then_some(self.payout_sign_rejection_metrics.as_ref());
         run_child(
             self.program.path(),
             &arguments,
             input,
             timeout,
             max_response_bytes,
+            payout_sign_metrics,
         )
+    }
+
+    #[cfg(test)]
+    fn payout_sign_rejection_count(&self, reason_code: WirePayoutSignRejectionReasonCode) -> u64 {
+        self.payout_sign_rejection_metrics.count(reason_code)
     }
 
     /// Invokes Wolf's seedless, tip-attested collector observation command.
@@ -764,16 +813,79 @@ enum WireBroadcastOutcome {
 struct WireFailure {
     protocol_version: u32,
     code: WireFailureCode,
-    error: String,
+    #[serde(rename = "error")]
+    error_text: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum WireFailureCode {
     Rejected,
     Unavailable,
     IdempotencyConflict,
     Ambiguous,
+}
+
+/// Fixed native-wallet categories accepted for payout-sign rejections.
+///
+/// Keeping this parser allow-listed prevents error text, filesystem paths,
+/// transaction identifiers, values, or unchecked wallet strings becoming a
+/// pool log label or metric value.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WirePayoutSignRejectionReasonCode {
+    Unknown,
+    FeeLimit,
+    ActivePendingTransaction,
+}
+
+impl WirePayoutSignRejectionReasonCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::FeeLimit => "fee_limit",
+            Self::ActivePendingTransaction => "active_pending_transaction",
+        }
+    }
+}
+
+fn payout_sign_rejection_reason(error_text: &str) -> Option<WirePayoutSignRejectionReasonCode> {
+    match error_text {
+        "payout_sign_rejected:unknown" => Some(WirePayoutSignRejectionReasonCode::Unknown),
+        "payout_sign_rejected:fee_limit" => Some(WirePayoutSignRejectionReasonCode::FeeLimit),
+        "payout_sign_rejected:active_pending_transaction" => {
+            Some(WirePayoutSignRejectionReasonCode::ActivePendingTransaction)
+        }
+        _ => None,
+    }
+}
+
+fn parse_wire_failure(
+    bytes: &[u8],
+    payout_sign_metrics: Option<&PayoutSignRejectionMetrics>,
+) -> Result<Option<WireFailureCode>, InvokeError> {
+    let Ok(failure) = serde_json::from_slice::<WireFailure>(bytes) else {
+        return Ok(None);
+    };
+    if failure.protocol_version != PAYOUT_FAILURE_PROTOCOL_VERSION || failure.error_text.is_empty()
+    {
+        return Ok(None);
+    }
+    if let (Some(metrics), WireFailureCode::Rejected, Some(reason_code)) = (
+        payout_sign_metrics,
+        failure.code,
+        payout_sign_rejection_reason(&failure.error_text),
+    ) {
+        let total = metrics.record(reason_code);
+        // This line is deliberately a bounded metric, not a native wallet
+        // diagnostic: it contains no paths, raw errors, transaction IDs,
+        // recipient data, or amounts.
+        eprintln!(
+            "wcash_payout_sign_rejection_total reason_code={} total={total}",
+            reason_code.as_str()
+        );
+    }
+    Ok(Some(failure.code))
 }
 
 fn parse_wire_identity(bytes: &[u8]) -> Result<WalletIdentity, NativeWalletError> {
@@ -982,6 +1094,7 @@ fn run_child(
     input: Zeroizing<Vec<u8>>,
     timeout: Duration,
     max_response_bytes: usize,
+    payout_sign_metrics: Option<&PayoutSignRejectionMetrics>,
 ) -> Result<Zeroizing<Vec<u8>>, InvokeError> {
     let mut command = Command::new(program);
     command
@@ -1052,13 +1165,7 @@ fn run_child(
         return Err(InvokeError::ResponseLimit);
     }
     if !status.success() {
-        let failure = serde_json::from_slice::<WireFailure>(&error.bytes)
-            .ok()
-            .filter(|failure| {
-                failure.protocol_version == PAYOUT_FAILURE_PROTOCOL_VERSION
-                    && !failure.error.is_empty()
-            })
-            .map(|failure| failure.code);
+        let failure = parse_wire_failure(&error.bytes, payout_sign_metrics)?;
         return Err(InvokeError::Exited(failure));
     }
     // A successful machine-protocol command has no diagnostic channel. Treat
@@ -1701,6 +1808,128 @@ mod tests {
         assert_eq!(
             transport.identity(TEST_PROCESS_TIMEOUT, 4_096),
             Err(NativeWalletError::IdempotencyConflict)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payout_sign_rejection_reason_is_counted_without_changing_rejection() {
+        let failure = serde_json::json!({
+            "protocol_version": 1,
+            "code": "rejected",
+            "error": "payout_sign_rejected:fee_limit"
+        });
+        let script = format!("printf '%s' '{}' >&2; exit 1", failure);
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert!(matches!(
+            transport.invoke_wallet(
+                "payout-sign",
+                true,
+                Zeroizing::new(Vec::new()),
+                TEST_PROCESS_TIMEOUT,
+                4_096,
+            ),
+            Err(InvokeError::Exited(Some(WireFailureCode::Rejected)))
+        ));
+        assert_eq!(
+            transport.payout_sign_rejection_count(WirePayoutSignRejectionReasonCode::FeeLimit),
+            1
+        );
+        assert_eq!(
+            map_sign_invoke_error(InvokeError::Exited(Some(WireFailureCode::Rejected))),
+            NativeWalletError::Rejected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejection_reason_is_conservative_and_legacy_wallet_shape_is_accepted() {
+        let legacy_failure = serde_json::json!({
+            "protocol_version": 1,
+            "code": "rejected",
+            "error": "legacy failure"
+        });
+        let script = format!("printf '%s' '{}' >&2; exit 1", legacy_failure);
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert!(matches!(
+            transport.invoke_wallet(
+                "payout-sign",
+                true,
+                Zeroizing::new(Vec::new()),
+                TEST_PROCESS_TIMEOUT,
+                4_096,
+            ),
+            Err(InvokeError::Exited(Some(WireFailureCode::Rejected)))
+        ));
+        assert_eq!(
+            transport.payout_sign_rejection_count(WirePayoutSignRejectionReasonCode::FeeLimit),
+            0
+        );
+
+        let unknown_failure = serde_json::json!({
+            "protocol_version": 1,
+            "code": "rejected",
+            "error": "payout_sign_rejected:unknown"
+        });
+        let script = format!("printf '%s' '{}' >&2; exit 1", unknown_failure);
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert!(matches!(
+            transport.invoke_wallet(
+                "payout-sign",
+                true,
+                Zeroizing::new(Vec::new()),
+                TEST_PROCESS_TIMEOUT,
+                4_096,
+            ),
+            Err(InvokeError::Exited(Some(WireFailureCode::Rejected)))
+        ));
+        assert_eq!(
+            transport.payout_sign_rejection_count(WirePayoutSignRejectionReasonCode::Unknown),
+            1
+        );
+
+        let unallowlisted_failure = serde_json::json!({
+            "protocol_version": 1,
+            "code": "rejected",
+            "error": "payout_sign_rejected:untrusted_detail"
+        });
+        let script = format!("printf '%s' '{}' >&2; exit 1", unallowlisted_failure);
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert!(matches!(
+            transport.invoke_wallet(
+                "payout-sign",
+                true,
+                Zeroizing::new(Vec::new()),
+                TEST_PROCESS_TIMEOUT,
+                4_096,
+            ),
+            Err(InvokeError::Exited(Some(WireFailureCode::Rejected)))
+        ));
+        assert_eq!(
+            transport.payout_sign_rejection_count(WirePayoutSignRejectionReasonCode::Unknown),
+            0
+        );
+
+        let reasoned_failure = serde_json::json!({
+            "protocol_version": 1,
+            "code": "rejected",
+            "error": "payout_sign_rejected:fee_limit"
+        });
+        let script = format!("printf '%s' '{}' >&2; exit 1", reasoned_failure);
+        let (_directory, _program, transport) = fixture_transport(&script);
+        assert!(matches!(
+            transport.invoke_wallet(
+                "payout-identity",
+                false,
+                Zeroizing::new(Vec::new()),
+                TEST_PROCESS_TIMEOUT,
+                4_096,
+            ),
+            Err(InvokeError::Exited(Some(WireFailureCode::Rejected)))
+        ));
+        assert_eq!(
+            transport.payout_sign_rejection_count(WirePayoutSignRejectionReasonCode::FeeLimit),
+            0
         );
     }
 
