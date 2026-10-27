@@ -26,14 +26,18 @@ use tokio::{
 use uuid::Uuid;
 use wcash_pool_portal::ChainNetwork;
 use wcash_pool_store::{
-    Chain, PayoutBatchState, PayoutConfirmation, PayoutReorg, PayoutWatch, SignedPayoutArtifact,
-    WalletObservation,
+    Chain, PayoutBatchState, PayoutConfirmation, PayoutExpiryEvidence, PayoutReorg, PayoutWatch,
+    SignedPayoutArtifact, WalletObservation,
 };
 use wcash_wec_payout_signer::WCASH_TESTNET_BRANCH_ID;
 use wcash_zec_payout_signer::validated_parent_payout_address_commitment;
 use zeroize::{Zeroize, Zeroizing};
 use zip32::fingerprint::SeedFingerprint;
 
+use crate::payout_expiry::{
+    ExpiryAuthority, ExpiryChainState, ExpiryObservation, ExpiryWatch, MAX_EXPIRY_CANDIDATES,
+    WCASH_EXPIRY_FINALITY_DEPTH,
+};
 use crate::{
     config::read_protected,
     payout_runtime::{
@@ -769,6 +773,145 @@ impl NodePayoutAuthority {
 struct ExactTransaction {
     raw: Vec<u8>,
     live: bool,
+}
+
+impl ExpiryAuthority for NodePayoutAuthority {
+    fn expiry_snapshot(
+        &self,
+        watches: Vec<ExpiryWatch>,
+    ) -> ObservationFuture<'_, Vec<ExpiryObservation>> {
+        Box::pin(async move {
+            if self.chain != Chain::Wcash
+                || watches.is_empty()
+                || watches.len() > MAX_EXPIRY_CANDIDATES as usize
+            {
+                return Err(ObservationFailure::Invariant);
+            }
+            let first_tip = self.verified_tip().await?;
+            let observed_at = unix_time()?;
+            let mut observations = Vec::with_capacity(watches.len());
+            let mut checkpoints = Vec::new();
+            let mut seen = HashSet::new();
+            for watch in &watches {
+                let artifact = &watch.candidate.artifact;
+                if artifact.chain != Chain::Wcash
+                    || artifact.batch_id.is_nil()
+                    || !seen.insert(artifact.transaction_id)
+                    || watch.expiry_height == 0
+                    || !matches!(
+                        artifact.state,
+                        PayoutBatchState::Signed
+                            | PayoutBatchState::Broadcasting
+                            | PayoutBatchState::Broadcast
+                            | PayoutBatchState::ExpiryPending
+                    )
+                {
+                    return Err(ObservationFailure::Invariant);
+                }
+                let held = artifact.state == PayoutBatchState::ExpiryPending;
+                if !held && first_tip.height <= watch.expiry_height {
+                    observations.push(ExpiryObservation {
+                        batch_id: artifact.batch_id,
+                        state: ExpiryChainState::Unexpired,
+                    });
+                    continue;
+                }
+                let response = self
+                    .rpc
+                    .call(
+                        "getrawtransaction",
+                        json!([hex::encode(artifact.transaction_id), 1]),
+                        RpcLimits::ordinary(),
+                    )
+                    .await;
+                let state = match response {
+                    Ok(value) => {
+                        let exact = value
+                            .get("hex")
+                            .and_then(Value::as_str)
+                            .and_then(parse_canonical_transaction)
+                            .ok_or(ObservationFailure::Invariant)?;
+                        if exact != artifact.signed_transaction {
+                            return Err(ObservationFailure::Invariant);
+                        }
+                        match parse_verbose_transaction(&value, artifact.transaction_id)? {
+                            ObservedTransaction::Mined(confirmation) => {
+                                if self.block_hash(confirmation.block_height).await?
+                                    != confirmation.block_hash
+                                    || exact_confirmations(
+                                        first_tip.height,
+                                        confirmation.block_height,
+                                    ) != Some(confirmation.confirmations)
+                                {
+                                    return Err(ObservationFailure::Unavailable);
+                                }
+                                ExpiryChainState::Mined(confirmation)
+                            }
+                            _ => ExpiryChainState::Unresolved,
+                        }
+                    }
+                    Err(RpcFailure::Server(-5)) if first_tip.height > watch.expiry_height => {
+                        let evidence = PayoutExpiryEvidence {
+                            transaction_id: artifact.transaction_id,
+                            signed_transaction_sha256: Sha256::digest(&artifact.signed_transaction)
+                                .into(),
+                            expiry_height: watch.expiry_height,
+                            tip_hash: first_tip.hash,
+                            tip_height: first_tip.height,
+                            observed_at,
+                        };
+                        let finalized = held
+                            && watch
+                                .expiry_height
+                                .checked_add(WCASH_EXPIRY_FINALITY_DEPTH)
+                                .is_some_and(|h| first_tip.height >= h);
+                        if finalized {
+                            // Wolf's full-node lookup checks the mempool, all
+                            // retained nonfinalized branches and finalized DB.
+                            // A separate explicit mempool check must agree.
+                            let mempool = self
+                                .rpc
+                                .call("getrawmempool", json!([]), RpcLimits::ordinary())
+                                .await
+                                .map_err(map_observation_rpc_failure)?;
+                            let ids = mempool.as_array().ok_or(ObservationFailure::Invariant)?;
+                            for id in ids {
+                                let id = id
+                                    .as_str()
+                                    .and_then(parse_canonical_hex32)
+                                    .ok_or(ObservationFailure::Invariant)?;
+                                if id == artifact.transaction_id {
+                                    return Err(ObservationFailure::Unavailable);
+                                }
+                            }
+                            checkpoints.push((
+                                watch.expiry_height,
+                                self.block_hash(watch.expiry_height).await?,
+                            ));
+                            ExpiryChainState::FinalMissing(evidence)
+                        } else {
+                            ExpiryChainState::Missing(evidence)
+                        }
+                    }
+                    Err(RpcFailure::Server(-5)) => ExpiryChainState::Unresolved,
+                    Err(e) => return Err(map_observation_rpc_failure(e)),
+                };
+                observations.push(ExpiryObservation {
+                    batch_id: artifact.batch_id,
+                    state,
+                });
+            }
+            if self.verified_tip().await? != first_tip {
+                return Err(ObservationFailure::Unavailable);
+            }
+            for (height, hash) in checkpoints {
+                if self.block_hash(height).await? != hash {
+                    return Err(ObservationFailure::Unavailable);
+                }
+            }
+            Ok(observations)
+        })
+    }
 }
 
 impl PayoutConfirmationAuthority for NodePayoutAuthority {
@@ -2858,3 +3001,7 @@ mod tests {
         server.await.expect("RPC server task");
     }
 }
+
+#[cfg(test)]
+#[path = "payout_expiry_authority_tests.rs"]
+mod expiry_tests;

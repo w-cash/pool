@@ -13,6 +13,7 @@ mod live_payout;
 mod miner_telemetry;
 #[cfg(test)]
 mod payout;
+mod payout_expiry;
 pub mod payout_runtime;
 #[cfg(all(test, feature = "regtest", unix))]
 #[path = "../tests/settlement/regtest_w1_lifecycle.rs"]

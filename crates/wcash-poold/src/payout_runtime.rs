@@ -188,7 +188,7 @@ impl PayoutLifecycleStore for PostgresStore {
     }
 }
 
-fn classify_store_error(error: StoreError) -> LifecycleStoreFailure {
+pub(crate) fn classify_store_error(error: StoreError) -> LifecycleStoreFailure {
     match error {
         StoreError::NoPayableBalances => LifecycleStoreFailure::NoPayableBalances,
         StoreError::WalletReconciliationBlocked
@@ -399,6 +399,7 @@ pub struct AutomaticPayoutRuntime {
     wallet: Arc<dyn WalletObservationSource>,
     authority: Arc<dyn PayoutConfirmationAuthority>,
     settlement: Arc<dyn SettlementDriver>,
+    expiry_recovery: Option<Arc<dyn crate::payout_expiry::PayoutExpiryDriver>>,
 }
 
 impl AutomaticPayoutRuntime {
@@ -425,7 +426,21 @@ impl AutomaticPayoutRuntime {
             wallet,
             authority,
             settlement,
+            expiry_recovery: None,
         })
+    }
+
+    /// Installs the WEC-only held-reservation recovery gate. It cannot be
+    /// attached to automatic ZEC payments.
+    pub(crate) fn with_expiry_recovery(
+        mut self,
+        recovery: Arc<dyn crate::payout_expiry::PayoutExpiryDriver>,
+    ) -> Result<Self, PayoutRuntimeError> {
+        if self.chain != Chain::Wcash {
+            return Err(PayoutRuntimeError::InvalidConfiguration);
+        }
+        self.expiry_recovery = Some(recovery);
+        Ok(self)
     }
 
     /// Runs one ordered lifecycle pass.
@@ -434,6 +449,16 @@ impl AutomaticPayoutRuntime {
     /// An unresolved broadcast prevents another wallet snapshot or batch. Only
     /// an idle settlement path may reconcile, reserve, and sign fresh outputs.
     pub async fn tick(&self) -> Result<PayoutTick, PayoutRuntimeError> {
+        if let Some(recovery) = &self.expiry_recovery {
+            if !recovery.recover().await? {
+                return Ok(PayoutTick {
+                    watches_checked: 0,
+                    confirmations_recorded: 0,
+                    batch_created: None,
+                    settlement: ResumeOutcome::Idle,
+                });
+            }
+        }
         let page = self
             .store
             .payout_watches(self.chain, self.policy.maximum_confirmation_watches)
@@ -1045,6 +1070,7 @@ mod tests {
     #[derive(Default)]
     struct FakeStoreState {
         watches: Vec<PayoutWatch>,
+        watch_calls: usize,
         watch_failure: Option<LifecycleStoreFailure>,
         reconciliations: Vec<WalletObservation>,
         created_keys: Vec<(Chain, Uuid, Uuid)>,
@@ -1102,7 +1128,8 @@ mod tests {
             _maximum: u32,
         ) -> LifecycleStoreFuture<'_, PayoutWatchPage> {
             Box::pin(async move {
-                let state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap();
+                state.watch_calls += 1;
                 if let Some(failure) = state.watch_failure {
                     Err(failure)
                 } else {
@@ -1906,5 +1933,139 @@ mod tests {
             ),
             Err(PayoutRuntimeError::InvalidConfiguration)
         ));
+    }
+
+    struct FakeExpiryGate {
+        fail: bool,
+        calls: AtomicUsize,
+    }
+
+    impl crate::payout_expiry::PayoutExpiryDriver for FakeExpiryGate {
+        fn recover(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, PayoutRuntimeError>> + Send + '_>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err(PayoutRuntimeError::AuthorityUnavailable {
+                        chain: Chain::Wcash,
+                        operation: "test_expiry_gate",
+                    })
+                } else {
+                    Ok(false)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_recovery_deferred_pass_never_reaches_any_normal_payout_boundary() {
+        let chain = Chain::Wcash;
+        let store = Arc::new(FakeStore::default());
+        let wallet = Arc::new(FakeWallet {
+            chain,
+            observation: Err(ObservationFailure::Invariant),
+            calls: AtomicUsize::new(0),
+        });
+        let authority = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Err(ObservationFailure::Invariant),
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, settlement) =
+            runtime(chain, store.clone(), wallet.clone(), authority.clone(), []).unwrap();
+        let gate = Arc::new(FakeExpiryGate {
+            fail: false,
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime.with_expiry_recovery(gate.clone()).unwrap();
+
+        let result = runtime.tick().await.unwrap();
+        assert_eq!(result.watches_checked, 0);
+        assert_eq!(result.confirmations_recorded, 0);
+        assert_eq!(result.batch_created, None);
+        assert_eq!(result.settlement, ResumeOutcome::Idle);
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert!(settlement.calls.lock().unwrap().is_empty());
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.watch_calls, 0);
+        assert!(state.reconciliations.is_empty());
+        assert!(state.created_keys.is_empty());
+        assert!(state.confirmations.is_empty());
+        assert!(state.reorgs.is_empty());
+        assert!(state.cursor_advances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expiry_recovery_failure_propagates_before_any_normal_payout_boundary() {
+        let chain = Chain::Wcash;
+        let store = Arc::new(FakeStore::default());
+        let wallet = Arc::new(FakeWallet {
+            chain,
+            observation: Ok(observation(chain)),
+            calls: AtomicUsize::new(0),
+        });
+        let authority = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Ok(snapshot(chain, vec![])),
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, settlement) =
+            runtime(chain, store.clone(), wallet.clone(), authority.clone(), []).unwrap();
+        let gate = Arc::new(FakeExpiryGate {
+            fail: true,
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime.with_expiry_recovery(gate.clone()).unwrap();
+
+        assert!(matches!(
+            runtime.tick().await,
+            Err(PayoutRuntimeError::AuthorityUnavailable {
+                chain: Chain::Wcash,
+                operation: "test_expiry_gate",
+            })
+        ));
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert!(settlement.calls.lock().unwrap().is_empty());
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.watch_calls, 0);
+        assert!(state.reconciliations.is_empty());
+        assert!(state.created_keys.is_empty());
+        assert!(state.confirmations.is_empty());
+        assert!(state.reorgs.is_empty());
+        assert!(state.cursor_advances.is_empty());
+    }
+
+    #[test]
+    fn expiry_recovery_cannot_be_attached_to_automatic_zcash() {
+        let chain = Chain::Zcash;
+        let store = Arc::new(FakeStore::default());
+        let wallet = Arc::new(FakeWallet {
+            chain,
+            observation: Ok(observation(chain)),
+            calls: AtomicUsize::new(0),
+        });
+        let authority = Arc::new(FakeAuthority {
+            chain,
+            snapshot: Ok(snapshot(chain, vec![])),
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, _) = runtime(chain, store, wallet, authority, []).unwrap();
+        let gate = Arc::new(FakeExpiryGate {
+            fail: false,
+            calls: AtomicUsize::new(0),
+        });
+        assert!(matches!(
+            runtime.with_expiry_recovery(gate.clone()),
+            Err(PayoutRuntimeError::InvalidConfiguration)
+        ));
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
     }
 }

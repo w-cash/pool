@@ -81,6 +81,10 @@ pub struct WecPreparedPayout {
     pub signed_transaction: Vec<u8>,
     /// Exact network fee reconciled against WEC collector value.
     pub network_fee_zat: u64,
+    /// Wallet-parser-verified proposal height, retained in the immutable journal.
+    pub target_height: u32,
+    /// Wallet-parser-verified consensus expiry height.
+    pub expiry_height: u32,
 }
 
 /// Prepare-only journal recovery result used to order startup reconciliation.
@@ -270,6 +274,49 @@ impl WecPayoutSigner {
             Ok(Some(WecPreparedRecovery {
                 payout: prepared_from_record(&record)?,
             }))
+        })
+    }
+
+    /// Independently rechecks an existing journal artifact against the native
+    /// wallet's persisted intent and consensus parser. This operation cannot
+    /// reserve, sign, broadcast, refresh, or replace a transaction. In
+    /// particular, an absent journal or wallet record is never recreated.
+    pub fn inspect_prepared(
+        &self,
+        request: &WecPayoutRequest,
+    ) -> Result<WecPreparedPayout, WecPayoutError> {
+        self.config.validate()?;
+        let validated = self.validate_request(request)?;
+        let _process_guard = lock_without_poison(&self.process_lock);
+        self.journal.with_exclusive_lock(|| {
+            let record = self
+                .journal
+                .load(request.batch.batch_id)?
+                .ok_or(WecPayoutError::JournalCorrupt)?;
+            if record.pipeline_commitment != validated.pipeline_commitment
+                || record.portal_commitment != validated.portal_commitment
+                || record.output_total_zat != validated.output_total_zat
+                || record.stage.artifact().is_none()
+            {
+                return Err(WecPayoutError::IdempotencyConflict);
+            }
+            let expected = record
+                .stage
+                .artifact()
+                .ok_or(WecPayoutError::JournalCorrupt)?;
+            let inspected = self
+                .recover_existing(request, &validated)?
+                .ok_or(WecPayoutError::JournalCorrupt)?;
+            if inspected.raw_transaction_hex != expected.raw_transaction_hex
+                || inspected.transaction_id != expected.transaction_id
+                || inspected.unsigned_digest != expected.unsigned_digest
+                || inspected.fee_zat != expected.fee_zat
+                || inspected.target_height != expected.target_height
+                || inspected.expiry_height != expected.expiry_height
+            {
+                return Err(WecPayoutError::IdempotencyConflict);
+            }
+            prepared_from_record(&record)
         })
     }
 
@@ -836,6 +883,8 @@ fn prepared_from_record(record: &JournalRecord) -> Result<WecPreparedPayout, Wec
         transaction_id_bytes,
         signed_transaction,
         network_fee_zat: artifact.fee_zat,
+        target_height: artifact.target_height,
+        expiry_height: artifact.expiry_height,
     })
 }
 

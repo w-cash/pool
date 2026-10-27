@@ -183,6 +183,8 @@ Deliverables:
 - independent Wcash and Zcash reward maturity and reorg reversal;
 - explicit fee, rounding, dust, minimum payout, and adjustment rules;
 - idempotent payout batches with an isolated wallet/signer boundary;
+- [held-reservation recovery for expired WEC transactions](wec-expired-payout-recovery.md),
+  including finality, duplicate-release and original-confirmation regressions;
 - an NU6.3 Zcash collector test that scans and reconciles direct Ironwood
   coinbase, constructs and signs a payout, broadcasts it through the selected
   parent stack, survives restart/rescan, and reverses state safely on reorg;

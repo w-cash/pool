@@ -680,12 +680,13 @@ impl SettlementOrchestrator {
                     transaction_id: artifact.transaction_id,
                 })
             }
-            PayoutBatchState::Confirmed | PayoutBatchState::Cancelled => {
-                Ok(ResumeOutcome::Terminal {
-                    batch_id: batch.id,
-                    state: batch.state,
-                })
-            }
+            PayoutBatchState::Confirmed
+            | PayoutBatchState::Cancelled
+            | PayoutBatchState::ExpiryPending
+            | PayoutBatchState::Expired => Ok(ResumeOutcome::Terminal {
+                batch_id: batch.id,
+                state: batch.state,
+            }),
         }
     }
 
@@ -753,6 +754,8 @@ impl SettlementOrchestrator {
             PayoutBatchState::Broadcast => Ok(ReconciliationGate::ExternalEffectPending),
             PayoutBatchState::Reorged
             | PayoutBatchState::Confirmed
+            | PayoutBatchState::ExpiryPending
+            | PayoutBatchState::Expired
             | PayoutBatchState::Cancelled => Err(SettlementError::Invariant(
                 "startup payout reconciliation state",
             )),
