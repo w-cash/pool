@@ -34,6 +34,10 @@ const PUBLIC_PROJECTION_WAIT: Duration = Duration::from_secs(5);
 const PUBLIC_PROJECTION_POLL: Duration = Duration::from_millis(25);
 const MAX_PPLNS_SHARES: i64 = 1_000_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
+const MAX_PAYOUT_EXPIRY_CANDIDATES: u32 = 8;
+const PAYOUT_HELD_LIMIT_FOR_NEW_BATCH: i64 = 2;
+/// One more than Wolf's maximum reorganization depth.
+const PAYOUT_EXPIRY_FINALITY_DEPTH: u32 = 1_001;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
 // The wallet observes newly matured coinbase outputs at the chain tip before
 // the backend journal projector has necessarily applied the corresponding
@@ -332,6 +336,11 @@ pub enum PayoutBatchState {
     Broadcasting,
     /// The exact transaction was accepted for broadcast.
     Broadcast,
+    /// Expired on the observed tip, but its full reserve remains held until
+    /// absence below the node finalization frontier is proven.
+    ExpiryPending,
+    /// Finalized non-inclusion released the reserve; signed facts remain intact.
+    Expired,
     /// The transaction reached the configured confirmation policy.
     Confirmed,
     /// A previously confirmed transaction left the best chain; chain payouts
@@ -349,6 +358,8 @@ impl PayoutBatchState {
             Self::Signed => "signed",
             Self::Broadcasting => "broadcasting",
             Self::Broadcast => "broadcast",
+            Self::ExpiryPending => "expiry_pending",
+            Self::Expired => "expired",
             Self::Confirmed => "confirmed",
             Self::Reorged => "reorged",
             Self::Cancelled => "cancelled",
@@ -362,6 +373,8 @@ impl PayoutBatchState {
             "signed" => Ok(Self::Signed),
             "broadcasting" => Ok(Self::Broadcasting),
             "broadcast" => Ok(Self::Broadcast),
+            "expiry_pending" => Ok(Self::ExpiryPending),
+            "expired" => Ok(Self::Expired),
             "confirmed" => Ok(Self::Confirmed),
             "reorged" => Ok(Self::Reorged),
             "cancelled" => Ok(Self::Cancelled),
@@ -453,6 +466,42 @@ pub struct SignedPayoutArtifact {
     pub signed_transaction: Vec<u8>,
     /// Exact network fee reconciled against the collector asset.
     pub network_fee_zat: u64,
+}
+
+/// Stable-tip chain-authority evidence bound to one exact signed WEC payout.
+///
+/// The caller must independently verify canonical and mempool non-inclusion.
+/// SQL validates identity, freshness and finality arithmetic; it does not decide
+/// chain consensus or turn an RPC "not found" into proof of non-inclusion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutExpiryEvidence {
+    /// Exact display-order transaction identifier from the signed artifact.
+    pub transaction_id: [u8; 32],
+    /// SHA-256 of the entire immutable signed transaction.
+    pub signed_transaction_sha256: [u8; 32],
+    /// Consensus expiry height parsed from the exact signed bytes.
+    pub expiry_height: u32,
+    /// Stable canonical observation tip in chain wire byte order.
+    pub tip_hash: [u8; 32],
+    /// Height of that stable canonical tip.
+    pub tip_height: u32,
+    /// Observation time as Unix seconds.
+    pub observed_at: u64,
+}
+
+/// Bounded WEC recovery work, including held reserves which normal payout
+/// resumption must never rebroadcast.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutExpiryCandidate {
+    /// Immutable signed bytes and current durable lifecycle state.
+    pub artifact: SignedPayoutArtifact,
+    /// Exact original request reconstructed without granting signing authority.
+    pub request: PayoutBatchRequest,
+    /// Original wallet reconciliation tip for audit lineage. This is not a
+    /// consensus minimum inclusion height for the transaction.
+    pub reconciliation_tip_height: u32,
+    /// Immutable first expiry observation, when the reserve is quarantined.
+    pub quarantine: Option<PayoutExpiryEvidence>,
 }
 
 /// Exact best-chain evidence authoritatively observed for a payout transaction.
@@ -1807,6 +1856,13 @@ impl PostgresStore {
         if has_ambiguous_payout {
             return Err(StoreError::WalletReconciliationBlocked);
         }
+        ensure_held_payouts_expired_at(
+            &mut transaction,
+            self.identity.id,
+            observation.chain,
+            observation.best_tip_height,
+        )
+        .await?;
 
         let snapshot =
             ledger_snapshot(&mut transaction, self.identity.id, observation.chain, None).await?;
@@ -1933,6 +1989,13 @@ impl PostgresStore {
         .await?;
         let current_snapshot =
             ledger_snapshot(&mut transaction, self.identity.id, chain, None).await?;
+        ensure_held_payouts_expired_at(
+            &mut transaction,
+            self.identity.id,
+            chain,
+            checkpoint.best_tip_height,
+        )
+        .await?;
         if checkpoint.ledger_root != current_snapshot.root
             || checkpoint.ledger_transaction_count != current_snapshot.transaction_count
             || checkpoint.wallet_spendable_zat != current_snapshot.collector_spendable_zat
@@ -1980,7 +2043,7 @@ impl PostgresStore {
                  SELECT pi.account_id,MAX(pb.created_at) AS last_payout_at \
                  FROM payout_items pi JOIN payout_batches pb \
                    ON (pb.deployment_id,pb.id)=(pi.deployment_id,pi.batch_id) \
-                 WHERE pb.deployment_id=$1 AND pb.chain=$2 AND pb.state <> 'cancelled' \
+                 WHERE pb.deployment_id=$1 AND pb.chain=$2 AND pb.state NOT IN ('cancelled','expired') \
                  GROUP BY pi.account_id \
              ) paid ON paid.account_id=e.account_id \
              WHERE e.deployment_id=$1 AND t.chain=$2 \
@@ -2407,6 +2470,212 @@ impl PostgresStore {
         Ok(batches)
     }
 
+    /// Lists at most eight exact WEC artifacts eligible for expiry inspection.
+    /// Overflow fails closed instead of silently skipping a held reserve.
+    pub async fn list_payout_expiry_candidates(
+        &self,
+        maximum: u32,
+    ) -> Result<Vec<PayoutExpiryCandidate>, StoreError> {
+        if !(1..=MAX_PAYOUT_EXPIRY_CANDIDATES).contains(&maximum) {
+            return Err(StoreError::InvalidPayoutExpiryEvidence);
+        }
+        let mut transaction = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT b.id,b.chain,b.state,b.unsigned_digest,b.transaction_id, \
+                    b.signed_transaction,b.network_fee_zat,r.best_tip_height, \
+                    q.expiry_height,q.transaction_id AS q_transaction_id, \
+                    q.signed_transaction_sha256,q.tip_hash,q.tip_height, \
+                    EXTRACT(EPOCH FROM q.observed_at)::BIGINT AS observed_at \
+             FROM payout_batches b JOIN wallet_reconciliations r \
+               ON (r.deployment_id,r.id)=(b.deployment_id,b.reconciliation_id) \
+             LEFT JOIN payout_expiry_evidence q \
+               ON (q.deployment_id,q.batch_id)=(b.deployment_id,b.id) AND q.phase='held' \
+             WHERE b.deployment_id=$1 AND b.chain='wcash' \
+               AND b.state IN ('signed','broadcasting','broadcast','expiry_pending') \
+             ORDER BY b.created_at,b.id LIMIT $2 FOR UPDATE OF b",
+        )
+        .bind(self.identity.id)
+        .bind(i64::from(maximum) + 1)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if rows.len() > usize::try_from(maximum).map_err(|_| StoreError::InvalidPayoutBatch)? {
+            return Err(StoreError::PayoutExpiryLimitExceeded);
+        }
+        let mut candidates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state = PayoutBatchState::parse(&row.try_get::<String, _>("state")?)?;
+            let artifact = signed_artifact_from_row(row.try_get("id")?, Chain::Wcash, state, &row)?;
+            let quarantine = if row.try_get::<Option<i64>, _>("expiry_height")?.is_some() {
+                Some(expiry_evidence_from_row(&row, "q_transaction_id")?)
+            } else {
+                None
+            };
+            if (state == PayoutBatchState::ExpiryPending) != quarantine.is_some() {
+                return Err(StoreError::CorruptDatabaseState("payout expiry quarantine"));
+            }
+            let batch =
+                load_payout_batch(&mut transaction, self.identity.id, artifact.batch_id).await?;
+            let request = frozen_payout_signer_request(
+                &mut transaction,
+                self.identity.id,
+                self.identity.network,
+                &batch,
+            )
+            .await?;
+            candidates.push(PayoutExpiryCandidate {
+                artifact,
+                request,
+                reconciliation_tip_height: u32::try_from(row.try_get::<i64, _>("best_tip_height")?)
+                    .map_err(|_| StoreError::CorruptDatabaseState("payout original tip"))?,
+                quarantine,
+            });
+        }
+        transaction.commit().await?;
+        Ok(candidates)
+    }
+
+    /// Stops expiry rebroadcast loops without releasing a single reserved zat.
+    /// The caller has proven non-inclusion against the stable current tip.
+    pub async fn hold_expired_payout(
+        &self,
+        batch_id: Uuid,
+        evidence: &PayoutExpiryEvidence,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        lock_chain_advisory(&mut transaction, self.identity.id, Chain::Wcash).await?;
+        let batch = load_payout_batch(&mut transaction, self.identity.id, batch_id).await?;
+        if batch.chain != Chain::Wcash {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        if batch.state == PayoutBatchState::ExpiryPending {
+            let prior =
+                load_expiry_evidence(&mut transaction, self.identity.id, batch_id, "held").await?;
+            transaction.rollback().await?;
+            return if prior == *evidence {
+                Ok(())
+            } else {
+                Err(StoreError::PayoutReplayConflict)
+            };
+        }
+        if !matches!(
+            batch.state,
+            PayoutBatchState::Signed | PayoutBatchState::Broadcasting | PayoutBatchState::Broadcast
+        ) {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        lock_chain_safety_row(&mut transaction, self.identity.id, Chain::Wcash).await?;
+        validate_payout_expiry_evidence(&mut transaction, self.identity.id, batch_id, evidence)
+            .await?;
+        insert_expiry_evidence(
+            &mut transaction,
+            self.identity.id,
+            batch_id,
+            "held",
+            evidence,
+            None,
+        )
+        .await?;
+        update_payout_state(
+            &mut transaction,
+            self.identity.id,
+            batch_id,
+            batch.state,
+            PayoutBatchState::ExpiryPending,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Releases a held WEC reserve exactly once only after its entire validity
+    /// range is below Wolf's finalization frontier and absence was verified.
+    /// All signed bytes, destination versions and accounting history survive.
+    pub async fn expire_held_payout(
+        &self,
+        batch_id: Uuid,
+        evidence: &PayoutExpiryEvidence,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        lock_chain_advisory(&mut transaction, self.identity.id, Chain::Wcash).await?;
+        let batch = load_payout_batch(&mut transaction, self.identity.id, batch_id).await?;
+        if batch.chain != Chain::Wcash {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        if batch.state == PayoutBatchState::Expired {
+            let prior =
+                load_expiry_evidence(&mut transaction, self.identity.id, batch_id, "finalized")
+                    .await?;
+            transaction.rollback().await?;
+            return if prior == *evidence {
+                Ok(())
+            } else {
+                Err(StoreError::PayoutReplayConflict)
+            };
+        }
+        if batch.state != PayoutBatchState::ExpiryPending {
+            return Err(StoreError::InvalidPayoutTransition);
+        }
+        lock_chain_safety_row(&mut transaction, self.identity.id, Chain::Wcash).await?;
+        validate_payout_expiry_evidence(&mut transaction, self.identity.id, batch_id, evidence)
+            .await?;
+        let held =
+            load_expiry_evidence(&mut transaction, self.identity.id, batch_id, "held").await?;
+        if held.transaction_id != evidence.transaction_id
+            || held.signed_transaction_sha256 != evidence.signed_transaction_sha256
+            || held.expiry_height != evidence.expiry_height
+            || evidence.tip_height < held.tip_height
+            || evidence.observed_at < held.observed_at
+            || evidence
+                .expiry_height
+                .checked_add(PAYOUT_EXPIRY_FINALITY_DEPTH)
+                .is_none_or(|minimum| evidence.tip_height < minimum)
+        {
+            return Err(StoreError::InvalidPayoutExpiryEvidence);
+        }
+        let mut entries = Vec::with_capacity(batch.outputs.len() * 2);
+        for output in &batch.outputs {
+            entries.push((
+                Some(output.account_id),
+                "payout_pending".to_owned(),
+                as_i64(output.liability_amount_zat)?,
+            ));
+            entries.push((
+                Some(output.account_id),
+                "miner_payable".to_owned(),
+                -as_i64(output.liability_amount_zat)?,
+            ));
+        }
+        let release = insert_owned_ledger_transaction(
+            &mut transaction,
+            self.identity.id,
+            batch.chain,
+            "payout_released",
+            None,
+            &batch_id.to_string(),
+            &entries,
+        )
+        .await?;
+        insert_expiry_evidence(
+            &mut transaction,
+            self.identity.id,
+            batch_id,
+            "finalized",
+            evidence,
+            Some(release),
+        )
+        .await?;
+        update_payout_state(
+            &mut transaction,
+            self.identity.id,
+            batch_id,
+            PayoutBatchState::ExpiryPending,
+            PayoutBatchState::Expired,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Lists exact transaction identities which must be checked against one
     /// chain's authoritative best-chain view.
     ///
@@ -2614,7 +2883,10 @@ impl PostgresStore {
                 Err(StoreError::PayoutReplayConflict)
             };
         }
-        if batch.state != PayoutBatchState::Broadcast {
+        if !matches!(
+            batch.state,
+            PayoutBatchState::Broadcast | PayoutBatchState::ExpiryPending
+        ) {
             return Err(StoreError::InvalidPayoutTransition);
         }
         // Serialize the final asset/liability debit with winner maturity and
@@ -2741,7 +3013,7 @@ impl PostgresStore {
         )
         .bind(self.identity.id)
         .bind(batch_id)
-        .bind(PayoutBatchState::Broadcast.as_str())
+        .bind(batch.state.as_str())
         .bind(confirmation.block_hash.as_slice())
         .bind(i64::from(confirmation.block_height))
         .bind(
@@ -3776,6 +4048,9 @@ async fn load_usable_wallet_reconciliation(
     {
         return Err(StoreError::WalletReconciliationStale);
     }
+    let best_tip_height = u32::try_from(row.try_get::<i64, _>("best_tip_height")?)
+        .map_err(|_| StoreError::CorruptDatabaseState("wallet best tip height"))?;
+    ensure_held_payouts_expired_at(transaction, deployment_id, chain, best_tip_height).await?;
     Ok(WalletReconciliation {
         id: reconciliation_id,
         chain,
@@ -3789,6 +4064,144 @@ async fn load_usable_wallet_reconciliation(
         observed_at: unix_u64(row.try_get("observed_at")?)?,
         valid_until: unix_u64(row.try_get("valid_until")?)?,
     })
+}
+
+async fn ensure_held_payouts_expired_at(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    chain: Chain,
+    tip_height: u32,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "SELECT COUNT(*)::BIGINT AS held_count, \
+                COUNT(q.expiry_height)::BIGINT AS evidence_count, \
+                COALESCE(MAX(q.expiry_height),0)::BIGINT AS maximum_expiry \
+         FROM payout_batches b LEFT JOIN payout_expiry_evidence q \
+           ON (q.deployment_id,q.batch_id)=(b.deployment_id,b.id) AND q.phase='held' \
+         WHERE b.deployment_id=$1 AND b.chain=$2 AND b.state='expiry_pending'",
+    )
+    .bind(deployment_id)
+    .bind(chain.as_str())
+    .fetch_one(&mut **transaction)
+    .await?;
+    let count = row.try_get::<i64, _>("held_count")?;
+    if count >= PAYOUT_HELD_LIMIT_FOR_NEW_BATCH {
+        return Err(StoreError::PayoutExpiryLimitExceeded);
+    }
+    if row.try_get::<i64, _>("evidence_count")? != count
+        || row.try_get::<i64, _>("maximum_expiry")? >= i64::from(tip_height)
+    {
+        return Err(StoreError::WalletReconciliationBlocked);
+    }
+    Ok(())
+}
+
+fn expiry_evidence_from_row(
+    row: &PgRow,
+    transaction_column: &'static str,
+) -> Result<PayoutExpiryEvidence, StoreError> {
+    Ok(PayoutExpiryEvidence {
+        transaction_id: exact_hash(
+            row.try_get(transaction_column)?,
+            "expiry transaction identity",
+        )?,
+        signed_transaction_sha256: exact_hash(
+            row.try_get("signed_transaction_sha256")?,
+            "expiry signed digest",
+        )?,
+        expiry_height: u32::try_from(row.try_get::<i64, _>("expiry_height")?)
+            .map_err(|_| StoreError::InvalidPayoutExpiryEvidence)?,
+        tip_hash: exact_hash(row.try_get("tip_hash")?, "expiry observation tip")?,
+        tip_height: u32::try_from(row.try_get::<i64, _>("tip_height")?)
+            .map_err(|_| StoreError::InvalidPayoutExpiryEvidence)?,
+        observed_at: unix_u64(row.try_get("observed_at")?)?,
+    })
+}
+
+async fn load_expiry_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    batch_id: Uuid,
+    phase: &str,
+) -> Result<PayoutExpiryEvidence, StoreError> {
+    let row = sqlx::query(
+        "SELECT transaction_id,signed_transaction_sha256,expiry_height,tip_hash,tip_height, \
+                EXTRACT(EPOCH FROM observed_at)::BIGINT AS observed_at \
+         FROM payout_expiry_evidence WHERE deployment_id=$1 AND batch_id=$2 AND phase=$3",
+    )
+    .bind(deployment_id)
+    .bind(batch_id)
+    .bind(phase)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(StoreError::CorruptDatabaseState("payout expiry evidence"))?;
+    expiry_evidence_from_row(&row, "transaction_id")
+}
+
+async fn validate_payout_expiry_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    batch_id: Uuid,
+    evidence: &PayoutExpiryEvidence,
+) -> Result<(), StoreError> {
+    if evidence.transaction_id == [0; 32]
+        || evidence.signed_transaction_sha256 == [0; 32]
+        || evidence.expiry_height == 0
+        || evidence.tip_hash == [0; 32]
+        || evidence.tip_height <= evidence.expiry_height
+        || evidence.observed_at == 0
+    {
+        return Err(StoreError::InvalidPayoutExpiryEvidence);
+    }
+    let row = sqlx::query(
+        "SELECT transaction_id,signed_transaction, \
+                EXTRACT(EPOCH FROM clock_timestamp())::BIGINT AS database_now \
+         FROM payout_batches WHERE deployment_id=$1 AND id=$2",
+    )
+    .bind(deployment_id)
+    .bind(batch_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let now = unix_u64(row.try_get("database_now")?)?;
+    let raw = row.try_get::<Vec<u8>, _>("signed_transaction")?;
+    let digest: [u8; 32] = Sha256::digest(&raw).into();
+    if row.try_get::<Vec<u8>, _>("transaction_id")? != evidence.transaction_id
+        || digest != evidence.signed_transaction_sha256
+        || evidence.observed_at > now
+        || now.saturating_sub(evidence.observed_at) > MAX_WALLET_RECONCILIATION_AGE_SECS
+    {
+        return Err(StoreError::InvalidPayoutExpiryEvidence);
+    }
+    Ok(())
+}
+
+async fn insert_expiry_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    batch_id: Uuid,
+    phase: &str,
+    evidence: &PayoutExpiryEvidence,
+    release: Option<Uuid>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO payout_expiry_evidence \
+         (deployment_id,batch_id,phase,transaction_id,signed_transaction_sha256,expiry_height, \
+          tip_hash,tip_height,observed_at,release_transaction_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9),$10)",
+    )
+    .bind(deployment_id)
+    .bind(batch_id)
+    .bind(phase)
+    .bind(evidence.transaction_id.as_slice())
+    .bind(evidence.signed_transaction_sha256.as_slice())
+    .bind(i64::from(evidence.expiry_height))
+    .bind(evidence.tip_hash.as_slice())
+    .bind(i64::from(evidence.tip_height))
+    .bind(unix_i64(evidence.observed_at)?)
+    .bind(release)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn exact_hash(value: Vec<u8>, field: &'static str) -> Result<[u8; 32], StoreError> {
@@ -4053,6 +4466,18 @@ async fn payout_signer_request(
     if derived_snapshot.root != batch.ledger_root {
         return Err(StoreError::WalletReconciliationStale);
     }
+    frozen_payout_signer_request(transaction, deployment_id, network, batch).await
+}
+
+// Recovery does not grant new signing authority. The sealed ledger and batch
+// are immutable; retain their exact commitment without rehashing all history
+// on each bounded expiry poll. The signer journal checks this request again.
+async fn frozen_payout_signer_request(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    network: DeploymentNetwork,
+    batch: &PayoutBatch,
+) -> Result<PayoutBatchRequest, StoreError> {
     let reservation_matches = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM ledger_transactions \
          WHERE deployment_id=$1 AND ledger_sequence=$2 AND chain=$3 \
@@ -5849,6 +6274,12 @@ pub enum StoreError {
     /// Payout confirmation evidence was empty or outside durable bounds.
     #[error("invalid payout confirmation evidence")]
     InvalidPayoutConfirmation,
+    /// Expiry evidence is stale, unbound or below the required finality frontier.
+    #[error("invalid or premature payout expiry evidence")]
+    InvalidPayoutExpiryEvidence,
+    /// The bounded expiry scan must not silently omit any held payment.
+    #[error("payout expiry recovery candidate limit exceeded")]
+    PayoutExpiryLimitExceeded,
     /// Payout confirmation has not reached the immutable policy depth.
     #[error("payout has {actual} confirmations; {required} are required")]
     PrematurePayoutConfirmation {

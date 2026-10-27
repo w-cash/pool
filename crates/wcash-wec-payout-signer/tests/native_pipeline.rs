@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::PathBuf,
     sync::{
@@ -88,6 +88,8 @@ enum Tamper {
     Fee,
     Stored,
     TransactionId,
+    TargetHeight,
+    ExpiryHeight,
 }
 
 struct BoundTransaction {
@@ -103,6 +105,7 @@ struct MockState {
     recovery_failures: VecDeque<NativeWalletError>,
     sign_after_store_failure: Option<NativeWalletError>,
     broadcasts: VecDeque<Result<BroadcastOutcome, BroadcastFailure>>,
+    identity_calls: usize,
     recovery_calls: usize,
     sign_calls: usize,
     inspection_calls: usize,
@@ -124,6 +127,7 @@ impl MockWallet {
                 recovery_failures: VecDeque::new(),
                 sign_after_store_failure: None,
                 broadcasts: VecDeque::new(),
+                identity_calls: 0,
                 recovery_calls: 0,
                 sign_calls: 0,
                 inspection_calls: 0,
@@ -174,6 +178,10 @@ impl MockWallet {
         )
     }
 
+    fn identity_calls(&self) -> usize {
+        self.state.lock().expect("mock mutex").identity_calls
+    }
+
     fn broadcasts(&self) -> Vec<WalletBroadcastCall> {
         self.state
             .lock()
@@ -202,7 +210,9 @@ impl NativeWalletTransport for MockWallet {
     ) -> Result<WalletIdentity, NativeWalletError> {
         assert!(!timeout.is_zero());
         assert!(max_response_bytes >= 1_024);
-        Ok(self.state.lock().expect("mock mutex").identity.clone())
+        let mut state = self.state.lock().expect("mock mutex");
+        state.identity_calls += 1;
+        Ok(state.identity.clone())
     }
 
     fn recover_exact(
@@ -324,6 +334,8 @@ impl NativeWalletTransport for MockWallet {
             Tamper::Fee => intent.fee_zat += 1,
             Tamper::Stored => intent.stored = false,
             Tamper::TransactionId => intent.transaction_id = "cd".repeat(32),
+            Tamper::TargetHeight => intent.target_height += 1,
+            Tamper::ExpiryHeight => intent.expiry_height += 1,
         }
         Ok(intent)
     }
@@ -409,6 +421,35 @@ fn request(account: Uuid) -> WecPayoutRequest {
 
 fn make_signer(fixture: &Fixture, wallet: Arc<MockWallet>) -> WecPayoutSigner {
     WecPayoutSigner::new(fixture.config(), wallet).expect("test signer")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct JournalFileSnapshot {
+    bytes: Vec<u8>,
+    inode: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    mode: u32,
+}
+
+fn journal_snapshot(fixture: &Fixture) -> BTreeMap<String, JournalFileSnapshot> {
+    fs::read_dir(&fixture.journal)
+        .expect("existing journal directory")
+        .map(|entry| {
+            let entry = entry.expect("journal directory entry");
+            let metadata = entry.metadata().expect("journal metadata");
+            (
+                entry.file_name().into_string().expect("test journal name"),
+                JournalFileSnapshot {
+                    bytes: fs::read(entry.path()).expect("journal bytes"),
+                    inode: metadata.ino(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                    mode: metadata.mode(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn accepted() -> Result<BroadcastOutcome, BroadcastFailure> {
@@ -502,6 +543,225 @@ fn prepare_is_durable_and_never_reaches_the_node() {
     assert_eq!(recovered.payout, prepared);
     assert_eq!(wallet.counts().1, 1, "recovery must not re-sign");
     assert_eq!(wallet.counts().3, 0, "recovery must not broadcast");
+}
+
+#[test]
+fn inspection_rechecks_native_intent_and_retains_original_expiry_without_writes() {
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    let payout = request(fixture.account);
+    let prepared = make_signer(&fixture, wallet.clone())
+        .prepare(&payout)
+        .expect("original artifact prepares");
+    let restarted = make_signer(&fixture, wallet.clone());
+    let journal_before = journal_snapshot(&fixture);
+    let counts_before = wallet.counts();
+    let identity_before = wallet.identity_calls();
+
+    // Expiry is evaluated by the settlement observer, not refreshed by this
+    // inspection API. An old artifact remains inspectable without a seed.
+    let observed_chain_tip = 2_000;
+    assert!(observed_chain_tip > prepared.expiry_height);
+    fs::remove_file(&fixture.seed).expect("inspection must not load spending authority");
+    for _ in 0..2 {
+        let inspected = restarted
+            .inspect_prepared(&payout)
+            .expect("old native-bound artifact remains inspectable");
+        assert_eq!(inspected, prepared);
+        assert_eq!(inspected.target_height, 1_000);
+        assert_eq!(inspected.expiry_height, 1_040);
+    }
+
+    let counts_after = wallet.counts();
+    assert_eq!(wallet.identity_calls(), identity_before + 2);
+    assert_eq!(counts_after.0, counts_before.0 + 2, "recover exact bytes");
+    assert_eq!(counts_after.2, counts_before.2 + 2, "recheck native intent");
+    assert_eq!(
+        counts_after.1, counts_before.1,
+        "never sign during inspection"
+    );
+    assert_eq!(
+        counts_after.3, counts_before.3,
+        "never broadcast during inspection"
+    );
+    assert_eq!(journal_snapshot(&fixture), journal_before);
+}
+
+#[test]
+fn inspection_of_missing_batch_journal_never_calls_wallet_or_creates_a_record() {
+    for wallet_already_has_artifact in [false, true] {
+        let fixture = Fixture::new();
+        let wallet = Arc::new(MockWallet::new(fixture.account));
+        let signer = make_signer(&fixture, wallet.clone());
+        let payout = request(fixture.account);
+        if wallet_already_has_artifact {
+            signer.prepare(&payout).expect("wallet artifact prepares");
+            fs::remove_file(
+                fixture
+                    .journal
+                    .join(format!("{}.json", payout.batch.batch_id.simple())),
+            )
+            .expect("simulate missing batch journal while wallet retains bytes");
+        }
+        let journal_before = journal_snapshot(&fixture);
+        let counts_before = wallet.counts();
+        let identity_before = wallet.identity_calls();
+
+        assert_eq!(
+            signer.inspect_prepared(&payout),
+            Err(WecPayoutError::JournalCorrupt)
+        );
+        assert_eq!(wallet.identity_calls(), identity_before);
+        assert_eq!(wallet.counts(), counts_before);
+        assert_eq!(journal_snapshot(&fixture), journal_before);
+    }
+}
+
+#[test]
+fn inspection_of_missing_wallet_binding_never_recreates_the_transaction() {
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    let signer = make_signer(&fixture, wallet.clone());
+    let payout = request(fixture.account);
+    signer.prepare(&payout).expect("original artifact prepares");
+    wallet.state.lock().expect("mock mutex").bound = None;
+    let journal_before = journal_snapshot(&fixture);
+    let counts_before = wallet.counts();
+
+    assert_eq!(
+        signer.inspect_prepared(&payout),
+        Err(WecPayoutError::JournalCorrupt)
+    );
+    let counts_after = wallet.counts();
+    assert_eq!(counts_after.0, counts_before.0 + 1);
+    assert_eq!(counts_after.1, counts_before.1);
+    assert_eq!(counts_after.2, counts_before.2);
+    assert_eq!(counts_after.3, counts_before.3);
+    assert_eq!(journal_snapshot(&fixture), journal_before);
+}
+
+#[test]
+fn inspection_rejects_every_native_intent_mismatch_without_mutating_the_journal() {
+    for tamper in [
+        Tamper::OutputAmount,
+        Tamper::OutputAddress,
+        Tamper::OutputOrder,
+        Tamper::OutputKind,
+        Tamper::OutputAllocation,
+        Tamper::Network,
+        Tamper::Account,
+        Tamper::PayoutCommitment,
+        Tamper::FundSource,
+        Tamper::RawDigest,
+        Tamper::Fee,
+        Tamper::Stored,
+        Tamper::TransactionId,
+        Tamper::TargetHeight,
+        Tamper::ExpiryHeight,
+    ] {
+        let fixture = Fixture::new();
+        let wallet = Arc::new(MockWallet::new(fixture.account));
+        let signer = make_signer(&fixture, wallet.clone());
+        let payout = request(fixture.account);
+        signer.prepare(&payout).expect("original artifact prepares");
+        wallet.tamper(tamper);
+        let journal_before = journal_snapshot(&fixture);
+        let counts_before = wallet.counts();
+
+        assert_eq!(
+            signer.inspect_prepared(&payout),
+            Err(WecPayoutError::WalletProtocolViolation)
+        );
+        let counts_after = wallet.counts();
+        assert_eq!(counts_after.0, counts_before.0 + 1);
+        assert_eq!(counts_after.2, counts_before.2 + 1);
+        assert_eq!(counts_after.1, counts_before.1);
+        assert_eq!(counts_after.3, counts_before.3);
+        assert_eq!(journal_snapshot(&fixture), journal_before);
+    }
+}
+
+#[test]
+fn inspection_rejects_a_different_native_artifact_even_when_its_intent_matches() {
+    let mutations: [fn(&mut BoundTransaction); 6] = [
+        |bound| {
+            bound.signed.transaction_id = "cd".repeat(32);
+            bound.intent.transaction_id = bound.signed.transaction_id.clone();
+        },
+        |bound| {
+            bound.signed.raw_transaction_hex = "06000000cafebabe".to_owned();
+            bound.intent.raw_transaction_sha256 = Sha256::digest(
+                hex::decode(&bound.signed.raw_transaction_hex).expect("changed test bytes"),
+            )
+            .into();
+        },
+        |bound| {
+            bound.signed.unsigned_digest = [0x34; 32];
+            bound.intent.unsigned_digest = bound.signed.unsigned_digest;
+        },
+        |bound| {
+            bound.signed.fee_zat += 1;
+            bound.intent.fee_zat = bound.signed.fee_zat;
+        },
+        |bound| {
+            bound.signed.target_height += 1;
+            bound.intent.target_height = bound.signed.target_height;
+        },
+        |bound| {
+            bound.signed.expiry_height += 1;
+            bound.intent.expiry_height = bound.signed.expiry_height;
+        },
+    ];
+    for mutate in mutations {
+        let fixture = Fixture::new();
+        let wallet = Arc::new(MockWallet::new(fixture.account));
+        let signer = make_signer(&fixture, wallet.clone());
+        let payout = request(fixture.account);
+        signer.prepare(&payout).expect("original artifact prepares");
+        mutate(
+            wallet
+                .state
+                .lock()
+                .expect("mock mutex")
+                .bound
+                .as_mut()
+                .expect("existing native artifact"),
+        );
+        let journal_before = journal_snapshot(&fixture);
+        let counts_before = wallet.counts();
+
+        assert_eq!(
+            signer.inspect_prepared(&payout),
+            Err(WecPayoutError::IdempotencyConflict)
+        );
+        let counts_after = wallet.counts();
+        assert_eq!(counts_after.0, counts_before.0 + 1);
+        assert_eq!(counts_after.2, counts_before.2 + 1);
+        assert_eq!(counts_after.1, counts_before.1);
+        assert_eq!(counts_after.3, counts_before.3);
+        assert_eq!(journal_snapshot(&fixture), journal_before);
+    }
+}
+
+#[test]
+fn inspection_rejects_changed_destination_request_before_native_calls() {
+    let fixture = Fixture::new();
+    let wallet = Arc::new(MockWallet::new(fixture.account));
+    let signer = make_signer(&fixture, wallet.clone());
+    let mut payout = request(fixture.account);
+    signer.prepare(&payout).expect("original artifact prepares");
+    payout.batch.outputs[0].canonical_address = "wctest1different-destination".to_owned();
+    let journal_before = journal_snapshot(&fixture);
+    let counts_before = wallet.counts();
+    let identity_before = wallet.identity_calls();
+
+    assert_eq!(
+        signer.inspect_prepared(&payout),
+        Err(WecPayoutError::IdempotencyConflict)
+    );
+    assert_eq!(wallet.identity_calls(), identity_before);
+    assert_eq!(wallet.counts(), counts_before);
+    assert_eq!(journal_snapshot(&fixture), journal_before);
 }
 
 #[test]

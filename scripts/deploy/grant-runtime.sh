@@ -203,6 +203,7 @@ GRANT SELECT ON TABLE
     payout_batches,
     payout_items,
     payout_reorg_events,
+    payout_expiry_evidence,
     payout_watch_cursors,
     payout_worker_leases
 TO :"payout_role";
@@ -215,6 +216,7 @@ GRANT INSERT ON TABLE
     payout_batches,
     payout_items,
     payout_reorg_events,
+    payout_expiry_evidence,
     payout_worker_leases
 TO :"payout_role";
 GRANT UPDATE (sealed_at, sealed_entry_count)

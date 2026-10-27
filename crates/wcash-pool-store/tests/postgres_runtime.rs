@@ -8,6 +8,7 @@
 use std::{sync::Arc, time::Duration};
 
 use num_bigint::BigUint;
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, Row};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -30,9 +31,9 @@ use wcash_pool_protocol::{
 };
 use wcash_pool_store::{
     generate_mining_token, hash_mining_token, Chain, ChainPolicy, DeploymentIdentity,
-    DeploymentNetwork, NewPortalSessionRecord, PayoutBatchState, PayoutConfirmation, PayoutReorg,
-    PostgresPoolDataSource, PostgresStore, ProjectionResult, StoreError, WalletObservation,
-    WalletReconciliation,
+    DeploymentNetwork, NewPortalSessionRecord, PayoutBatchState, PayoutConfirmation,
+    PayoutExpiryEvidence, PayoutReorg, PostgresPoolDataSource, PostgresStore, ProjectionResult,
+    StoreError, WalletObservation, WalletReconciliation,
 };
 
 fn identity(seed: u8) -> DeploymentIdentity {
@@ -350,6 +351,438 @@ async fn assert_public_payout_selection_is_opt_in_and_homogeneous(
             + next.maximum_network_fee_zat,
         800
     );
+}
+
+// These arbitrary signed bytes exercise durable SQL boundaries only. Full
+// consensus parsing and node non-inclusion are separate coordinator tests.
+async fn assert_expired_wcash_payout_keeps_reserve_until_finality(
+    database_url: &str,
+    admin: &sqlx::PgPool,
+) {
+    for (seed, initial_state, confirm_held) in [
+        (110_u8, PayoutBatchState::Signed, false),
+        (111, PayoutBatchState::Broadcasting, false),
+        (112, PayoutBatchState::Broadcast, true),
+        (113, PayoutBatchState::Broadcast, false),
+    ] {
+        let store = PostgresStore::connect(database_url, 6, identity(seed))
+            .await
+            .unwrap();
+        store.bind_deployment().await.unwrap();
+        let mut wec = policy(Chain::Wcash);
+        wec.minimum_payout_zat = 100;
+        wec.maximum_payout_zat = 100;
+        store
+            .bind_zero_fee_launch_policies(&wec, &policy(Chain::Zcash))
+            .await
+            .unwrap();
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts(deployment_id,id,login) VALUES ($1,$2,'expiry_owner')")
+            .bind(store.deployment_id())
+            .bind(account)
+            .execute(admin)
+            .await
+            .unwrap();
+        insert_destination(&store, admin, account, Chain::Wcash)
+            .await
+            .unwrap();
+        credit_payable(&store, admin, account, Chain::Wcash, 200)
+            .await
+            .unwrap();
+        let checkpoint = reconcile_wallet(&store, admin, Chain::Wcash).await.unwrap();
+        let batch = store
+            .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+            .await
+            .unwrap();
+        let request = store.authorize_payout_signing(batch.id).await.unwrap();
+        let raw = vec![seed, 0x11, 0x22];
+        let txid = [seed; 32];
+        store
+            .mark_payout_signed(batch.id, &[0xa1; 32], &txid, &raw, 1)
+            .await
+            .unwrap();
+        if initial_state != PayoutBatchState::Signed {
+            store.authorize_payout_broadcast(batch.id).await.unwrap();
+        }
+        if initial_state == PayoutBatchState::Broadcast {
+            store.mark_payout_broadcast(batch.id).await.unwrap();
+        }
+        assert!(matches!(
+            reconcile_wallet(&store, admin, Chain::Wcash).await,
+            Err(StoreError::WalletReconciliationBlocked)
+        ));
+        let original = store
+            .signed_payout_artifact(batch.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = u64::try_from(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT",
+            )
+            .fetch_one(admin)
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let evidence = PayoutExpiryEvidence {
+            transaction_id: txid,
+            signed_transaction_sha256: Sha256::digest(&raw).into(),
+            expiry_height: 50_020,
+            tip_hash: [0xd1; 32],
+            tip_height: 50_021,
+            observed_at: now,
+        };
+        let mut invalid = evidence.clone();
+        invalid.signed_transaction_sha256 = [0xee; 32];
+        assert!(matches!(
+            store.hold_expired_payout(batch.id, &invalid).await,
+            Err(StoreError::InvalidPayoutExpiryEvidence)
+        ));
+        invalid = evidence.clone();
+        invalid.tip_height = evidence.expiry_height;
+        assert!(matches!(
+            store.hold_expired_payout(batch.id, &invalid).await,
+            Err(StoreError::InvalidPayoutExpiryEvidence)
+        ));
+        invalid = evidence.clone();
+        invalid.observed_at = now.saturating_sub(301);
+        assert!(matches!(
+            store.hold_expired_payout(batch.id, &invalid).await,
+            Err(StoreError::InvalidPayoutExpiryEvidence)
+        ));
+        assert!(sqlx::query(
+            "UPDATE payout_batches SET state='expiry_pending' WHERE deployment_id=$1 AND id=$2"
+        )
+        .bind(store.deployment_id())
+        .bind(batch.id)
+        .execute(admin)
+        .await
+        .is_err());
+        store
+            .hold_expired_payout(batch.id, &evidence)
+            .await
+            .unwrap();
+        store
+            .hold_expired_payout(batch.id, &evidence)
+            .await
+            .unwrap();
+        invalid = evidence.clone();
+        invalid.tip_hash = [0xee; 32];
+        assert!(matches!(
+            store.hold_expired_payout(batch.id, &invalid).await,
+            Err(StoreError::PayoutReplayConflict)
+        ));
+        let held = store.list_payout_expiry_candidates(8).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].request, request);
+        assert_eq!(held[0].reconciliation_tip_height, 50_000);
+        assert_eq!(held[0].quarantine.as_ref(), Some(&evidence));
+        assert_eq!(held[0].artifact.state, PayoutBatchState::ExpiryPending);
+        assert!(store
+            .list_resumable_payout_batches(Chain::Wcash, 8)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            store.authorize_payout_broadcast(batch.id).await,
+            Err(StoreError::InvalidPayoutTransition)
+        ));
+        assert!(matches!(
+            store
+                .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+                .await,
+            Err(StoreError::WalletReconciliationBlocked)
+        ));
+        // Reorganization below expiry cannot create fresh wallet authority.
+        assert!(matches!(
+            reconcile_wallet(&store, admin, Chain::Wcash).await,
+            Err(StoreError::WalletReconciliationBlocked)
+        ));
+        let balances=sqlx::query("SELECT e.ledger_account,SUM(e.amount_zat)::BIGINT AS amount FROM ledger_entries e JOIN ledger_transactions t ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) WHERE e.deployment_id=$1 AND t.chain='wcash' GROUP BY e.ledger_account ORDER BY e.ledger_account")
+            .bind(store.deployment_id()).fetch_all(admin).await.unwrap();
+        assert!(balances
+            .iter()
+            .any(|r| r.get::<String, _>("ledger_account") == "payout_pending"
+                && r.get::<i64, _>("amount") == -100));
+        assert!(balances
+            .iter()
+            .any(|r| r.get::<String, _>("ledger_account") == "miner_payable"
+                && r.get::<i64, _>("amount") == -100));
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM ledger_transactions WHERE deployment_id=$1 AND kind='payout_released'").bind(store.deployment_id()).fetch_one(admin).await.unwrap(),0);
+        let current = store
+            .record_wallet_reconciliation(&WalletObservation {
+                chain: Chain::Wcash,
+                wallet_state_digest: [0xc1; 32],
+                wallet_spendable_zat: 200,
+                best_tip_hash: evidence.tip_hash,
+                best_tip_height: evidence.tip_height,
+                observed_at: now,
+                valid_until: now + 240,
+            })
+            .await
+            .unwrap();
+        let later = store
+            .create_payout_batch(Chain::Wcash, Uuid::new_v4(), current.id)
+            .await
+            .unwrap();
+        assert_eq!(later.outputs[0].address, batch.outputs[0].address);
+        let second_hold = if seed == 110 {
+            store.authorize_payout_signing(later.id).await.unwrap();
+            let raw_second = vec![seed, 0x33, 0x44];
+            let mut second = evidence.clone();
+            second.transaction_id = [0xf1; 32];
+            second.signed_transaction_sha256 = Sha256::digest(&raw_second).into();
+            store
+                .mark_payout_signed(
+                    later.id,
+                    &[0xb1; 32],
+                    &second.transaction_id,
+                    &raw_second,
+                    1,
+                )
+                .await
+                .unwrap();
+            store.hold_expired_payout(later.id, &second).await.unwrap();
+            assert!(matches!(
+                store.list_payout_expiry_candidates(1).await,
+                Err(StoreError::PayoutExpiryLimitExceeded)
+            ));
+            assert!(matches!(
+                store
+                    .create_payout_batch(Chain::Wcash, Uuid::new_v4(), current.id)
+                    .await,
+                Err(StoreError::PayoutExpiryLimitExceeded)
+            ));
+            assert!(matches!(
+                store
+                    .record_wallet_reconciliation(&WalletObservation {
+                        chain: Chain::Wcash,
+                        wallet_state_digest: [0xc2; 32],
+                        wallet_spendable_zat: 200,
+                        best_tip_hash: evidence.tip_hash,
+                        best_tip_height: evidence.tip_height,
+                        observed_at: now,
+                        valid_until: now + 240,
+                    })
+                    .await,
+                Err(StoreError::PayoutExpiryLimitExceeded)
+            ));
+            Some((later.id, second))
+        } else {
+            store.cancel_payout_draft(later.id).await.unwrap();
+            None
+        };
+        let mut finalized = evidence.clone();
+        finalized.tip_hash = [0xd2; 32];
+        finalized.tip_height = evidence.expiry_height + 1000;
+        assert!(matches!(
+            store.expire_held_payout(batch.id, &finalized).await,
+            Err(StoreError::InvalidPayoutExpiryEvidence)
+        ));
+        finalized.tip_height += 1;
+        assert!(sqlx::query(
+            "UPDATE payout_batches SET state='expired' WHERE deployment_id=$1 AND id=$2"
+        )
+        .bind(store.deployment_id())
+        .bind(batch.id)
+        .execute(admin)
+        .await
+        .is_err());
+        if seed == 111 {
+            // A sealed but under-sized reversal with the same textual batch
+            // reference cannot satisfy the immutable exact-release fence.
+            let mut rogue = admin.begin().await.unwrap();
+            let release = Uuid::new_v4();
+            sqlx::query("INSERT INTO ledger_transactions(deployment_id,id,chain,kind,reference) VALUES ($1,$2,'wcash','payout_released',$3)")
+                .bind(store.deployment_id()).bind(release).bind(batch.id.to_string()).execute(&mut *rogue).await.unwrap();
+            sqlx::query("INSERT INTO ledger_entries(deployment_id,transaction_id,line_no,account_id,ledger_account,amount_zat) VALUES ($1,$2,1,$3,'payout_pending',1),($1,$2,2,$3,'miner_payable',-1)")
+                .bind(store.deployment_id()).bind(release).bind(account).execute(&mut *rogue).await.unwrap();
+            sqlx::query("UPDATE ledger_transactions SET sealed_at=clock_timestamp(),sealed_entry_count=2 WHERE deployment_id=$1 AND id=$2")
+                .bind(store.deployment_id()).bind(release).execute(&mut *rogue).await.unwrap();
+            assert!(sqlx::query("INSERT INTO payout_expiry_evidence(deployment_id,batch_id,phase,transaction_id,signed_transaction_sha256,expiry_height,tip_hash,tip_height,observed_at,release_transaction_id) VALUES ($1,$2,'finalized',$3,$4,$5,$6,$7,to_timestamp($8),$9)")
+                .bind(store.deployment_id()).bind(batch.id).bind(finalized.transaction_id.as_slice())
+                .bind(finalized.signed_transaction_sha256.as_slice()).bind(i64::from(finalized.expiry_height))
+                .bind(finalized.tip_hash.as_slice()).bind(i64::from(finalized.tip_height))
+                .bind(i64::try_from(finalized.observed_at).unwrap()).bind(release)
+                .execute(&mut *rogue).await.is_err());
+            rogue.rollback().await.unwrap();
+        }
+        invalid = finalized.clone();
+        invalid.expiry_height -= 1;
+        assert!(matches!(
+            store.expire_held_payout(batch.id, &invalid).await,
+            Err(StoreError::InvalidPayoutExpiryEvidence)
+        ));
+        assert!(sqlx::query("UPDATE payout_expiry_evidence SET tip_height=tip_height+1 WHERE deployment_id=$1 AND batch_id=$2")
+            .bind(store.deployment_id()).bind(batch.id).execute(admin).await.is_err());
+        assert!(sqlx::query("UPDATE payout_batches SET signed_transaction=decode('aabb','hex') WHERE deployment_id=$1 AND id=$2")
+            .bind(store.deployment_id()).bind(batch.id).execute(admin).await.is_err());
+        if seed == 113 {
+            // Chain observations can race across coordinator generations.
+            // Only one terminal path may consume or release this reservation.
+            let confirmation = PayoutConfirmation {
+                block_hash: [0xc9; 32],
+                block_height: 50_010,
+                confirmations: 12,
+            };
+            let (confirmed, expired) = tokio::join!(
+                store.confirm_payout(batch.id, &confirmation),
+                store.expire_held_payout(batch.id, &finalized)
+            );
+            let (expected_state, expected_debit) = match (confirmed, expired) {
+                (Ok(()), Err(StoreError::InvalidPayoutTransition)) => (
+                    PayoutBatchState::Confirmed,
+                    batch.payout_total_zat + original.network_fee_zat,
+                ),
+                (Err(StoreError::InvalidPayoutTransition), Ok(())) => {
+                    (PayoutBatchState::Expired, 0)
+                }
+                outcomes => panic!("confirmation/expiry race had invalid outcomes: {outcomes:?}"),
+            };
+            assert_eq!(
+                store
+                    .signed_payout_artifact(batch.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                expected_state
+            );
+            let terminal = sqlx::query(
+                "SELECT kind,COUNT(*)::BIGINT AS count FROM ledger_transactions \
+                 WHERE deployment_id=$1 AND reference=$2 \
+                   AND kind IN ('payout_confirmed','payout_released') GROUP BY kind",
+            )
+            .bind(store.deployment_id())
+            .bind(batch.id.to_string())
+            .fetch_all(admin)
+            .await
+            .unwrap();
+            assert_eq!(
+                terminal.len(),
+                1,
+                "reserve cannot be both paid and released"
+            );
+            assert_eq!(terminal[0].get::<i64, _>("count"), 1);
+            assert_eq!(
+                terminal[0].get::<String, _>("kind"),
+                if expected_state == PayoutBatchState::Confirmed {
+                    "payout_confirmed"
+                } else {
+                    "payout_released"
+                }
+            );
+            let balances = sqlx::query(
+                "SELECT e.ledger_account,SUM(e.amount_zat)::BIGINT AS amount \
+                 FROM ledger_entries e JOIN ledger_transactions t \
+                   ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) \
+                 WHERE e.deployment_id=$1 AND t.chain='wcash' \
+                 GROUP BY e.ledger_account",
+            )
+            .bind(store.deployment_id())
+            .fetch_all(admin)
+            .await
+            .unwrap();
+            let balance = |account: &str| {
+                balances
+                    .iter()
+                    .find(|row| row.get::<String, _>("ledger_account") == account)
+                    .map(|row| row.get::<i64, _>("amount"))
+                    .unwrap_or(0)
+            };
+            let remaining = 200 - i64::try_from(expected_debit).unwrap();
+            assert_eq!(balance("payout_pending"), 0);
+            assert_eq!(balance("collector_spendable_asset"), remaining);
+            assert_eq!(balance("miner_payable"), -remaining);
+        } else if confirm_held {
+            store
+                .confirm_payout(
+                    batch.id,
+                    &PayoutConfirmation {
+                        block_hash: [0xc9; 32],
+                        block_height: 50_010,
+                        confirmations: 12,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                store.expire_held_payout(batch.id, &finalized).await,
+                Err(StoreError::InvalidPayoutTransition)
+            ));
+            assert_eq!(
+                store
+                    .signed_payout_artifact(batch.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                PayoutBatchState::Confirmed
+            );
+        } else {
+            let (left, right) = tokio::join!(
+                store.expire_held_payout(batch.id, &finalized),
+                store.expire_held_payout(batch.id, &finalized)
+            );
+            left.unwrap();
+            right.unwrap();
+            store
+                .expire_held_payout(batch.id, &finalized)
+                .await
+                .unwrap();
+            invalid = finalized.clone();
+            invalid.tip_hash = [0xee; 32];
+            assert!(matches!(
+                store.expire_held_payout(batch.id, &invalid).await,
+                Err(StoreError::PayoutReplayConflict)
+            ));
+            if let Some((second_id, mut second)) = second_hold {
+                second.tip_height = finalized.tip_height;
+                second.tip_hash = finalized.tip_hash;
+                store.expire_held_payout(second_id, &second).await.unwrap();
+            }
+            let retired = store
+                .signed_payout_artifact(batch.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retired.state, PayoutBatchState::Expired);
+            assert_eq!(retired.signed_transaction, original.signed_transaction);
+            assert_eq!(retired.transaction_id, original.transaction_id);
+            assert!(store
+                .list_payout_expiry_candidates(8)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(matches!(
+                store.authorize_payout_broadcast(batch.id).await,
+                Err(StoreError::InvalidPayoutTransition)
+            ));
+            assert!(matches!(
+                store
+                    .confirm_payout(
+                        batch.id,
+                        &PayoutConfirmation {
+                            block_hash: [0xc9; 32],
+                            block_height: 50_010,
+                            confirmations: 12
+                        }
+                    )
+                    .await,
+                Err(StoreError::InvalidPayoutTransition)
+            ));
+            let release_count=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM ledger_transactions WHERE deployment_id=$1 AND kind='payout_released' AND reference=$2")
+                .bind(store.deployment_id()).bind(batch.id.to_string()).fetch_one(admin).await.unwrap();
+            assert_eq!(release_count, 1);
+            let reserve=sqlx::query_scalar::<_,i64>("SELECT COALESCE(SUM(e.amount_zat),0)::BIGINT FROM ledger_entries e JOIN ledger_transactions t ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) WHERE e.deployment_id=$1 AND t.chain='wcash' AND e.ledger_account='payout_pending'")
+                .bind(store.deployment_id()).fetch_one(admin).await.unwrap();
+            assert_eq!(reserve, 0);
+            let payable=sqlx::query_scalar::<_,i64>("SELECT COALESCE(SUM(e.amount_zat),0)::BIGINT FROM ledger_entries e JOIN ledger_transactions t ON (t.deployment_id,t.id)=(e.deployment_id,e.transaction_id) WHERE e.deployment_id=$1 AND t.chain='wcash' AND e.ledger_account='miner_payable'")
+                .bind(store.deployment_id()).fetch_one(admin).await.unwrap();
+            assert_eq!(payable, -200);
+        }
+    }
 }
 
 async fn insert_destination(
@@ -1184,12 +1617,12 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
              TO {projector_role}; \
          GRANT SELECT ON deployments,backend_cursors,chain_policies,chain_safety_state, \
              payout_destinations,ledger_transactions,ledger_entries,wallet_reconciliations, \
-             payout_batches,payout_items,payout_reorg_events,payout_watch_cursors, \
+             payout_batches,payout_items,payout_reorg_events,payout_expiry_evidence,payout_watch_cursors, \
              payout_worker_leases \
              TO {payout_role}; \
          GRANT SELECT(deployment_id,event_seq,payload_sha256) ON backend_events TO {payout_role}; \
          GRANT INSERT ON wallet_reconciliations,ledger_transactions,ledger_entries, \
-             payout_batches,payout_items,payout_reorg_events,payout_worker_leases TO {payout_role}; \
+             payout_batches,payout_items,payout_reorg_events,payout_expiry_evidence,payout_worker_leases TO {payout_role}; \
          GRANT UPDATE(sealed_at,sealed_entry_count) ON ledger_transactions TO {payout_role}; \
          GRANT UPDATE(reconciliation_id,ledger_root,ledger_sequence_cutoff,state,updated_at, \
              unsigned_digest,transaction_id,signed_transaction,network_fee_zat, \
@@ -1280,6 +1713,13 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         (&public_role, "payout_batches", "UPDATE", false),
         (&public_role, "payout_items", "INSERT", false),
         (&public_role, "payout_reorg_events", "INSERT", false),
+        (&public_role, "payout_expiry_evidence", "SELECT", false),
+        (&public_role, "payout_expiry_evidence", "INSERT", false),
+        (&projector_role, "payout_expiry_evidence", "INSERT", false),
+        (&payout_role, "payout_expiry_evidence", "SELECT", true),
+        (&payout_role, "payout_expiry_evidence", "INSERT", true),
+        (&payout_role, "payout_expiry_evidence", "UPDATE", false),
+        (&payout_role, "payout_expiry_evidence", "DELETE", false),
         (&public_role, "payout_watch_cursors", "SELECT", false),
         (&public_role, "payout_watch_cursors", "UPDATE", false),
         (&public_role, "payout_worker_leases", "UPDATE", false),
@@ -1783,6 +2223,35 @@ async fn assert_database_privilege_boundaries(pool: &sqlx::PgPool, database_url:
         .mark_payout_broadcast(role_batch.id)
         .await
         .expect("payout role marks the batch broadcast through API");
+    let expiry_now = u64::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+            .fetch_one(pool)
+            .await
+            .expect("role expiry time reads"),
+    )
+    .expect("positive clock");
+    payout_store
+        .hold_expired_payout(
+            role_batch.id,
+            &PayoutExpiryEvidence {
+                transaction_id: [0xa2; 32],
+                signed_transaction_sha256: Sha256::digest([0xa3, 0xa4]).into(),
+                expiry_height: 50_020,
+                tip_hash: [0xc3; 32],
+                tip_height: 50_021,
+                observed_at: expiry_now,
+            },
+        )
+        .await
+        .expect("payout role quarantines without releasing through API");
+    assert_eq!(
+        payout_store
+            .list_payout_expiry_candidates(2)
+            .await
+            .expect("payout role reads bound expiry candidates through API")
+            .len(),
+        1
+    );
     payout_store
         .confirm_payout(
             role_batch.id,
@@ -2656,6 +3125,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_public_payout_selection_is_opt_in_and_homogeneous(&database_url, &admin).await;
     assert_database_privilege_boundaries(&admin, &database_url).await;
     assert_winner_depth_regression_is_reversible(&admin, &database_url).await;
+    assert_expired_wcash_payout_keeps_reserve_until_finality(&database_url, &admin).await;
     let mut mismatched_identity = store_identity.clone();
     mismatched_identity.chain_id = mismatched_identity
         .chain_id

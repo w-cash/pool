@@ -38,6 +38,7 @@ use crate::{
         LivePayoutConfigError, LoopbackJsonRpc, NodePayoutAuthority, RpcExactBroadcaster,
     },
     miner_telemetry::LiveMinerTelemetry,
+    payout_expiry::{PayoutExpiryDriver, WecExpiryInspector, WecPayoutExpiryRecovery},
     payout_runtime::{
         AutomaticPayoutRuntime, ObservationFailure, PayoutConfirmationAuthority, PayoutLoopPolicy,
         PayoutRuntimeError, WalletObservationSource, WcashObservationSource,
@@ -92,13 +93,18 @@ const MAX_WEC_DEFAULT_SIGNER_PASS_SECS: u64 = 15 + 15 + 300 + 30 + 15;
 const MAX_EMPTY_AUTHORITY_SNAPSHOT_SECS: u64 = 2 * (15 + 10 + 10);
 const MAX_AUTHORITY_WATCH_SECS: u64 = 15 + 10;
 const MAX_EXACT_BROADCAST_PASS_SECS: u64 = 35 + 15 + 15 + 15 + 35;
+// Two stable-tip probes plus at most two transaction and canonical block lookups. Native wallet
+// inspection and expiry/confirmation writes occupy separate recovery-only
+// passes; their deadlines never accumulate with sync/proving/signing.
+const MAX_EXPIRY_GATE_SECS: u64 = 2 * (15 + 10 + 10) + 2 * (15 + 10);
 const SIGNER_READINESS_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const MAX_WEC_IN_FLIGHT_PASS_SECS: u64 = MAX_WCASH_WALLET_SYNC_TIMEOUT.as_secs()
     + 15
     + MAX_EMPTY_AUTHORITY_SNAPSHOT_SECS
     + MAX_AUTHORITY_WATCH_SECS * PAYOUT_MAXIMUM_CONFIRMATION_WATCHES as u64
     + MAX_WEC_DEFAULT_SIGNER_PASS_SECS
-    + MAX_EXACT_BROADCAST_PASS_SECS;
+    + MAX_EXACT_BROADCAST_PASS_SECS
+    + MAX_EXPIRY_GATE_SECS;
 const _: () = assert!(SERVICE_DRAIN_TIMEOUT.as_secs() > MAX_WEC_IN_FLIGHT_PASS_SECS);
 const _: () =
     assert!(REQUIRED_SERVICE_MANAGER_STOP_TIMEOUT.as_secs() > SERVICE_DRAIN_TIMEOUT.as_secs());
@@ -1370,14 +1376,31 @@ async fn build_payout_services(
         Arc::new(RpcExactBroadcaster::new(Arc::clone(&wcash_authority))),
     )?);
 
+    let expiry_recovery = Arc::new(WecPayoutExpiryRecovery::new(
+        Arc::clone(&store) as Arc<dyn crate::payout_expiry::ExpiryStore>,
+        Arc::new(WecExpiryInspector::new(
+            Arc::clone(&wec),
+            payout.wcash_signer_account,
+        )),
+        Arc::clone(&wcash_authority) as Arc<dyn crate::payout_expiry::ExpiryAuthority>,
+    ));
+    // Expired Broadcasting rows must be quarantined before startup attempts
+    // exact-byte recovery. Inspection-only startup safely defers all effects
+    // to the normal gated worker poll.
+    let expiry_ready = expiry_recovery.recover().await?;
+
     // SQL authorizes the signer boundary first. Recover durable Signing rows
     // before comparing wallet balances: an exact journal artifact is copied to
     // Signed, while an empty journal completes only that already-authorized
     // idempotent request. Migration 0009 rejects ambiguous legacy Draft/Signed
     // rows, so startup never guesses whether an older release crossed a fence.
-    let wec_gate = settlement
-        .recover_before_wallet_reconciliation(Chain::Wcash)
-        .await?;
+    let wec_gate = if expiry_ready {
+        settlement
+            .recover_before_wallet_reconciliation(Chain::Wcash)
+            .await?
+    } else {
+        ReconciliationGate::ExternalEffectPending
+    };
 
     // With no in-flight external effect, a collector can join this accounting
     // namespace only when its spendable balance is represented by the sealed
@@ -1411,15 +1434,18 @@ async fn build_payout_services(
     };
     let lifecycle_store: Arc<dyn crate::payout_runtime::PayoutLifecycleStore> = store;
     let settlement_driver: Arc<dyn crate::payout_runtime::SettlementDriver> = settlement;
-    let wec = Arc::new(AutomaticPayoutRuntime::new(
-        Chain::Wcash,
-        config.deployment_id,
-        policy,
-        Arc::clone(&lifecycle_store),
-        wcash_wallet,
-        wcash_authority,
-        Arc::clone(&settlement_driver),
-    )?);
+    let wec = Arc::new(
+        AutomaticPayoutRuntime::new(
+            Chain::Wcash,
+            config.deployment_id,
+            policy,
+            Arc::clone(&lifecycle_store),
+            wcash_wallet,
+            wcash_authority,
+            Arc::clone(&settlement_driver),
+        )?
+        .with_expiry_recovery(expiry_recovery)?,
+    );
     Ok(PayoutServices { wec })
 }
 

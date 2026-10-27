@@ -24,7 +24,8 @@ pub use postgres::{
     AccountCredentialRecord, AuthenticatedPortalSession, Chain, ChainPolicy,
     ConfirmedPayoutWatchCursor, DeploymentIdentity, DeploymentNetwork, NewPortalSessionRecord,
     NonceNamespaceClaim, NonceRange, PayoutBatch, PayoutBatchState, PayoutConfigurationReadiness,
-    PayoutConfirmation, PayoutInstruction, PayoutReorg, PayoutWatch, PayoutWatchPage,
-    PostgresEventProjector, PostgresStore, ProjectionResult, ReceiverKind, SignedPayoutArtifact,
-    StoreError, WalletObservation, WalletReconciliation,
+    PayoutConfirmation, PayoutExpiryCandidate, PayoutExpiryEvidence, PayoutInstruction,
+    PayoutReorg, PayoutWatch, PayoutWatchPage, PostgresEventProjector, PostgresStore,
+    ProjectionResult, ReceiverKind, SignedPayoutArtifact, StoreError, WalletObservation,
+    WalletReconciliation,
 };
