@@ -186,6 +186,7 @@ struct PendingShareState {
     target: TargetBinding,
     admitted_at_ms: u64,
     vardiff_sample: Option<bool>,
+    winner_recovery: bool,
     expected_job_id: [u8; 32],
     expected_share_id: [u8; 32],
     expected_attribution_id: [u8; 32],
@@ -515,7 +516,11 @@ impl ConnectionActor {
         }
         let vardiff_sample = result
             .as_ref()
-            .is_ok_and(|verified| counts_toward_vardiff(verified.replayed()));
+            .is_ok_and(|verified| counts_toward_vardiff(verified.replayed()))
+            && self
+                .pending_shares
+                .get(&ticket.ticket)
+                .is_some_and(|pending| !pending.winner_recovery);
         let response_index = match self.pending_shares.get_mut(&ticket.ticket) {
             Some(pending) if pending.vardiff_sample.is_none() => {
                 pending.vardiff_sample = Some(vardiff_sample);
@@ -609,7 +614,9 @@ impl ConnectionActor {
             JobUpdate::Retired { job_id } => {
                 self.assignments.remove(&job_id);
                 self.advertised_lineage.remove(&job_id);
-                self.session.remove_announced_job(job_id);
+                self.session.retire_announced_job(job_id);
+                self.session
+                    .retain_winner_recovery_jobs(&self.router.winner_recovery_job_ids()?);
             }
             JobUpdate::Suspended => self.close(),
         }
@@ -634,14 +641,16 @@ impl ConnectionActor {
         // A health pause blocks admission without revoking the generation's
         // immutable target assignment. Only real expiry/invalidation removes it.
         let admissible: HashSet<_> = self.router.retained_job_ids()?.into_iter().collect();
+        let recovery_ids = self.router.winner_recovery_job_ids()?;
         self.assignments.retain(|job_id, _| {
             if admissible.contains(job_id) {
                 true
             } else {
-                self.session.remove_announced_job(*job_id);
+                self.session.retire_announced_job(*job_id);
                 false
             }
         });
+        self.session.retain_winner_recovery_jobs(&recovery_ids);
         let assignments = &self.assignments;
         self.advertised_lineage
             .retain(|job_id| assignments.contains_key(job_id));
@@ -722,7 +731,6 @@ impl ConnectionActor {
                 return Ok(None);
             }
         };
-        let target = self.assignments.get(&job_id).copied();
         let context = match self.router.prepare_submission(
             &self.session,
             &submitted.worker,
@@ -741,7 +749,17 @@ impl ConnectionActor {
             }
             Err(error) => return Err(error.into()),
         };
-        let target = target.ok_or(ConnectionActorError::MissingAssignment(job_id))?;
+        // No session mutation can interleave this synchronous preparation and
+        // lookup. The assignment owns the full binding once; the context keeps
+        // only its existing backend target for the asynchronous exchange.
+        let target = self
+            .session
+            .announced_target_binding(job_id)
+            .ok_or(ConnectionActorError::MissingAssignment(job_id))?;
+        let winner_recovery = context.is_winner_recovery();
+        if !winner_recovery && self.assignments.get(&job_id).copied() != Some(target) {
+            return Err(ConnectionActorError::MissingAssignment(job_id));
+        }
         let expected_job_id = *context.job_id().as_bytes();
         let expected_share_id = *canonical_share_id(
             &context.job_id(),
@@ -761,6 +779,7 @@ impl ConnectionActor {
                 target,
                 admitted_at_ms: now_ms,
                 vardiff_sample: None,
+                winner_recovery,
                 expected_job_id,
                 expected_share_id,
                 expected_attribution_id,
@@ -1070,6 +1089,7 @@ pub enum ConnectionActorError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod winner_recovery_tests;
     use std::{sync::Mutex, time::Duration};
 
     use super::*;
@@ -1373,6 +1393,7 @@ mod tests {
                 target,
                 admitted_at_ms: 3,
                 vardiff_sample: None,
+                winner_recovery: false,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],
@@ -1797,6 +1818,7 @@ mod tests {
                 target,
                 admitted_at_ms: 10,
                 vardiff_sample: None,
+                winner_recovery: false,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],
@@ -1809,6 +1831,7 @@ mod tests {
                 target,
                 admitted_at_ms: 20,
                 vardiff_sample: Some(true),
+                winner_recovery: false,
                 expected_job_id: [4; 32],
                 expected_share_id: [5; 32],
                 expected_attribution_id: [6; 32],
@@ -1850,6 +1873,7 @@ mod tests {
                 target,
                 admitted_at_ms: 10,
                 vardiff_sample: Some(counts_toward_vardiff(true)),
+                winner_recovery: false,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],
@@ -1885,6 +1909,7 @@ mod tests {
                 .expect("fixture target is valid"),
             admitted_at_ms: 0,
             vardiff_sample: None,
+            winner_recovery: false,
             expected_job_id: [1; 32],
             expected_share_id: [2; 32],
             expected_attribution_id: [3; 32],

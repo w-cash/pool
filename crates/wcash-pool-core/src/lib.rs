@@ -16,7 +16,7 @@ mod vardiff;
 pub use jobs::{
     AdmissibleJobIds, BackendGeneration, GenerationAdmission, GenerationRegistry,
     GenerationRegistryConfig, JobAssignment, JobAssignmentError, JobId, JobRegistryError,
-    TipIdentity,
+    TipIdentity, MAX_ZCASH_WINNER_RECOVERY_JOBS,
 };
 pub use nonce::{
     NonceCursor, NonceNamespaceLease, NoncePrefix, NoncePrefixAllocator, NoncePrefixError,

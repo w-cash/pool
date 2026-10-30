@@ -422,6 +422,14 @@ impl JobRouter {
         Ok(ids)
     }
 
+    /// Retains only bounded immutable assignments for the late-winner filter.
+    pub(crate) fn winner_recovery_job_ids(&self) -> Result<Vec<JobId>, JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        Ok(state
+            .registry
+            .winner_recovery_job_ids(self.timeline.now_ms()?)?)
+    }
+
     /// Validates miner-controlled submission fields and retains an admission fence.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_submission(

@@ -130,6 +130,21 @@ a second S-NOMP runtime or require an external pool integration. See the
   The pool owns which jobs remain advertised to each miner, but cannot extend
   wolf's acceptance window or turn a hard invalidation into grace.
 
+A coordinated pool/backend deployment can retain a separate winner-only route
+for a previously announced job after ordinary admission ends. Its fixed deadline
+is the original remaining lease deadline plus 60 seconds, with at most 32 jobs
+globally and 32 assignments per session. The ordinary grace and announcement
+limits do not change. Only an exact frozen header, session nonce, time, target,
+and authenticated identity whose canonical SHA256d meets the original Zcash
+network target can use this route, on a live matching Zcash parent. Suspension,
+health pause, Zcash tip invalidation, and final `GenerationClosed` fail closed.
+Wolf still performs complete consensus validation and durable winner handling;
+the cheap frontend filter is not proof of consensus validity. Ordinary shares
+perform no additional header hashing, and recovered winners do not update
+vardiff. The wire protocol and six capabilities are unchanged, so deployment must
+pin the reviewed pool/backend binary pair rather than infer compatibility from
+capabilities alone.
+
 ### Share acceptance and idempotency
 
 - SubmitShare carries the exact job ID, pool-authenticated account and worker

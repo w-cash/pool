@@ -14,7 +14,8 @@ use wcash_pool_protocol::{
 
 use crate::{
     GenerationAdmission, GenerationRegistry, JobAssignment, JobAssignmentError, JobId,
-    JobRegistryError, NoncePrefixAllocator, NoncePrefixError,
+    JobRegistryError, NoncePrefixAllocator, NoncePrefixError, TargetBinding,
+    MAX_ZCASH_WINNER_RECOVERY_JOBS,
 };
 
 /// Stable account and worker identity returned by trusted authorization.
@@ -116,6 +117,7 @@ pub struct MiningSession {
     nonce_prefix: Option<NoncePrefix>,
     worker: Option<AuthenticatedWorker>,
     announced_jobs: VecDeque<JobAssignment>,
+    winner_recovery_jobs: VecDeque<JobAssignment>,
     maximum_announced_jobs: usize,
 }
 
@@ -131,6 +133,7 @@ impl fmt::Debug for MiningSession {
             )
             .field("worker", &self.worker.as_ref().map(|_| "[REDACTED]"))
             .field("announced_jobs", &self.announced_jobs.len())
+            .field("winner_recovery_jobs", &self.winner_recovery_jobs.len())
             .field("maximum_announced_jobs", &self.maximum_announced_jobs)
             .finish()
     }
@@ -151,6 +154,7 @@ impl MiningSession {
             nonce_prefix: None,
             worker: None,
             announced_jobs: VecDeque::with_capacity(maximum_announced_jobs),
+            winner_recovery_jobs: VecDeque::new(),
             maximum_announced_jobs,
         })
     }
@@ -223,6 +227,7 @@ impl MiningSession {
         if let Some(existing) = self
             .announced_jobs
             .iter()
+            .chain(self.winner_recovery_jobs.iter())
             .find(|existing| existing.generation_id() == assignment.generation_id())
         {
             return if existing == &assignment {
@@ -242,12 +247,49 @@ impl MiningSession {
         Ok(())
     }
 
+    /// Returns the original binding for an ordinary or recovery-only assignment.
+    /// This does not announce work or grant registry admission.
+    pub fn announced_target_binding(&self, id: JobId) -> Option<TargetBinding> {
+        self.announced_jobs
+            .iter()
+            .chain(self.winner_recovery_jobs.iter())
+            .find(|assignment| assignment.generation_id() == id)
+            .map(JobAssignment::target_binding)
+    }
+
     /// Removes one assignment after backend invalidation or closure.
     pub fn remove_announced_job(&mut self, id: JobId) -> bool {
         let original = self.announced_jobs.len();
+        let recovery_original = self.winner_recovery_jobs.len();
         self.announced_jobs
             .retain(|assignment| assignment.generation_id() != id);
+        self.winner_recovery_jobs
+            .retain(|assignment| assignment.generation_id() != id);
         self.announced_jobs.len() != original
+            || self.winner_recovery_jobs.len() != recovery_original
+    }
+
+    /// Removes ordinary reachability while retaining a bounded exact assignment.
+    /// This cannot announce work or authorize recovery without registry approval.
+    pub fn retire_announced_job(&mut self, id: JobId) {
+        if let Some(index) = self
+            .announced_jobs
+            .iter()
+            .position(|assignment| assignment.generation_id() == id)
+        {
+            if let Some(assignment) = self.announced_jobs.remove(index) {
+                if self.winner_recovery_jobs.len() == MAX_ZCASH_WINNER_RECOVERY_JOBS {
+                    self.winner_recovery_jobs.pop_back();
+                }
+                self.winner_recovery_jobs.push_front(assignment);
+            }
+        }
+    }
+
+    /// Drops recovery-only assignments omitted by the bounded trusted registry.
+    pub fn retain_winner_recovery_jobs(&mut self, ids: &[JobId]) {
+        self.winner_recovery_jobs
+            .retain(|assignment| ids.contains(&assignment.generation_id()));
     }
 
     /// Closes a session after a prepared notification could not be written.
@@ -279,18 +321,31 @@ impl MiningSession {
         let assignment = self
             .announced_jobs
             .iter()
+            .chain(self.winner_recovery_jobs.iter())
             .find(|assignment| assignment.generation_id() == job_id)
             .ok_or(SessionError::JobNotAnnounced(job_id))?;
-
-        let admission = registry.begin_admission(job_id, now_ms)?;
+        let nonce =
+            join_nonce(prefix, &nonce_suffix).map_err(|_| SessionError::NonceProfileMismatch)?;
+        let admission = match registry.begin_admission(job_id, now_ms) {
+            Ok(admission) => admission,
+            Err(JobRegistryError::StaleJob(_)) => {
+                let generation = registry
+                    .generation(job_id)
+                    .ok_or(JobRegistryError::UnknownJob(job_id))?;
+                JobAssignment::new(generation, assignment.target_binding())
+                    .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
+                if generation.header_time() != submitted_time {
+                    return Err(SessionError::HeaderTimeMismatch(job_id));
+                }
+                registry.begin_zcash_winner_recovery(job_id, &nonce, &solution, now_ms)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         JobAssignment::new(admission.generation(), assignment.target_binding())
             .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
         if admission.generation().header_time() != submitted_time {
             return Err(SessionError::HeaderTimeMismatch(job_id));
         }
-        let nonce =
-            join_nonce(prefix, &nonce_suffix).map_err(|_| SessionError::NonceProfileMismatch)?;
-
         Ok(SubmissionContext {
             session_id: self.id,
             identity: worker.backend_identity(),
@@ -308,6 +363,7 @@ impl MiningSession {
         self.worker = None;
         self.nonce_prefix = None;
         self.announced_jobs.clear();
+        self.winner_recovery_jobs.clear();
     }
 
     fn require(&self, required: SessionState) -> Result<(), SessionError> {
@@ -375,6 +431,11 @@ impl SubmissionContext {
     /// Returns the exact session target in backend little-endian order.
     pub const fn target_le(&self) -> &TargetLe {
         &self.target_le
+    }
+
+    /// Whether this context forwards only a potential late Zcash winner.
+    pub const fn is_winner_recovery(&self) -> bool {
+        self.admission.is_winner_recovery()
     }
 
     /// Returns the exact raw header time verified against the generation.
@@ -463,6 +524,7 @@ pub enum SessionError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod winner_recovery_tests;
     use super::*;
     use crate::{
         BackendGeneration, GenerationRegistryConfig, NonceNamespaceLease, NonceProfile,
