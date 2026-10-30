@@ -10,10 +10,17 @@ use std::{
 
 use thiserror::Error;
 use wcash_pool_protocol::{
-    AcceptableJob, BackendEvent, Hex32, Hex4, JobDescriptor, JobInvalidationReason,
+    canonical_parent_header_hash_le, AcceptableJob, BackendEvent, Hex1344, Hex32, Hex4,
+    JobDescriptor, JobInvalidationReason,
 };
 
 use crate::{ShareTarget, TargetBinding};
+
+/// Maximum previous generations retained for a Zcash-winner-only submission.
+pub const MAX_ZCASH_WINNER_RECOVERY_JOBS: usize = 32;
+
+/// Bounded winner-only tail beyond a generation's original admission deadline.
+const ZCASH_WINNER_RECOVERY_TAIL_MS: u64 = 60_000;
 
 /// Opaque non-zero generation identifier assigned by Wolf.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -313,6 +320,7 @@ impl GenerationStorage {
 struct RegistryEntry {
     storage: GenerationStorage,
     accept_until_ms: u64,
+    winner_recovery_until_ms: u64,
     state: AdmissionState,
 }
 
@@ -351,6 +359,7 @@ pub struct GenerationRegistry {
     entries: HashMap<JobId, RegistryEntry>,
     current: Option<JobId>,
     recent: VecDeque<JobId>,
+    winner_recovery: VecDeque<JobId>,
     watermark_current: Option<JobId>,
     watermark_recent: VecDeque<JobId>,
     last_event_seq: Option<u64>,
@@ -367,6 +376,7 @@ impl GenerationRegistry {
             entries: HashMap::new(),
             current: None,
             recent: VecDeque::with_capacity(config.maximum_recent),
+            winner_recovery: VecDeque::new(),
             watermark_current: None,
             watermark_recent: VecDeque::with_capacity(config.maximum_recent),
             last_event_seq: None,
@@ -405,6 +415,7 @@ impl GenerationRegistry {
         }
         self.current = None;
         self.recent.clear();
+        self.winner_recovery.clear();
         self.synchronized = false;
     }
 
@@ -482,6 +493,17 @@ impl GenerationRegistry {
                 // a lease; the effective policy time prevents a delayed response
                 // from rewinding expiry already observed by another caller.
                 self.expire_at(effective_now_ms);
+                // A snapshot cannot restore recovery-only history from a failed
+                // stream. Its current/recent entries keep their original bounds.
+                let ids: Vec<_> = self
+                    .current
+                    .into_iter()
+                    .chain(self.recent.iter().copied())
+                    .collect();
+                for id in ids {
+                    self.remember_winner_recovery(id);
+                }
+                self.prune_winner_recovery(effective_now_ms);
                 Ok(())
             }
             Err(error) => {
@@ -556,6 +578,76 @@ impl GenerationRegistry {
             .map_err(|_| JobRegistryError::AdmissionCounterExhausted(id))?;
         Ok(GenerationAdmission {
             resource: Arc::clone(resource),
+            winner_recovery: false,
+        })
+    }
+
+    /// Returns bounded retained IDs without reopening ordinary admission.
+    ///
+    /// The absence of current work can temporarily prevent winner admission;
+    /// it does not refresh or erase the fixed retention deadline.
+    pub fn winner_recovery_job_ids(&mut self, now_ms: u64) -> Result<Vec<JobId>, JobRegistryError> {
+        self.advance_clock(now_ms)?;
+        if !self.synchronized {
+            return Err(JobRegistryError::NotSynchronized);
+        }
+        self.prune_winner_recovery(now_ms);
+        Ok(self.winner_recovery.iter().copied().collect())
+    }
+
+    /// Retains an expired generation only for a potential Zcash network winner.
+    ///
+    /// This cheap hash check is a forwarding filter, not Equihash verification
+    /// or acceptance. Wolf must validate and durably acknowledge the exact proof.
+    pub(crate) fn begin_zcash_winner_recovery(
+        &mut self,
+        id: JobId,
+        nonce: &Hex32,
+        solution: &Hex1344,
+        now_ms: u64,
+    ) -> Result<GenerationAdmission, JobRegistryError> {
+        self.advance_clock(now_ms)?;
+        if !self.synchronized {
+            return Err(JobRegistryError::NotSynchronized);
+        }
+        self.prune_winner_recovery(now_ms);
+        let current = self
+            .current
+            .and_then(|current| self.entries.get(&current))
+            .filter(|entry| entry.accepting(now_ms))
+            .ok_or(JobRegistryError::StaleJob(id))?;
+        let entry = self
+            .entries
+            .get(&id)
+            .filter(|entry| {
+                self.winner_recovery.contains(&id)
+                    && now_ms < entry.winner_recovery_until_ms
+                    && entry.state != AdmissionState::Closed
+                    && entry.storage.generation().tips().zcash_previous_hash_le()
+                        == current.storage.generation().tips().zcash_previous_hash_le()
+            })
+            .ok_or(JobRegistryError::StaleJob(id))?;
+        let generation = entry.storage.generation();
+        let hash =
+            canonical_parent_header_hash_le(&generation.descriptor().header_input, nonce, solution);
+        if hash.as_bytes().iter().rev().cmp(
+            generation
+                .descriptor()
+                .zcash_target_le
+                .as_bytes()
+                .iter()
+                .rev(),
+        ) == std::cmp::Ordering::Greater
+        {
+            return Err(JobRegistryError::StaleJob(id));
+        }
+        // Ordinary retirement may already have compacted this entry. The
+        // recovery guard owns only its immutable descriptor, never a new lease.
+        let resource = Arc::new(GenerationResource::new(generation.clone()));
+        resource.in_flight.store(1, Ordering::Release);
+        Ok(GenerationAdmission {
+            resource,
+            winner_recovery: true,
         })
     }
 
@@ -709,6 +801,7 @@ impl GenerationRegistry {
                 RegistryEntry {
                     storage: old.storage.clone(),
                     accept_until_ms,
+                    winner_recovery_until_ms: old.winner_recovery_until_ms,
                     state: AdmissionState::Accepting,
                 },
             ));
@@ -718,6 +811,7 @@ impl GenerationRegistry {
             RegistryEntry {
                 storage: GenerationStorage::Live(Arc::new(GenerationResource::new(generation))),
                 accept_until_ms: proposed_deadline,
+                winner_recovery_until_ms: winner_recovery_deadline(proposed_deadline)?,
                 state: AdmissionState::Accepting,
             },
         ))
@@ -768,6 +862,9 @@ impl GenerationRegistry {
                 ..
             } => {
                 let id = JobId::new(*job_id.as_bytes())?;
+                if *reason == JobInvalidationReason::ZcashTipChanged {
+                    self.winner_recovery.retain(|retained| *retained != id);
+                }
                 self.invalidate_job(id, *reason, *accept_for_ms, anchor_ms)?;
             }
             BackendEvent::GenerationClosed { job_id, .. } => {
@@ -778,6 +875,7 @@ impl GenerationRegistry {
                         self.current = None;
                     }
                     self.recent.retain(|recent| *recent != id);
+                    self.winner_recovery.retain(|retained| *retained != id);
                 }
             }
             BackendEvent::ShareCommitted { .. }
@@ -834,11 +932,42 @@ impl GenerationRegistry {
             RegistryEntry {
                 storage: GenerationStorage::Live(Arc::new(GenerationResource::new(generation))),
                 accept_until_ms,
+                winner_recovery_until_ms: winner_recovery_deadline(accept_until_ms)?,
                 state: AdmissionState::Accepting,
             },
         );
         self.current = Some(id);
+        self.remember_winner_recovery(id);
+        self.prune_winner_recovery(anchor_ms);
         Ok(())
+    }
+
+    fn remember_winner_recovery(&mut self, id: JobId) {
+        if self.winner_recovery.contains(&id) {
+            return;
+        }
+        if self.winner_recovery.len() == MAX_ZCASH_WINNER_RECOVERY_JOBS {
+            self.winner_recovery.pop_front();
+        }
+        self.winner_recovery.push_back(id);
+    }
+
+    fn prune_winner_recovery(&mut self, now_ms: u64) {
+        let current_parent = self.current.and_then(|id| {
+            self.entries
+                .get(&id)
+                .filter(|entry| entry.accepting(now_ms))
+                .map(|entry| entry.storage.generation().tips().zcash_previous_hash_le())
+        });
+        self.winner_recovery.retain(|id| {
+            self.entries.get(id).is_some_and(|entry| {
+                entry.state != AdmissionState::Closed
+                    && now_ms < entry.winner_recovery_until_ms
+                    && current_parent.is_none_or(|parent| {
+                        entry.storage.generation().tips().zcash_previous_hash_le() == parent
+                    })
+            })
+        });
     }
 
     fn invalidate_job(
@@ -980,6 +1109,7 @@ impl GenerationRegistry {
 #[derive(Debug)]
 pub struct GenerationAdmission {
     resource: Arc<GenerationResource>,
+    winner_recovery: bool,
 }
 
 impl GenerationAdmission {
@@ -991,6 +1121,11 @@ impl GenerationAdmission {
     /// Returns the admitted generation identifier.
     pub fn job_id(&self) -> JobId {
         self.resource.generation.id()
+    }
+
+    /// Whether only a potential Zcash network winner may use this guard.
+    pub const fn is_winner_recovery(&self) -> bool {
+        self.winner_recovery
     }
 }
 
@@ -1094,9 +1229,16 @@ fn deadline(anchor_ms: u64, duration_ms: u32) -> Result<u64, JobRegistryError> {
         .ok_or(JobRegistryError::DeadlineOverflow)
 }
 
+fn winner_recovery_deadline(original_deadline_ms: u64) -> Result<u64, JobRegistryError> {
+    original_deadline_ms
+        .checked_add(ZCASH_WINNER_RECOVERY_TAIL_MS)
+        .ok_or(JobRegistryError::DeadlineOverflow)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod winner_recovery_tests;
     use super::*;
     use crate::{TargetBinding, TargetBounds};
     use wcash_pool_protocol::{ChainTip, Hex108, MergedChain, TargetLe, WinnerDescriptor};

@@ -19,9 +19,9 @@ use wcash_pool_protocol::{
     canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id,
     decode_backend_message, encode_backend_request, AcceptableJob, BackendCapability,
     BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex1344, Hex32,
-    Hex4, JobDescriptor, ProtocolError, ShareReceipt, TargetBe, TargetLe, WorkerIdentity,
-    BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES,
-    MAX_EVENT_PAGE_ITEMS,
+    Hex4, JobDescriptor, MergedChain, ProtocolError, ShareReceipt, TargetBe, TargetLe,
+    WorkerIdentity, BACKEND_LENGTH_PREFIX_BYTES, BACKEND_PROTOCOL_VERSION,
+    MAX_BACKEND_PAYLOAD_BYTES, MAX_EVENT_PAGE_ITEMS,
 };
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1372,6 +1372,8 @@ impl BackendClient {
                     commit.receipt(),
                     &descriptor,
                     &expected_parent_hash_le,
+                    context.is_winner_recovery(),
+                    commit.replayed(),
                 )?;
                 Ok(VerifiedShareCommit {
                     receipt: commit.receipt,
@@ -1379,7 +1381,13 @@ impl BackendClient {
                 })
             }
             Err(ClientError::HistoricalReplayRequiresProjection { receipt }) => {
-                self.validate_receipt_for_job(&receipt, &descriptor, &expected_parent_hash_le)?;
+                self.validate_receipt_for_job(
+                    &receipt,
+                    &descriptor,
+                    &expected_parent_hash_le,
+                    context.is_winner_recovery(),
+                    true,
+                )?;
                 Err(ClientError::HistoricalReplayRequiresProjection { receipt })
             }
             Err(error) => Err(error),
@@ -1660,9 +1668,29 @@ impl BackendClient {
         receipt: &ShareReceipt,
         descriptor: &JobDescriptor,
         expected_parent_hash_le: &Hex32,
+        winner_recovery: bool,
+        replayed: bool,
     ) -> Result<(), ClientError> {
         if let Err(error) = receipt.validate_for_job(descriptor) {
             return Err(self.invalidate(ClientError::Protocol(error)));
+        }
+        let recovery_role_matches = if replayed {
+            // A valid ordinary dual-chain winner may be retried after its ACK
+            // was lost and ordinary admission ended. Preserve that exact receipt.
+            receipt
+                .winners
+                .iter()
+                .any(|winner| winner.chain == MergedChain::Zcash)
+        } else {
+            matches!(receipt.winners.as_slice(), [winner] if winner.chain == MergedChain::Zcash)
+        };
+        if winner_recovery && !recovery_role_matches {
+            return Err(
+                self.invalidate(ClientError::Protocol(ProtocolError::InvalidField {
+                    field: "share_receipt.winners",
+                    reason: "fresh late recovery must create only a Zcash winner; replay must retain its original Zcash winner".to_owned(),
+                })),
+            );
         }
         if &receipt.parent_hash_le != expected_parent_hash_le {
             return Err(
@@ -2127,6 +2155,7 @@ fn expected_response_kind(operation: &'static str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    mod winner_recovery_tests;
     use std::{
         error::Error,
         ffi::OsStr,
