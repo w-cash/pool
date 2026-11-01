@@ -402,3 +402,198 @@ async fn authority_transport_failure_never_changes_a_reservation() {
     ));
     assert!(f.store.transitions().is_empty());
 }
+
+#[tokio::test]
+async fn expired_orphan_is_held_before_separate_settlement_can_resume() {
+    let original = candidate(1, false);
+    let f = Fixture::new(vec![original.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+
+    let first = evidence(&original, EXPIRY + 1);
+    f.observe(
+        original.artifact.batch_id,
+        ExpiryChainState::ExpiredOrphan(first.clone()),
+    );
+    assert!(!f.recovery.recover().await.unwrap());
+    assert_eq!(
+        f.store.transitions(),
+        [Transition::Hold(original.artifact.batch_id, first)]
+    );
+
+    let held = candidate(1, true);
+    assert_eq!(
+        held.artifact.signed_transaction,
+        original.artifact.signed_transaction
+    );
+    assert_eq!(
+        held.artifact.network_fee_zat,
+        original.artifact.network_fee_zat
+    );
+    assert_eq!(
+        held.request.commitment().unwrap(),
+        original.request.commitment().unwrap()
+    );
+    f.store.replace(vec![held.clone()]);
+    f.observe(
+        held.artifact.batch_id,
+        ExpiryChainState::ExpiredOrphan(evidence(&held, EXPIRY + 2)),
+    );
+    assert!(f.recovery.recover().await.unwrap());
+    assert_eq!(f.inspector.calls.lock().unwrap().len(), 1);
+    assert_eq!(f.store.transitions().len(), 1);
+    assert!(f
+        .store
+        .transitions()
+        .iter()
+        .all(|t| matches!(t, Transition::Hold(..))));
+    let calls = f.authority.calls.lock().unwrap();
+    let watched = &calls.last().unwrap()[0].candidate;
+    assert_eq!(
+        watched.artifact.signed_transaction,
+        original.artifact.signed_transaction
+    );
+    assert_eq!(
+        watched.request.commitment().unwrap(),
+        original.request.commitment().unwrap()
+    );
+    assert_eq!(watched.request.outputs[0].amount_zat, 754_270_863);
+    assert_eq!(watched.artifact.network_fee_zat, 100);
+}
+
+#[tokio::test]
+async fn restarted_held_orphan_requires_fresh_native_inspection_before_resuming() {
+    let held = candidate(1, true);
+    let f = Fixture::new(vec![held.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.observe(
+        held.artifact.batch_id,
+        ExpiryChainState::ExpiredOrphan(evidence(&held, EXPIRY + 2)),
+    );
+    assert!(f.recovery.recover().await.unwrap());
+
+    let restarted =
+        WecPayoutExpiryRecovery::new(f.store.clone(), f.inspector.clone(), f.authority.clone());
+    assert!(!restarted.recover().await.unwrap());
+    assert_eq!(f.inspector.calls.lock().unwrap().len(), 2);
+    assert_eq!(f.authority.calls.lock().unwrap().len(), 1);
+    f.observe(
+        held.artifact.batch_id,
+        ExpiryChainState::ExpiredOrphan(evidence(&held, EXPIRY + 3)),
+    );
+    assert!(restarted.recover().await.unwrap());
+    assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn positive_orphan_evidence_never_releases_even_beyond_finality() {
+    let c = candidate(1, true);
+    let f = Fixture::new(vec![c.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    for height in [
+        EXPIRY + WCASH_EXPIRY_FINALITY_DEPTH,
+        EXPIRY + 2 * WCASH_EXPIRY_FINALITY_DEPTH,
+    ] {
+        f.observe(
+            c.artifact.batch_id,
+            ExpiryChainState::ExpiredOrphan(evidence(&c, height)),
+        );
+        assert!(f.recovery.recover().await.unwrap());
+        assert!(f.store.transitions().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn expired_orphan_evidence_must_match_exact_artifact_and_expired_tip() {
+    for held in [false, true] {
+        for change in 0..7 {
+            let c = candidate(1, held);
+            let f = Fixture::new(vec![c.clone()]);
+            assert!(!f.recovery.recover().await.unwrap());
+            let mut e = evidence(&c, EXPIRY + 1);
+            match change {
+                0 => e.transaction_id = [2; 32],
+                1 => e.signed_transaction_sha256 = [3; 32],
+                2 => e.expiry_height -= 1,
+                3 => e.tip_hash = [0; 32],
+                4 => e.observed_at = 0,
+                5 => e.tip_height = EXPIRY,
+                _ => e.tip_height = EXPIRY - 1,
+            }
+            f.observe(c.artifact.batch_id, ExpiryChainState::ExpiredOrphan(e));
+            assert!(f.recovery.recover().await.is_err());
+            assert!(f.store.transitions().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn held_orphan_that_becomes_canonical_confirms_only_original_batch() {
+    let c = candidate(1, true);
+    let f = Fixture::new(vec![c.clone()]);
+    *f.store.confirmations_succeed.lock().unwrap() = true;
+    assert!(!f.recovery.recover().await.unwrap());
+    f.observe(
+        c.artifact.batch_id,
+        ExpiryChainState::ExpiredOrphan(evidence(&c, EXPIRY + 1)),
+    );
+    assert!(f.recovery.recover().await.unwrap());
+    let confirmation = PayoutConfirmation {
+        block_hash: [71; 32],
+        block_height: EXPIRY - 1,
+        confirmations: 3,
+    };
+    f.observe(
+        c.artifact.batch_id,
+        ExpiryChainState::Mined(confirmation.clone()),
+    );
+    assert!(!f.recovery.recover().await.unwrap());
+    assert_eq!(
+        f.store.transitions(),
+        [Transition::Confirm(c.artifact.batch_id, confirmation)]
+    );
+}
+
+#[tokio::test]
+async fn held_orphan_cannot_resume_after_mempool_reorg_or_rpc_uncertainty() {
+    let c = candidate(1, true);
+    let f = Fixture::new(vec![c.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.observe(
+        c.artifact.batch_id,
+        ExpiryChainState::ExpiredOrphan(evidence(&c, EXPIRY + 1)),
+    );
+    assert!(f.recovery.recover().await.unwrap());
+    f.observe(c.artifact.batch_id, ExpiryChainState::Unresolved);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority
+        .results
+        .lock()
+        .unwrap()
+        .push_back(Err(ObservationFailure::Unavailable));
+    assert!(matches!(
+        f.recovery.recover().await,
+        Err(PayoutRuntimeError::AuthorityUnavailable { .. })
+    ));
+    assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn two_held_orphans_exhaust_recovery_bound_without_releasing_or_resubmitting() {
+    let one = candidate(1, true);
+    let two = candidate(2, true);
+    let f = Fixture::new(vec![one.clone(), two.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority.results.lock().unwrap().push_back(Ok(vec![
+        ExpiryObservation {
+            batch_id: one.artifact.batch_id,
+            state: ExpiryChainState::ExpiredOrphan(evidence(&one, EXPIRY + 1)),
+        },
+        ExpiryObservation {
+            batch_id: two.artifact.batch_id,
+            state: ExpiryChainState::ExpiredOrphan(evidence(&two, EXPIRY + 1)),
+        },
+    ]));
+    assert!(!f.recovery.recover().await.unwrap());
+    assert_eq!(f.authority.calls.lock().unwrap()[0].len(), 2);
+    assert!(f.store.transitions().is_empty());
+}

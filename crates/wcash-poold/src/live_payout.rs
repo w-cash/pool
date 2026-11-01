@@ -847,6 +847,43 @@ impl ExpiryAuthority for NodePayoutAuthority {
                                 }
                                 ExpiryChainState::Mined(confirmation)
                             }
+                            ObservedTransaction::Orphan
+                                if first_tip.height > watch.expiry_height =>
+                            {
+                                let mempool = self
+                                    .rpc
+                                    .call("getrawmempool", json!([]), RpcLimits::ordinary())
+                                    .await
+                                    .map_err(map_observation_rpc_failure)?;
+                                let ids =
+                                    mempool.as_array().ok_or(ObservationFailure::Invariant)?;
+                                let mut present = false;
+                                for id in ids {
+                                    let id = id
+                                        .as_str()
+                                        .and_then(parse_canonical_hex32)
+                                        .ok_or(ObservationFailure::Invariant)?;
+                                    present |= id == artifact.transaction_id;
+                                }
+                                if present {
+                                    ExpiryChainState::Unresolved
+                                } else {
+                                    // Exact orphan storage is not whole-chain absence,
+                                    // even beyond the finality depth. Preserve the full
+                                    // reserve and permit only a hold transition.
+                                    ExpiryChainState::ExpiredOrphan(PayoutExpiryEvidence {
+                                        transaction_id: artifact.transaction_id,
+                                        signed_transaction_sha256: Sha256::digest(
+                                            &artifact.signed_transaction,
+                                        )
+                                        .into(),
+                                        expiry_height: watch.expiry_height,
+                                        tip_hash: first_tip.hash,
+                                        tip_height: first_tip.height,
+                                        observed_at,
+                                    })
+                                }
+                            }
                             _ => ExpiryChainState::Unresolved,
                         }
                     }

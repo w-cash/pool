@@ -154,9 +154,11 @@ pub(crate) enum ExpiryChainState {
     Unexpired,
     /// Held transaction remains missing beyond expiry, with its reserve intact.
     Missing(PayoutExpiryEvidence),
+    /// Exact expired artifact is orphaned and absent from mempool; hold only.
+    ExpiredOrphan(PayoutExpiryEvidence),
     /// The exact original reached the authority's canonical chain.
     Mined(PayoutConfirmation),
-    /// Present in mempool/orphan storage, or rollback makes it unexpired.
+    /// Present in mempool, unverified orphan status, or rollback makes it unexpired.
     Unresolved,
     /// Whole-chain indexed and mempool absence, after the expiry is finalized.
     FinalMissing(PayoutExpiryEvidence),
@@ -353,7 +355,9 @@ impl WecPayoutExpiryRecovery {
                     }
                 }
                 ExpiryChainState::Unresolved => {}
-                ExpiryChainState::Missing(evidence) => validate_evidence(watch, evidence, false)?,
+                ExpiryChainState::Missing(evidence) | ExpiryChainState::ExpiredOrphan(evidence) => {
+                    validate_evidence(watch, evidence, false)?
+                }
                 ExpiryChainState::FinalMissing(evidence) => {
                     validate_evidence(watch, evidence, held)?
                 }
@@ -385,7 +389,9 @@ impl WecPayoutExpiryRecovery {
                 ExpiryChainState::Unresolved => {
                     ready &= !held;
                 }
-                ExpiryChainState::Missing(evidence) | ExpiryChainState::FinalMissing(evidence)
+                ExpiryChainState::Missing(evidence)
+                | ExpiryChainState::ExpiredOrphan(evidence)
+                | ExpiryChainState::FinalMissing(evidence)
                     if !held =>
                 {
                     validate_evidence(watch, &evidence, false)?;
@@ -396,7 +402,9 @@ impl WecPayoutExpiryRecovery {
                     );
                     ready = false;
                 }
-                ExpiryChainState::Missing(evidence) if held => {
+                ExpiryChainState::Missing(evidence) | ExpiryChainState::ExpiredOrphan(evidence)
+                    if held =>
+                {
                     validate_evidence(watch, &evidence, false)?;
                 }
                 ExpiryChainState::FinalMissing(evidence) if held => {
