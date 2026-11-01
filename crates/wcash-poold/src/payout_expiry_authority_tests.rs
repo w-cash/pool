@@ -334,3 +334,198 @@ async fn malformed_mempool_or_expiry_overflow_cannot_release() {
     assert!(matches!(result[0].state, ExpiryChainState::Missing(_)));
     rpc.drained();
 }
+
+fn exact_orphan(w: &ExpiryWatch) -> Value {
+    json!({
+        "hex": hex::encode(&w.candidate.artifact.signed_transaction),
+        "txid": hex::encode(w.candidate.artifact.transaction_id),
+        "in_active_chain": false,
+        "height": -1,
+        "blockhash": display(CHECKPOINT),
+        "confirmations": 0,
+        "expiryheight": EXPIRY,
+    })
+}
+
+fn orphan_lookup_steps(w: &ExpiryWatch, height: u32) -> Vec<Step> {
+    let mut steps = vec![];
+    tip(&mut steps, height, TIP);
+    steps.push(ok(
+        "getrawtransaction",
+        json!([hex::encode(TX), 1]),
+        exact_orphan(w),
+    ));
+    steps
+}
+
+#[tokio::test]
+async fn exact_expired_orphan_and_explicit_mempool_absence_only_authorize_hold() {
+    for held in [false, true] {
+        let w = watch(held);
+        let mut steps = orphan_lookup_steps(&w, EXPIRY + 1);
+        steps.push(ok("getrawmempool", json!([]), json!([])));
+        tip(&mut steps, EXPIRY + 1, TIP);
+        let rpc = Rpc::new(steps);
+        let result = authority(rpc.clone())
+            .expiry_snapshot(vec![w.clone()])
+            .await
+            .unwrap();
+        let ExpiryChainState::ExpiredOrphan(e) = &result[0].state else {
+            panic!("known orphan must authorize hold only")
+        };
+        assert_eq!(e.transaction_id, TX);
+        assert_eq!(e.expiry_height, EXPIRY);
+        assert_eq!(e.tip_height, EXPIRY + 1);
+        assert_eq!(e.tip_hash, TIP);
+        assert_ne!(e.observed_at, 0);
+        assert_eq!(
+            e.signed_transaction_sha256,
+            <[u8; 32]>::from(Sha256::digest(&w.candidate.artifact.signed_transaction))
+        );
+        rpc.drained();
+    }
+}
+
+#[tokio::test]
+async fn known_orphan_beyond_finality_is_not_authoritative_transaction_absence() {
+    let w = watch(true);
+    let height = EXPIRY + 2 * WCASH_EXPIRY_FINALITY_DEPTH;
+    let mut steps = orphan_lookup_steps(&w, height);
+    steps.push(ok("getrawmempool", json!([]), json!([])));
+    tip(&mut steps, height, TIP);
+    let rpc = Rpc::new(steps);
+    let result = authority(rpc.clone())
+        .expiry_snapshot(vec![w])
+        .await
+        .unwrap();
+    assert!(matches!(
+        result[0].state,
+        ExpiryChainState::ExpiredOrphan(_)
+    ));
+    // No finalized-absence checkpoint RPC is permitted for a positive lookup.
+    rpc.drained();
+}
+
+#[tokio::test]
+async fn known_orphan_reappearing_in_mempool_remains_unresolved() {
+    for held in [false, true] {
+        let w = watch(held);
+        let mut steps = orphan_lookup_steps(&w, EXPIRY + 1);
+        steps.push(ok(
+            "getrawmempool",
+            json!([]),
+            json!([hex::encode([8; 32]), hex::encode(TX), hex::encode([9; 32])]),
+        ));
+        tip(&mut steps, EXPIRY + 1, TIP);
+        let rpc = Rpc::new(steps);
+        let result = authority(rpc.clone())
+            .expiry_snapshot(vec![w])
+            .await
+            .unwrap();
+        assert_eq!(result[0].state, ExpiryChainState::Unresolved);
+        rpc.drained();
+    }
+}
+
+#[tokio::test]
+async fn known_orphan_requires_every_mempool_id_to_be_canonical() {
+    for mempool in [
+        json!(null),
+        json!({}),
+        json!(["invalid"]),
+        json!([hex::encode(TX), "invalid"]),
+        json!([hex::encode([8; 32]), hex::encode([0xab; 32]).to_uppercase()]),
+    ] {
+        let w = watch(true);
+        let mut steps = orphan_lookup_steps(&w, EXPIRY + 1);
+        steps.push(ok("getrawmempool", json!([]), mempool));
+        let rpc = Rpc::new(steps);
+        assert_eq!(
+            authority(rpc.clone()).expiry_snapshot(vec![w]).await,
+            Err(ObservationFailure::Invariant)
+        );
+        rpc.drained();
+    }
+}
+
+#[tokio::test]
+async fn known_orphan_mempool_rpc_failure_cannot_authorize_hold() {
+    for failure in [
+        RpcFailure::Timeout,
+        RpcFailure::Unavailable,
+        RpcFailure::Server(-28),
+    ] {
+        let w = watch(true);
+        let mut steps = orphan_lookup_steps(&w, EXPIRY + 1);
+        steps.push(Step {
+            method: "getrawmempool",
+            params: json!([]),
+            result: Err(failure),
+        });
+        let rpc = Rpc::new(steps);
+        assert_eq!(
+            authority(rpc.clone()).expiry_snapshot(vec![w]).await,
+            Err(ObservationFailure::Unavailable)
+        );
+        rpc.drained();
+    }
+}
+
+#[tokio::test]
+async fn known_orphan_observation_requires_stable_tip_and_expiry_still_passed() {
+    let w = watch(true);
+    let mut steps = orphan_lookup_steps(&w, EXPIRY + 1);
+    steps.push(ok("getrawmempool", json!([]), json!([])));
+    tip(&mut steps, EXPIRY + 2, [92; 32]);
+    let rpc = Rpc::new(steps);
+    assert_eq!(
+        authority(rpc.clone())
+            .expiry_snapshot(vec![w.clone()])
+            .await,
+        Err(ObservationFailure::Unavailable)
+    );
+    rpc.drained();
+
+    // A held artifact seen after rollback to expiry cannot resume new payouts.
+    let mut steps = orphan_lookup_steps(&w, EXPIRY);
+    tip(&mut steps, EXPIRY, TIP);
+    let rpc = Rpc::new(steps);
+    let result = authority(rpc.clone())
+        .expiry_snapshot(vec![w])
+        .await
+        .unwrap();
+    assert_eq!(result[0].state, ExpiryChainState::Unresolved);
+    rpc.drained();
+}
+
+#[tokio::test]
+async fn orphan_lookup_requires_exact_bytes_id_and_strict_orphan_shape() {
+    for change in 0..7 {
+        let w = watch(true);
+        let mut value = exact_orphan(&w);
+        match change {
+            0 => value["hex"] = json!("060000804e"),
+            1 => value["txid"] = json!(hex::encode([9; 32])),
+            2 => value["height"] = json!(0),
+            3 => value["confirmations"] = json!(1),
+            4 => value["blockhash"] = json!(display([0; 32])),
+            5 => value["in_active_chain"] = json!("false"),
+            _ => {
+                assert!(value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("confirmations")
+                    .is_some());
+            }
+        }
+        let mut steps = vec![];
+        tip(&mut steps, EXPIRY + 1, TIP);
+        steps.push(ok("getrawtransaction", json!([hex::encode(TX), 1]), value));
+        let rpc = Rpc::new(steps);
+        assert_eq!(
+            authority(rpc.clone()).expiry_snapshot(vec![w]).await,
+            Err(ObservationFailure::Invariant)
+        );
+        rpc.drained();
+    }
+}
