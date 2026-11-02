@@ -137,13 +137,27 @@ globally and 32 assignments per session. The ordinary grace and announcement
 limits do not change. Only an exact frozen header, session nonce, time, target,
 and authenticated identity whose canonical SHA256d meets the original Zcash
 network target can use this route, on a live matching Zcash parent. Suspension,
-health pause, Zcash tip invalidation, and final `GenerationClosed` fail closed.
+Zcash tip invalidation, and final `GenerationClosed` fail closed.
 Wolf still performs complete consensus validation and durable winner handling;
 the cheap frontend filter is not proof of consensus validity. Ordinary shares
 perform no additional header hashing, and recovered winners do not update
-vardiff. The wire protocol and six capabilities are unchanged, so deployment must
-pin the reviewed pool/backend binary pair rather than infer compatibility from
-capabilities alone.
+vardiff.
+
+The backend-v2 `HealthStatus` response can explicitly grant `recovery_only`
+while `healthy` is false. This permits only a previously assigned Zcash-target
+candidate through the bounded winner route; it does not announce work, extend
+any deadline, or admit ordinary shares. A plain unhealthy response without this
+permission still refuses submission. Live stream identity, synchronization and
+all session checks remain mandatory. The backend independently proves fresh
+exact Zcash parent authority and validates the original proof before committing.
+
+The optional field defaults to false and is omitted when false. A new frontend
+can read an old backend response; an old frontend rejects a true new field under
+strict decoding. This conditional extension keeps protocol version 2 and the six
+capabilities but requires a paired deployment and rollback. Read-only health
+responses must omit the permission so an unchanged isolated payout worker remains
+compatible. Pin the reviewed pool/backend binary pair rather than infer support
+from capabilities alone.
 
 ### Share acceptance and idempotency
 
