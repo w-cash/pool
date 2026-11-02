@@ -128,11 +128,14 @@ impl MinerError {
             | BackendErrorCode::TargetOutOfRange => {
                 Self::new(MinerErrorCode::Other, "invalid share", false)
             }
-            BackendErrorCode::Overloaded
-            | BackendErrorCode::BackendUnhealthy
-            | BackendErrorCode::RecoveryDeferred => {
+            BackendErrorCode::Overloaded | BackendErrorCode::BackendUnhealthy => {
                 Self::new(MinerErrorCode::Other, "service unavailable", true)
             }
+            BackendErrorCode::RecoveryDeferred => Self::new(
+                MinerErrorCode::Other,
+                "service temporarily unavailable",
+                false,
+            ),
         }
     }
 }
@@ -157,6 +160,15 @@ mod tests {
         assert_eq!(error.code(), MinerErrorCode::Other);
         assert_eq!(error.message(), "service unavailable");
         assert!(error.close_connection());
+        assert!(MinerError::from_backend(BackendErrorCode::Overloaded).close_connection());
+    }
+
+    #[test]
+    fn exhausted_recovery_deferral_preserves_the_authorized_connection() {
+        let error = MinerError::from_backend(BackendErrorCode::RecoveryDeferred);
+        assert_eq!(error.code(), MinerErrorCode::Other);
+        assert_eq!(error.message(), "service temporarily unavailable");
+        assert!(!error.close_connection());
     }
 
     #[test]

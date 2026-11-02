@@ -179,6 +179,7 @@ enum CandidateCase {
     OrdinaryExpiry,
     HighHash,
     AlwaysDeferred,
+    ExhaustThenOrdinary,
     Revoke,
     OtherError,
 }
@@ -200,6 +201,8 @@ async fn candidate_case(case: CandidateCase) -> TestResult {
         job.max_age_ms = 1_000;
     }
     let (stop, stopped) = oneshot::channel();
+    let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_resumed = resumed.clone();
     let server_job = job.clone();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
@@ -221,6 +224,10 @@ async fn candidate_case(case: CandidateCase) -> TestResult {
             match request {
                 BackendRequest::Health { id, .. } => {
                     health_count += 1;
+                    if server_resumed.load(Ordering::Acquire) {
+                        reply_health(&mut stream, id, event_seq, true).await?;
+                        continue;
+                    }
                     recovery_health(
                         &mut stream,
                         id,
@@ -230,6 +237,12 @@ async fn candidate_case(case: CandidateCase) -> TestResult {
                     .await?;
                 }
                 request @ BackendRequest::SubmitShare { .. } => {
+                    if server_resumed.load(Ordering::Acquire) {
+                        submissions.push(request.clone());
+                        event_seq += 1;
+                        commit_share(&mut stream, request, &server_job, event_seq).await?;
+                        continue;
+                    }
                     if let Some(first) = submissions.first() {
                         let mut original = first.clone();
                         let mut repeated = request.clone();
@@ -332,7 +345,7 @@ async fn candidate_case(case: CandidateCase) -> TestResult {
             result,
             Err(ShareRouterError::Rejected(BackendErrorCode::LowDifficulty))
         ),
-        CandidateCase::AlwaysDeferred => {
+        CandidateCase::AlwaysDeferred | CandidateCase::ExhaustThenOrdinary => {
             assert_eq!(
                 result,
                 Err(ShareRouterError::Rejected(
@@ -345,17 +358,41 @@ async fn candidate_case(case: CandidateCase) -> TestResult {
             );
         }
     }
+    if matches!(case, CandidateCase::ExhaustThenOrdinary) {
+        assert!(!service.is_finished());
+        assert!(service.terminal_error().is_none());
+        resumed.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while router.current_generation().ok().flatten().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let ordinary = assigned_context(&router, &session, &generation, 10)?;
+        assert!(!ordinary.is_winner_recovery());
+        assert!(service
+            .handle()
+            .submit(ordinary)
+            .await?
+            .receipt()
+            .winners
+            .is_empty());
+    }
     service.shutdown().await?;
     let _ = stop.send(());
     let (submissions, health_count) = server.await??;
     match case {
         CandidateCase::RetryCommit | CandidateCase::OrdinaryExpiry => assert_eq!(submissions, 2),
         CandidateCase::AlwaysDeferred => assert!((2..=4).contains(&submissions)),
+        CandidateCase::ExhaustThenOrdinary => assert!((3..=5).contains(&submissions)),
         _ => assert_eq!(submissions, 1),
     }
     if matches!(
         case,
-        CandidateCase::RetryCommit | CandidateCase::AlwaysDeferred | CandidateCase::Revoke
+        CandidateCase::RetryCommit
+            | CandidateCase::AlwaysDeferred
+            | CandidateCase::ExhaustThenOrdinary
+            | CandidateCase::Revoke
     ) {
         assert!(
             health_count >= 2,
@@ -381,6 +418,10 @@ async fn typed_deferral_never_retries_nonwinning_ordinary_work() -> TestResult {
 #[tokio::test]
 async fn candidate_retry_preserves_existing_shorter_client_deadline() -> TestResult {
     candidate_case(CandidateCase::AlwaysDeferred).await
+}
+#[tokio::test]
+async fn exhausted_candidate_retry_leaves_health_and_later_ordinary_work_live() -> TestResult {
+    candidate_case(CandidateCase::ExhaustThenOrdinary).await
 }
 #[tokio::test]
 async fn revoked_recovery_permission_stops_pending_candidate() -> TestResult {

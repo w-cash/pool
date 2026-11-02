@@ -169,6 +169,10 @@ Heartbeats retain priority, and ready commands and
 due candidate retries alternate turns. Shutdown, stream mismatch, lost
 synchronization, and a plain unhealthy response revoke pending forwarding.
 Other backend errors never trigger this retry.
+Exhausting this temporary retry returns a sanitized service-unavailable response
+without disconnecting the authorized miner or declaring its share invalid. The
+backend stream, health pump and later job notifications remain live; ordinary
+admission still requires its normal health and generation checks.
 
 A context originally admitted as ordinary can cross its lease while queued or
 in flight. Only `recovery_deferred` permits a new authenticated health/event

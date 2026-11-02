@@ -212,3 +212,63 @@ fn final_backend_closure_and_unannounced_jobs_do_not_forward() {
     }
     assert!(actor.pending_shares.is_empty());
 }
+
+#[test]
+fn exhausted_temporary_recovery_keeps_authorization_and_later_job_route_alive() {
+    let (mut actor, old, _, _) = rotated_actor();
+    let at = actor.router.now_ms_for_test().expect("clock");
+    let action = actor
+        .handle_request(
+            Zip301Request::Submit {
+                id: Zip301Id::Number(30),
+                worker: "account.rig".to_owned(),
+                job_id: old.id().to_protocol(),
+                time: old.header_time(),
+                nonce_2: fixture_suffix(),
+                solution: Box::new(fixture_solution()),
+            },
+            at,
+        )
+        .expect("qualified candidate request")
+        .expect("candidate action");
+    let pending = match action {
+        ConnectionAction::Submit(pending) => Some(pending),
+        _ => None,
+    }
+    .expect("candidate submission ticket");
+    let (ticket, context) = pending.into_parts();
+    assert!(context.is_winner_recovery());
+    drop(context);
+    actor
+        .complete_submission(
+            ticket,
+            Err(ShareRouterError::Rejected(
+                wcash_pool_protocol::BackendErrorCode::RecoveryDeferred,
+            )),
+        )
+        .expect("bounded retry exhausted without terminating miner");
+    assert!(!actor.is_closed());
+    assert_eq!(
+        actor.session.state(),
+        wcash_pool_core::SessionState::Authorized
+    );
+    assert!(
+        matches!(actor.pop_outbound(), Some(Zip301ServerMessage::Error { id: Zip301Id::Number(30), code: 20, message }) if message == "service temporarily unavailable")
+    );
+    let generation = actor
+        .router
+        .current_generation()
+        .expect("healthy current query")
+        .expect("current job");
+    actor
+        .apply_job_update(JobUpdate::Activated {
+            generation: Box::new(generation),
+            clean_jobs: true,
+        })
+        .expect("later notification path remains available");
+    assert!(!actor.is_closed());
+    assert!(actor
+        .outbound
+        .iter()
+        .any(|message| matches!(message, Zip301ServerMessage::Notify(_))));
+}
