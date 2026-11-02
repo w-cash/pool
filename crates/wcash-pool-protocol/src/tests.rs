@@ -191,6 +191,26 @@ fn backend_recovery_only_health_is_explicit_and_excludes_ordinary_admission() ->
 }
 
 #[test]
+fn backend_recovery_deferred_is_an_explicit_nonfatal_wire_rejection() -> TestResult {
+    let message = BackendMessage::Error {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+        code: BackendErrorCode::RecoveryDeferred,
+        message: "Zcash recovery authority is temporarily unavailable".to_owned(),
+    };
+    let payload = br#"{"type":"error","v":2,"id":7,"code":"recovery_deferred","message":"Zcash recovery authority is temporarily unavailable"}"#;
+    assert_eq!(
+        encode_backend_message(&message)?,
+        raw_backend_frame(payload)
+    );
+    assert_eq!(
+        decode_backend_message(&raw_backend_frame(payload))?,
+        message
+    );
+    Ok(())
+}
+
+#[test]
 fn backend_frame_rejects_missing_empty_oversize_truncated_and_trailing() {
     assert_eq!(
         decode_backend_request(&[0, 0, 0]),

@@ -350,6 +350,8 @@ pub enum BackendErrorCode {
     Overloaded,
     /// A required node, journal, or backend invariant is unhealthy.
     BackendUnhealthy,
+    /// A bounded Zcash candidate awaits a fresh recovery-authority observation.
+    RecoveryDeferred,
 }
 
 /// Explicit versioned backend features that must be negotiated before mining.
