@@ -309,6 +309,54 @@ impl MiningSession {
         registry: &mut GenerationRegistry,
         now_ms: u64,
     ) -> Result<SubmissionContext, SessionError> {
+        self.prepare_submission_mode(
+            claimed_login,
+            job_id,
+            submitted_time,
+            nonce_suffix,
+            solution,
+            registry,
+            now_ms,
+            false,
+        )
+    }
+
+    /// Filters an original assignment under explicit backend recovery-only permission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_paused_zcash_candidate(
+        &self,
+        claimed_login: &str,
+        job_id: JobId,
+        submitted_time: Hex4,
+        nonce_suffix: NonceSuffix,
+        solution: Box<Hex1344>,
+        registry: &mut GenerationRegistry,
+        now_ms: u64,
+    ) -> Result<SubmissionContext, SessionError> {
+        self.prepare_submission_mode(
+            claimed_login,
+            job_id,
+            submitted_time,
+            nonce_suffix,
+            solution,
+            registry,
+            now_ms,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_submission_mode(
+        &self,
+        claimed_login: &str,
+        job_id: JobId,
+        submitted_time: Hex4,
+        nonce_suffix: NonceSuffix,
+        solution: Box<Hex1344>,
+        registry: &mut GenerationRegistry,
+        now_ms: u64,
+        paused_only: bool,
+    ) -> Result<SubmissionContext, SessionError> {
         self.require(SessionState::Authorized)?;
         let worker = self.worker.as_ref().ok_or(SessionError::MissingIdentity)?;
         let prefix = self
@@ -326,20 +374,32 @@ impl MiningSession {
             .ok_or(SessionError::JobNotAnnounced(job_id))?;
         let nonce =
             join_nonce(prefix, &nonce_suffix).map_err(|_| SessionError::NonceProfileMismatch)?;
-        let admission = match registry.begin_admission(job_id, now_ms) {
-            Ok(admission) => admission,
-            Err(JobRegistryError::StaleJob(_)) => {
-                let generation = registry
-                    .generation(job_id)
-                    .ok_or(JobRegistryError::UnknownJob(job_id))?;
-                JobAssignment::new(generation, assignment.target_binding())
-                    .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
-                if generation.header_time() != submitted_time {
-                    return Err(SessionError::HeaderTimeMismatch(job_id));
-                }
-                registry.begin_zcash_winner_recovery(job_id, &nonce, &solution, now_ms)?
+        let admission = if paused_only {
+            let generation = registry
+                .generation(job_id)
+                .ok_or(JobRegistryError::UnknownJob(job_id))?;
+            JobAssignment::new(generation, assignment.target_binding())
+                .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
+            if generation.header_time() != submitted_time {
+                return Err(SessionError::HeaderTimeMismatch(job_id));
             }
-            Err(error) => return Err(error.into()),
+            registry.begin_paused_zcash_candidate(job_id, &nonce, &solution, now_ms)?
+        } else {
+            match registry.begin_admission(job_id, now_ms) {
+                Ok(admission) => admission,
+                Err(JobRegistryError::StaleJob(_)) => {
+                    let generation = registry
+                        .generation(job_id)
+                        .ok_or(JobRegistryError::UnknownJob(job_id))?;
+                    JobAssignment::new(generation, assignment.target_binding())
+                        .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
+                    if generation.header_time() != submitted_time {
+                        return Err(SessionError::HeaderTimeMismatch(job_id));
+                    }
+                    registry.begin_zcash_winner_recovery(job_id, &nonce, &solution, now_ms)?
+                }
+                Err(error) => return Err(error.into()),
+            }
         };
         JobAssignment::new(admission.generation(), assignment.target_binding())
             .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
@@ -408,6 +468,37 @@ impl fmt::Debug for SubmissionContext {
 }
 
 impl SubmissionContext {
+    /// Rechecks the exact authenticated assignment for bounded candidate forwarding.
+    ///
+    /// The caller must enforce synchronized backend permission. An ordinary
+    /// context may be promoted only after the backend's typed recovery deferral.
+    pub fn refilter_zcash_candidate(
+        mut self,
+        registry: &mut GenerationRegistry,
+        now_ms: u64,
+        recovery_only: bool,
+    ) -> Result<Self, SessionError> {
+        let id = self.admission.job_id();
+        let admission =
+            if self.is_paused_zcash_candidate() || (!self.is_winner_recovery() && recovery_only) {
+                registry.begin_paused_zcash_candidate(id, &self.nonce, &self.solution, now_ms)?
+            } else if recovery_only {
+                registry.begin_historical_zcash_candidate_during_pause(
+                    id,
+                    &self.nonce,
+                    &self.solution,
+                    now_ms,
+                )?
+            } else {
+                registry.begin_zcash_winner_recovery(id, &self.nonce, &self.solution, now_ms)?
+            };
+        if admission.generation().descriptor() != self.generation().descriptor() {
+            return Err(SessionError::RegistryAssignmentMismatch(id));
+        }
+        self.admission = admission;
+        Ok(self)
+    }
+
     /// Returns the source transport session.
     pub const fn session_id(&self) -> Uuid {
         self.session_id
@@ -436,6 +527,11 @@ impl SubmissionContext {
     /// Whether this context forwards only a potential late Zcash winner.
     pub const fn is_winner_recovery(&self) -> bool {
         self.admission.is_winner_recovery()
+    }
+
+    /// Whether the backend explicitly permitted a Zcash candidate during a health pause.
+    pub const fn is_paused_zcash_candidate(&self) -> bool {
+        self.admission.is_paused_zcash_candidate()
     }
 
     /// Returns the exact raw header time verified against the generation.

@@ -39,6 +39,7 @@ pub enum JobUpdate {
 struct RouterState {
     registry: GenerationRegistry,
     health_paused: bool,
+    recovery_only: bool,
     force_clean_jobs: bool,
     backend_authority: Option<BackendAuthority>,
     connection_binding: Option<BackendConnectionBinding>,
@@ -139,6 +140,7 @@ impl JobRouter {
             state: Arc::new(Mutex::new(RouterState {
                 registry,
                 health_paused: false,
+                recovery_only: false,
                 force_clean_jobs: false,
                 backend_authority: Some(snapshot.authority().clone()),
                 connection_binding: Some(snapshot.connection_binding()),
@@ -177,6 +179,7 @@ impl JobRouter {
         match self.state.lock() {
             Ok(mut state) => {
                 state.registry.suspend();
+                state.recovery_only = false;
                 state.force_clean_jobs = true;
                 // Publish while the transition lock is held so a concurrently
                 // completed activation cannot be observed after this suspension.
@@ -207,6 +210,7 @@ impl JobRouter {
                     return Ok(false);
                 }
                 state.registry.suspend();
+                state.recovery_only = false;
                 state.force_clean_jobs = true;
                 let _ = self.updates.send(JobUpdate::Suspended);
                 Ok(true)
@@ -259,6 +263,7 @@ impl JobRouter {
             Ok(now_ms) => now_ms,
             Err(error) => {
                 state.registry.suspend();
+                state.recovery_only = false;
                 state.force_clean_jobs = true;
                 let _ = self.updates.send(JobUpdate::Suspended);
                 return Err(error.into());
@@ -334,7 +339,8 @@ impl JobRouter {
 
     /// Stops miner admission during an authenticated, temporary unhealthy status.
     /// The contiguous registry, immutable assignments, and original deadlines
-    /// remain intact while every new submission is refused.
+    /// remain intact. Candidate forwarding needs a separate explicit permission
+    /// after every health/event barrier; ordinary submission stays paused.
     pub(crate) fn pause_for_health(&self, client: &BackendClient) -> Result<(), JobRouterError> {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         if !state
@@ -345,6 +351,7 @@ impl JobRouter {
             return Err(JobRouterError::BackendConnectionMismatch);
         }
         state.registry.admissible_job_ids(self.timeline.now_ms()?)?;
+        state.recovery_only = false;
         if !state.health_paused {
             state.health_paused = true;
             state.force_clean_jobs = true;
@@ -371,6 +378,7 @@ impl JobRouter {
             .registry
             .current_generation(self.timeline.now_ms()?)?
             .cloned();
+        state.recovery_only = false;
         if state.health_paused {
             state.health_paused = false;
             state.force_clean_jobs = true;
@@ -383,6 +391,57 @@ impl JobRouter {
             }
         }
         Ok(())
+    }
+
+    /// Grants candidate-only forwarding after the authenticated health barrier is applied.
+    pub(crate) fn allow_recovery_only_after_health(
+        &self,
+        client: &BackendClient,
+    ) -> Result<(), JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        if !state.health_paused
+            || !state
+                .connection_binding
+                .as_ref()
+                .is_some_and(|binding| client.is_bound_to(binding))
+            || state.registry.last_event_seq() != client.live_event_cursor()
+        {
+            return Err(JobRouterError::BackendConnectionMismatch);
+        }
+        state
+            .registry
+            .winner_recovery_job_ids(self.timeline.now_ms()?)?;
+        state.recovery_only = true;
+        Ok(())
+    }
+
+    /// Refilters queued work while preserving its original authenticated assignment.
+    pub(crate) fn prepare_queued_paused_candidate(
+        &self,
+        context: SubmissionContext,
+        client: &BackendClient,
+    ) -> Result<SubmissionContext, JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        if state.health_paused && !state.recovery_only {
+            return Err(SessionError::Registry(JobRegistryError::StaleJob(
+                context.generation().id(),
+            ))
+            .into());
+        }
+        if !state
+            .connection_binding
+            .as_ref()
+            .is_some_and(|binding| client.is_bound_to(binding))
+            || state.registry.last_event_seq() != client.live_event_cursor()
+        {
+            return Err(JobRouterError::BackendConnectionMismatch);
+        }
+        let recovery_only = state.health_paused && state.recovery_only;
+        Ok(context.refilter_zcash_candidate(
+            &mut state.registry,
+            self.timeline.now_ms()?,
+            recovery_only,
+        )?)
     }
 
     /// Returns the current admissible generation at this process's monotonic time.
@@ -445,6 +504,17 @@ impl JobRouter {
         let now_ms = self.timeline.now_ms()?;
         if state.health_paused {
             state.registry.admissible_job_ids(now_ms)?;
+            if state.recovery_only {
+                return Ok(session.prepare_paused_zcash_candidate(
+                    claimed_login,
+                    job_id,
+                    submitted_time,
+                    nonce_suffix,
+                    solution,
+                    &mut state.registry,
+                    now_ms,
+                )?);
+            }
             return Err(SessionError::Registry(JobRegistryError::StaleJob(job_id)).into());
         }
         Ok(session.prepare_submission(
@@ -475,6 +545,7 @@ impl JobRouter {
             state: Arc::new(Mutex::new(RouterState {
                 registry,
                 health_paused: false,
+                recovery_only: false,
                 force_clean_jobs: false,
                 backend_authority: None,
                 connection_binding: None,
@@ -544,6 +615,7 @@ impl JobRouter {
         }
 
         state.force_clean_jobs = true;
+        state.recovery_only = false;
         match apply(&mut state.registry) {
             Ok(()) => {
                 state.health_paused = false;

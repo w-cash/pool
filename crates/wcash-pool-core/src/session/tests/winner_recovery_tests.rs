@@ -143,6 +143,74 @@ fn recovery_does_not_relax_login_time_profile_or_announcement_checks() {
 }
 
 #[test]
+fn paused_forwarding_and_refilter_keep_the_exact_original_assignment() {
+    let (session, mut registry, generation, target) = fixture();
+    assert!(registry
+        .current_generation(75_001)
+        .expect("clock advances")
+        .is_none());
+    let context = session
+        .prepare_paused_zcash_candidate(
+            "account.rig",
+            generation.id(),
+            generation.header_time(),
+            NonceSuffix::TwentyEight(Hex28::new([0xa5; 28])),
+            Box::new(Hex1344::new([0x5a; 1344])),
+            &mut registry,
+            75_001,
+        )
+        .expect("assigned candidate may be forwarded without ordinary work");
+    assert!(context.is_paused_zcash_candidate());
+    assert_eq!(context.generation(), &generation);
+    assert_eq!(context.target_le(), &target.target().to_backend());
+    let nonce = context.nonce().clone();
+    let context = context
+        .refilter_zcash_candidate(&mut registry, 104_999, true)
+        .expect("retry keeps original recovery deadline");
+    assert_eq!(context.nonce(), &nonce);
+    assert_eq!(context.generation(), &generation);
+    assert!(context
+        .refilter_zcash_candidate(&mut registry, 105_000, true)
+        .is_err());
+}
+
+#[test]
+fn paused_forwarding_preserves_login_time_nonce_and_announcement_rejection() {
+    for variant in 0..4 {
+        let (session, mut registry, generation, _) = fixture();
+        let result = session.prepare_paused_zcash_candidate(
+            if variant == 0 {
+                "another.rig"
+            } else {
+                "account.rig"
+            },
+            if variant == 3 {
+                JobId::new([0x99; 32]).expect("nonzero ID")
+            } else {
+                generation.id()
+            },
+            if variant == 1 {
+                Hex4::new([0xff; 4])
+            } else {
+                generation.header_time()
+            },
+            if variant == 2 {
+                NonceSuffix::TwentyFour(wcash_pool_protocol::Hex24::new([0xa5; 24]))
+            } else {
+                NonceSuffix::TwentyEight(Hex28::new([0xa5; 28]))
+            },
+            Box::new(Hex1344::new([0x5a; 1344])),
+            &mut registry,
+            75_001,
+        );
+        assert!(
+            result.is_err(),
+            "paused mode must reject crossed field {variant}"
+        );
+    }
+}
+
+#[test]
 fn reannouncement_cannot_change_the_retired_target_binding() {
     let (mut session, _, generation, target) = fixture();
     let same = JobAssignment::new(&generation, target).expect("same assignment");

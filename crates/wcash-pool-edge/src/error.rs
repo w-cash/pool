@@ -128,7 +128,9 @@ impl MinerError {
             | BackendErrorCode::TargetOutOfRange => {
                 Self::new(MinerErrorCode::Other, "invalid share", false)
             }
-            BackendErrorCode::Overloaded | BackendErrorCode::BackendUnhealthy => {
+            BackendErrorCode::Overloaded
+            | BackendErrorCode::BackendUnhealthy
+            | BackendErrorCode::RecoveryDeferred => {
                 Self::new(MinerErrorCode::Other, "service unavailable", true)
             }
         }

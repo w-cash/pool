@@ -578,7 +578,7 @@ impl GenerationRegistry {
             .map_err(|_| JobRegistryError::AdmissionCounterExhausted(id))?;
         Ok(GenerationAdmission {
             resource: Arc::clone(resource),
-            winner_recovery: false,
+            role: AdmissionRole::Ordinary,
         })
     }
 
@@ -606,6 +606,59 @@ impl GenerationRegistry {
         solution: &Hex1344,
         now_ms: u64,
     ) -> Result<GenerationAdmission, JobRegistryError> {
+        self.begin_zcash_candidate(
+            id,
+            nonce,
+            solution,
+            now_ms,
+            AdmissionRole::HistoricalZcashRecovery,
+            false,
+        )
+    }
+
+    pub(crate) fn begin_historical_zcash_candidate_during_pause(
+        &mut self,
+        id: JobId,
+        nonce: &Hex32,
+        solution: &Hex1344,
+        now_ms: u64,
+    ) -> Result<GenerationAdmission, JobRegistryError> {
+        self.begin_zcash_candidate(
+            id,
+            nonce,
+            solution,
+            now_ms,
+            AdmissionRole::HistoricalZcashRecovery,
+            true,
+        )
+    }
+
+    pub(crate) fn begin_paused_zcash_candidate(
+        &mut self,
+        id: JobId,
+        nonce: &Hex32,
+        solution: &Hex1344,
+        now_ms: u64,
+    ) -> Result<GenerationAdmission, JobRegistryError> {
+        self.begin_zcash_candidate(
+            id,
+            nonce,
+            solution,
+            now_ms,
+            AdmissionRole::PausedZcashCandidate,
+            true,
+        )
+    }
+
+    fn begin_zcash_candidate(
+        &mut self,
+        id: JobId,
+        nonce: &Hex32,
+        solution: &Hex1344,
+        now_ms: u64,
+        role: AdmissionRole,
+        allow_no_current: bool,
+    ) -> Result<GenerationAdmission, JobRegistryError> {
         self.advance_clock(now_ms)?;
         if !self.synchronized {
             return Err(JobRegistryError::NotSynchronized);
@@ -614,8 +667,10 @@ impl GenerationRegistry {
         let current = self
             .current
             .and_then(|current| self.entries.get(&current))
-            .filter(|entry| entry.accepting(now_ms))
-            .ok_or(JobRegistryError::StaleJob(id))?;
+            .filter(|entry| entry.accepting(now_ms));
+        if !allow_no_current && current.is_none() {
+            return Err(JobRegistryError::StaleJob(id));
+        }
         let entry = self
             .entries
             .get(&id)
@@ -623,8 +678,10 @@ impl GenerationRegistry {
                 self.winner_recovery.contains(&id)
                     && now_ms < entry.winner_recovery_until_ms
                     && entry.state != AdmissionState::Closed
-                    && entry.storage.generation().tips().zcash_previous_hash_le()
-                        == current.storage.generation().tips().zcash_previous_hash_le()
+                    && current.is_none_or(|current| {
+                        entry.storage.generation().tips().zcash_previous_hash_le()
+                            == current.storage.generation().tips().zcash_previous_hash_le()
+                    })
             })
             .ok_or(JobRegistryError::StaleJob(id))?;
         let generation = entry.storage.generation();
@@ -645,10 +702,7 @@ impl GenerationRegistry {
         // recovery guard owns only its immutable descriptor, never a new lease.
         let resource = Arc::new(GenerationResource::new(generation.clone()));
         resource.in_flight.store(1, Ordering::Release);
-        Ok(GenerationAdmission {
-            resource,
-            winner_recovery: true,
-        })
+        Ok(GenerationAdmission { resource, role })
     }
 
     /// Releases heavy non-admitting resources after their final guard drops.
@@ -1105,11 +1159,18 @@ impl GenerationRegistry {
     }
 }
 
-/// Non-cloneable RAII proof that one submission began while its job was valid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionRole {
+    Ordinary,
+    HistoricalZcashRecovery,
+    PausedZcashCandidate,
+}
+
+/// Non-cloneable RAII proof that one submission passed its bounded job policy.
 #[derive(Debug)]
 pub struct GenerationAdmission {
     resource: Arc<GenerationResource>,
-    winner_recovery: bool,
+    role: AdmissionRole,
 }
 
 impl GenerationAdmission {
@@ -1125,7 +1186,12 @@ impl GenerationAdmission {
 
     /// Whether only a potential Zcash network winner may use this guard.
     pub const fn is_winner_recovery(&self) -> bool {
-        self.winner_recovery
+        !matches!(self.role, AdmissionRole::Ordinary)
+    }
+
+    /// Whether authenticated health explicitly permitted forwarding while paused.
+    pub const fn is_paused_zcash_candidate(&self) -> bool {
+        matches!(self.role, AdmissionRole::PausedZcashCandidate)
     }
 }
 
