@@ -449,6 +449,55 @@ async fn due_retries_and_ready_commands_take_alternating_turns() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn due_retry_wins_before_rounded_timer_tick() -> TestResult {
+    let (sender, mut receiver) = mpsc::channel(2);
+    let (complete, _acknowledged) = oneshot::channel();
+    tokio::time::advance(Duration::from_micros(500)).await;
+    sender.send(SubmitCommand::Shutdown { complete }).await?;
+    let due = Some(Instant::now());
+
+    assert!(matches!(
+        next_submission_work(&mut receiver, due, false).await,
+        ActorWork::CandidateRetry
+    ));
+    assert!(matches!(
+        next_submission_work(&mut receiver, due, true).await,
+        ActorWork::Command(Some(SubmitCommand::Shutdown { .. }))
+    ));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_retry_checks_exact_deadline_again_before_ready_command() -> TestResult {
+    let (sender, mut receiver) = mpsc::channel(2);
+    let deadline = Instant::now() + Duration::from_micros(500);
+    let due = Some(deadline);
+    let (complete, acknowledged) = oneshot::channel();
+
+    {
+        let work = next_submission_work(&mut receiver, due, false);
+        tokio::pin!(work);
+        let first_poll =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending());
+
+        tokio::time::advance(Duration::from_micros(500)).await;
+        assert_eq!(Instant::now(), deadline);
+        sender.send(SubmitCommand::Shutdown { complete }).await?;
+        assert!(matches!(work.await, ActorWork::CandidateRetry));
+    }
+
+    let ActorWork::Command(Some(SubmitCommand::Shutdown { complete })) =
+        next_submission_work(&mut receiver, due, true).await
+    else {
+        return Err("command-preferred turn must retain the queued shutdown".into());
+    };
+    assert!(complete.send(()).is_ok());
+    acknowledged.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn pending_candidate_does_not_block_ordinary_submission_after_health_recovers() -> TestResult
 {

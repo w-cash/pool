@@ -379,7 +379,19 @@ async fn next_submission_work(
 ) -> ActorWork {
     let candidate_due = async {
         match candidate_deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            Some(deadline) => {
+                let sleep = tokio::time::sleep_until(deadline);
+                tokio::pin!(sleep);
+                std::future::poll_fn(|cx| {
+                    // Timer ticks can lag an already-due exact Instant deadline.
+                    if Instant::now() >= deadline {
+                        std::task::Poll::Ready(())
+                    } else {
+                        sleep.as_mut().poll(cx)
+                    }
+                })
+                .await
+            }
             None => std::future::pending::<()>().await,
         }
     };
