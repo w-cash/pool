@@ -215,7 +215,18 @@ fn final_backend_closure_and_unannounced_jobs_do_not_forward() {
 
 #[test]
 fn exhausted_temporary_recovery_keeps_authorization_and_later_job_route_alive() {
-    let (mut actor, old, _, _) = rotated_actor();
+    let (mut actor, old, target, _) = rotated_actor();
+    let expected_target = Zip301ServerMessage::SetTarget {
+        target_be: target.target().to_zip301(),
+    };
+    let expected_notify = Zip301ServerMessage::Notify(Zip301Notify {
+        job_id: Hex32::new([2; 32]),
+        header_input: old.descriptor().header_input.clone(),
+        clean_jobs: true,
+    });
+    assert_eq!(actor.pop_outbound(), Some(expected_target.clone()));
+    assert_eq!(actor.pop_outbound(), Some(expected_notify.clone()));
+    assert_eq!(actor.pop_outbound(), None);
     let at = actor.router.now_ms_for_test().expect("clock");
     let action = actor
         .handle_request(
@@ -252,9 +263,15 @@ fn exhausted_temporary_recovery_keeps_authorization_and_later_job_route_alive() 
         actor.session.state(),
         wcash_pool_core::SessionState::Authorized
     );
-    assert!(
-        matches!(actor.pop_outbound(), Some(Zip301ServerMessage::Error { id: Zip301Id::Number(30), code: 20, message }) if message == "service temporarily unavailable")
+    assert_eq!(
+        actor.pop_outbound(),
+        Some(Zip301ServerMessage::Error {
+            id: Zip301Id::Number(30),
+            code: 20,
+            message: "service temporarily unavailable".to_owned(),
+        })
     );
+    assert_eq!(actor.pop_outbound(), None);
     let generation = actor
         .router
         .current_generation()
@@ -267,8 +284,7 @@ fn exhausted_temporary_recovery_keeps_authorization_and_later_job_route_alive() 
         })
         .expect("later notification path remains available");
     assert!(!actor.is_closed());
-    assert!(actor
-        .outbound
-        .iter()
-        .any(|message| matches!(message, Zip301ServerMessage::Notify(_))));
+    assert_eq!(actor.pop_outbound(), Some(expected_target));
+    assert_eq!(actor.pop_outbound(), Some(expected_notify));
+    assert_eq!(actor.pop_outbound(), None);
 }
