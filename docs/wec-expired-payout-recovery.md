@@ -36,9 +36,13 @@ appears canonical consumes its original reservation through normal confirmation;
 insufficient confirmations defer fresh settlement. A rollback to or below its
 expiry also defers settlement. A held exact expired orphan continues to permit
 only separately payable rewards while its full original reserve remains held.
-Mempool presence or uncertain observations defer fresh settlement. Two held
-batches block new signing, and candidate overflow fails closed. The worker never
-resubmits a held or retired artifact.
+Mempool presence or uncertain observations on the selected page defer fresh
+settlement for that pass. Held count alone does not block new signing. Every
+fresh wallet reconciliation and batch still checks all held records for complete
+immutable expiry evidence and requires every held expiry below its fresh wallet
+tip. Full pending reserves remain excluded from payable rewards. More than one
+active artifact fails closed. The worker never resubmits a held or retired
+artifact.
 
 ## Finalized non-inclusion
 
@@ -70,21 +74,27 @@ mining wire format, job, share, consensus, ZEC submission or payout destination
 format changes. The automatic recovery is WEC-only; it does not enable automatic
 ZEC payouts.
 
-Recovery visits at most two artifacts. Wallet inspection is cached against the
-immutable request and signed facts, and occupies its own worker pass. State
-transitions also defer the remaining settlement pass. Ordinary held polling
-uses bounded read-only RPCs, with no historical scan or repeated ledger rehash.
+Recovery visits at most two artifacts per pass. At most one active artifact is
+always selected first; remaining slots visit held artifacts by UUID cursor with
+wraparound. Only a completed authority pass advances the cursor, so an
+inspection-only pass retries its same page. Wallet inspection is cached against
+the selected immutable request and signed facts, and occupies its own worker
+pass. State transitions also defer the remaining settlement pass. A larger held
+backlog changes the number of pages, not the per-pass artifact or shutdown
+budget. Ordinary held polling uses bounded read-only RPCs, with no historical
+scan or repeated ledger rehash.
 The service's existing shutdown/lease bound includes the extra gate. Logs are
 emitted only after a durable hold, release or held confirmation, outside every
 mining and ZEC submission path.
 
-Build and test away from the mining VPS. The hold-only correction requires only
+Build and test away from the mining VPS. The held-backlog correction requires only
 the payout executable where migration 0022 and its reviewed grants are already
 present; retain those grants, all configurations, credentials, journals, wallets
 and ledger history. Do not use the full deployment preflight or grant reset
 scripts on a running pool. Only the isolated payout worker needs a restart.
 The previous expiry-aware worker understands the held state, but can block
-payouts again when the node retains an orphan. It is a safety fallback, not a
-recovery of payout availability. A binary predating migration 0022 cannot safely
+payouts again when the node retains an orphan or fail closed when more than two
+recovery candidates have accumulated. Rolling back to it is a funds-safety
+fallback, not a recovery of payout availability. A binary predating migration 0022 cannot safely
 interpret these states. Stop only the payout worker if recovery is uncertain,
 retain evidence, and keep mining running.
