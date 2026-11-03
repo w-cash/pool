@@ -1018,7 +1018,9 @@ fn share_outcome_for_backend(code: wcash_pool_protocol::BackendErrorCode) -> Opt
         | BackendErrorCode::LowDifficulty
         | BackendErrorCode::InvalidEquihash
         | BackendErrorCode::TargetOutOfRange => Some(ShareOutcome::Invalid),
-        BackendErrorCode::Overloaded | BackendErrorCode::BackendUnhealthy => None,
+        BackendErrorCode::Overloaded
+        | BackendErrorCode::BackendUnhealthy
+        | BackendErrorCode::RecoveryDeferred => None,
     }
 }
 

@@ -152,6 +152,7 @@ fn backend_health_frame_has_exact_big_endian_golden_encoding() -> TestResult {
         id: 7,
         event_seq: 9,
         healthy: true,
+        recovery_only: false,
         pending_wcash: 2,
         quarantined_wcash: 1,
         pending_zcash: 3,
@@ -160,6 +161,52 @@ fn backend_health_frame_has_exact_big_endian_golden_encoding() -> TestResult {
     let payload = br#"{"type":"health_status","v":2,"id":7,"event_seq":9,"healthy":true,"pending_wcash":2,"quarantined_wcash":1,"pending_zcash":3}"#;
     assert_eq!(frame, raw_backend_frame(payload));
     assert_eq!(decode_backend_message(&frame)?, response);
+    Ok(())
+}
+
+#[test]
+fn backend_recovery_only_health_is_explicit_and_excludes_ordinary_admission() -> TestResult {
+    let message = BackendMessage::HealthStatus {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+        event_seq: 9,
+        healthy: false,
+        recovery_only: true,
+        pending_wcash: 0,
+        quarantined_wcash: 0,
+        pending_zcash: 0,
+    };
+    let payload = br#"{"type":"health_status","v":2,"id":7,"event_seq":9,"healthy":false,"recovery_only":true,"pending_wcash":0,"quarantined_wcash":0,"pending_zcash":0}"#;
+    assert_eq!(
+        encode_backend_message(&message)?,
+        raw_backend_frame(payload)
+    );
+    assert_eq!(
+        decode_backend_message(&raw_backend_frame(payload))?,
+        message
+    );
+    let inconsistent = br#"{"type":"health_status","v":2,"id":7,"event_seq":9,"healthy":true,"recovery_only":true,"pending_wcash":0,"quarantined_wcash":0,"pending_zcash":0}"#;
+    assert!(decode_backend_message(&raw_backend_frame(inconsistent)).is_err());
+    Ok(())
+}
+
+#[test]
+fn backend_recovery_deferred_is_an_explicit_nonfatal_wire_rejection() -> TestResult {
+    let message = BackendMessage::Error {
+        version: BACKEND_PROTOCOL_VERSION,
+        id: 7,
+        code: BackendErrorCode::RecoveryDeferred,
+        message: "Zcash recovery authority is temporarily unavailable".to_owned(),
+    };
+    let payload = br#"{"type":"error","v":2,"id":7,"code":"recovery_deferred","message":"Zcash recovery authority is temporarily unavailable"}"#;
+    assert_eq!(
+        encode_backend_message(&message)?,
+        raw_backend_frame(payload)
+    );
+    assert_eq!(
+        decode_backend_message(&raw_backend_frame(payload))?,
+        message
+    );
     Ok(())
 }
 
@@ -350,6 +397,7 @@ fn frame_codec_decodes_server_messages_and_submit_share_is_redacted() -> TestRes
         id: 7,
         event_seq: 4,
         healthy: true,
+        recovery_only: false,
         pending_wcash: 0,
         quarantined_wcash: 0,
         pending_zcash: 1,
@@ -384,6 +432,7 @@ fn backend_health_requires_consistent_wcash_quarantine_pressure() -> TestResult 
         id: 7,
         event_seq: 4,
         healthy: true,
+        recovery_only: false,
         pending_wcash: 2,
         quarantined_wcash: 1,
         pending_zcash: 3,
@@ -399,6 +448,7 @@ fn backend_health_requires_consistent_wcash_quarantine_pressure() -> TestResult 
         id: 7,
         event_seq: 4,
         healthy: false,
+        recovery_only: false,
         pending_wcash: 1,
         quarantined_wcash: 2,
         pending_zcash: 0,

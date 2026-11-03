@@ -30,6 +30,9 @@ const MAXIMUM_EVENT_CONSUMER_TIMEOUT: Duration = Duration::from_secs(60);
 // tearing down the whole pool before the backend can publish the next job.
 // This matches the projector's two-minute backend-health grace.
 const BACKEND_HEALTH_GRACE: Duration = Duration::from_secs(120);
+const CANDIDATE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const CANDIDATE_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const MAX_DEFERRED_CANDIDATES: usize = 8;
 
 /// Finite queue and time policy for the one live Wolf actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +153,7 @@ enum SubmitCommand {
     Share {
         context: SubmissionContext,
         response: oneshot::Sender<Result<VerifiedShareCommit, ShareRouterError>>,
+        queued_at: Instant,
     },
     Shutdown {
         complete: oneshot::Sender<()>,
@@ -159,6 +163,7 @@ enum SubmitCommand {
 enum ActorWork {
     Heartbeat,
     HealthDeadline,
+    CandidateRetry,
     Command(Option<SubmitCommand>),
 }
 
@@ -183,7 +188,11 @@ impl ShareRouterHandle {
     ) -> Result<VerifiedShareCommit, ShareRouterError> {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .try_send(SubmitCommand::Share { context, response })
+            .try_send(SubmitCommand::Share {
+                context,
+                response,
+                queued_at: Instant::now(),
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ShareRouterError::Overloaded,
                 mpsc::error::TrySendError::Closed(_) => ShareRouterError::Unavailable,
@@ -317,6 +326,90 @@ impl Drop for ShareRouter {
     }
 }
 
+struct DeferredCandidate {
+    context: SubmissionContext,
+    response: oneshot::Sender<Result<VerifiedShareCommit, ShareRouterError>>,
+    deadline: Instant,
+    next_try: Instant,
+}
+
+struct DeferredCandidates {
+    entries: Vec<DeferredCandidate>,
+    maximum: usize,
+    router: JobRouter,
+    binding: Option<BackendConnectionBinding>,
+}
+
+impl DeferredCandidates {
+    fn next_deadline(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .map(|entry| entry.next_try.min(entry.deadline))
+            .min()
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<DeferredCandidate> {
+        let (index, deadline) = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.next_try.min(entry.deadline)))
+            .min_by_key(|(_, deadline)| *deadline)?;
+        (deadline <= now).then(|| self.entries.swap_remove(index))
+    }
+}
+
+impl Drop for DeferredCandidates {
+    fn drop(&mut self) {
+        if !self.entries.is_empty() {
+            // Suspend this exact owning stream before dropping response senders.
+            if let Some(binding) = self.binding.as_ref() {
+                let _ = self.router.suspend_if_bound(binding);
+            } else {
+                let _ = self.router.suspend();
+            }
+        }
+    }
+}
+
+async fn next_submission_work(
+    receiver: &mut mpsc::Receiver<SubmitCommand>,
+    candidate_deadline: Option<Instant>,
+    prefer_command: bool,
+) -> ActorWork {
+    let candidate_due = async {
+        match candidate_deadline {
+            Some(deadline) => {
+                let sleep = tokio::time::sleep_until(deadline);
+                tokio::pin!(sleep);
+                std::future::poll_fn(|cx| {
+                    // Timer ticks can lag an already-due exact Instant deadline.
+                    if Instant::now() >= deadline {
+                        std::task::Poll::Ready(())
+                    } else {
+                        sleep.as_mut().poll(cx)
+                    }
+                })
+                .await
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    if prefer_command {
+        tokio::select! {
+            biased;
+            command = receiver.recv() => ActorWork::Command(command),
+            _ = candidate_due => ActorWork::CandidateRetry,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = candidate_due => ActorWork::CandidateRetry,
+            command = receiver.recv() => ActorWork::Command(command),
+        }
+    }
+}
+
 async fn run_submission_actor(
     mut client: BackendClient,
     job_router: JobRouter,
@@ -329,11 +422,17 @@ async fn run_submission_actor(
     let mut heartbeat = interval_at(first_heartbeat_deadline, config.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut health_deadline = None;
+    let mut prefer_command = false;
+    let retry_budget = CANDIDATE_RETRY_BUDGET.min(client.request_timeout());
+    let mut deferred = DeferredCandidates {
+        entries: Vec::with_capacity(MAX_DEFERRED_CANDIDATES.min(config.queue_capacity())),
+        maximum: MAX_DEFERRED_CANDIDATES.min(config.queue_capacity()),
+        router: job_router.clone(),
+        binding: client.connection_binding(),
+    };
 
     loop {
         let work = tokio::select! {
-            // Once due, one health exchange wins over an already-ready submission.
-            // This bounds event lag while the submission queue remains non-empty.
             biased;
             _ = async {
                 match health_deadline {
@@ -342,9 +441,9 @@ async fn run_submission_actor(
                 }
             } => ActorWork::HealthDeadline,
             _ = heartbeat.tick() => ActorWork::Heartbeat,
-            command = receiver.recv() => ActorWork::Command(command),
+            work = next_submission_work(&mut receiver, deferred.next_deadline(), prefer_command) => work,
         };
-        match work {
+        let mut pending = match work {
             ActorWork::Heartbeat => {
                 let health = pump_health(
                     &mut client,
@@ -387,6 +486,7 @@ async fn run_submission_actor(
                     fail_pending(&mut receiver).await;
                     return Err(error);
                 }
+                continue;
             }
             ActorWork::HealthDeadline => {
                 suspension.suspend();
@@ -394,63 +494,231 @@ async fn run_submission_actor(
                 fail_pending(&mut receiver).await;
                 return Err(ShareRouterError::BackendHealthDeadline);
             }
-            ActorWork::Command(Some(SubmitCommand::Share { context, response })) => {
-                if health_deadline.is_some() {
-                    // Contexts queued before the health response must not bypass
-                    // the pause. Preserve the connection with a normal stale job.
-                    let _ =
-                        response.send(Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob)));
+            ActorWork::CandidateRetry => {
+                prefer_command = true;
+                let Some(pending) = deferred.take_due(Instant::now()) else {
                     continue;
-                }
-                // This guard is declared after `response`, so unwinding or task
-                // cancellation suspends admission before dropping the response
-                // sender and waking its caller with an unavailable result.
-                let mut response_suspension = ResponseSuspension::new(&mut suspension);
-                let mut result = client
-                    .submit_prepared_share(context)
-                    .await
-                    .map_err(ShareRouterError::from_client);
-                if let Err(error) = drain_backend_events(
-                    &mut client,
-                    &job_router,
-                    event_consumer.as_ref(),
-                    config.event_consumer_timeout(),
-                )
-                .await
-                {
-                    result = Err(error);
-                }
-                let terminal = result
-                    .as_ref()
-                    .err()
-                    .filter(|error| error.is_terminal())
-                    .cloned();
-                if terminal.is_some() {
-                    // Stop every current and future miner session before exposing
-                    // the terminal share outcome to its caller.
-                    response_suspension.suspend();
-                } else {
-                    response_suspension.disarm();
-                }
-                drop(response_suspension);
-                let _ = response.send(result);
-                if let Some(error) = terminal {
-                    receiver.close();
-                    fail_pending(&mut receiver).await;
-                    return Err(error);
+                };
+                pending
+            }
+            ActorWork::Command(Some(SubmitCommand::Share {
+                context,
+                response,
+                queued_at,
+            })) => {
+                prefer_command = false;
+                DeferredCandidate {
+                    context,
+                    response,
+                    deadline: queued_at + retry_budget,
+                    next_try: Instant::now(),
                 }
             }
             ActorWork::Command(Some(SubmitCommand::Shutdown { complete })) => {
                 suspension.suspend();
                 receiver.close();
                 fail_pending(&mut receiver).await;
+                deferred.entries.clear();
                 let _ = complete.send(());
                 break;
             }
             ActorWork::Command(None) => break,
+        };
+        let mut response_suspension = ResponseSuspension::new(&mut suspension);
+        if health_deadline.is_some() || pending.context.is_winner_recovery() {
+            pending.context =
+                match job_router.prepare_queued_paused_candidate(pending.context, &client) {
+                    Ok(context) => context,
+                    Err(crate::JobRouterError::Session(_)) => {
+                        response_suspension.disarm();
+                        let _ = pending
+                            .response
+                            .send(Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob)));
+                        continue;
+                    }
+                    Err(_) => {
+                        response_suspension.suspend();
+                        let _ = pending
+                            .response
+                            .send(Err(ShareRouterError::JobStreamUnusable));
+                        receiver.close();
+                        fail_pending(&mut receiver).await;
+                        return Err(ShareRouterError::JobStreamUnusable);
+                    }
+                };
+        }
+        if pending.context.is_winner_recovery() && Instant::now() >= pending.deadline {
+            response_suspension.disarm();
+            let _ = pending.response.send(Err(ShareRouterError::Rejected(
+                BackendErrorCode::RecoveryDeferred,
+            )));
+            continue;
+        }
+        let (mut result, mut retained) = submit_context_and_drain(
+            &mut client,
+            &job_router,
+            event_consumer.as_ref(),
+            config,
+            pending.context,
+            pending.deadline,
+        )
+        .await;
+        // An ordinary guard may cross its lease while queued or in flight. Only
+        // this typed response permits a fresh health barrier and cheap candidate
+        // qualification; no ordinary work or generic rejection is retried.
+        if matches!(
+            &result,
+            Err(ShareRouterError::Rejected(
+                BackendErrorCode::RecoveryDeferred
+            ))
+        ) && retained
+            .as_ref()
+            .is_some_and(|context| !context.is_winner_recovery())
+            && Instant::now() < pending.deadline
+        {
+            match tokio::time::timeout_at(
+                pending.deadline,
+                pump_health(
+                    &mut client,
+                    &job_router,
+                    event_consumer.as_ref(),
+                    config.event_consumer_timeout(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok((healthy, observed_at))) => {
+                    if healthy {
+                        if job_router.resume_after_health(&client).is_err() {
+                            result = Err(ShareRouterError::JobStreamUnusable);
+                        } else {
+                            health_deadline = None;
+                        }
+                    } else {
+                        health_deadline.get_or_insert(observed_at + BACKEND_HEALTH_GRACE);
+                    }
+                    if matches!(
+                        &result,
+                        Err(ShareRouterError::Rejected(
+                            BackendErrorCode::RecoveryDeferred
+                        ))
+                    ) {
+                        if let Some(context) = retained.take() {
+                            match job_router.prepare_queued_paused_candidate(context, &client) {
+                                Ok(candidate) => retained = Some(candidate),
+                                Err(crate::JobRouterError::Session(_)) => {
+                                    result =
+                                        Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob))
+                                }
+                                Err(_) => result = Err(ShareRouterError::JobStreamUnusable),
+                            }
+                        }
+                    }
+                }
+                Ok(Err(error)) => result = Err(error),
+                Err(_) => result = Err(ShareRouterError::Unavailable),
+            }
+        }
+        let terminal = result
+            .as_ref()
+            .err()
+            .filter(|error| error.is_terminal())
+            .cloned();
+        if terminal.is_some() {
+            response_suspension.suspend();
+        } else {
+            response_suspension.disarm();
+        }
+        drop(response_suspension);
+        if matches!(
+            &result,
+            Err(ShareRouterError::Rejected(
+                BackendErrorCode::RecoveryDeferred
+            ))
+        ) {
+            if let Some(context) = retained {
+                if Instant::now() < pending.deadline {
+                    if deferred.entries.len() < deferred.maximum {
+                        deferred.entries.push(DeferredCandidate {
+                            context,
+                            response: pending.response,
+                            deadline: pending.deadline,
+                            next_try: Instant::now() + CANDIDATE_RETRY_INTERVAL,
+                        });
+                        continue;
+                    }
+                    let _ = pending.response.send(Err(ShareRouterError::Overloaded));
+                    continue;
+                }
+            }
+        }
+        let _ = pending.response.send(result);
+        if let Some(error) = terminal {
+            receiver.close();
+            fail_pending(&mut receiver).await;
+            return Err(error);
         }
     }
     Ok(())
+}
+
+async fn submit_context_and_drain(
+    client: &mut BackendClient,
+    job_router: &JobRouter,
+    event_consumer: &dyn BackendEventConsumer,
+    config: ShareRouterConfig,
+    context: SubmissionContext,
+    deadline: Instant,
+) -> (
+    Result<VerifiedShareCommit, ShareRouterError>,
+    Option<SubmissionContext>,
+) {
+    if context.is_winner_recovery() {
+        let attempt = async {
+            let mut result = client
+                .submit_recovery_candidate(&context)
+                .await
+                .map_err(ShareRouterError::from_client);
+            if let Err(error) = drain_backend_events(
+                client,
+                job_router,
+                event_consumer,
+                config.event_consumer_timeout(),
+            )
+            .await
+            {
+                result = Err(error);
+            }
+            result
+        };
+        let result = tokio::time::timeout_at(deadline, attempt)
+            .await
+            .unwrap_or(Err(ShareRouterError::Unavailable));
+        (result, Some(context))
+    } else {
+        let mut result = client
+            .submit_prepared_share_borrowed(&context)
+            .await
+            .map_err(ShareRouterError::from_client);
+        if let Err(error) = drain_backend_events(
+            client,
+            job_router,
+            event_consumer,
+            config.event_consumer_timeout(),
+        )
+        .await
+        {
+            result = Err(error);
+        }
+        let retained = matches!(
+            &result,
+            Err(ShareRouterError::Rejected(
+                BackendErrorCode::RecoveryDeferred
+            ))
+        )
+        .then_some(context);
+        (result, retained)
+    }
 }
 
 /// Ensures cancellation, panic, or loss of every producer cannot leave stale work live.
@@ -557,6 +825,11 @@ async fn pump_health(
         drain_backend_events(client, job_router, event_consumer, event_consumer_timeout).await?;
     }
     let health = health?;
+    if !health.healthy && health.recovery_only {
+        job_router
+            .allow_recovery_only_after_health(client)
+            .map_err(|_| ShareRouterError::JobStreamUnusable)?;
+    }
     Ok((health.healthy, observed_at))
 }
 
@@ -691,6 +964,8 @@ impl ShareRouterError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    #[path = "recovery_only_tests.rs"]
+    mod recovery_only_tests;
     use std::{
         error::Error,
         fs, future,
@@ -813,6 +1088,7 @@ mod tests {
     }
 
     async fn establish_live_stream(stream: &mut UnixStream, current: JobDescriptor) -> TestResult {
+        let accept_for_ms = current.max_age_ms.min(30_000);
         let BackendRequest::Hello { id, .. } = read_request(stream).await? else {
             return TestResult::Err("first request was not hello".into());
         };
@@ -846,7 +1122,7 @@ mod tests {
                 event_seq: 10,
                 current: Some(AcceptableJob {
                     job: current,
-                    accept_for_ms: 30_000,
+                    accept_for_ms,
                 }),
                 recent: Vec::new(),
             },
@@ -1030,6 +1306,7 @@ mod tests {
             ShareRouterError::Rejected(BackendErrorCode::LowDifficulty)
         );
         assert!(!mapped.is_terminal());
+        assert!(!ShareRouterError::Rejected(BackendErrorCode::RecoveryDeferred).is_terminal());
         assert!(ShareRouterError::Rejected(BackendErrorCode::BackendUnhealthy).is_terminal());
     }
 
@@ -1165,6 +1442,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -1243,6 +1521,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -1319,6 +1598,7 @@ mod tests {
                 id,
                 event_seq,
                 healthy,
+                recovery_only: false,
                 pending_wcash: 0,
                 quarantined_wcash: 0,
                 pending_zcash: 0,
@@ -1400,6 +1680,7 @@ mod tests {
             .try_send(SubmitCommand::Share {
                 context: queued_context,
                 response,
+                queued_at: Instant::now(),
             })
             .map_err(|_| "could not enqueue context during health exchange")?;
         let _ = allow_pause.send(());
@@ -1682,6 +1963,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -1753,6 +2035,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -1944,6 +2227,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -2267,6 +2551,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -2319,6 +2604,7 @@ mod tests {
             .try_send(SubmitCommand::Share {
                 context: second_context,
                 response: second_response,
+                queued_at: Instant::now(),
             })
             .map_err(|_| "could not enqueue the second test submission")?;
         tokio::time::advance(Duration::from_secs(10)).await;

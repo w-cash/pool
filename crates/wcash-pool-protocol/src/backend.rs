@@ -41,6 +41,10 @@ pub const SHARE_ID_DOMAIN: &[u8] = b"wcash-pool/share-id/v1";
 /// Domain separator for immutable worker-and-target attribution.
 pub const ATTRIBUTION_ID_DOMAIN: &[u8] = b"wcash-pool/attribution-id/v1";
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn encode_length_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtocolError> {
     let payload =
         serde_json::to_vec(message).map_err(|error| ProtocolError::Json(error.to_string()))?;
@@ -346,6 +350,8 @@ pub enum BackendErrorCode {
     Overloaded,
     /// A required node, journal, or backend invariant is unhealthy.
     BackendUnhealthy,
+    /// A bounded Zcash candidate awaits a fresh recovery-authority observation.
+    RecoveryDeferred,
 }
 
 /// Explicit versioned backend features that must be negotiated before mining.
@@ -1224,6 +1230,10 @@ pub enum BackendMessage {
         event_seq: u64,
         /// True only while the backend can accept shares safely.
         healthy: bool,
+        /// Explicit permission to forward only bounded, original-assignment Zcash candidates.
+        /// This is never ordinary share admission and is omitted for legacy/read-only clients.
+        #[serde(default, skip_serializing_if = "is_false")]
+        recovery_only: bool,
         /// Wcash winners retained in the durable outbox.
         pending_wcash: u32,
         /// Pending Wcash winners held behind conflicting-witness quarantine.
@@ -1333,6 +1343,7 @@ impl fmt::Debug for BackendMessage {
                 id,
                 event_seq,
                 healthy,
+                recovery_only,
                 pending_wcash,
                 quarantined_wcash,
                 pending_zcash,
@@ -1342,6 +1353,7 @@ impl fmt::Debug for BackendMessage {
                 .field("id", id)
                 .field("event_seq", event_seq)
                 .field("healthy", healthy)
+                .field("recovery_only", recovery_only)
                 .field("pending_wcash", pending_wcash)
                 .field("quarantined_wcash", quarantined_wcash)
                 .field("pending_zcash", pending_zcash)
@@ -1540,11 +1552,19 @@ impl BackendMessage {
             }
             Self::HealthStatus {
                 id,
+                healthy,
+                recovery_only,
                 pending_wcash,
                 quarantined_wcash,
                 ..
             } => {
                 require_nonzero_id(*id)?;
+                if *healthy && *recovery_only {
+                    return Err(invalid(
+                        "health_status.recovery_only",
+                        "cannot be combined with ordinary healthy admission",
+                    ));
+                }
                 if quarantined_wcash > pending_wcash {
                     return Err(invalid(
                         "health_status.quarantined_wcash",

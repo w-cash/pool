@@ -1,6 +1,10 @@
 use super::*;
 
-async fn assert_recovered_receipt_role(mask: u8, historical_replay: bool) -> TestResult {
+async fn assert_recovered_receipt_role(
+    mask: u8,
+    historical_replay: bool,
+    paused: bool,
+) -> TestResult {
     let encoded = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../wcash-pool-core/tests/vectors/zcash-mainnet-1687118-header.hex"
@@ -151,16 +155,31 @@ async fn assert_recovered_receipt_role(mask: u8, historical_replay: bool) -> Tes
     registry.apply_event(&invalidated, at)?;
     registry.apply_event(&activated, at)?;
     session.retire_announced_job(generation.id());
-    let context = session.prepare_submission(
-        "account.worker",
-        generation.id(),
-        generation.header_time(),
-        NonceSuffix::TwentyEight(Hex28::new(header[112..140].try_into()?)),
-        Box::new(Hex1344::new(header[143..1487].try_into()?)),
-        &mut registry,
-        timeline.now_ms()?,
-    )?;
+    let suffix = NonceSuffix::TwentyEight(Hex28::new(header[112..140].try_into()?));
+    let solution = Box::new(Hex1344::new(header[143..1487].try_into()?));
+    let context = if paused {
+        session.prepare_paused_zcash_candidate(
+            "account.worker",
+            generation.id(),
+            generation.header_time(),
+            suffix,
+            solution,
+            &mut registry,
+            timeline.now_ms()?,
+        )?
+    } else {
+        session.prepare_submission(
+            "account.worker",
+            generation.id(),
+            generation.header_time(),
+            suffix,
+            solution,
+            &mut registry,
+            timeline.now_ms()?,
+        )?
+    };
     assert!(context.is_winner_recovery());
+    assert_eq!(context.is_paused_zcash_candidate(), paused);
     // A historical acknowledgement models a receipt already committed during
     // ordinary admission whose acknowledgement was lost. It must survive the
     // late retry byte-for-byte, including any original Wcash winner.
@@ -192,7 +211,7 @@ async fn assert_recovered_receipt_role(mask: u8, historical_replay: bool) -> Tes
         parent_hash_le: original_parent,
         winners: original_winners,
     };
-    let allowed = mask == 2 || (historical_replay && mask == 3);
+    let allowed = mask == 2 || ((historical_replay || paused) && mask == 3);
     match client.submit_prepared_share(context).await {
         Ok(commit) if allowed => {
             assert_eq!(commit.receipt(), &original_receipt);
@@ -229,12 +248,23 @@ async fn assert_recovered_receipt_role(mask: u8, historical_replay: bool) -> Tes
 async fn recovered_context_requires_zcash_and_preserves_original_dual_chain_replay() -> TestResult {
     for historical_replay in [false, true] {
         for mask in [0, 1, 3, 2] {
-            if let Err(error) = assert_recovered_receipt_role(mask, historical_replay).await {
+            if let Err(error) = assert_recovered_receipt_role(mask, historical_replay, false).await
+            {
                 return Err(format!(
                     "receipt role mask={mask}, historical_replay={historical_replay}: {error}"
                 )
                 .into());
             }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn paused_candidate_requires_zcash_but_preserves_a_valid_dual_receipt() -> TestResult {
+    for historical_replay in [false, true] {
+        for mask in [0, 1, 3, 2] {
+            assert_recovered_receipt_role(mask, historical_replay, true).await?;
         }
     }
     Ok(())

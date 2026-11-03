@@ -202,6 +202,76 @@ fn a_live_matching_zcash_parent_is_required() {
 }
 
 #[test]
+fn paused_candidate_survives_no_ordinary_authority_without_renewing_its_tail() {
+    let mut registry = recovery_registry();
+    let nonce = Hex32::new([0xa5; 32]);
+    let solution = Hex1344::new([0x5a; 1344]);
+    assert!(registry
+        .current_generation(45_001)
+        .expect("clock advances")
+        .is_none());
+    assert!(matches!(
+        recover(&mut registry, 1, 45_001),
+        Err(JobRegistryError::StaleJob(_))
+    ));
+    let candidate = registry
+        .begin_paused_zcash_candidate(id(1), &nonce, &solution, 45_001)
+        .expect("explicit forwarding permission does not require an ordinary lease");
+    assert!(candidate.is_paused_zcash_candidate());
+    assert!(candidate.is_winner_recovery());
+    drop(candidate);
+    assert!(registry
+        .begin_paused_zcash_candidate(id(1), &nonce, &solution, 104_999)
+        .is_ok());
+    assert!(matches!(
+        registry.begin_paused_zcash_candidate(id(1), &nonce, &solution, 105_000),
+        Err(JobRegistryError::StaleJob(_))
+    ));
+}
+
+#[test]
+fn paused_candidate_still_requires_sync_original_target_and_matching_known_parent() {
+    let nonce = Hex32::new([0xa5; 32]);
+    let solution = Hex1344::new([0x5a; 1344]);
+    let mut registry = recovery_registry();
+    replace(&mut registry, 1, 2, 2, 30_000);
+    let current = registry.entries.get_mut(&id(2)).expect("current entry");
+    let mut changed = current.storage.generation().descriptor().clone();
+    changed.zcash_previous_hash_le = Hex32::new([0x43; 32]);
+    let mut header = *changed.header_input.as_bytes();
+    header[4..36].copy_from_slice(changed.zcash_previous_hash_le.as_bytes());
+    changed.header_input = Hex108::new(header);
+    current.storage = GenerationStorage::Live(Arc::new(GenerationResource::new(
+        BackendGeneration::from_descriptor(changed).expect("other parent"),
+    )));
+    assert!(matches!(
+        registry.begin_paused_zcash_candidate(id(1), &nonce, &solution, 32_001),
+        Err(JobRegistryError::StaleJob(_))
+    ));
+    registry.suspend();
+    assert!(matches!(
+        registry.begin_paused_zcash_candidate(id(1), &nonce, &solution, 32_002),
+        Err(JobRegistryError::NotSynchronized)
+    ));
+
+    let mut registry = recovery_registry();
+    let old = registry.entries.get_mut(&id(1)).expect("known job");
+    let mut hard = old.storage.generation().descriptor().clone();
+    hard.zcash_target_le = TargetLe::new({
+        let mut target = [0; 32];
+        target[0] = 1;
+        target
+    });
+    old.storage = GenerationStorage::Live(Arc::new(GenerationResource::new(
+        BackendGeneration::from_descriptor(hard).expect("hard target"),
+    )));
+    assert!(matches!(
+        registry.begin_paused_zcash_candidate(id(1), &nonce, &solution, 1),
+        Err(JobRegistryError::StaleJob(_))
+    ));
+}
+
+#[test]
 fn recovery_history_is_bounded_without_changing_ordinary_capacity() {
     let mut registry = recovery_registry();
     let mut seq = 2;

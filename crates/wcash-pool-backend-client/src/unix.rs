@@ -683,6 +683,8 @@ pub struct HealthSnapshot {
     pub event_seq: u64,
     /// Whether the backend reports that share acceptance is safe.
     pub healthy: bool,
+    /// Whether only bounded original-assignment Zcash candidates may be forwarded.
+    pub recovery_only: bool,
     /// Pending Wcash winner submissions.
     pub pending_wcash: u32,
     /// Wcash winners held due to a conflicting AuxPoW witness.
@@ -971,6 +973,11 @@ impl fmt::Debug for BackendClient {
 }
 
 impl BackendClient {
+    /// Maximum duration of one backend exchange, also bounding candidate retry budgets.
+    pub const fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
+    }
+
     /// Connects and completes the mandatory version and network hello.
     ///
     /// This verifies protocol identifiers supplied by the listener. It does not
@@ -1352,6 +1359,31 @@ impl BackendClient {
         &mut self,
         context: SubmissionContext,
     ) -> Result<VerifiedShareCommit, ClientError> {
+        self.submit_prepared_share_borrowed(&context).await
+    }
+
+    /// Retains a sealed historical or paused candidate across a bounded retry.
+    pub async fn submit_recovery_candidate(
+        &mut self,
+        context: &SubmissionContext,
+    ) -> Result<VerifiedShareCommit, ClientError> {
+        if !context.is_winner_recovery() {
+            return Err(ClientError::Protocol(ProtocolError::InvalidField {
+                field: "submission.role",
+                reason: "bounded retries require a qualified Zcash candidate".to_owned(),
+            }));
+        }
+        self.submit_prepared_share_borrowed(context).await
+    }
+
+    /// Sends one exact sealed context while its caller retains the admission guard.
+    ///
+    /// This permits no retry by itself. Callers must separately qualify a Zcash
+    /// recovery role before retrying a typed recovery deferral.
+    pub async fn submit_prepared_share_borrowed(
+        &mut self,
+        context: &SubmissionContext,
+    ) -> Result<VerifiedShareCommit, ClientError> {
         let descriptor = context.generation().descriptor().clone();
         let expected_parent_hash_le = canonical_parent_header_hash_le(
             &descriptor.header_input,
@@ -1373,6 +1405,7 @@ impl BackendClient {
                     &descriptor,
                     &expected_parent_hash_le,
                     context.is_winner_recovery(),
+                    context.is_paused_zcash_candidate(),
                     commit.replayed(),
                 )?;
                 Ok(VerifiedShareCommit {
@@ -1386,13 +1419,13 @@ impl BackendClient {
                     &descriptor,
                     &expected_parent_hash_le,
                     context.is_winner_recovery(),
+                    context.is_paused_zcash_candidate(),
                     true,
                 )?;
                 Err(ClientError::HistoricalReplayRequiresProjection { receipt })
             }
             Err(error) => Err(error),
         };
-        drop(context);
         result
     }
 
@@ -1496,6 +1529,7 @@ impl BackendClient {
             BackendMessage::HealthStatus {
                 event_seq,
                 healthy,
+                recovery_only,
                 pending_wcash,
                 quarantined_wcash,
                 pending_zcash,
@@ -1506,6 +1540,7 @@ impl BackendClient {
                 Ok(HealthSnapshot {
                     event_seq,
                     healthy,
+                    recovery_only,
                     pending_wcash,
                     quarantined_wcash,
                     pending_zcash,
@@ -1669,14 +1704,15 @@ impl BackendClient {
         descriptor: &JobDescriptor,
         expected_parent_hash_le: &Hex32,
         winner_recovery: bool,
+        paused_zcash_candidate: bool,
         replayed: bool,
     ) -> Result<(), ClientError> {
         if let Err(error) = receipt.validate_for_job(descriptor) {
             return Err(self.invalidate(ClientError::Protocol(error)));
         }
-        let recovery_role_matches = if replayed {
-            // A valid ordinary dual-chain winner may be retried after its ACK
-            // was lost and ordinary admission ended. Preserve that exact receipt.
+        let recovery_role_matches = if replayed || paused_zcash_candidate {
+            // A paused candidate may still have ordinary dual-chain authority.
+            // A historical ACK retry must also preserve its exact dual receipt.
             receipt
                 .winners
                 .iter()
@@ -1688,7 +1724,7 @@ impl BackendClient {
             return Err(
                 self.invalidate(ClientError::Protocol(ProtocolError::InvalidField {
                     field: "share_receipt.winners",
-                    reason: "fresh late recovery must create only a Zcash winner; replay must retain its original Zcash winner".to_owned(),
+                    reason: "historical fresh recovery must create only a Zcash winner; paused candidates and replay must contain Zcash".to_owned(),
                 })),
             );
         }
@@ -3026,6 +3062,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 1,
                     quarantined_wcash: 1,
                     pending_zcash: 0,
@@ -3381,6 +3418,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -3420,6 +3458,7 @@ mod tests {
                     id,
                     event_seq: 10,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -3702,6 +3741,7 @@ mod tests {
                     id,
                     event_seq: 10,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -3948,6 +3988,7 @@ mod tests {
                     id,
                     event_seq: 11,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -4767,6 +4808,7 @@ mod tests {
                     id,
                     event_seq: 9,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -4906,6 +4948,7 @@ mod tests {
                     id: id + 1,
                     event_seq: 10,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,
@@ -4960,6 +5003,7 @@ mod tests {
                     id: second_id,
                     event_seq: 10,
                     healthy: true,
+                    recovery_only: false,
                     pending_wcash: 0,
                     quarantined_wcash: 0,
                     pending_zcash: 0,

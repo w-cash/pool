@@ -136,14 +136,66 @@ is the original remaining lease deadline plus 60 seconds, with at most 32 jobs
 globally and 32 assignments per session. The ordinary grace and announcement
 limits do not change. Only an exact frozen header, session nonce, time, target,
 and authenticated identity whose canonical SHA256d meets the original Zcash
-network target can use this route, on a live matching Zcash parent. Suspension,
-health pause, Zcash tip invalidation, and final `GenerationClosed` fail closed.
+network target can use this route. Historical recovery ordinarily requires a
+live matching Zcash parent; explicit recovery-only forwarding can retain the
+original context while no ordinary generation remains. Suspension,
+Zcash tip invalidation, and final `GenerationClosed` fail closed.
 Wolf still performs complete consensus validation and durable winner handling;
 the cheap frontend filter is not proof of consensus validity. Ordinary shares
 perform no additional header hashing, and recovered winners do not update
-vardiff. The wire protocol and six capabilities are unchanged, so deployment must
-pin the reviewed pool/backend binary pair rather than infer compatibility from
-capabilities alone.
+vardiff.
+
+The backend-v2 `HealthStatus` response can explicitly grant `recovery_only`
+while `healthy` is false. This permits only a previously assigned Zcash-target
+candidate through the bounded winner route; it does not announce work, extend
+any deadline, or admit ordinary shares. A plain unhealthy response without this
+permission still refuses submission. Live stream identity, synchronization and
+all session checks remain mandatory. The backend independently proves fresh
+exact Zcash parent authority and validates the original proof before committing.
+The permission can remain available while that independent authority is unknown;
+it is permission to submit a candidate, not evidence that the parent is current.
+A fresh different parent revokes eligibility, while an unknown observation can
+return the nonfatal `recovery_deferred` error without accepting the proof.
+
+Only a sealed, original-assignment candidate meeting its frozen Zcash network
+target may retry that specific error. Retries run at 250 ms intervals, retain
+the original enqueue deadline, and end after the smaller of two seconds and the
+existing backend request timeout, or when the original recovery tail expires.
+At most eight deferred candidates are retained globally (fewer if the configured
+queue capacity is smaller), in addition to the existing single bounded in-flight
+exchange and bounded command queue. A ninth first exchange can still commit;
+if it also defers while all retained slots are occupied, it returns overloaded.
+Heartbeats retain priority, and ready commands and
+due candidate retries alternate turns. Shutdown, stream mismatch, lost
+synchronization, and a plain unhealthy response revoke pending forwarding.
+Other backend errors never trigger this retry.
+Exhausting this temporary retry returns a sanitized service-unavailable response
+without disconnecting the authorized miner or declaring its share invalid. The
+backend stream, health pump and later job notifications remain live; ordinary
+admission still requires its normal health and generation checks.
+
+A context originally admitted as ordinary can cross its lease while queued or
+in flight. Only `recovery_deferred` permits a new authenticated health/event
+barrier and a cheap original-target qualification before that same context joins
+the candidate retry route. This keeps its exact proof, account, worker, assigned
+target, and original deadline. It does not create another share reservation.
+Fresh historical recovery still requires an exact Zcash-only receipt. A paused
+candidate may return a valid dual-chain receipt when ordinary backend authority
+also remains; historical replay preserves any exact original dual-chain receipt.
+
+The optional field defaults to false and is omitted when false. A new frontend
+can read an old backend response; an old frontend rejects a true new field under
+strict decoding. This conditional extension keeps protocol version 2 and the six
+capabilities but requires a paired deployment and rollback. Read-only health
+responses must omit the permission so an unchanged isolated payout worker remains
+compatible. Pin the reviewed pool/backend binary pair rather than infer support
+from capabilities alone.
+
+This repair improves delivery of eligible late Zcash candidates during dual-chain
+preparation stalls. It does not prove a historical winning proof was lost, create
+new mining work during a pause, or guarantee a reward. Sampled parent eligibility
+and accepted-share work must remain separately labelled; the Pool cannot observe
+an ASIC's exact work installation time or all hashes never submitted.
 
 ### Share acceptance and idempotency
 

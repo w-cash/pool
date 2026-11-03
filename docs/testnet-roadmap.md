@@ -18,6 +18,23 @@ Each phase has an explicit exit gate. Work may be prototyped in parallel, but a
 later phase cannot be called complete until every earlier gate is evidenced on
 the exact release commit.
 
+## Recovery-only candidate forwarding change
+
+The paired Wolf/Pool source candidate adds explicit backend-v2 recovery-only
+permission and a bounded retry for qualified Zcash candidates. Its scope and
+compatibility contract are described in [the architecture](architecture.md#job-stream).
+Release gates must exercise no-current-generation forwarding, a queued ordinary
+proof crossing its lease, stale/unknown/current independent Zcash authority,
+original-deadline expiry, synchronization loss, distinct receipt roles, pending
+capacity, ordinary-command progress, and cancellation before rollout.
+
+This is a conditional breaking wire extension despite retaining protocol version
+2 and the six existing capabilities. Pin and review both exact artifacts, update
+every live Pool client that may receive the permission, and perform paired
+rollback if required. Read-only health responses must omit the new permission so
+the isolated payout worker can retain its reviewed executable. Source changes
+do not establish production deployment or improved reward yield.
+
 ## Phase 0 — Repository foundation
 
 Deliverables:
