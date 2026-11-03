@@ -35,7 +35,6 @@ const PUBLIC_PROJECTION_POLL: Duration = Duration::from_millis(25);
 const MAX_PPLNS_SHARES: i64 = 1_000_001;
 const MAX_SIGNED_TRANSACTION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_PAYOUT_EXPIRY_CANDIDATES: u32 = 8;
-const PAYOUT_HELD_LIMIT_FOR_NEW_BATCH: i64 = 2;
 /// One more than Wolf's maximum reorganization depth.
 const PAYOUT_EXPIRY_FINALITY_DEPTH: u32 = 1_001;
 const MAX_WALLET_RECONCILIATION_AGE_SECS: u64 = 5 * 60;
@@ -2470,16 +2469,73 @@ impl PostgresStore {
         Ok(batches)
     }
 
-    /// Lists at most eight exact WEC artifacts eligible for expiry inspection.
-    /// Overflow fails closed instead of silently skipping a held reserve.
+    /// Starts a bounded expiry page at the lowest held payout identity.
+    /// Callers that poll repeatedly should retain the held cursor and use
+    /// [`Self::list_payout_expiry_candidates_page`] to visit the whole backlog.
     pub async fn list_payout_expiry_candidates(
         &self,
         maximum: u32,
     ) -> Result<Vec<PayoutExpiryCandidate>, StoreError> {
+        self.list_payout_expiry_candidates_page(maximum, None).await
+    }
+
+    /// Lists one active artifact first, followed by a bounded held-payout page.
+    /// Held identities are visited in ascending order after `after_held`, then
+    /// wrap to the start. A second active artifact fails closed; a held backlog
+    /// does not hide the active artifact or require loading every signed blob.
+    pub async fn list_payout_expiry_candidates_page(
+        &self,
+        maximum: u32,
+        after_held: Option<Uuid>,
+    ) -> Result<Vec<PayoutExpiryCandidate>, StoreError> {
         if !(1..=MAX_PAYOUT_EXPIRY_CANDIDATES).contains(&maximum) {
             return Err(StoreError::InvalidPayoutExpiryEvidence);
         }
+        if after_held.is_some_and(|id| id.is_nil()) {
+            return Err(StoreError::InvalidPayoutExpiryEvidence);
+        }
         let mut transaction = self.pool.begin().await?;
+        let mut ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM payout_batches \
+             WHERE deployment_id=$1 AND chain='wcash' \
+               AND state IN ('signed','broadcasting','broadcast') \
+             ORDER BY id LIMIT 2 FOR UPDATE",
+        )
+        .bind(self.identity.id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if ids.len() > 1 {
+            return Err(StoreError::PayoutExpiryLimitExceeded);
+        }
+        let capacity = usize::try_from(maximum).map_err(|_| StoreError::InvalidPayoutBatch)?;
+        if ids.len() < capacity {
+            let held = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM payout_batches \
+                 WHERE deployment_id=$1 AND chain='wcash' AND state='expiry_pending' \
+                   AND ($2::UUID IS NULL OR id>$2) \
+                 ORDER BY id LIMIT $3 FOR UPDATE",
+            )
+            .bind(self.identity.id)
+            .bind(after_held)
+            .bind(i64::try_from(capacity - ids.len()).map_err(|_| StoreError::InvalidPayoutBatch)?)
+            .fetch_all(&mut *transaction)
+            .await?;
+            ids.extend(held);
+        }
+        if let Some(cursor) = after_held.filter(|_| ids.len() < capacity) {
+            let wrapped = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM payout_batches \
+                 WHERE deployment_id=$1 AND chain='wcash' AND state='expiry_pending' \
+                   AND id<=$2 \
+                 ORDER BY id LIMIT $3 FOR UPDATE",
+            )
+            .bind(self.identity.id)
+            .bind(cursor)
+            .bind(i64::try_from(capacity - ids.len()).map_err(|_| StoreError::InvalidPayoutBatch)?)
+            .fetch_all(&mut *transaction)
+            .await?;
+            ids.extend(wrapped);
+        }
         let rows = sqlx::query(
             "SELECT b.id,b.chain,b.state,b.unsigned_digest,b.transaction_id, \
                     b.signed_transaction,b.network_fee_zat,r.best_tip_height, \
@@ -2490,16 +2546,15 @@ impl PostgresStore {
                ON (r.deployment_id,r.id)=(b.deployment_id,b.reconciliation_id) \
              LEFT JOIN payout_expiry_evidence q \
                ON (q.deployment_id,q.batch_id)=(b.deployment_id,b.id) AND q.phase='held' \
-             WHERE b.deployment_id=$1 AND b.chain='wcash' \
-               AND b.state IN ('signed','broadcasting','broadcast','expiry_pending') \
-             ORDER BY b.created_at,b.id LIMIT $2 FOR UPDATE OF b",
+             WHERE b.deployment_id=$1 AND b.chain='wcash' AND b.id=ANY($2::UUID[]) \
+             ORDER BY array_position($2::UUID[],b.id)",
         )
         .bind(self.identity.id)
-        .bind(i64::from(maximum) + 1)
+        .bind(&ids)
         .fetch_all(&mut *transaction)
         .await?;
-        if rows.len() > usize::try_from(maximum).map_err(|_| StoreError::InvalidPayoutBatch)? {
-            return Err(StoreError::PayoutExpiryLimitExceeded);
+        if rows.len() != ids.len() {
+            return Err(StoreError::CorruptDatabaseState("payout expiry binding"));
         }
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
@@ -4085,9 +4140,9 @@ async fn ensure_held_payouts_expired_at(
     .fetch_one(&mut **transaction)
     .await?;
     let count = row.try_get::<i64, _>("held_count")?;
-    if count >= PAYOUT_HELD_LIMIT_FOR_NEW_BATCH {
-        return Err(StoreError::PayoutExpiryLimitExceeded);
-    }
+    // Held payouts retain their full pending liability and cannot become fresh
+    // payable balance. Their number does not grant or revoke spending authority:
+    // every held artifact must still be expired at the fresh wallet checkpoint.
     if row.try_get::<i64, _>("evidence_count")? != count
         || row.try_get::<i64, _>("maximum_expiry")? >= i64::from(tip_height)
     {
@@ -6277,7 +6332,7 @@ pub enum StoreError {
     /// Expiry evidence is stale, unbound or below the required finality frontier.
     #[error("invalid or premature payout expiry evidence")]
     InvalidPayoutExpiryEvidence,
-    /// The bounded expiry scan must not silently omit any held payment.
+    /// More than one active expiry candidate cannot share the settlement lane.
     #[error("payout expiry recovery candidate limit exceeded")]
     PayoutExpiryLimitExceeded,
     /// Payout confirmation has not reached the immutable policy depth.
