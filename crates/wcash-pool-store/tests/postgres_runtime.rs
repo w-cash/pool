@@ -544,29 +544,33 @@ async fn assert_expired_wcash_payout_keeps_reserve_until_finality(
                 .await
                 .unwrap();
             store.hold_expired_payout(later.id, &second).await.unwrap();
-            assert!(matches!(
-                store.list_payout_expiry_candidates(1).await,
-                Err(StoreError::PayoutExpiryLimitExceeded)
-            ));
+            assert_eq!(
+                store.list_payout_expiry_candidates(1).await.unwrap().len(),
+                1
+            );
             assert!(matches!(
                 store
                     .create_payout_batch(Chain::Wcash, Uuid::new_v4(), current.id)
                     .await,
-                Err(StoreError::PayoutExpiryLimitExceeded)
+                Err(StoreError::WalletReconciliationStale)
             ));
+            let fully_reserved = store
+                .record_wallet_reconciliation(&WalletObservation {
+                    chain: Chain::Wcash,
+                    wallet_state_digest: [0xc2; 32],
+                    wallet_spendable_zat: 200,
+                    best_tip_hash: evidence.tip_hash,
+                    best_tip_height: evidence.tip_height,
+                    observed_at: now,
+                    valid_until: now + 240,
+                })
+                .await
+                .unwrap();
             assert!(matches!(
                 store
-                    .record_wallet_reconciliation(&WalletObservation {
-                        chain: Chain::Wcash,
-                        wallet_state_digest: [0xc2; 32],
-                        wallet_spendable_zat: 200,
-                        best_tip_hash: evidence.tip_hash,
-                        best_tip_height: evidence.tip_height,
-                        observed_at: now,
-                        valid_until: now + 240,
-                    })
+                    .create_payout_batch(Chain::Wcash, Uuid::new_v4(), fully_reserved.id)
                     .await,
-                Err(StoreError::PayoutExpiryLimitExceeded)
+                Err(StoreError::NoPayableBalances)
             ));
             Some((later.id, second))
         } else {
@@ -783,6 +787,288 @@ async fn assert_expired_wcash_payout_keeps_reserve_until_finality(
             assert_eq!(payable, -200);
         }
     }
+}
+
+// A backlog of held artifacts must neither lend its gross reserves to another
+// payout nor block a separately funded payout. SQL fixture bytes deliberately
+// avoid consensus/signing work, which is covered by the expiry coordinator.
+async fn assert_held_payout_backlog_preserves_reserves_and_pages_fairly(
+    database_url: &str,
+    admin: &sqlx::PgPool,
+) {
+    let store = PostgresStore::connect(database_url, 4, identity(114))
+        .await
+        .unwrap();
+    store.bind_deployment().await.unwrap();
+    let mut wec = policy(Chain::Wcash);
+    wec.minimum_payout_zat = 100;
+    wec.maximum_payout_zat = 100;
+    store
+        .bind_zero_fee_launch_policies(&wec, &policy(Chain::Zcash))
+        .await
+        .unwrap();
+    let account = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts(deployment_id,id,login) VALUES ($1,$2,'held_backlog_owner')")
+        .bind(store.deployment_id())
+        .bind(account)
+        .execute(admin)
+        .await
+        .unwrap();
+    insert_destination(&store, admin, account, Chain::Wcash)
+        .await
+        .unwrap();
+    credit_payable(&store, admin, account, Chain::Wcash, 600)
+        .await
+        .unwrap();
+    let now = u64::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+            .fetch_one(admin)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let observation = |height| WalletObservation {
+        chain: Chain::Wcash,
+        wallet_state_digest: [0xc4; 32],
+        wallet_spendable_zat: 600,
+        best_tip_hash: [0xd4; 32],
+        best_tip_height: height,
+        observed_at: now,
+        valid_until: now + 240,
+    };
+    let mut held_artifacts = Vec::new();
+    let mut tip = 50_000;
+    for index in 0..3_u8 {
+        let checkpoint = store
+            .record_wallet_reconciliation(&observation(tip))
+            .await
+            .unwrap();
+        let batch = store
+            .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+            .await
+            .unwrap();
+        assert_eq!(batch.payout_total_zat + batch.maximum_network_fee_zat, 100);
+        store.authorize_payout_signing(batch.id).await.unwrap();
+        let raw = vec![0xc0 + index, 0x11, 0x22];
+        let transaction_id = [0xb0 + index; 32];
+        store
+            .mark_payout_signed(batch.id, &[0xa0 + index; 32], &transaction_id, &raw, 1)
+            .await
+            .unwrap();
+        let expiry_height = 50_020 + u32::from(index) * 10;
+        tip = expiry_height + 1;
+        store
+            .hold_expired_payout(
+                batch.id,
+                &PayoutExpiryEvidence {
+                    transaction_id,
+                    signed_transaction_sha256: Sha256::digest(&raw).into(),
+                    expiry_height,
+                    tip_hash: [0xd4; 32],
+                    tip_height: tip,
+                    observed_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        held_artifacts.push(
+            store
+                .signed_payout_artifact(batch.id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let mut held_ids = held_artifacts
+        .iter()
+        .map(|a| a.batch_id)
+        .collect::<Vec<_>>();
+    held_ids.sort_unstable();
+    // Rollback must check every held expiry, including a newest-expiry
+    // artifact deliberately excluded from the selected one-artifact page.
+    let newest_expiry_id = held_artifacts[2].batch_id;
+    let selected = store
+        .list_payout_expiry_candidates_page(1, Some(newest_expiry_id))
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_ne!(selected[0].artifact.batch_id, newest_expiry_id);
+    assert!(matches!(
+        store
+            .record_wallet_reconciliation(&observation(50_040))
+            .await,
+        Err(StoreError::WalletReconciliationBlocked)
+    ));
+    let checkpoint = store
+        .record_wallet_reconciliation(&observation(tip))
+        .await
+        .unwrap();
+    let active = store
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        active.payout_total_zat + active.maximum_network_fee_zat,
+        100
+    );
+    store.authorize_payout_signing(active.id).await.unwrap();
+    let active_raw = vec![0xc3, 0x33, 0x44];
+    store
+        .mark_payout_signed(active.id, &[0xa3; 32], &[0xb3; 32], &active_raw, 1)
+        .await
+        .unwrap();
+    let mut cursor = None;
+    let mut visited = Vec::new();
+    for _ in 0..3 {
+        let page = store
+            .list_payout_expiry_candidates_page(2, cursor)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].artifact.batch_id, active.id);
+        assert_eq!(page[0].artifact.state, PayoutBatchState::Signed);
+        assert_eq!(page[1].artifact.state, PayoutBatchState::ExpiryPending);
+        cursor = Some(page[1].artifact.batch_id);
+        visited.push(page[1].artifact.batch_id);
+    }
+    assert_eq!(visited, held_ids);
+    let wrapped = store
+        .list_payout_expiry_candidates_page(2, cursor)
+        .await
+        .unwrap();
+    assert_eq!(wrapped[0].artifact.batch_id, active.id);
+    assert_eq!(wrapped[1].artifact.batch_id, held_ids[0]);
+    assert_eq!(
+        store
+            .list_payout_expiry_candidates_page(1, cursor)
+            .await
+            .unwrap()[0]
+            .artifact
+            .batch_id,
+        active.id
+    );
+    assert!(matches!(
+        store
+            .list_payout_expiry_candidates_page(2, Some(Uuid::nil()))
+            .await,
+        Err(StoreError::InvalidPayoutExpiryEvidence)
+    ));
+    for original in &held_artifacts {
+        assert!(
+            store
+                .signed_payout_artifact(original.batch_id)
+                .await
+                .unwrap()
+                .as_ref()
+                == Some(original)
+        );
+    }
+    let balances = sqlx::query(
+        "SELECT ledger_account,SUM(amount_zat)::BIGINT AS amount FROM ledger_entries \
+         WHERE deployment_id=$1 GROUP BY ledger_account",
+    )
+    .bind(store.deployment_id())
+    .fetch_all(admin)
+    .await
+    .unwrap();
+    let balance = |name: &str| {
+        balances
+            .iter()
+            .find(|row| row.get::<String, _>("ledger_account") == name)
+            .map(|row| row.get::<i64, _>("amount"))
+            .unwrap_or(0)
+    };
+    assert_eq!(balance("collector_spendable_asset"), 600);
+    assert_eq!(balance("payout_pending"), -400);
+    assert_eq!(balance("miner_payable"), -200);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ledger_transactions \
+             WHERE deployment_id=$1 AND kind IN ('payout_released','payout_confirmed')",
+        )
+        .bind(store.deployment_id())
+        .fetch_one(admin)
+        .await
+        .unwrap(),
+        0
+    );
+    // Quarantine the fourth artifact, then prove the same account can reserve
+    // another separate 100 without consuming any of the four held reserves.
+    store
+        .hold_expired_payout(
+            active.id,
+            &PayoutExpiryEvidence {
+                transaction_id: [0xb3; 32],
+                signed_transaction_sha256: Sha256::digest(&active_raw).into(),
+                expiry_height: 50_050,
+                tip_hash: [0xd4; 32],
+                tip_height: 50_051,
+                observed_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    let checkpoint = store
+        .record_wallet_reconciliation(&observation(50_051))
+        .await
+        .unwrap();
+    let separate = store
+        .create_payout_batch(Chain::Wcash, Uuid::new_v4(), checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        separate.payout_total_zat + separate.maximum_network_fee_zat,
+        100
+    );
+    store.cancel_payout_draft(separate.id).await.unwrap();
+    // Deliberately corrupt only this disposable fixture: a held row missing its
+    // immutable evidence must block reconciliation even outside the first page.
+    let corrupt_id = Uuid::from_u128(u128::MAX);
+    sqlx::query(
+        "INSERT INTO payout_batches(deployment_id,id,chain,policy_version,idempotency_key, \
+         state,unsigned_digest,transaction_id,signed_transaction,network_fee_zat) \
+         VALUES($1,$2,'wcash',1,$3,'expiry_pending',$4,$5,$6,1)",
+    )
+    .bind(store.deployment_id())
+    .bind(corrupt_id)
+    .bind(Uuid::new_v4())
+    .bind([0xa4_u8; 32].as_slice())
+    .bind([0xb4_u8; 32].as_slice())
+    .bind([0xc4_u8, 0x55, 0x66].as_slice())
+    .execute(admin)
+    .await
+    .unwrap();
+    let selected = store.list_payout_expiry_candidates(1).await.unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_ne!(selected[0].artifact.batch_id, corrupt_id);
+    assert!(matches!(
+        store
+            .record_wallet_reconciliation(&observation(50_051))
+            .await,
+        Err(StoreError::WalletReconciliationBlocked)
+    ));
+    // An unexpectedly concurrent active lane must fail closed regardless of
+    // held pagination. These synthetic rows are never signed or broadcast.
+    for index in 5..7_u8 {
+        sqlx::query(
+            "INSERT INTO payout_batches(deployment_id,id,chain,policy_version,idempotency_key, \
+             state,unsigned_digest,transaction_id,signed_transaction,network_fee_zat) \
+             VALUES($1,$2,'wcash',1,$3,'signed',$4,$5,$6,1)",
+        )
+        .bind(store.deployment_id())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind([0xa0 + index; 32].as_slice())
+        .bind([0xb0 + index; 32].as_slice())
+        .bind([0xc0 + index, 0x77, 0x88].as_slice())
+        .execute(admin)
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        store.list_payout_expiry_candidates_page(2, None).await,
+        Err(StoreError::PayoutExpiryLimitExceeded)
+    ));
 }
 
 async fn insert_destination(
@@ -3126,6 +3412,7 @@ async fn durable_runtime_is_chain_scoped_conserved_and_revocable() {
     assert_database_privilege_boundaries(&admin, &database_url).await;
     assert_winner_depth_regression_is_reversible(&admin, &database_url).await;
     assert_expired_wcash_payout_keeps_reserve_until_finality(&database_url, &admin).await;
+    assert_held_payout_backlog_preserves_reserves_and_pages_fairly(&database_url, &admin).await;
     let mut mismatched_identity = store_identity.clone();
     mismatched_identity.chain_id = mismatched_identity
         .chain_id

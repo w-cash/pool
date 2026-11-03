@@ -19,8 +19,8 @@ use wcash_wec_payout_signer::{
 
 use crate::payout_runtime::{ObservationFailure, ObservationFuture, PayoutRuntimeError};
 
-/// One held payout plus one active payout. Further recovery is fail-closed,
-/// rather than growing the worker's bounded shutdown/lease duration.
+/// Maximum work in one expiry pass: at most one active payout, plus a fair
+/// page of held payouts. Backlog length never increases the lease/drain budget.
 pub(crate) const MAX_EXPIRY_CANDIDATES: u32 = 2;
 /// Pinned Wolf WEC state rollback window (3e708002), plus one completed writer
 /// iteration. This is node-local finality, not universal chain finality.
@@ -37,7 +37,10 @@ pub(crate) trait PayoutExpiryDriver: Send + Sync {
 }
 
 pub(crate) trait ExpiryStore: Send + Sync {
-    fn candidates(&self) -> RecoveryFuture<'_, Vec<PayoutExpiryCandidate>>;
+    fn candidates(
+        &self,
+        after_held: Option<Uuid>,
+    ) -> RecoveryFuture<'_, Vec<PayoutExpiryCandidate>>;
     fn hold(&self, id: Uuid, evidence: PayoutExpiryEvidence) -> RecoveryFuture<'_, ()>;
     fn expire(&self, id: Uuid, evidence: PayoutExpiryEvidence) -> RecoveryFuture<'_, ()>;
     fn confirm(&self, id: Uuid, evidence: PayoutConfirmation) -> RecoveryFuture<'_, bool>;
@@ -60,9 +63,12 @@ fn store_failure(operation: &'static str, error: StoreError) -> PayoutRuntimeErr
 }
 
 impl ExpiryStore for PostgresStore {
-    fn candidates(&self) -> RecoveryFuture<'_, Vec<PayoutExpiryCandidate>> {
+    fn candidates(
+        &self,
+        after_held: Option<Uuid>,
+    ) -> RecoveryFuture<'_, Vec<PayoutExpiryCandidate>> {
         Box::pin(async move {
-            self.list_payout_expiry_candidates(MAX_EXPIRY_CANDIDATES)
+            self.list_payout_expiry_candidates_page(MAX_EXPIRY_CANDIDATES, after_held)
                 .await
                 .map_err(|e| store_failure("expiry_candidates", e))
         })
@@ -191,7 +197,15 @@ pub(crate) struct WecPayoutExpiryRecovery {
     store: Arc<dyn ExpiryStore>,
     inspector: Arc<dyn ExpiryInspector>,
     authority: Arc<dyn ExpiryAuthority>,
-    inspected: Mutex<HashMap<Uuid, InspectedExpiry>>,
+    // Serialize complete recovery passes. A cursor can move only after its
+    // entire authenticated result set and all durable transitions succeeded.
+    progress: Mutex<RecoveryProgress>,
+}
+
+#[derive(Default)]
+struct RecoveryProgress {
+    after_held: Option<Uuid>,
+    inspected: HashMap<Uuid, InspectedExpiry>,
 }
 
 impl WecPayoutExpiryRecovery {
@@ -204,20 +218,27 @@ impl WecPayoutExpiryRecovery {
             store,
             inspector,
             authority,
-            inspected: Mutex::new(HashMap::new()),
+            progress: Mutex::new(RecoveryProgress::default()),
         }
     }
 
     async fn pass(&self) -> Result<bool, PayoutRuntimeError> {
-        let candidates = self.store.candidates().await?;
-        if candidates.len() > MAX_EXPIRY_CANDIDATES as usize {
+        let mut progress = self.progress.lock().await;
+        let candidates = self.store.candidates(progress.after_held).await?;
+        if candidates.len() > MAX_EXPIRY_CANDIDATES as usize
+            || candidates
+                .iter()
+                .filter(|c| c.artifact.state != PayoutBatchState::ExpiryPending)
+                .count()
+                > 1
+        {
             return Err(invariant("expiry_candidate_bound"));
         }
         if candidates.is_empty() {
-            self.inspected.lock().await.clear();
+            *progress = RecoveryProgress::default();
             return Ok(true);
         }
-        let mut inspected = self.inspected.lock().await;
+        let inspected = &mut progress.inspected;
         inspected.retain(|id, _| candidates.iter().any(|c| c.artifact.batch_id == *id));
         let mut did_inspect = false;
         let mut watches = Vec::with_capacity(candidates.len());
@@ -309,7 +330,6 @@ impl WecPayoutExpiryRecovery {
                 candidate,
             });
         }
-        drop(inspected);
         // Inspection is its own bounded pass; never accumulate its child-process
         // deadlines with a wallet sync/prove/sign pass under the worker lease.
         if did_inspect {
@@ -416,14 +436,18 @@ impl WecPayoutExpiryRecovery {
                 _ => return Err(invariant("expiry_state_transition")),
             }
         }
-        // Two held reserves exhaust the bounded recovery allowance. Keep
-        // observing them without repeatedly attempting a knowingly blocked
-        // reconciliation or crashing the healthy waiting worker.
-        let held_count = watches
+        // Advance only after the complete authority pass and every transition
+        // succeeded. Inspection-only passes and failures retain this cursor,
+        // so a newly inspected page always reaches authority observation.
+        // A valid unresolved observation blocks this poll, but does not starve
+        // other held rows forever. Every fresh settlement independently checks
+        // all held expiry evidence against the current reconciled wallet tip.
+        progress.after_held = watches
             .iter()
             .filter(|w| w.candidate.artifact.state == PayoutBatchState::ExpiryPending)
-            .count();
-        Ok(ready && held_count < MAX_EXPIRY_CANDIDATES as usize)
+            .map(|w| w.candidate.artifact.batch_id)
+            .next_back();
+        Ok(ready)
     }
 }
 

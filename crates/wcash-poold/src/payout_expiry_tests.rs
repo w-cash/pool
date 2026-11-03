@@ -87,6 +87,9 @@ enum Transition {
 #[derive(Default)]
 struct Store {
     candidates: StdMutex<Vec<PayoutExpiryCandidate>>,
+    candidate_cursors: StdMutex<Vec<Option<Uuid>>>,
+    bypass_paging: StdMutex<bool>,
+    fail_transitions: StdMutex<bool>,
     transitions: StdMutex<Vec<Transition>>,
     confirmations_succeed: StdMutex<bool>,
 }
@@ -99,9 +102,36 @@ impl Store {
     }
 }
 impl ExpiryStore for Store {
-    fn candidates(&self) -> RecoveryFuture<'_, Vec<PayoutExpiryCandidate>> {
+    fn candidates(
+        &self,
+        after_held: Option<Uuid>,
+    ) -> RecoveryFuture<'_, Vec<PayoutExpiryCandidate>> {
+        self.candidate_cursors.lock().unwrap().push(after_held);
         let c = self.candidates.lock().unwrap().clone();
-        Box::pin(async move { Ok(c) })
+        if *self.bypass_paging.lock().unwrap() {
+            return Box::pin(async move { Ok(c) });
+        }
+        let mut active: Vec<_> = c
+            .iter()
+            .filter(|c| c.artifact.state != PayoutBatchState::ExpiryPending)
+            .cloned()
+            .collect();
+        // Expose malformed active overflow to the runtime's independent guard.
+        if active.len() > 1 {
+            return Box::pin(async move { Ok(active) });
+        }
+        let mut held: Vec<_> = c
+            .into_iter()
+            .filter(|c| c.artifact.state == PayoutBatchState::ExpiryPending)
+            .collect();
+        held.sort_by_key(|c| c.artifact.batch_id);
+        let split = after_held.map_or(0, |cursor| {
+            held.partition_point(|c| c.artifact.batch_id <= cursor)
+        });
+        held.rotate_left(split);
+        let remaining = MAX_EXPIRY_CANDIDATES as usize - active.len();
+        active.extend(held.into_iter().take(remaining));
+        Box::pin(async move { Ok(active) })
     }
     fn hold(&self, id: Uuid, e: PayoutExpiryEvidence) -> RecoveryFuture<'_, ()> {
         self.transitions
@@ -111,6 +141,9 @@ impl ExpiryStore for Store {
         Box::pin(async { Ok(()) })
     }
     fn expire(&self, id: Uuid, e: PayoutExpiryEvidence) -> RecoveryFuture<'_, ()> {
+        if *self.fail_transitions.lock().unwrap() {
+            return Box::pin(async { Err(invariant("scripted_expiry_transition")) });
+        }
         self.transitions
             .lock()
             .unwrap()
@@ -358,6 +391,7 @@ async fn oversized_or_duplicate_candidates_are_not_partially_observed() {
         candidate(2, true),
         candidate(3, true),
     ]);
+    *f.store.bypass_paging.lock().unwrap() = true;
     assert!(f.recovery.recover().await.is_err());
     assert!(f.inspector.calls.lock().unwrap().is_empty());
     assert!(f.authority.calls.lock().unwrap().is_empty());
@@ -370,7 +404,7 @@ async fn oversized_or_duplicate_candidates_are_not_partially_observed() {
 #[tokio::test]
 async fn duplicate_observations_cannot_partially_hold_or_release() {
     let c = candidate(1, false);
-    let f = Fixture::new(vec![c.clone(), candidate(2, false)]);
+    let f = Fixture::new(vec![c.clone(), candidate(2, true)]);
     assert!(!f.recovery.recover().await.unwrap());
     let o = ExpiryObservation {
         batch_id: c.artifact.batch_id,
@@ -578,7 +612,7 @@ async fn held_orphan_cannot_resume_after_mempool_reorg_or_rpc_uncertainty() {
 }
 
 #[tokio::test]
-async fn two_held_orphans_exhaust_recovery_bound_without_releasing_or_resubmitting() {
+async fn two_held_orphans_allow_separate_settlement_without_releasing_or_resubmitting() {
     let one = candidate(1, true);
     let two = candidate(2, true);
     let f = Fixture::new(vec![one.clone(), two.clone()]);
@@ -593,7 +627,251 @@ async fn two_held_orphans_exhaust_recovery_bound_without_releasing_or_resubmitti
             state: ExpiryChainState::ExpiredOrphan(evidence(&two, EXPIRY + 1)),
         },
     ]));
-    assert!(!f.recovery.recover().await.unwrap());
+    assert!(f.recovery.recover().await.unwrap());
     assert_eq!(f.authority.calls.lock().unwrap()[0].len(), 2);
     assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn held_backlog_rotates_bounded_pages_and_always_observes_active_payout() {
+    let active = candidate(100, false);
+    let held: Vec<_> = (1..=5).map(|id| candidate(id, true)).collect();
+    let mut rows = held.clone();
+    rows.push(active.clone());
+    let f = Fixture::new(rows);
+    for current in &held {
+        let previous_authority_calls = f.authority.calls.lock().unwrap().len();
+        // Pin the page during inspection. Otherwise a long held backlog would
+        // rotate before any of its native inspections reached chain authority.
+        assert!(!f.recovery.recover().await.unwrap());
+        assert_eq!(
+            f.authority.calls.lock().unwrap().len(),
+            previous_authority_calls
+        );
+        assert!(f.recovery.progress.lock().await.inspected.len() <= 2);
+        f.authority.results.lock().unwrap().push_back(Ok(vec![
+            ExpiryObservation {
+                batch_id: active.artifact.batch_id,
+                state: ExpiryChainState::Unexpired,
+            },
+            ExpiryObservation {
+                batch_id: current.artifact.batch_id,
+                state: ExpiryChainState::ExpiredOrphan(evidence(current, EXPIRY + 1)),
+            },
+        ]));
+        assert!(f.recovery.recover().await.unwrap());
+    }
+    let calls = f.authority.calls.lock().unwrap();
+    assert_eq!(calls.len(), held.len());
+    for (page, current) in calls.iter().zip(&held) {
+        assert_eq!(page.len(), 2);
+        assert_eq!(
+            page[0].candidate.artifact.batch_id,
+            active.artifact.batch_id
+        );
+        assert_eq!(
+            page[1].candidate.artifact.batch_id,
+            current.artifact.batch_id
+        );
+    }
+    drop(calls);
+    assert_eq!(
+        f.inspector
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| **id == active.artifact.batch_id)
+            .count(),
+        1,
+        "active inspection survives held-page rotation"
+    );
+    let cursors = f.store.candidate_cursors.lock().unwrap();
+    assert_eq!(cursors[0..2], [None, None]);
+    for (i, current) in held.iter().take(held.len() - 1).enumerate() {
+        assert_eq!(
+            cursors[2 * i + 2..2 * i + 4],
+            [
+                Some(current.artifact.batch_id),
+                Some(current.artifact.batch_id)
+            ]
+        );
+    }
+    assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn held_page_wraps_after_deleted_cursor_and_new_active_keeps_priority() {
+    let one = candidate(1, true);
+    let two = candidate(2, true);
+    let three = candidate(3, true);
+    let f = Fixture::new(vec![one.clone(), two.clone(), three.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority.results.lock().unwrap().push_back(Ok(vec![
+        ExpiryObservation {
+            batch_id: one.artifact.batch_id,
+            state: ExpiryChainState::Missing(evidence(&one, EXPIRY + 1)),
+        },
+        ExpiryObservation {
+            batch_id: two.artifact.batch_id,
+            state: ExpiryChainState::Missing(evidence(&two, EXPIRY + 1)),
+        },
+    ]));
+    assert!(f.recovery.recover().await.unwrap());
+    let active = candidate(100, false);
+    // The cursor row can disappear through confirmation/expiry independently
+    // of this worker. UUID keyset selection still reaches three, then wraps.
+    f.store
+        .replace(vec![one.clone(), three.clone(), active.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority.results.lock().unwrap().push_back(Ok(vec![
+        ExpiryObservation {
+            batch_id: active.artifact.batch_id,
+            state: ExpiryChainState::Unexpired,
+        },
+        ExpiryObservation {
+            batch_id: three.artifact.batch_id,
+            state: ExpiryChainState::Missing(evidence(&three, EXPIRY + 1)),
+        },
+    ]));
+    assert!(f.recovery.recover().await.unwrap());
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority.results.lock().unwrap().push_back(Ok(vec![
+        ExpiryObservation {
+            batch_id: active.artifact.batch_id,
+            state: ExpiryChainState::Unexpired,
+        },
+        ExpiryObservation {
+            batch_id: one.artifact.batch_id,
+            state: ExpiryChainState::Missing(evidence(&one, EXPIRY + 1)),
+        },
+    ]));
+    assert!(f.recovery.recover().await.unwrap());
+    let calls = f.authority.calls.lock().unwrap();
+    assert_eq!(
+        calls[1][1].candidate.artifact.batch_id,
+        three.artifact.batch_id
+    );
+    assert_eq!(
+        calls[2][1].candidate.artifact.batch_id,
+        one.artifact.batch_id
+    );
+    assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn authority_failure_keeps_cursor_but_valid_unresolved_page_rotates_safely() {
+    let active = candidate(100, false);
+    let one = candidate(1, true);
+    let two = candidate(2, true);
+    let f = Fixture::new(vec![one.clone(), two.clone(), active.clone()]);
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority
+        .results
+        .lock()
+        .unwrap()
+        .push_back(Err(ObservationFailure::Unavailable));
+    assert!(matches!(
+        f.recovery.recover().await,
+        Err(PayoutRuntimeError::AuthorityUnavailable { .. })
+    ));
+    assert_eq!(f.recovery.progress.lock().await.after_held, None);
+    f.authority.results.lock().unwrap().push_back(Ok(vec![
+        ExpiryObservation {
+            batch_id: active.artifact.batch_id,
+            state: ExpiryChainState::Unexpired,
+        },
+        ExpiryObservation {
+            batch_id: one.artifact.batch_id,
+            state: ExpiryChainState::Unresolved,
+        },
+    ]));
+    assert!(!f.recovery.recover().await.unwrap());
+    assert_eq!(
+        f.recovery.progress.lock().await.after_held,
+        Some(one.artifact.batch_id)
+    );
+    assert!(!f.recovery.recover().await.unwrap());
+    f.authority.results.lock().unwrap().push_back(Ok(vec![
+        ExpiryObservation {
+            batch_id: active.artifact.batch_id,
+            state: ExpiryChainState::Unexpired,
+        },
+        ExpiryObservation {
+            batch_id: two.artifact.batch_id,
+            state: ExpiryChainState::Missing(evidence(&two, EXPIRY + 1)),
+        },
+    ]));
+    assert!(f.recovery.recover().await.unwrap());
+    let calls = f.authority.calls.lock().unwrap();
+    assert_eq!(
+        calls[0][1].candidate.artifact.batch_id,
+        one.artifact.batch_id
+    );
+    assert_eq!(
+        calls[1][1].candidate.artifact.batch_id,
+        one.artifact.batch_id
+    );
+    assert_eq!(
+        calls[2][1].candidate.artifact.batch_id,
+        two.artifact.batch_id
+    );
+    assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn multiple_active_payouts_fail_before_inspection_or_authority() {
+    let f = Fixture::new(vec![candidate(100, false), candidate(101, false)]);
+    assert!(f.recovery.recover().await.is_err());
+    assert!(f.inspector.calls.lock().unwrap().is_empty());
+    assert!(f.authority.calls.lock().unwrap().is_empty());
+    assert!(f.store.transitions().is_empty());
+}
+
+#[tokio::test]
+async fn failed_durable_transition_pins_page_until_successful_retry() {
+    let one = candidate(1, true);
+    let two = candidate(2, true);
+    let three = candidate(3, true);
+    let f = Fixture::new(vec![one.clone(), two.clone(), three]);
+    assert!(!f.recovery.recover().await.unwrap());
+    let observations = vec![
+        ExpiryObservation {
+            batch_id: one.artifact.batch_id,
+            state: ExpiryChainState::FinalMissing(evidence(
+                &one,
+                EXPIRY + WCASH_EXPIRY_FINALITY_DEPTH,
+            )),
+        },
+        ExpiryObservation {
+            batch_id: two.artifact.batch_id,
+            state: ExpiryChainState::Missing(evidence(&two, EXPIRY + 1)),
+        },
+    ];
+    *f.store.fail_transitions.lock().unwrap() = true;
+    f.authority
+        .results
+        .lock()
+        .unwrap()
+        .push_back(Ok(observations.clone()));
+    assert!(f.recovery.recover().await.is_err());
+    assert_eq!(f.recovery.progress.lock().await.after_held, None);
+    assert!(f.store.transitions().is_empty());
+    *f.store.fail_transitions.lock().unwrap() = false;
+    f.authority
+        .results
+        .lock()
+        .unwrap()
+        .push_back(Ok(observations));
+    assert!(!f.recovery.recover().await.unwrap());
+    assert_eq!(
+        f.recovery.progress.lock().await.after_held,
+        Some(two.artifact.batch_id)
+    );
+    assert!(matches!(
+        f.store.transitions().as_slice(),
+        [Transition::Expire(id, _)] if *id == one.artifact.batch_id
+    ));
+    let cursors = f.store.candidate_cursors.lock().unwrap();
+    assert_eq!(*cursors, [None, None, None]);
 }
