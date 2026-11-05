@@ -32,8 +32,20 @@ The Mainnet configuration pins Wcash genesis
 `5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48`,
 Zcash genesis
 `00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08`,
-AuxPoW chain ID `0x57434153`, Wcash branch `d9c6a7ee`, and Zcash branch
-`37a5165b`.
+AuxPoW chain ID `0x57434153` and Wcash branch `d9c6a7ee`. Read-only Zcash
+authority checks require branch `37a5165b` before Mainnet NU7 height 3,543,405
+and `77190ad9` from that height, following [ZIP 259](https://zips.z.cash/zip-0259).
+The current and next branch are checked independently, so at tip 3,543,404 the
+required pair is `37a5165b` / `77190ad9`. Unknown, premature and stale branches
+remain rejected, along with wrong network/genesis, unsynchronized headers and
+inconsistent direct tips. Wcash, Testnet and Regtest authority rules are unchanged.
+
+Public frontend startup performs these read-only authority checks even when ZEC
+payouts are manual. Upgrade the frontend before NU7 so it can start or restart
+across the boundary. This compatibility change does not enable automatic ZEC
+payouts, update the ZEC signer, change the miner/backend wire protocol, or migrate
+PostgreSQL records or journals. Wcash parent-proof activation and the matching
+Wolf node/backend release still require their coordinated WEC activation height.
 
 Operational checks must prove that 3336 and 3338 return a short job alias, submitted
 shares appear under the existing canonical worker in the shared deployment,

@@ -2803,4 +2803,399 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(*order.lock().expect("order"), ["wcash", "zcash", "backend"]);
     }
+
+    #[cfg(unix)]
+    mod nu7_deferred_probe {
+        use super::*;
+        use serde_json::{json, Value};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, UnixListener, UnixStream},
+            task::JoinHandle,
+            time::timeout,
+        };
+        use wcash_pool_backend_client::{
+            BackendClient, BackendClientConfig, ExpectedBackend, MonotonicTimeline,
+        };
+        use wcash_pool_core::GenerationRegistryConfig;
+        use wcash_pool_edge::JobRouter;
+        use wcash_pool_portal::{ChainNetwork, PayoutExecution};
+        use wcash_pool_protocol::{
+            decode_backend_request, encode_backend_message, AcceptableJob, BackendMessage,
+            BackendRequest, CanonicalUuid, Hex108, Hex32, JobDescriptor, TargetBe, TargetLe,
+            BACKEND_PROTOCOL_VERSION, MAX_FRAME_BYTES, REQUIRED_BACKEND_CAPABILITIES,
+        };
+
+        const ACTIVATION: u32 = 3_543_405;
+        const WEC_HEIGHT: u32 = 50_859;
+        const WEC_TIP: [u8; 32] = [0x31; 32];
+        const ZEC_TIP: [u8; 32] = [0x32; 32];
+
+        fn wire_hash(display: &str) -> [u8; 32] {
+            let mut bytes: [u8; 32] = hex::decode(display)
+                .expect("fixture hash")
+                .try_into()
+                .expect("32 bytes");
+            bytes.reverse();
+            bytes
+        }
+
+        fn display_hash(mut wire: [u8; 32]) -> String {
+            wire.reverse();
+            hex::encode(wire)
+        }
+
+        fn deferred_config(root: &Path) -> RuntimeConfig {
+            let cookie = write_probe_file(root, "node.cookie", b"fixture:readonly", 0o600);
+            let policy = ChainRuntimePolicy {
+                pplns_window_work: BigUint::from(1_u8),
+                payout_threshold_zat: 100_000_000,
+                required_confirmations: 100,
+                payout_confirmations: 3,
+                maximum_payout_outputs: 50,
+                minimum_payout_zat: 100_000_000,
+                maximum_payout_zat: 100_000_000,
+                payout_skip_bps: 0,
+                maximum_network_fee_zat: 1_000_000,
+                maximum_network_fee_bps: 100,
+                policy_version: 1,
+            };
+            RuntimeConfig {
+                network: ChainNetwork::Mainnet,
+                deployment_id: Uuid::from_u128(1),
+                pool_instance: Uuid::from_u128(2),
+                backend_instance: Uuid::from_u128(3),
+                journal_stream: Uuid::from_u128(4),
+                chain_id: 1_991_772_603,
+                wcash_genesis: wire_hash(
+                    "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48",
+                ),
+                zcash_genesis: wire_hash(
+                    "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08",
+                ),
+                wcash_payout_commitment: [3; 32],
+                zcash_payout_commitment: [4; 32],
+                backend_socket: root.join("backend.sock"),
+                database_url_file: root.join("not-opened-db"),
+                stratum_listen: "127.0.0.1:1".parse().expect("fixture address"),
+                portal_listen: "127.0.0.1:2".parse().expect("fixture address"),
+                portal_origin: "https://example.invalid".to_owned(),
+                registration_open: false,
+                wcash_transparent_payouts_enabled: false,
+                payout_change_hold_secs: 172800,
+                nonce_namespace: 1,
+                nonce_reservation: 1_000_000,
+                database_connections: 1,
+                maximum_miners: 1,
+                maximum_miners_per_ip: 1,
+                authentication_parallelism: 1,
+                mining_authentication: wcash_pool_store::MiningAuthenticationMode::Token,
+                wcash_wallet_program: root.join("must-not-execute-wallet"),
+                wcash_wallet_sha256: [0x44; 32],
+                wcash_wallet_uid: rustix::process::geteuid().as_raw(),
+                payout_mode: PayoutMode::Deferred,
+                automatic_payout: None,
+                wcash_node_rpc: "127.0.0.1:3".parse().expect("fixture address"),
+                wcash_node_cookie_file: cookie.clone(),
+                zcash_node_rpc: "127.0.0.1:4".parse().expect("fixture address"),
+                zcash_node_cookie_file: cookie,
+                portal_token_pepper_file: root.join("not-opened-pepper"),
+                portal_totp_key_file: root.join("not-opened-totp"),
+                wcash_policy: policy.clone(),
+                zcash_policy: policy,
+                initial_share_target_be: [6; 32],
+                easiest_share_target_be: [7; 32],
+            }
+        }
+
+        /// Real bounded loopback transport, restricted to the exact three read-only calls.
+        async fn node_rpc(
+            genesis: [u8; 32],
+            tip: [u8; 32],
+            height: u32,
+            branches: (&str, &str),
+            calls: usize,
+        ) -> (SocketAddr, JoinHandle<Vec<String>>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("private node RPC");
+            let address = listener.local_addr().expect("node RPC address");
+            let values = [
+                (
+                    "getblockchaininfo",
+                    json!([]),
+                    json!({"chain":"main", "blocks":height,
+                    "headers":height,"bestblockhash":display_hash(tip),
+                    "consensus":{"chaintip":branches.0,"nextblock":branches.1}}),
+                ),
+                ("getblockhash", json!([0]), json!(display_hash(genesis))),
+                (
+                    "getbestblockheightandhash",
+                    json!([]),
+                    json!({"height":height,"hash":tip}),
+                ),
+            ];
+            let task = tokio::spawn(async move {
+                timeout(Duration::from_secs(5), async {
+                    let mut observed = Vec::new();
+                    for (method, params, result) in values.into_iter().take(calls) {
+                        let (mut stream, _) = listener.accept().await.expect("RPC connects");
+                        let mut bytes = Vec::new();
+                        let (header_end, body_len) = loop {
+                            let mut chunk = [0; 1024];
+                            let count = stream.read(&mut chunk).await.expect("RPC request reads");
+                            assert!(count > 0 && bytes.len() + count <= 16 * 1024);
+                            bytes.extend_from_slice(&chunk[..count]);
+                            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let header = std::str::from_utf8(&bytes[..end]).expect("request header");
+                                assert!(header.contains("Authorization: Basic Zml4dHVyZTpyZWFkb25seQ=="));
+                                let length = header.lines().find_map(|line| line.strip_prefix("Content-Length: "))
+                                    .expect("body length").parse::<usize>().expect("numeric length");
+                                assert!(length <= 8 * 1024);
+                                break (end + 4, length);
+                            }
+                        };
+                        while bytes.len() < header_end + body_len {
+                            let mut chunk = [0; 1024];
+                            let count = stream.read(&mut chunk).await.expect("request body reads");
+                            assert!(count > 0 && bytes.len() + count <= 16 * 1024);
+                            bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        let request: Value = serde_json::from_slice(&bytes[header_end..header_end + body_len]).expect("RPC JSON");
+                        assert_eq!(request["method"], method);
+                        assert_eq!(request["params"], params);
+                        observed.push(method.to_owned());
+                        let response = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result})).expect("RPC response");
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()).as_bytes()).await.expect("response headers");
+                        stream.write_all(&response).await.expect("response body");
+                    }
+                    observed
+                }).await.expect("bounded node fixture")
+            });
+            (address, task)
+        }
+
+        async fn request(stream: &mut UnixStream) -> BackendRequest {
+            let mut prefix = [0; 4];
+            stream
+                .read_exact(&mut prefix)
+                .await
+                .expect("backend prefix");
+            let size = usize::try_from(u32::from_be_bytes(prefix)).expect("frame size fits");
+            assert!(size <= MAX_FRAME_BYTES);
+            let mut frame = prefix.to_vec();
+            frame.resize(size + 4, 0);
+            stream
+                .read_exact(&mut frame[4..])
+                .await
+                .expect("backend payload");
+            decode_backend_request(&frame).expect("backend request")
+        }
+
+        /// Protocol-only job fixture: no proof solving, accounting DB, or synthetic credit.
+        async fn job_router(config: &RuntimeConfig, zcash_candidate: u32) -> JobRouter {
+            assert!(config.backend_socket.as_os_str().as_encoded_bytes().len() < 100);
+            let timeline = MonotonicTimeline::new();
+            let listener =
+                UnixListener::bind(&config.backend_socket).expect("private backend socket");
+            let mut header = [0x21; 108];
+            header[..4].copy_from_slice(&4_u32.to_le_bytes());
+            header[4..36].copy_from_slice(&ZEC_TIP);
+            header[100..104].copy_from_slice(&1_725_000_000_u32.to_le_bytes());
+            let job = JobDescriptor {
+                job_id: Hex32::new([0x20; 32]),
+                wcash_candidate_hash_le: Hex32::new([0x61; 32]),
+                header_input: Hex108::new(header),
+                wcash_previous_hash_le: Hex32::new(WEC_TIP),
+                zcash_previous_hash_le: Hex32::new(ZEC_TIP),
+                wcash_coinbase_txid_le: Hex32::new([0x62; 32]),
+                zcash_coinbase_txid_le: Hex32::new([0x63; 32]),
+                wcash_target_le: TargetLe::new([0x7f; 32]),
+                zcash_target_le: TargetLe::new([0x3f; 32]),
+                wcash_height: WEC_HEIGHT + 1,
+                zcash_height: zcash_candidate,
+                wcash_reward_zat: 100_000_000,
+                zcash_reward_zat: 100_000_000,
+                wcash_maturity_confirmations: 100,
+                zcash_maturity_confirmations: 100,
+                max_age_ms: 45_000,
+            };
+            let expected = ExpectedBackend::new(
+                Hex32::new(config.wcash_genesis),
+                Hex32::new(config.zcash_genesis),
+                config.chain_id,
+                Hex32::new(config.wcash_payout_commitment),
+                Hex32::new(config.zcash_payout_commitment),
+                TargetBe::new([0x7f; 32]),
+            )
+            .expect("expected backend")
+            .with_backend_instance(CanonicalUuid::new(config.backend_instance))
+            .with_journal_stream(CanonicalUuid::new(config.journal_stream));
+            let identity = config.clone();
+            let server = tokio::spawn(async move {
+                timeout(Duration::from_secs(5), async {
+                    let (mut stream, _) = listener.accept().await.expect("backend connects");
+                    let BackendRequest::Hello { id, .. } = request(&mut stream).await else {
+                        panic!("Hello required")
+                    };
+                    let hello = BackendMessage::HelloOk {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id,
+                        backend_session: CanonicalUuid::new(Uuid::from_u128(8)),
+                        backend_instance: CanonicalUuid::new(identity.backend_instance),
+                        journal_stream: CanonicalUuid::new(identity.journal_stream),
+                        capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
+                        wcash_genesis: Hex32::new(identity.wcash_genesis),
+                        zcash_genesis: Hex32::new(identity.zcash_genesis),
+                        wcash_payout_commitment: Hex32::new(identity.wcash_payout_commitment),
+                        zcash_payout_commitment: Hex32::new(identity.zcash_payout_commitment),
+                        share_target_ceiling_be: TargetBe::new([0x7f; 32]),
+                        chain_id: identity.chain_id,
+                        current_event_seq: 0,
+                    };
+                    stream
+                        .write_all(&encode_backend_message(&hello).expect("Hello encodes"))
+                        .await
+                        .expect("Hello writes");
+                    let BackendRequest::SubscribeJobs { id, .. } = request(&mut stream).await
+                    else {
+                        panic!("Subscribe required")
+                    };
+                    let snapshot = BackendMessage::JobSnapshot {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id,
+                        event_seq: 0,
+                        current: Some(AcceptableJob {
+                            job,
+                            accept_for_ms: 45_000,
+                        }),
+                        recent: Vec::new(),
+                    };
+                    stream
+                        .write_all(&encode_backend_message(&snapshot).expect("snapshot encodes"))
+                        .await
+                        .expect("snapshot writes");
+                })
+                .await
+                .expect("bounded backend fixture");
+            });
+            let client_config =
+                BackendClientConfig::new(&config.backend_socket, expected).expect("client config");
+            let mut client =
+                BackendClient::connect(client_config, CanonicalUuid::new(Uuid::from_u128(9)), 0)
+                    .await
+                    .expect("backend Hello");
+            let snapshot = client.subscribe_jobs(0).await.expect("branded snapshot");
+            server.await.expect("backend fixture finished");
+            JobRouter::from_snapshot(
+                &snapshot,
+                GenerationRegistryConfig::new(4, 16).expect("registry limits"),
+                timeline,
+                16,
+            )
+            .expect("job router")
+        }
+
+        #[tokio::test]
+        async fn mainnet_deferred_startup_probe_crosses_nu7_without_spending_or_binding() {
+            for (height, current, next, backend_offset, success) in [
+                (ACTIVATION - 1, "37a5165b", "77190ad9", 1, true),
+                (ACTIVATION, "77190ad9", "77190ad9", 1, true),
+                (ACTIVATION - 1, "37a5165b", "37a5165b", 1, false),
+                (ACTIVATION, "77190ad9", "77190ad9", 2, false),
+            ] {
+                let directory = tempfile::Builder::new()
+                    .prefix(".nu7-probe-test-")
+                    .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                    .expect("protected composition fixture");
+                let root = fs::canonicalize(directory.path()).expect("fixture root");
+                let mut config = deferred_config(&root);
+                // Credentials need protected ancestry; only the socket uses a short /tmp path.
+                let socket_directory = tempfile::Builder::new()
+                    .prefix("p7-")
+                    .tempdir_in("/tmp")
+                    .expect("short owned socket directory");
+                config.backend_socket = fs::canonicalize(socket_directory.path())
+                    .expect("socket fixture root")
+                    .join("backend.sock");
+                // Occupied sentinel ports make an accidental frontend bind fail this probe.
+                let stratum = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("stratum sentinel");
+                let portal = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("portal sentinel");
+                config.stratum_listen = stratum.local_addr().expect("sentinel address");
+                config.portal_listen = portal.local_addr().expect("sentinel address");
+                let (wec_rpc, wec_server) = node_rpc(
+                    config.wcash_genesis,
+                    WEC_TIP,
+                    WEC_HEIGHT,
+                    ("d9c6a7ee", "d9c6a7ee"),
+                    3,
+                )
+                .await;
+                let invalid_branch = next == "37a5165b";
+                let (zec_rpc, zec_server) = node_rpc(
+                    config.zcash_genesis,
+                    ZEC_TIP,
+                    height,
+                    (current, next),
+                    if invalid_branch { 1 } else { 3 },
+                )
+                .await;
+                config.wcash_node_rpc = wec_rpc;
+                config.zcash_node_rpc = zec_rpc;
+                let jobs = job_router(&config, height + backend_offset).await;
+                let before = directory_names(&root);
+                let result = timeout(
+                    Duration::from_secs(5),
+                    super::super::build_probe_only_payout_boundary(&config, &jobs),
+                )
+                .await
+                .expect("bounded actual startup probe");
+                if success {
+                    assert_eq!(
+                        result
+                            .expect("Mainnet read-only authority accepts NU7")
+                            .execution(),
+                        PayoutExecution::Deferred
+                    );
+                } else if invalid_branch {
+                    assert!(matches!(
+                        result,
+                        Err(ServiceError::PayoutAuthorityConfiguration)
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(ServiceError::PayoutAuthorityUnavailable)
+                    ));
+                }
+                let allowed = vec![
+                    "getblockchaininfo",
+                    "getblockhash",
+                    "getbestblockheightandhash",
+                ];
+                assert_eq!(wec_server.await.expect("WEC reads complete"), allowed);
+                assert_eq!(
+                    zec_server.await.expect("ZEC reads complete"),
+                    if invalid_branch {
+                        vec!["getblockchaininfo"]
+                    } else {
+                        allowed
+                    }
+                );
+                assert_eq!(
+                    directory_names(&root),
+                    before,
+                    "no signer journals, wallet files or runtime state"
+                );
+                assert!(
+                    !config.wcash_wallet_program.exists(),
+                    "no wallet executable or spending authority"
+                );
+            }
+        }
+    }
 }

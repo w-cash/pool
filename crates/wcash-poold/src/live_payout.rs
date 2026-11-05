@@ -48,6 +48,11 @@ use crate::{
 };
 
 pub(crate) const ZCASH_NU6_3_BRANCH_ID: &str = "37a5165b";
+// ZIP 259 Mainnet schedule; this selects read-only authority, not payout signing.
+// https://zips.z.cash/zip-0259#nu7-network-constants
+const ZCASH_NU7_BRANCH_ID: &str = "77190ad9";
+// The Zcash Mainnet schedule is independent of Wcash's child acceptance height.
+const ZCASH_MAINNET_NU7_ACTIVATION_HEIGHT: u32 = 3_543_405;
 const WALLET_OBSERVATION_DOMAIN: &[u8] = b"ZECWEC-ZALLET-OBSERVATION-V2\0";
 const OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 const MAX_COOKIE_BYTES: u64 = 1_024;
@@ -465,6 +470,19 @@ impl NodePayoutAuthority {
         let best_tip_hash = parse_display_hash_to_wire(&info.best_block_hash)
             .filter(|hash| *hash != [0; 32])
             .ok_or(ObservationFailure::Invariant)?;
+        let (expected_current_branch, expected_next_branch) =
+            if self.network == ChainNetwork::Mainnet && self.chain == Chain::Zcash {
+                let next_height = info
+                    .blocks
+                    .checked_add(1)
+                    .ok_or(ObservationFailure::Invariant)?;
+                (
+                    zcash_mainnet_branch_at(info.blocks),
+                    zcash_mainnet_branch_at(next_height),
+                )
+            } else {
+                (self.expected_branch, self.expected_branch)
+            };
         // Zebra's BIP70 name is "test" for both Testnet and Regtest. A freshly
         // launched Wcash Testnet must be able to start its pool at the exact
         // pinned genesis, before block 1 activates the transaction branch.
@@ -485,7 +503,7 @@ impl NodePayoutAuthority {
         let expected_tip_branch = if at_allowed_genesis {
             "00000000"
         } else {
-            self.expected_branch
+            expected_current_branch
         };
         let expected_chain = if self.network == ChainNetwork::Mainnet {
             "main"
@@ -496,7 +514,7 @@ impl NodePayoutAuthority {
             || (info.blocks == 0 && !at_allowed_genesis)
             || info.headers != info.blocks
             || info.consensus.chain_tip != expected_tip_branch
-            || info.consensus.next_block != self.expected_branch
+            || info.consensus.next_block != expected_next_branch
         {
             return Err(ObservationFailure::Invariant);
         }
@@ -1135,6 +1153,14 @@ fn expected_branch(chain: Chain) -> &'static str {
     match chain {
         Chain::Wcash => WCASH_TESTNET_BRANCH_ID,
         Chain::Zcash => ZCASH_NU6_3_BRANCH_ID,
+    }
+}
+
+fn zcash_mainnet_branch_at(height: u32) -> &'static str {
+    if height >= ZCASH_MAINNET_NU7_ACTIVATION_HEIGHT {
+        ZCASH_NU7_BRANCH_ID
+    } else {
+        ZCASH_NU6_3_BRANCH_ID
     }
 }
 
@@ -1942,6 +1968,245 @@ mod tests {
 
     fn authority(chain: Chain, rpc: Arc<ScriptedRpc>) -> NodePayoutAuthority {
         NodePayoutAuthority::with_client(chain, rpc, GENESIS).expect("valid authority")
+    }
+
+    fn mainnet_zcash_tip_steps(
+        height: u32,
+        tip: [u8; 32],
+        current_branch: &str,
+        next_branch: &str,
+    ) -> Vec<RpcStep> {
+        let mut steps = tip_steps_with_direct(current_branch, tip, height, json!(tip));
+        let info = steps[0].result.as_mut().expect("chain info");
+        info["chain"] = json!("main");
+        info["consensus"]["nextblock"] = json!(next_branch);
+        steps
+    }
+
+    #[tokio::test]
+    async fn mainnet_zcash_preflight_accepts_exact_nu7_boundary_branches() {
+        for (height, current, next) in [
+            (3_543_403, "37a5165b", "37a5165b"),
+            (3_543_404, "37a5165b", "77190ad9"),
+            (3_543_405, "77190ad9", "77190ad9"),
+            (3_543_406, "77190ad9", "77190ad9"),
+        ] {
+            let rpc = Arc::new(ScriptedRpc::new(mainnet_zcash_tip_steps(
+                height, TIP, current, next,
+            )));
+            let selected = authority(Chain::Zcash, Arc::clone(&rpc)).with_mainnet_network();
+            assert_eq!(
+                selected.preflight_probe().await,
+                Ok(VerifiedTip { hash: TIP, height }),
+                "height {height}",
+            );
+            // Only getblockchaininfo, getblockhash(0) and the direct tip are
+            // scripted. Any wallet, transaction or submission RPC panics.
+            rpc.assert_drained();
+        }
+    }
+
+    #[tokio::test]
+    async fn mainnet_zcash_preflight_rejects_inexact_nu7_branch_pairs() {
+        for (height, current, next) in [
+            (3_543_403, "77190ad9", "77190ad9"),
+            (3_543_403, "37a5165b", "77190ad9"),
+            (3_543_404, "77190ad9", "77190ad9"),
+            (3_543_404, "37a5165b", "37a5165b"),
+            (3_543_405, "37a5165b", "77190ad9"),
+            (3_543_405, "77190ad9", "37a5165b"),
+            (3_543_406, "37a5165b", "37a5165b"),
+            (3_543_405, "deadbeef", "77190ad9"),
+            (3_543_405, "77190ad9", "deadbeef"),
+            (3_543_405, "77190AD9", "77190ad9"),
+            (3_543_405, "77190ad9", "d9c6a7ee"),
+        ] {
+            let mut steps = mainnet_zcash_tip_steps(height, TIP, current, next);
+            steps.truncate(1);
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let selected = authority(Chain::Zcash, Arc::clone(&rpc)).with_mainnet_network();
+            assert_eq!(
+                selected.preflight_probe().await,
+                Err(ObservationFailure::Invariant),
+                "height {height}, current {current}, next {next}",
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[tokio::test]
+    async fn mainnet_zcash_authority_tracks_reorgs_across_nu7() {
+        let earlier_tip = [0x88; 32];
+        let observations = [
+            (3_543_404, TIP, "37a5165b", "77190ad9"),
+            (3_543_405, BLOCK, "77190ad9", "77190ad9"),
+            (3_543_406, TRANSACTION, "77190ad9", "77190ad9"),
+            (3_543_404, TIP, "37a5165b", "77190ad9"),
+            (3_543_403, earlier_tip, "37a5165b", "37a5165b"),
+        ];
+        let mut steps = Vec::new();
+        for (height, tip, current, next) in observations {
+            steps.extend(mainnet_zcash_tip_steps(height, tip, current, next));
+        }
+        let rpc = Arc::new(ScriptedRpc::new(steps));
+        let selected = authority(Chain::Zcash, Arc::clone(&rpc)).with_mainnet_network();
+        for (height, hash, _, _) in observations {
+            assert_eq!(
+                selected.preflight_probe().await,
+                Ok(VerifiedTip { hash, height }),
+            );
+        }
+        rpc.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn mainnet_zcash_preflight_preserves_chain_identity_fences() {
+        for invalid_field in ["chain", "headers", "bestblockhash", "genesis"] {
+            let mut steps = mainnet_zcash_tip_steps(3_543_405, TIP, "77190ad9", "77190ad9");
+            if invalid_field == "genesis" {
+                steps[1].result = Ok(json!(display_hash(BLOCK)));
+                steps.truncate(2);
+            } else {
+                let info = steps[0].result.as_mut().expect("chain info");
+                info[invalid_field] = match invalid_field {
+                    "chain" => json!("test"),
+                    "headers" => json!(3_543_406),
+                    "bestblockhash" => json!("00".repeat(32)),
+                    _ => unreachable!("fixed invalid-field cases"),
+                };
+                steps.truncate(1);
+            }
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let selected = authority(Chain::Zcash, Arc::clone(&rpc)).with_mainnet_network();
+            assert_eq!(
+                selected.preflight_probe().await,
+                Err(ObservationFailure::Invariant),
+                "invalid {invalid_field}",
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[tokio::test]
+    async fn mainnet_zcash_preflight_rejects_moving_direct_tip() {
+        for direct in [
+            json!({ "height": 3_543_406, "hash": TIP }),
+            json!({ "height": 3_543_405, "hash": BLOCK }),
+        ] {
+            let mut steps = mainnet_zcash_tip_steps(3_543_405, TIP, "77190ad9", "77190ad9");
+            steps[2].result = Ok(direct);
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let selected = authority(Chain::Zcash, Arc::clone(&rpc)).with_mainnet_network();
+            assert_eq!(
+                selected.preflight_probe().await,
+                Err(ObservationFailure::Unavailable),
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[tokio::test]
+    async fn mainnet_zcash_preflight_rejects_malformed_or_overflowing_heights() {
+        for height in [
+            json!(-1),
+            json!(3_543_405.5),
+            json!("3543405"),
+            Value::Null,
+            json!(u64::from(u32::MAX) + 1),
+            json!(u32::MAX),
+        ] {
+            let mut steps = mainnet_zcash_tip_steps(3_543_405, TIP, "77190ad9", "77190ad9");
+            let info = steps[0].result.as_mut().expect("chain info");
+            info["blocks"] = height.clone();
+            info["headers"] = height;
+            steps.truncate(1);
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let selected = authority(Chain::Zcash, Arc::clone(&rpc)).with_mainnet_network();
+            assert_eq!(
+                selected.preflight_probe().await,
+                Err(ObservationFailure::Invariant),
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[tokio::test]
+    async fn nu7_mainnet_policy_preserves_other_authority_profiles() {
+        for (chain, mainnet, branch) in [
+            (Chain::Wcash, true, "d9c6a7ee"),
+            (Chain::Wcash, false, WCASH_TESTNET_BRANCH_ID),
+            (Chain::Zcash, false, "37a5165b"),
+        ] {
+            let mut steps = tip_steps_with_direct(branch, TIP, 3_543_405, json!(TIP));
+            if mainnet {
+                steps[0].result.as_mut().expect("chain info")["chain"] = json!("main");
+            }
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let selected = authority(chain, Arc::clone(&rpc));
+            let selected = if mainnet {
+                selected.with_mainnet_network()
+            } else {
+                selected
+            };
+            assert_eq!(
+                selected.preflight_probe().await,
+                Ok(VerifiedTip {
+                    hash: TIP,
+                    height: 3_543_405,
+                }),
+            );
+            rpc.assert_drained();
+
+            let mut wrong = tip_steps_with_direct("77190ad9", TIP, 3_543_405, json!(TIP));
+            if mainnet {
+                wrong[0].result.as_mut().expect("chain info")["chain"] = json!("main");
+            }
+            wrong.truncate(1);
+            let rpc = Arc::new(ScriptedRpc::new(wrong));
+            let selected = authority(chain, Arc::clone(&rpc));
+            let selected = if mainnet {
+                selected.with_mainnet_network()
+            } else {
+                selected
+            };
+            assert_eq!(
+                selected.preflight_probe().await,
+                Err(ObservationFailure::Invariant),
+            );
+            rpc.assert_drained();
+        }
+    }
+
+    #[cfg(feature = "regtest")]
+    #[tokio::test]
+    async fn regtest_zcash_authority_keeps_its_frozen_branch_after_mainnet_nu7() {
+        let genesis_display = "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327";
+        let genesis = parse_display_hash_to_wire(genesis_display).expect("Regtest genesis");
+        for branch in ["37a5165b", "77190ad9"] {
+            let mut steps = tip_steps_with_direct(branch, TIP, 3_543_405, json!(TIP));
+            if branch == "37a5165b" {
+                steps[1].result = Ok(json!(genesis_display));
+            } else {
+                steps.truncate(1);
+            }
+            let rpc = Arc::new(ScriptedRpc::new(steps));
+            let selected = NodePayoutAuthority::with_client(Chain::Zcash, rpc.clone(), genesis)
+                .expect("node authority")
+                .with_regtest_network()
+                .expect("Regtest identity");
+            assert_eq!(
+                selected.preflight_probe().await,
+                if branch == "37a5165b" {
+                    Ok(VerifiedTip {
+                        hash: TIP,
+                        height: 3_543_405,
+                    })
+                } else {
+                    Err(ObservationFailure::Invariant)
+                },
+            );
+            rpc.assert_drained();
+        }
     }
 
     #[tokio::test]
