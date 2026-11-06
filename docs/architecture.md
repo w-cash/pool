@@ -53,6 +53,22 @@ the Wcash merged-mining design.
    later reward attribution, maturity, reorg reversal, and payout policy after
    those facts are projected.
 
+The public share router verifies each bounded event batch against one PostgreSQL
+snapshot of its deployment cursor and every exact event hash. Only the isolated
+projector writes those records. If the projection is behind, a read times out, or
+an explicitly classified temporary database connection fault occurs, the router
+retains that same batch and backend connection for at most 30 seconds total.
+It pauses ordinary admission while waiting and applies no event until the entire
+batch is verified. A fresh authenticated backend health/event barrier must pass
+before ordinary work resumes, including work queued before the pause. Retrying
+the projection does not resubmit a share or renew a job or nonce lease.
+
+Authority changes, sequence gaps, conflicting or missing covered event hashes,
+schema or permission errors, and an exhausted recovery budget remain terminal.
+Logs identify these fixed error categories without database connection details.
+This path uses existing read privileges and requires no database migration or
+additional grants.
+
 `wcash-poold serve` now composes this flow for Testnet. Public admission still
 requires exact-artifact, ASIC, payout, restart, reorganization, and HTTPS
 evidence; source composition alone is not that evidence.

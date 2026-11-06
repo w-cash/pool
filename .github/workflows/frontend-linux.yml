@@ -1,0 +1,193 @@
+name: Frontend Linux qualification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "fix/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Never restore Ubuntu 24.04 target files into a production ABI build.
+  CARGO_TARGET_DIR: target/frontend-ubuntu22
+
+jobs:
+  frontend-linux:
+    name: Frontend Linux qualification
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16.10-bookworm@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
+        env:
+          POSTGRES_DB: wcash_pool_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d wcash_pool_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.91.0
+          components: clippy,rustfmt
+          cache-shared-key: pool-frontend-ubuntu22-rust-1.91.0
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting and frontend lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p wcash-poold -p wcash-pool-edge -p wcash-pool-store --all-targets --all-features -- -D warnings
+
+      - name: Run deterministic workspace tests
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Run PostgreSQL frontend recovery regressions
+        run: |
+          cargo test --locked -p wcash-pool-store --test frontend_projection_recovery -- --list --ignored |
+            python3 -c 'import sys; assert "public_projection_batch_is_readonly_exact_and_bounded: test" in sys.stdin.read().splitlines()'
+          cargo test --locked -p wcash-pool-store --test frontend_projection_recovery \
+            public_projection_batch_is_readonly_exact_and_bounded -- --ignored --exact --test-threads=1
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
+      - name: Run PostgreSQL runtime authority regressions
+        run: >-
+          cargo test --locked -p wcash-pool-store --test postgres_runtime
+          durable_runtime_is_chain_scoped_conserved_and_revocable -- --exact --ignored
+        env:
+          WCASH_POOL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/wcash_pool_test
+
+      - name: Verify read-only startup authority
+        run: |
+          cargo test --locked -p wcash-poold --lib -- --list |
+            python3 -c 'import sys; assert "live_payout::tests::exec_start_pre_probe_uses_only_read_only_tip_authority: test" in sys.stdin.read().splitlines()'
+          cargo test --locked -p wcash-poold --lib \
+            live_payout::tests::exec_start_pre_probe_uses_only_read_only_tip_authority -- --exact
+
+      - name: Build the normal production frontend
+        run: cargo build --locked --release -p wcash-poold --bin wcash-poold --no-default-features
+
+      - name: Record source, toolchain and ELF compatibility
+        id: artifact
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import re
+          import shutil
+          import subprocess
+
+          def command(*args):
+              return subprocess.check_output(args, text=True, timeout=20).strip()
+
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(chunk)
+              return value.hexdigest()
+
+          commit = command("git", "rev-parse", "HEAD")
+          assert re.fullmatch(r"[0-9a-f]{40}", commit)
+          assert commit == os.environ["EXPECTED_SOURCE_SHA"]
+          assert not command("git", "status", "--porcelain", "--untracked-files=no")
+          assert platform.machine() == "x86_64" and platform.system() == "Linux"
+          artifact = Path("artifacts/frontend-linux")
+          artifact.mkdir(parents=True, exist_ok=False)
+          binary = Path(os.environ["CARGO_TARGET_DIR"]) / "release/wcash-poold"
+          assert binary.is_file() and not binary.is_symlink()
+          with binary.open("rb") as stream:
+              prefix = stream.read(20)
+          assert prefix[:6] == b"\x7fELF\x02\x01"
+          assert int.from_bytes(prefix[18:20], "little") == 62
+          version_info = command("readelf", "--version-info", str(binary))
+          versions = sorted({tuple(map(int, item.split("."))) for item in
+                             re.findall(r"GLIBC_([0-9]+(?:\.[0-9]+)+)", version_info)})
+          assert versions and versions[-1] <= (2, 35)
+          dynamic = command("readelf", "--dynamic", str(binary))
+          assert not re.search(r"\((?:RPATH|RUNPATH)\)", dynamic)
+          needed = re.findall(r"\(NEEDED\).*\[([^\]]+)\]", dynamic)
+          program_headers = command("readelf", "--program-headers", str(binary))
+          assert "/lib64/ld-linux-x86-64.so.2" in program_headers
+          shutil.copyfile(binary, artifact / "wcash-poold")
+          source_files = []
+          for raw in subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0"):
+              if not raw:
+                  continue
+              path = Path(os.fsdecode(raw))
+              assert path.is_file() and not path.is_symlink()
+              source_files.append({"path": path.as_posix(), "sha256": digest(path)})
+          source_manifest = artifact / "source-files.json"
+          source_manifest.write_text(json.dumps(source_files, sort_keys=True, indent=2) + "\n")
+          manifest = {
+              "schema": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "source_commit": commit,
+              "source_tree": command("git", "rev-parse", "HEAD^{tree}"),
+              "source_files_sha256": digest(source_manifest),
+              "cargo_lock_sha256": digest(Path("Cargo.lock")),
+              "rust_toolchain_file_sha256": digest(Path("rust-toolchain.toml")),
+              "rustc": command("rustc", "--version", "--verbose"),
+              "cargo": command("cargo", "--version"),
+              "runner": "ubuntu-22.04",
+              "target": "x86_64-unknown-linux-gnu",
+              "build_command": "cargo build --locked --release -p wcash-poold --bin wcash-poold --no-default-features",
+              "production_features": [],
+              "binary_sha256": digest(binary),
+              "binary_bytes": binary.stat().st_size,
+              "glibc_maximum": ".".join(map(str, versions[-1])),
+              "needed_libraries": needed,
+              "rpath_or_runpath": False,
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "deployment_performed": False,
+          }
+          (artifact / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+          for name, value in (("elf-version-info.txt", version_info),
+                              ("elf-dynamic.txt", dynamic),
+                              ("elf-program-headers.txt", program_headers)):
+              (artifact / name).write_text(value + "\n")
+          checksum_files = sorted(path for path in artifact.iterdir() if path.is_file())
+          (artifact / "SHA256SUMS").write_text("".join(
+              digest(path) + "  " + path.name + "\n" for path in checksum_files))
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write("source_commit=" + commit + "\n")
+          PY
+
+      - name: Upload the qualified frontend and receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wcash-poold-linux-x86_64-${{ steps.artifact.outputs.source_commit }}
+          path: artifacts/frontend-linux/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
