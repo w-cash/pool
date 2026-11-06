@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::{interval_at, timeout, Instant, MissedTickBehavior},
+    time::{interval_at, Instant, MissedTickBehavior},
 };
 use wcash_pool_backend_client::{
     BackendAuthority, BackendClient, BackendConnectionBinding, BackendStreamPhase, ClientError,
@@ -33,6 +33,11 @@ const BACKEND_HEALTH_GRACE: Duration = Duration::from_secs(120);
 const CANDIDATE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const CANDIDATE_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const MAX_DEFERRED_CANDIDATES: usize = 8;
+// A transient read-only projection barrier must not restart every miner edge.
+// Keep the original batch and connection while admission is paused. This fixed
+// budget is below the serving process's 60-second nonce namespace lease.
+const EVENT_CONSUMER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const EVENT_CONSUMER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Finite queue and time policy for the one live Wolf actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,17 +134,52 @@ pub enum ShareRouterConfigError {
 /// telemetry. The miner-facing edge deliberately treats every such failure as
 /// an unavailable trusted event path without exposing storage detail.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("backend event consumer could not acknowledge journal progress")]
-pub struct BackendEventConsumerError;
+pub enum BackendEventConsumerError {
+    /// The isolated projector has not durably reached the required cursor.
+    #[error("accounting projection is behind: required {required}, projected {projected}")]
+    ProjectionLag {
+        /// Cursor required by the exact pending batch.
+        required: u64,
+        /// Last durable cursor observed by the verifier.
+        projected: u64,
+    },
+    /// A narrowly classified transient database or pool failure.
+    #[error("accounting projection storage is temporarily unavailable")]
+    StorageUnavailable,
+    /// The consumer did not finish one bounded attempt.
+    #[error("accounting projection verification attempt timed out")]
+    TimedOut,
+    /// The batch is not from the independently configured authority.
+    #[error("accounting projection authority does not match")]
+    AuthorityMismatch,
+    /// A batch is empty, excessive, non-contiguous or otherwise malformed.
+    #[error("accounting projection batch is invalid")]
+    InvalidBatch,
+    /// A durable cursor covers missing or different event bytes.
+    #[error("accounting projection event content conflicts")]
+    EventConflict,
+    /// An unclassified storage failure must not authorize a retry.
+    #[error("accounting projection storage rejected verification")]
+    StorageRejected,
+}
+
+impl BackendEventConsumerError {
+    const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::ProjectionLag { .. } | Self::StorageUnavailable | Self::TimedOut
+        )
+    }
+}
 
 /// Acknowledges every ordered live journal batch before pool policy observes it.
 ///
 /// Batches are non-empty, bounded by [`BackendClient`]'s event queue, and tied to
 /// `authority` by an identity-checked connection. A deployment implementation
 /// must return success only after the complete batch and its cursor are durable
-/// and must accept byte-identical retries idempotently. This repository currently
-/// supplies no durable implementation; in-memory consumers are suitable only for
-/// deterministic tests.
+/// and must accept byte-identical retries idempotently. The public PostgreSQL
+/// consumer verifies the isolated projector's durable cursor and exact hashes;
+/// in-memory consumers are suitable only for deterministic tests.
 pub trait BackendEventConsumer: Send + Sync + 'static {
     /// Consumes one non-empty, contiguous batch under a finite actor deadline.
     fn consume<'a>(
@@ -238,7 +278,7 @@ impl ShareRouter {
             return Err(ShareRouterError::BackendConnectionMismatch);
         }
         let suspension = SuspendOnDrop::new(job_router.clone(), Some(connection_binding));
-        drain_backend_events(
+        let projection_recovered = drain_backend_events(
             &mut client,
             &job_router,
             event_consumer.as_ref(),
@@ -247,7 +287,11 @@ impl ShareRouter {
         .await?;
         let (sender, receiver) = mpsc::channel(config.queue_capacity());
         let handle = ShareRouterHandle { sender };
-        let first_heartbeat_deadline = Instant::now() + config.heartbeat_interval();
+        let first_heartbeat_deadline = if projection_recovered {
+            Instant::now()
+        } else {
+            Instant::now() + config.heartbeat_interval()
+        };
         let terminal_error = Arc::new(Mutex::new(None));
         let actor_error = terminal_error.clone();
         let actor = run_submission_actor(
@@ -554,7 +598,7 @@ async fn run_submission_actor(
             )));
             continue;
         }
-        let (mut result, mut retained) = submit_context_and_drain(
+        let (mut result, mut retained, projection_recovered) = submit_context_and_drain(
             &mut client,
             &job_router,
             event_consumer.as_ref(),
@@ -563,6 +607,13 @@ async fn run_submission_actor(
             pending.deadline,
         )
         .await;
+        if projection_recovered {
+            // Already queued contexts predate the admission pause. Force a new
+            // authenticated health barrier ahead of the next queued command,
+            // independently of the configured idle heartbeat interval.
+            health_deadline.get_or_insert(Instant::now() + BACKEND_HEALTH_GRACE);
+            heartbeat.reset_immediately();
+        }
         // An ordinary guard may cross its lease while queued or in flight. Only
         // this typed response permits a fresh health barrier and cheap candidate
         // qualification; no ordinary work or generic rejection is retried.
@@ -672,14 +723,17 @@ async fn submit_context_and_drain(
 ) -> (
     Result<VerifiedShareCommit, ShareRouterError>,
     Option<SubmissionContext>,
+    bool,
 ) {
     if context.is_winner_recovery() {
+        let mut draining = false;
         let attempt = async {
             let mut result = client
                 .submit_recovery_candidate(&context)
                 .await
                 .map_err(ShareRouterError::from_client);
-            if let Err(error) = drain_backend_events(
+            draining = true;
+            let recovered = match drain_backend_events(
                 client,
                 job_router,
                 event_consumer,
@@ -687,20 +741,27 @@ async fn submit_context_and_drain(
             )
             .await
             {
-                result = Err(error);
-            }
-            result
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    result = Err(error);
+                    false
+                }
+            };
+            draining = false;
+            (result, recovered)
         };
-        let result = tokio::time::timeout_at(deadline, attempt)
-            .await
-            .unwrap_or(Err(ShareRouterError::Unavailable));
-        (result, Some(context))
+        let (result, recovered) = match tokio::time::timeout_at(deadline, attempt).await {
+            Ok(outcome) => outcome,
+            Err(_) if draining => (Err(ShareRouterError::EventConsumerUnusable), false),
+            Err(_) => (Err(ShareRouterError::Unavailable), false),
+        };
+        (result, Some(context), recovered)
     } else {
         let mut result = client
             .submit_prepared_share_borrowed(&context)
             .await
             .map_err(ShareRouterError::from_client);
-        if let Err(error) = drain_backend_events(
+        let recovered = match drain_backend_events(
             client,
             job_router,
             event_consumer,
@@ -708,8 +769,12 @@ async fn submit_context_and_drain(
         )
         .await
         {
-            result = Err(error);
-        }
+            Ok(recovered) => recovered,
+            Err(error) => {
+                result = Err(error);
+                false
+            }
+        };
         let retained = matches!(
             &result,
             Err(ShareRouterError::Rejected(
@@ -717,7 +782,7 @@ async fn submit_context_and_drain(
             ))
         )
         .then_some(context);
-        (result, retained)
+        (result, retained, recovered)
     }
 }
 
@@ -805,7 +870,7 @@ async fn pump_health(
             .pause_for_health(client)
             .map_err(|_| ShareRouterError::JobStreamUnusable)?;
     }
-    if unhealthy {
+    let projection_recovered = if unhealthy {
         let deadline = observed_at + BACKEND_HEALTH_GRACE;
         let drained = tokio::time::timeout_at(
             deadline,
@@ -820,17 +885,20 @@ async fn pump_health(
         if Instant::now() >= deadline {
             return Err(ShareRouterError::BackendHealthDeadline);
         }
-        drained.map_err(|_| ShareRouterError::BackendHealthDeadline)??;
+        drained.map_err(|_| ShareRouterError::BackendHealthDeadline)??
     } else {
-        drain_backend_events(client, job_router, event_consumer, event_consumer_timeout).await?;
-    }
+        drain_backend_events(client, job_router, event_consumer, event_consumer_timeout).await?
+    };
     let health = health?;
-    if !health.healthy && health.recovery_only {
+    if !health.healthy && health.recovery_only && !projection_recovered {
         job_router
             .allow_recovery_only_after_health(client)
             .map_err(|_| ShareRouterError::JobStreamUnusable)?;
     }
-    Ok((health.healthy, observed_at))
+    // Verification may have recovered after the health sample was taken. Keep
+    // admission paused until the next ordinary heartbeat supplies a fresh
+    // authenticated health/event barrier; never resume from the old sample.
+    Ok((health.healthy && !projection_recovered, observed_at))
 }
 
 async fn drain_backend_events(
@@ -838,7 +906,7 @@ async fn drain_backend_events(
     job_router: &JobRouter,
     event_consumer: &dyn BackendEventConsumer,
     event_consumer_timeout: Duration,
-) -> Result<(), ShareRouterError> {
+) -> Result<bool, ShareRouterError> {
     if !job_router
         .client_binding_matches(client)
         .map_err(|_| ShareRouterError::JobStreamUnusable)?
@@ -855,22 +923,25 @@ async fn drain_backend_events(
         }
         events.push(event);
     }
-    if !events.is_empty() {
-        match timeout(
+    let recovered = if !events.is_empty() {
+        let recovered = acknowledge_event_batch(
+            client,
+            job_router,
+            event_consumer,
+            &binding,
+            &events,
             event_consumer_timeout,
-            event_consumer.consume(binding.authority(), &events),
         )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => return Err(ShareRouterError::EventConsumerUnusable),
-        }
+        .await?;
         for event in &events {
             job_router
                 .apply_event(client, event)
                 .map_err(|_| ShareRouterError::JobStreamUnusable)?;
         }
-    }
+        recovered
+    } else {
+        false
+    };
     if !job_router
         .client_binding_matches(client)
         .map_err(|_| ShareRouterError::JobStreamUnusable)?
@@ -883,7 +954,64 @@ async fn drain_backend_events(
     {
         return Err(ShareRouterError::JobStreamUnusable);
     }
-    Ok(())
+    Ok(recovered)
+}
+
+async fn acknowledge_event_batch(
+    client: &BackendClient,
+    job_router: &JobRouter,
+    event_consumer: &dyn BackendEventConsumer,
+    binding: &BackendConnectionBinding,
+    events: &[DeliveredBackendEvent],
+    attempt_timeout: Duration,
+) -> Result<bool, ShareRouterError> {
+    let deadline = Instant::now() + EVENT_CONSUMER_RECOVERY_TIMEOUT;
+    let mut recovered = false;
+    loop {
+        if Instant::now() >= deadline {
+            eprintln!("backend event projection recovery deadline expired");
+            return Err(ShareRouterError::EventConsumerUnusable);
+        }
+        if !client.is_bound_to(binding)
+            || !job_router
+                .client_binding_matches(client)
+                .map_err(|_| ShareRouterError::JobStreamUnusable)?
+            || events
+                .iter()
+                .any(|event| event.connection_binding() != binding)
+        {
+            return Err(ShareRouterError::BackendConnectionMismatch);
+        }
+        let attempt_deadline = (Instant::now() + attempt_timeout).min(deadline);
+        let error = match tokio::time::timeout_at(
+            attempt_deadline,
+            event_consumer.consume(binding.authority(), events),
+        )
+        .await
+        {
+            Ok(Ok(())) if Instant::now() < deadline => return Ok(recovered),
+            Ok(Ok(())) => BackendEventConsumerError::TimedOut,
+            Ok(Err(error)) => error,
+            Err(_) => BackendEventConsumerError::TimedOut,
+        };
+        if !error.is_retryable() {
+            eprintln!("backend event projection rejected: {error}");
+            return Err(ShareRouterError::EventConsumerUnusable);
+        }
+        if !recovered {
+            job_router
+                .pause_for_health(client)
+                .map_err(|_| ShareRouterError::JobStreamUnusable)?;
+            eprintln!("backend event projection recovery paused admission: {error}");
+            recovered = true;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("backend event projection recovery deadline expired: {error}");
+            return Err(ShareRouterError::EventConsumerUnusable);
+        }
+        tokio::time::sleep_until((Instant::now() + EVENT_CONSUMER_RETRY_INTERVAL).min(deadline))
+            .await;
+    }
 }
 
 async fn fail_pending(receiver: &mut mpsc::Receiver<SubmitCommand>) {
@@ -964,6 +1092,8 @@ impl ShareRouterError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    #[path = "projection_recovery_tests.rs"]
+    mod projection_recovery_tests;
     #[path = "recovery_only_tests.rs"]
     mod recovery_only_tests;
     use std::{
@@ -1207,7 +1337,7 @@ mod tests {
             let result = self
                 .events
                 .lock()
-                .map_err(|_| BackendEventConsumerError)
+                .map_err(|_| BackendEventConsumerError::StorageRejected)
                 .map(|mut consumed| {
                     consumed.extend(events.iter().map(|event| event.event().clone()));
                 });

@@ -3637,10 +3637,8 @@ impl PostgresStore {
         if events.len() > MAX_REPLAY_BATCH {
             return Err(StoreError::ReplayBatchTooLarge(events.len()));
         }
-        for event in events {
-            self.project_event(authority, event).await?;
-        }
-        Ok(())
+        let events: Vec<_> = events.iter().collect();
+        verify_projected_batch(&self.pool, &self.identity, &events, PUBLIC_PROJECTION_WAIT).await
     }
 
     /// Returns a database-backed miner authentication provider for this exact
@@ -3695,20 +3693,21 @@ impl BackendEventConsumer for PostgresStore {
         events: &'a [DeliveredBackendEvent],
     ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>> {
         Box::pin(async move {
-            if events.len() > MAX_REPLAY_BATCH || self.verify_authority(authority).is_err() {
-                return Err(BackendEventConsumerError);
+            if events.is_empty() || events.len() > MAX_REPLAY_BATCH {
+                return Err(BackendEventConsumerError::InvalidBatch);
             }
-            for delivered in events {
-                if delivered.connection_binding().authority() != authority
-                    || self
-                        .project_event(authority, delivered.event())
-                        .await
-                        .is_err()
-                {
-                    return Err(BackendEventConsumerError);
-                }
+            if self.verify_authority(authority).is_err()
+                || events.iter().any(|event| {
+                    event.connection_binding().authority() != authority
+                        || event.connection_binding() != events[0].connection_binding()
+                })
+            {
+                return Err(BackendEventConsumerError::AuthorityMismatch);
             }
-            Ok(())
+            let events: Vec<_> = events.iter().map(DeliveredBackendEvent::event).collect();
+            verify_projected_batch(&self.pool, &self.identity, &events, PUBLIC_PROJECTION_WAIT)
+                .await
+                .map_err(event_consumer_error)
         })
     }
 }
@@ -3721,7 +3720,7 @@ impl BackendEventConsumer for PostgresEventProjector {
     ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>> {
         Box::pin(async move {
             if events.len() > MAX_REPLAY_BATCH || self.store.verify_authority(authority).is_err() {
-                return Err(BackendEventConsumerError);
+                return Err(BackendEventConsumerError::AuthorityMismatch);
             }
             for delivered in events {
                 if delivered.connection_binding().authority() != authority
@@ -3730,7 +3729,7 @@ impl BackendEventConsumer for PostgresEventProjector {
                         .await
                         .is_err()
                 {
-                    return Err(BackendEventConsumerError);
+                    return Err(BackendEventConsumerError::StorageRejected);
                 }
             }
             Ok(())
@@ -4906,40 +4905,243 @@ async fn verify_projected_one(
     event: &BackendEvent,
     maximum_wait: Duration,
 ) -> Result<(), StoreError> {
-    event.validate()?;
-    let event_seq = i64::try_from(event.event_seq()).map_err(|_| StoreError::EventSeqOverflow)?;
-    let payload_bytes = serde_json::to_vec(event)?;
-    let payload_hash: [u8; 32] = Sha256::digest(&payload_bytes).into();
+    verify_projected_batch(pool, identity, &[event], maximum_wait).await
+}
+
+struct ProjectionFingerprint {
+    sequence: i64,
+    hash: [u8; 32],
+}
+
+fn projection_fingerprints(
+    events: &[&BackendEvent],
+) -> Result<Vec<ProjectionFingerprint>, StoreError> {
+    if events.len() > MAX_REPLAY_BATCH {
+        return Err(StoreError::ReplayBatchTooLarge(events.len()));
+    }
+    let mut previous: Option<u64> = None;
+    events
+        .iter()
+        .map(|event| {
+            event.validate()?;
+            let sequence = event.event_seq();
+            if let Some(previous) = previous {
+                let expected = previous
+                    .checked_add(1)
+                    .ok_or(StoreError::EventSeqOverflow)?;
+                if sequence != expected {
+                    return Err(StoreError::EventSequenceGap {
+                        expected,
+                        actual: sequence,
+                    });
+                }
+            }
+            previous = Some(sequence);
+            Ok(ProjectionFingerprint {
+                sequence: i64::try_from(sequence).map_err(|_| StoreError::EventSeqOverflow)?,
+                hash: Sha256::digest(serde_json::to_vec(event)?).into(),
+            })
+        })
+        .collect()
+}
+
+async fn verify_projected_batch(
+    pool: &PgPool,
+    identity: &DeploymentIdentity,
+    events: &[&BackendEvent],
+    maximum_wait: Duration,
+) -> Result<(), StoreError> {
+    let expected = projection_fingerprints(events)?;
+    let Some(last) = expected.last() else {
+        return Ok(());
+    };
+    let required = u64::try_from(last.sequence).map_err(|_| StoreError::EventSeqOverflow)?;
+    let sequences: Vec<_> = expected.iter().map(|event| event.sequence).collect();
     let deadline = tokio::time::Instant::now() + maximum_wait;
     loop {
-        let row = sqlx::query(
-            "SELECT c.last_event_seq,e.payload_sha256 \
+        // One statement binds the cursor and every exact event hash to the same
+        // database snapshot. This verifier never writes accounting or cursors.
+        let rows = sqlx::query(
+            "SELECT c.last_event_seq,r.event_seq,e.payload_sha256 \
              FROM backend_cursors c \
+             CROSS JOIN unnest($2::bigint[]) AS r(event_seq) \
              LEFT JOIN backend_events e \
-               ON e.deployment_id=c.deployment_id AND e.event_seq=$2 \
-             WHERE c.deployment_id=$1",
+               ON e.deployment_id=c.deployment_id AND e.event_seq=r.event_seq \
+             WHERE c.deployment_id=$1 ORDER BY r.event_seq",
         )
         .bind(identity.id)
-        .bind(event_seq)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(StoreError::DeploymentIdentityMismatch)?;
-        let projected = row.try_get::<i64, _>("last_event_seq")?;
-        if projected >= event_seq {
+        .bind(&sequences)
+        .fetch_all(pool)
+        .await?;
+        if rows.len() != expected.len() {
+            return Err(StoreError::DeploymentIdentityMismatch);
+        }
+        let projected = rows[0].try_get::<i64, _>("last_event_seq")?;
+        let projected = u64::try_from(projected).map_err(|_| StoreError::EventSeqOverflow)?;
+        for (row, event) in rows.iter().zip(&expected) {
+            if row.try_get::<i64, _>("event_seq")? != event.sequence
+                || row.try_get::<i64, _>("last_event_seq")?
+                    != i64::try_from(projected).map_err(|_| StoreError::EventSeqOverflow)?
+            {
+                return Err(StoreError::CorruptDatabaseState(
+                    "projection batch snapshot",
+                ));
+            }
+            let sequence =
+                u64::try_from(event.sequence).map_err(|_| StoreError::EventSeqOverflow)?;
             let stored = row.try_get::<Option<Vec<u8>>, _>("payload_sha256")?;
-            return if stored.as_deref() == Some(payload_hash.as_slice()) {
-                Ok(())
-            } else {
-                Err(StoreError::EventReplayConflict(event.event_seq()))
-            };
+            if stored
+                .as_ref()
+                .is_some_and(|hash| hash.as_slice() != event.hash.as_slice())
+                || (projected >= sequence && stored.is_none())
+            {
+                return Err(StoreError::EventReplayConflict(sequence));
+            }
+        }
+        if projected >= required {
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(StoreError::EventProjectionLag {
-                projected: u64::try_from(projected).map_err(|_| StoreError::EventSeqOverflow)?,
-                required: event.event_seq(),
+                projected,
+                required,
             });
         }
-        tokio::time::sleep(PUBLIC_PROJECTION_POLL).await;
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + PUBLIC_PROJECTION_POLL).min(deadline),
+        )
+        .await;
+    }
+}
+
+fn event_consumer_error(error: StoreError) -> BackendEventConsumerError {
+    match error {
+        StoreError::EventProjectionLag {
+            projected,
+            required,
+        } => BackendEventConsumerError::ProjectionLag {
+            projected,
+            required,
+        },
+        StoreError::BackendAuthorityMismatch | StoreError::DeploymentIdentityMismatch => {
+            BackendEventConsumerError::AuthorityMismatch
+        }
+        StoreError::EventReplayConflict(_) => BackendEventConsumerError::EventConflict,
+        StoreError::ReplayBatchTooLarge(_)
+        | StoreError::EventSeqOverflow
+        | StoreError::EventSequenceGap { .. }
+        | StoreError::Protocol(_)
+        | StoreError::Json(_) => BackendEventConsumerError::InvalidBatch,
+        StoreError::Database(error) if transient_projection_database_error(&error) => {
+            BackendEventConsumerError::StorageUnavailable
+        }
+        _ => BackendEventConsumerError::StorageRejected,
+    }
+}
+
+fn transient_projection_database_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+        ),
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(error) => error.code().is_some_and(|code| {
+            matches!(
+                code.as_ref(),
+                "08003" | "08006" | "57P01" | "57P02" | "57P03" | "53300" | "55P03" | "57014"
+            )
+        }),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod projection_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn projection_storage_errors_retry_only_explicit_transients() {
+        assert!(matches!(
+            event_consumer_error(StoreError::Database(sqlx::Error::PoolTimedOut)),
+            BackendEventConsumerError::StorageUnavailable
+        ));
+        assert!(matches!(
+            event_consumer_error(StoreError::Database(sqlx::Error::Io(
+                std::io::ErrorKind::ConnectionReset.into()
+            ))),
+            BackendEventConsumerError::StorageUnavailable
+        ));
+        for error in [
+            sqlx::Error::PoolClosed,
+            sqlx::Error::RowNotFound,
+            sqlx::Error::ColumnNotFound("private-column".to_owned()),
+            sqlx::Error::Protocol("private-transport-detail".to_owned()),
+            sqlx::Error::Io(std::io::ErrorKind::PermissionDenied.into()),
+            sqlx::Error::Io(std::io::ErrorKind::Other.into()),
+        ] {
+            let classified = event_consumer_error(StoreError::Database(error));
+            assert_eq!(classified, BackendEventConsumerError::StorageRejected);
+            assert!(!classified.to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn projection_integrity_errors_keep_their_terminal_category() {
+        assert_eq!(
+            event_consumer_error(StoreError::BackendAuthorityMismatch),
+            BackendEventConsumerError::AuthorityMismatch
+        );
+        assert_eq!(
+            event_consumer_error(StoreError::EventReplayConflict(11)),
+            BackendEventConsumerError::EventConflict
+        );
+        assert_eq!(
+            event_consumer_error(StoreError::EventProjectionLag {
+                projected: 10,
+                required: 11
+            }),
+            BackendEventConsumerError::ProjectionLag {
+                projected: 10,
+                required: 11
+            }
+        );
+    }
+
+    #[test]
+    fn projection_batch_fingerprints_reject_gaps_duplicates_and_excess() {
+        let event = |sequence| BackendEvent::GenerationClosed {
+            event_seq: sequence,
+            job_id: wcash_pool_protocol::Hex32::new([1; 32]),
+        };
+        assert!(matches!(
+            projection_fingerprints(&[&event(10), &event(12)]),
+            Err(StoreError::EventSequenceGap {
+                expected: 11,
+                actual: 12
+            })
+        ));
+        assert!(matches!(
+            projection_fingerprints(&[&event(10), &event(10)]),
+            Err(StoreError::EventSequenceGap {
+                expected: 11,
+                actual: 10
+            })
+        ));
+        let events: Vec<_> = (1..=1_025).map(event).collect();
+        let references: Vec<_> = events.iter().collect();
+        assert!(matches!(
+            projection_fingerprints(&references),
+            Err(StoreError::ReplayBatchTooLarge(1_025))
+        ));
     }
 }
 
