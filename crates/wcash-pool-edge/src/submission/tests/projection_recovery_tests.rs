@@ -435,6 +435,7 @@ async fn write_zec_winning_commit(
     stream: &mut UnixStream,
     request: BackendRequest,
     job: &JobDescriptor,
+    event_seq: u64,
 ) -> TestResult {
     let BackendRequest::SubmitShare {
         id,
@@ -451,7 +452,7 @@ async fn write_zec_winning_commit(
     };
     let parent_hash_le = canonical_parent_header_hash_le(&job.header_input, &nonce, &solution);
     let receipt = ShareReceipt {
-        event_seq: 11,
+        event_seq,
         job_id: job_id.clone(),
         share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
         attribution_id: wcash_pool_protocol::canonical_attribution_id(&identity, &target_le)?,
@@ -505,7 +506,7 @@ async fn projection_recovery_withholds_winning_ack_without_resubmitting_solution
         establish_live_stream(&mut stream, server_job.clone()).await?;
         let request = read_request(&mut stream).await?;
         peer_submissions.fetch_add(1, Ordering::SeqCst);
-        write_zec_winning_commit(&mut stream, request, &server_job).await?;
+        write_zec_winning_commit(&mut stream, request, &server_job, 11).await?;
         loop {
             tokio::select! {
                 biased;
@@ -570,7 +571,7 @@ async fn projection_recovery_prequeued_ordinary_share_requires_fresh_health() ->
         let (mut stream, _) = listener.accept().await?;
         establish_live_stream(&mut stream, server_job.clone()).await?;
         let first = read_request(&mut stream).await?;
-        write_zec_winning_commit(&mut stream, first, &server_job).await?;
+        write_zec_winning_commit(&mut stream, first, &server_job, 11).await?;
         loop {
             tokio::select! {
                 biased;
@@ -671,7 +672,7 @@ async fn projection_recovery_candidate_deadline_cannot_reuse_an_unacknowledged_s
         .await?;
         let request = read_request(&mut stream).await?;
         peer_submissions.fetch_add(1, Ordering::SeqCst);
-        write_zec_winning_commit(&mut stream, request, &server_job).await?;
+        write_zec_winning_commit(&mut stream, request, &server_job, 11).await?;
         loop {
             tokio::select! {
                 biased;
@@ -735,4 +736,325 @@ async fn projection_recovery_candidate_deadline_cannot_reuse_an_unacknowledged_s
     let _ = stop.send(());
     peer.await??;
     Ok(())
+}
+
+#[derive(Default)]
+struct QueuedWinnerProjection {
+    lagging: bool,
+    release: Notify,
+    first: GatedProjection,
+    later: RecordingEventConsumer,
+}
+
+impl BackendEventConsumer for QueuedWinnerProjection {
+    fn consume<'a>(
+        &'a self,
+        authority: &'a BackendAuthority,
+        events: &'a [DeliveredBackendEvent],
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>> {
+        if events
+            .first()
+            .is_some_and(|event| event.event().event_seq() == 13)
+        {
+            if self.lagging {
+                return self.first.consume(authority, events);
+            }
+            Box::pin(async move {
+                self.first.attempted.notify_one();
+                self.release.notified().await;
+                self.first.outcome.store(1, Ordering::SeqCst);
+                self.first.consume(authority, events).await
+            })
+        } else {
+            self.later.consume(authority, events)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueuedWinnerAuthority {
+    Preserved,
+    DifferentParent,
+    OriginalClosed,
+    PermissionRevoked,
+}
+
+async fn queued_winner_after_projection_wait(
+    authority: QueuedWinnerAuthority,
+    lagging: bool,
+) -> TestResult {
+    // Keep simulated time under explicit control while local Unix I/O is ready.
+    // Tokio otherwise auto-advances a pending request timer before the OS peer
+    // task is polled, which is unrelated to the queue-budget regression.
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let socket = TestSocket::new()?;
+    let listener = UnixListener::bind(&socket.path)?;
+    let mut original = descriptor(0x70);
+    original.zcash_target_le = TargetLe::new([0xff; 32]);
+    let mut current = descriptor(0x71);
+    // A WEC-only refresh changes the job while preserving its exact ZEC parent.
+    let mut current_header = *current.header_input.as_bytes();
+    current_header[4..36].copy_from_slice(original.zcash_previous_hash_le.as_bytes());
+    current.header_input = Hex108::new(current_header);
+    current.zcash_previous_hash_le = original.zcash_previous_hash_le.clone();
+    current.zcash_target_le = TargetLe::new([0xff; 32]);
+    let peer_original = original.clone();
+    let peer_current = current.clone();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let peer_submissions = Arc::clone(&submissions);
+    let barriers = Arc::new(AtomicUsize::new(0));
+    let peer_barriers = Arc::clone(&barriers);
+    let (expected_tx, expected_rx) = oneshot::channel::<BackendRequest>();
+    let (stop, mut stopped) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        establish_live_stream(&mut stream, peer_original.clone()).await?;
+        let BackendRequest::Health { id, .. } = read_request(&mut stream).await? else {
+            return Err("expected initial replacement barrier".into());
+        };
+        write_message(
+            &mut stream,
+            &BackendMessage::Event {
+                version: BACKEND_PROTOCOL_VERSION,
+                event: BackendEvent::JobActivated {
+                    event_seq: 11,
+                    job: peer_current.clone(),
+                },
+            },
+        )
+        .await?;
+        write_message(
+            &mut stream,
+            &BackendMessage::Event {
+                version: BACKEND_PROTOCOL_VERSION,
+                event: BackendEvent::JobInvalidated {
+                    event_seq: 12,
+                    job_id: peer_original.job_id.clone(),
+                    reason: wcash_pool_protocol::JobInvalidationReason::WcashTipChanged,
+                    accept_for_ms: 0,
+                },
+            },
+        )
+        .await?;
+        healthy(&mut stream, id, 12).await?;
+        let first = read_request(&mut stream).await?;
+        let BackendRequest::SubmitShare { job_id, .. } = &first else {
+            return Err("expected first ordinary submission".into());
+        };
+        assert_eq!(job_id, &peer_current.job_id);
+        peer_submissions.fetch_add(1, Ordering::SeqCst);
+        write_zec_winning_commit(&mut stream, first, &peer_current, 13).await?;
+        let expected = expected_rx.await?;
+        let mut cursor = 13;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stopped => return TestResult::Ok(()),
+                request = read_request(&mut stream) => match request? {
+                    BackendRequest::Health { id, .. } => {
+                        let first_barrier = peer_barriers.fetch_add(1, Ordering::SeqCst) == 0;
+                        if first_barrier {
+                            match authority {
+                                QueuedWinnerAuthority::DifferentParent => {
+                                    cursor += 1;
+                                    let mut replacement = descriptor(0x72);
+                                    replacement.zcash_target_le = TargetLe::new([0xff; 32]);
+                                    write_message(&mut stream, &BackendMessage::Event {
+                                        version: BACKEND_PROTOCOL_VERSION,
+                                        event: BackendEvent::JobActivated {
+                                            event_seq: cursor, job: replacement,
+                                        },
+                                    }).await?;
+                                }
+                                QueuedWinnerAuthority::OriginalClosed => {
+                                    cursor += 1;
+                                    write_message(&mut stream, &BackendMessage::Event {
+                                        version: BACKEND_PROTOCOL_VERSION,
+                                        event: BackendEvent::GenerationClosed {
+                                            event_seq: cursor,
+                                            job_id: peer_original.job_id.clone(),
+                                        },
+                                    }).await?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if matches!(authority, QueuedWinnerAuthority::PermissionRevoked) {
+                            write_message(&mut stream, &BackendMessage::HealthStatus {
+                                version: BACKEND_PROTOCOL_VERSION, id, event_seq: cursor,
+                                healthy: false, recovery_only: false, pending_wcash: 0,
+                                quarantined_wcash: 0, pending_zcash: 0,
+                            }).await?;
+                        } else {
+                            healthy(&mut stream, id, cursor).await?;
+                        }
+                    }
+                    request @ BackendRequest::SubmitShare { .. } => {
+                        assert!(matches!(authority, QueuedWinnerAuthority::Preserved),
+                            "revoked original authority reached backend");
+                        assert!(peer_barriers.load(Ordering::SeqCst) > 0,
+                            "second proof used the old health sample");
+                        let prior = peer_submissions.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(prior, 1, "one of the two proofs was submitted again");
+                        // Normalize only the request ID; every original proof,
+                        // attribution and assigned-target byte must be identical.
+                        let mut normalized = request.clone();
+                        if let BackendRequest::SubmitShare { id, .. } = &mut normalized { *id = 0; }
+                        assert_eq!(normalized, expected);
+                        cursor += 1;
+                        write_zec_winning_commit(&mut stream, request, &peer_original, cursor).await?;
+                    }
+                    _ => return Err("unexpected queued winner request".into()),
+                }
+            }
+        }
+    });
+    let timeline = MonotonicTimeline::new();
+    let config = client_config(&socket.path)?
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(20))?;
+    let mut client = BackendClient::connect(config, uuid(9), 10).await?;
+    let snapshot = client.subscribe_jobs(10).await?;
+    let router =
+        JobRouter::from_snapshot(&snapshot, GenerationRegistryConfig::new(2, 8)?, timeline, 8)?;
+    let original_context = prepared_context(&router, 0x73)?;
+    let initial_health = match client.health().await {
+        Ok(health) => health,
+        Err(error) => {
+            return Err(format!(
+                "initial replacement health: {error:?}; peer: {:?}",
+                peer.await
+            )
+            .into())
+        }
+    };
+    assert!(initial_health.healthy);
+    drain_backend_events(
+        &mut client,
+        &router,
+        &RecordingEventConsumer::default(),
+        Duration::from_secs(1),
+    )
+    .await?;
+    router.resume_after_health(&client)?;
+    let second = router.prepare_queued_paused_candidate(original_context, &client)?;
+    assert!(second.is_winner_recovery());
+    // The all-ff target exercises the frontend forwarding filter. Complete
+    // Equihash/consensus acceptance remains the backend's responsibility.
+    expected_tx
+        .send(BackendRequest::SubmitShare {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 0,
+            job_id: second.job_id(),
+            identity: second.identity().clone(),
+            target_le: second.target_le().clone(),
+            time: second.time().clone(),
+            nonce: second.nonce().clone(),
+            solution: Box::new(second.solution().clone()),
+        })
+        .map_err(|_| "fixture proof receiver closed")?;
+    let first = prepared_context(&router, 0x74)?;
+    let consumer = Arc::new(QueuedWinnerProjection {
+        lagging,
+        ..Default::default()
+    });
+    let heartbeat = if lagging {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(1)
+    };
+    let config = ShareRouterConfig::new(2, heartbeat, Duration::from_secs(10))?;
+    let service = ShareRouter::spawn(client, router.clone(), config, consumer.clone()).await?;
+    let first_handle = service.handle();
+    let first_result = tokio::spawn(async move { first_handle.submit(first).await });
+    consumer.first.attempted.notified().await;
+    if lagging {
+        observe_pause(&router).await?;
+    }
+    let second_handle = service.handle();
+    let second_result = tokio::spawn(async move { second_handle.submit(second).await });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        service.handle.sender.capacity(),
+        1,
+        "second proof did not enter the actor queue"
+    );
+    tokio::time::advance(Duration::from_millis(5_100)).await;
+    assert!(
+        !first_result.is_finished(),
+        "first acknowledgement escaped its projection barrier"
+    );
+    assert!(
+        !second_result.is_finished(),
+        "queued proof escaped the first barrier"
+    );
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    assert_eq!(consumer.first.acknowledged.load(Ordering::SeqCst), 0);
+    if lagging {
+        consumer.first.outcome.store(1, Ordering::SeqCst);
+    } else {
+        consumer.release.notify_one();
+    }
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let first_commit = first_result.await?;
+    assert!(
+        first_commit.is_ok(),
+        "first proof failed: {first_commit:?}; actor={:?}",
+        service.terminal_error()
+    );
+    assert_eq!(first_commit?.receipt().winners[0].chain, MergedChain::Zcash);
+    assert_eq!(consumer.first.acknowledged.load(Ordering::SeqCst), 1);
+    let result = second_result.await?;
+    clock_guard.abort();
+    match authority {
+        QueuedWinnerAuthority::Preserved => {
+            let committed = result?;
+            assert_eq!(committed.receipt().job_id, original.job_id);
+            assert_eq!(committed.receipt().winners[0].chain, MergedChain::Zcash);
+            assert_eq!(submissions.load(Ordering::SeqCst), 2);
+            assert_eq!(consumer.later.events()?.len(), 1);
+        }
+        _ => {
+            assert_eq!(
+                result,
+                Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob))
+            );
+            assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        }
+    }
+    assert!(barriers.load(Ordering::SeqCst) > 0);
+    service.shutdown().await?;
+    let _ = stop.send(());
+    peer.await??;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_queue_wait_does_not_spend_candidate_attempt_budget() -> TestResult {
+    queued_winner_after_projection_wait(QueuedWinnerAuthority::Preserved, false).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_queue_wait_cannot_cross_a_different_zcash_parent() -> TestResult {
+    queued_winner_after_projection_wait(QueuedWinnerAuthority::DifferentParent, false).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_queue_wait_cannot_reopen_a_closed_original_job() -> TestResult {
+    queued_winner_after_projection_wait(QueuedWinnerAuthority::OriginalClosed, false).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_queue_wait_cannot_restore_revoked_backend_permission() -> TestResult {
+    queued_winner_after_projection_wait(QueuedWinnerAuthority::PermissionRevoked, false).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_queue_wait_rechecks_health_after_projection_lag() -> TestResult {
+    queued_winner_after_projection_wait(QueuedWinnerAuthority::Preserved, true).await
 }

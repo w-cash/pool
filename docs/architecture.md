@@ -174,16 +174,21 @@ A fresh different parent revokes eligibility, while an unknown observation can
 return the nonfatal `recovery_deferred` error without accepting the proof.
 
 Only a sealed, original-assignment candidate meeting its frozen Zcash network
-target may retry that specific error. Retries run at 250 ms intervals, retain
-the original enqueue deadline, and end after the smaller of two seconds and the
-existing backend request timeout, or when the original recovery tail expires.
+target may retry that specific error. Its bounded attempt budget starts once,
+when the actor first dequeues the context. Waiting in the bounded command queue
+still consumes the original job recovery lifetime, but does not spend that
+attempt budget. Retries run at 250 ms intervals, retain the same attempt deadline,
+and end after the smaller of two seconds and the existing backend request
+timeout, or when the original recovery tail expires.
 At most eight deferred candidates are retained globally (fewer if the configured
 queue capacity is smaller), in addition to the existing single bounded in-flight
 exchange and bounded command queue. A ninth first exchange can still commit;
 if it also defers while all retained slots are occupied, it returns overloaded.
-Heartbeats retain priority, and ready commands and
-due candidate retries alternate turns. Shutdown, stream mismatch, lost
-synchronization, and a plain unhealthy response revoke pending forwarding.
+After projection recovery, a fresh authenticated health/event barrier runs
+before queued work, independently of idle-heartbeat timer scheduling. Heartbeats
+retain priority, and ready commands and due candidate retries alternate turns.
+Shutdown, stream mismatch, lost synchronization, and a plain unhealthy response
+revoke pending forwarding.
 Other backend errors never trigger this retry.
 Exhausting this temporary retry returns a sanitized service-unavailable response
 without disconnecting the authorized miner or declaring its share invalid. The
