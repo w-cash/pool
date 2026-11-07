@@ -44,6 +44,27 @@ pub struct EdgeCounters {
     failed_connections: AtomicU64,
 }
 
+impl EdgeCounters {
+    pub(crate) fn snapshot(&self) -> [(&'static str, u64); 5] {
+        [
+            (
+                "accepted",
+                self.accepted_connections.load(Ordering::Relaxed),
+            ),
+            ("active", self.active_connections.load(Ordering::Relaxed)),
+            (
+                "completed",
+                self.completed_connections.load(Ordering::Relaxed),
+            ),
+            (
+                "rejected",
+                self.rejected_connections.load(Ordering::Relaxed),
+            ),
+            ("failed", self.failed_connections.load(Ordering::Relaxed)),
+        ]
+    }
+}
+
 /// Clone-only dependencies retained by miner sessions while the owned share
 /// router remains available to the service shutdown coordinator.
 pub struct EdgeDependencies {

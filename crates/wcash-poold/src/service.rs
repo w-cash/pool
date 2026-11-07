@@ -38,6 +38,7 @@ use crate::{
         LivePayoutConfigError, LoopbackJsonRpc, NodePayoutAuthority, RpcExactBroadcaster,
     },
     miner_telemetry::LiveMinerTelemetry,
+    operational_summary::{self, OperationalSummary},
     payout_expiry::{PayoutExpiryDriver, WecExpiryInspector, WecPayoutExpiryRecovery},
     payout_runtime::{
         AutomaticPayoutRuntime, ObservationFailure, PayoutConfirmationAuthority, PayoutLoopPolicy,
@@ -854,7 +855,8 @@ async fn run_started(
         LoopbackJsonRpc::new(config.wcash_node_rpc, config.wcash_node_cookie_file.clone())
             .map_err(|_| ServiceError::PayoutAuthorityConfiguration)?;
     refresh_network_hashrate(&pool_data, &hashrate_rpc, &started.jobs).await;
-    let miner_telemetry = Arc::new(LiveMinerTelemetry::default());
+    let diagnostics = started.shares.diagnostics();
+    let miner_telemetry = Arc::new(LiveMinerTelemetry::new(Arc::clone(&diagnostics)));
     let portal = build_portal(
         config,
         started,
@@ -887,6 +889,9 @@ async fn run_started(
         miner_telemetry as Arc<dyn wcash_pool_edge::MinerTelemetrySink>,
     );
     let counters = Arc::new(EdgeCounters::default());
+    let mut operational_summary =
+        OperationalSummary::new(Arc::clone(&diagnostics), Arc::clone(&counters));
+    operational_summary.emit_if_due();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
 
@@ -915,7 +920,14 @@ async fn run_started(
     let refresh_jobs = started.jobs.clone();
     tasks.spawn(async move {
         ServiceTask::Refresh(
-            refresh_portal(pool_data, hashrate_rpc, refresh_jobs, refresh_shutdown).await,
+            refresh_portal(
+                pool_data,
+                hashrate_rpc,
+                refresh_jobs,
+                refresh_shutdown,
+                operational_summary,
+            )
+            .await,
         )
     });
 
@@ -974,6 +986,7 @@ async fn run_started(
     // every command already admitted before its shutdown marker.
     let owned = bootstrap.take().ok_or(ServiceError::Invariant)?;
     let authority_shutdown = shutdown_bootstrap(owned).await;
+    operational_summary::emit_final(&diagnostics, &counters);
 
     let mut service_error = None;
     retain_first_error(&mut service_error, first_exit.transpose().map(|_| ()));
@@ -1725,6 +1738,7 @@ async fn refresh_portal(
     rpc: LoopbackJsonRpc,
     jobs: JobRouter,
     mut shutdown: watch::Receiver<bool>,
+    mut operational_summary: OperationalSummary,
 ) -> Result<(), StoreError> {
     let mut interval = time::interval(PORTAL_REFRESH_INTERVAL);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -1739,6 +1753,7 @@ async fn refresh_portal(
                 }
             }
             _ = interval.tick() => {
+                operational_summary.emit_if_due();
                 source.refresh().await?;
                 refresh_network_hashrate(&source, &rpc, &jobs).await;
             },

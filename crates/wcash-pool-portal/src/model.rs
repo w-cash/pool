@@ -395,6 +395,8 @@ pub struct WorkerTelemetrySummary {
     pub duplicate: u64,
     /// Unix time of the latest recorded share outcome, if any.
     pub last_share_at: Option<u64>,
+    /// Fixed nonzero diagnostic counters for only this worker; no proof-loss inference.
+    pub diagnostics: std::collections::BTreeMap<String, u64>,
 }
 
 /// Authenticated, account-scoped live mining telemetry.
@@ -404,6 +406,12 @@ pub struct MinerTelemetrySummary {
     pub available: bool,
     /// Unix time when this snapshot was produced.
     pub updated_at: Option<u64>,
+    /// Process-counter identity; changes on restart and is not a worker identifier.
+    pub process_instance_id: Option<Uuid>,
+    /// Best-effort Unix time when this process-counter instance began.
+    pub process_started_at: Option<u64>,
+    /// Fixed nonzero diagnostic totals for only this account's tracked workers.
+    pub diagnostics: std::collections::BTreeMap<String, u64>,
     /// Number of this account's workers with an authorized connection.
     pub active_workers: u64,
     /// Aggregate share counters for only this account.

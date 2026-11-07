@@ -10,6 +10,7 @@ struct GatedProjection {
     calls: AtomicUsize,
     acknowledged: AtomicUsize,
     attempted: Notify,
+    lifecycle: Mutex<Vec<(&'static str, &'static str)>>,
     expected: Mutex<
         Option<(
             BackendAuthority,
@@ -20,6 +21,13 @@ struct GatedProjection {
 }
 
 impl BackendEventConsumer for GatedProjection {
+    fn projection_lifecycle(&self, phase: &'static str, reason: &'static str) {
+        self.lifecycle
+            .lock()
+            .expect("lifecycle capture")
+            .push((phase, reason));
+    }
+
     fn consume<'a>(
         &'a self,
         authority: &'a BackendAuthority,
@@ -533,6 +541,7 @@ async fn projection_recovery_withholds_winning_ack_without_resubmitting_solution
     let consumer = Arc::new(GatedProjection::default());
     let service =
         ShareRouter::spawn(client, router.clone(), router_config()?, consumer.clone()).await?;
+    let diagnostics = service.diagnostics();
     let handle = service.handle();
     let accepted = tokio::spawn(async move { handle.submit(context).await });
     consumer.attempted.notified().await;
@@ -544,6 +553,10 @@ async fn projection_recovery_withholds_winning_ack_without_resubmitting_solution
     );
     assert_eq!(submissions.load(Ordering::SeqCst), 1);
     assert_eq!(consumer.acknowledged.load(Ordering::SeqCst), 0);
+    assert_eq!(diagnostics.count(Diagnostic::BackendReceiptNew), 1);
+    assert_eq!(diagnostics.count(Diagnostic::BackendZecWinnerReceipt), 1);
+    assert_eq!(diagnostics.count(Diagnostic::ProjectionPaused), 1);
+    assert_eq!(diagnostics.count(Diagnostic::ProjectionBatchVerified), 0);
     consumer.outcome.store(1, Ordering::SeqCst);
     tokio::time::advance(Duration::from_millis(100)).await;
     let verified = accepted.await??;
@@ -551,6 +564,11 @@ async fn projection_recovery_withholds_winning_ack_without_resubmitting_solution
     assert_eq!(verified.receipt().winners[0].chain, MergedChain::Zcash);
     assert_eq!(submissions.load(Ordering::SeqCst), 1);
     assert_eq!(consumer.acknowledged.load(Ordering::SeqCst), 1);
+    assert_eq!(diagnostics.count(Diagnostic::BackendAttemptOrdinary), 1);
+    assert_eq!(diagnostics.count(Diagnostic::BackendReceiptNew), 1);
+    assert_eq!(diagnostics.count(Diagnostic::BackendZecWinnerReceipt), 1);
+    assert_eq!(diagnostics.count(Diagnostic::ProjectionBatchVerified), 1);
+    assert_eq!(diagnostics.count(Diagnostic::ProjectionRecovered), 1);
     service.shutdown().await?;
     let _ = stop.send(());
     let _ = peer.await?;
@@ -703,11 +721,16 @@ async fn projection_recovery_candidate_deadline_cannot_reuse_an_unacknowledged_s
     .await?;
     let candidate = router.prepare_queued_paused_candidate(ordinary, &client)?;
     assert!(candidate.is_winner_recovery());
-    let consumer = GatedProjection::default();
+    let consumer = Arc::new(GatedProjection::default());
+    let diagnostics = Arc::new(OperationalCounters::default());
+    let observed = ObservedEventConsumer {
+        inner: consumer.clone(),
+        diagnostics: Arc::clone(&diagnostics),
+    };
     let (result, retained, recovered) = submit_context_and_drain(
         &mut client,
         &router,
-        &consumer,
+        &observed,
         router_config()?,
         candidate,
         Instant::now() + Duration::from_millis(500),
@@ -725,6 +748,10 @@ async fn projection_recovery_candidate_deadline_cannot_reuse_an_unacknowledged_s
     assert_eq!(submissions.load(Ordering::SeqCst), 1);
     assert!(consumer.calls.load(Ordering::SeqCst) > 0);
     assert_eq!(consumer.acknowledged.load(Ordering::SeqCst), 0);
+    assert_eq!(diagnostics.count(Diagnostic::BackendReceiptNew), 1);
+    assert_eq!(diagnostics.count(Diagnostic::BackendZecWinnerReceipt), 1);
+    assert_eq!(diagnostics.count(Diagnostic::ProjectionBatchVerified), 0);
+    assert_eq!(diagnostics.count(Diagnostic::RecoveryRetryExpired), 1);
     // The transport already read the committed event, but it never passed the
     // exact durable barrier. A later healthy reply cannot repair that lost Vec.
     assert!(!router.client_cursor_matches(&client)?);
@@ -1057,4 +1084,47 @@ async fn recovery_queue_wait_cannot_restore_revoked_backend_permission() -> Test
 #[tokio::test(start_paused = true)]
 async fn recovery_queue_wait_rechecks_health_after_projection_lag() -> TestResult {
     queued_winner_after_projection_wait(QueuedWinnerAuthority::Preserved, true).await
+}
+
+#[tokio::test]
+async fn diagnostics_startup_projection_failure_preserves_immediate_sanitized_evidence(
+) -> TestResult {
+    let QueuedProjection {
+        _socket,
+        client,
+        router,
+        stop,
+        peer,
+        ..
+    } = queued_projection(45_000).await?;
+    let consumer = Arc::new(GatedProjection::default());
+    consumer.outcome.store(2, Ordering::SeqCst);
+    // This is the actual initial drain inside ShareRouter::spawn. No successful
+    // router handle or periodic OperationalSummary exists after this failure.
+    let started =
+        ShareRouter::spawn(client, router.clone(), router_config()?, consumer.clone()).await;
+    assert!(matches!(
+        started,
+        Err(ShareRouterError::EventConsumerUnusable)
+    ));
+    let evidence = consumer
+        .lifecycle
+        .lock()
+        .map_err(|_| "lifecycle capture poisoned")?
+        .clone();
+    assert_eq!(evidence, vec![("rejected", "projection_event_conflict")]);
+    assert!(router.current_generation()?.is_none());
+    assert_eq!(consumer.acknowledged.load(Ordering::SeqCst), 0);
+    // Logger injection captures the exact fixed labels supplied by production;
+    // this does not claim an operating-system journal persistence test.
+    assert_eq!(
+        format!(
+            "frontend_projection_lifecycle phase={} reason={}",
+            evidence[0].0, evidence[0].1
+        ),
+        "frontend_projection_lifecycle phase=rejected reason=projection_event_conflict"
+    );
+    let _ = stop.send(());
+    peer.await??;
+    Ok(())
 }

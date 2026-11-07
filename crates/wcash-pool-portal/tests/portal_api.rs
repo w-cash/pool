@@ -1871,6 +1871,12 @@ async fn private_read_models_are_successful_empty_and_account_isolated() {
         MinerTelemetrySummary {
             available: true,
             updated_at: Some(1_800_000_000),
+            process_instance_id: None,
+            process_started_at: None,
+            diagnostics: std::collections::BTreeMap::from([(
+                "submission_unavailable".to_owned(),
+                7,
+            )]),
             active_workers: 1,
             accepted: 12,
             stale: 2,
@@ -1955,6 +1961,7 @@ async fn private_read_models_are_successful_empty_and_account_isolated() {
     )
     .await;
     assert_eq!(owner_telemetry["accepted"], 12);
+    assert_eq!(owner_telemetry["diagnostics"]["submission_unavailable"], 7);
 
     for route in ["/api/v1/rewards", "/api/v1/blocks", "/api/v1/payouts"] {
         let other = json_response(
@@ -1998,6 +2005,7 @@ async fn private_read_models_are_successful_empty_and_account_isolated() {
     )
     .await;
     assert_eq!(other_telemetry["accepted"], 0);
+    assert_eq!(other_telemetry["diagnostics"], json!({}));
     assert!(!other_telemetry.to_string().contains("historyowner"));
 }
 

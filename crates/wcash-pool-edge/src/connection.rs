@@ -22,7 +22,7 @@ use wcash_pool_protocol::{
 
 use crate::rate_limit::RequestRateLimiter;
 use crate::{
-    EdgeConfig, JobRouter, JobRouterError, JobUpdate, MinerError, MinerErrorCode,
+    Diagnostic, EdgeConfig, JobRouter, JobRouterError, JobUpdate, MinerError, MinerErrorCode,
     MinerTelemetrySink, NoopMinerTelemetry, ShareOutcome, ShareRouterError,
 };
 
@@ -237,6 +237,7 @@ pub struct ConnectionActor {
     next_ticket: u64,
     telemetry: Arc<dyn MinerTelemetrySink>,
     telemetry_connected: bool,
+    telemetry_worker: Option<AuthenticatedWorker>,
     closed: bool,
 }
 
@@ -312,6 +313,7 @@ impl ConnectionActor {
             next_ticket: 1,
             telemetry,
             telemetry_connected: false,
+            telemetry_worker: None,
             closed: false,
         })
     }
@@ -348,7 +350,14 @@ impl ConnectionActor {
         now_ms: u64,
     ) -> Result<Option<ConnectionAction>, ConnectionActorError> {
         self.require_open()?;
+        let is_submit = matches!(&request, Zip301Request::Submit { .. });
+        if is_submit {
+            self.record_diagnostic(Diagnostic::SubmitObserved);
+        }
         if self.rate_limiter.admit(now_ms).is_err() {
+            if is_submit {
+                self.record_diagnostic(Diagnostic::AdmissionRateLimited);
+            }
             self.queue_error(
                 request.id().clone(),
                 MinerError::new(MinerErrorCode::Other, "rate limit exceeded", true),
@@ -457,6 +466,7 @@ impl ConnectionActor {
                     self.session.complete_authorization(worker.clone())?;
                     self.authentication_grant = Some(grant);
                     self.telemetry.worker_connected(&worker);
+                    self.telemetry_worker = Some(worker);
                     self.telemetry_connected = true;
                     self.queue(Zip301ServerMessage::Boolean {
                         id: response_id,
@@ -536,6 +546,7 @@ impl ConnectionActor {
             ConnectionActorError::CompletionTicketMismatch
         })?;
         let response_id = self.take_response_id(response_index)?;
+        self.record_diagnostic(submission_diagnostic(&result));
         let outcome = match &result {
             Ok(verified) if verified.replayed() => Some(ShareOutcome::Duplicate),
             Ok(_) => Some(ShareOutcome::Accepted),
@@ -714,6 +725,7 @@ impl ConnectionActor {
         now_ms: u64,
     ) -> Result<Option<ConnectionAction>, ConnectionActorError> {
         if self.pending_shares.len() >= self.config.limits().outbound_queue_capacity() {
+            self.record_diagnostic(Diagnostic::AdmissionPendingLimit);
             self.queue_error(
                 id,
                 MinerError::new(MinerErrorCode::Other, "too many pending shares", true),
@@ -724,6 +736,7 @@ impl ConnectionActor {
             Ok(job_id) => job_id,
             Err(_) => {
                 self.record_share_outcome(ShareOutcome::Stale);
+                self.record_diagnostic(Diagnostic::AdmissionInvalidJob);
                 self.queue_error(
                     id,
                     MinerError::new(MinerErrorCode::StaleJob, "stale job", false),
@@ -741,13 +754,17 @@ impl ConnectionActor {
         ) {
             Ok(context) => context,
             Err(JobRouterError::Session(error)) => {
+                self.record_diagnostic(session_diagnostic(&error));
                 if let Some(outcome) = share_outcome_for_session(&error) {
                     self.record_share_outcome(outcome);
                 }
                 self.queue_session_error(id, error)?;
                 return Ok(None);
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                self.record_diagnostic(Diagnostic::AdmissionRouterFailed);
+                return Err(error.into());
+            }
         };
         // No session mutation can interleave this synchronous preparation and
         // lookup. The assignment owns the full binding once; the context keeps
@@ -786,6 +803,11 @@ impl ConnectionActor {
             },
         );
         self.timing_order.push_back(ticket);
+        self.record_diagnostic(if winner_recovery {
+            Diagnostic::RawZcashRecoveryCandidate
+        } else {
+            Diagnostic::PreparedOrdinary
+        });
         Ok(Some(ConnectionAction::Submit(PendingShare {
             ticket: ShareTicket {
                 session_id: self.session.id(),
@@ -978,6 +1000,13 @@ impl ConnectionActor {
         }
     }
 
+    pub(crate) fn record_diagnostic(&self, diagnostic: Diagnostic) {
+        // Keep the already authenticated identity through final policy closure,
+        // solely so the driver can report its terminal category before dropping.
+        self.telemetry
+            .diagnostic(self.telemetry_worker.as_ref(), diagnostic);
+    }
+
     fn record_share_outcome(&self, outcome: ShareOutcome) {
         if let Some(worker) = self.session.authenticated_worker() {
             self.telemetry.share_outcome(worker, outcome);
@@ -1005,6 +1034,54 @@ impl ConnectionActor {
     #[cfg(test)]
     fn binding(&self) -> Option<TargetBinding> {
         self.vardiff.as_ref().map(VardiffController::binding)
+    }
+}
+
+fn submission_diagnostic(result: &Result<VerifiedShareCommit, ShareRouterError>) -> Diagnostic {
+    use wcash_pool_protocol::BackendErrorCode;
+    match result {
+        Ok(commit) if commit.replayed() => Diagnostic::SubmissionReplay,
+        Ok(_) => Diagnostic::SubmissionAccepted,
+        Err(ShareRouterError::Rejected(code)) => match code {
+            BackendErrorCode::StaleJob => Diagnostic::SubmissionStale,
+            BackendErrorCode::AttributionConflict => Diagnostic::SubmissionAttributionConflict,
+            BackendErrorCode::InvalidRequest
+            | BackendErrorCode::LowDifficulty
+            | BackendErrorCode::InvalidEquihash
+            | BackendErrorCode::TargetOutOfRange => Diagnostic::SubmissionInvalid,
+            BackendErrorCode::Overloaded => Diagnostic::SubmissionBackendBusy,
+            BackendErrorCode::BackendUnhealthy => Diagnostic::SubmissionBackendUnhealthy,
+            BackendErrorCode::RecoveryDeferred => Diagnostic::SubmissionRecoveryDeferred,
+        },
+        Err(ShareRouterError::Overloaded) => Diagnostic::SubmissionQueueFull,
+        Err(ShareRouterError::ReplayRequiresProjection { .. }) => {
+            Diagnostic::SubmissionProjectionPending
+        }
+        Err(ShareRouterError::Unavailable) => Diagnostic::SubmissionUnavailable,
+        Err(ShareRouterError::JobStreamUnusable) => Diagnostic::SubmissionJobStreamUnavailable,
+        Err(ShareRouterError::EventConsumerUnusable) => Diagnostic::SubmissionProjectionUnavailable,
+        Err(ShareRouterError::BackendHealthDeadline) => Diagnostic::SubmissionHealthDeadline,
+        Err(ShareRouterError::BackendConnectionMismatch) => Diagnostic::SubmissionAuthorityMismatch,
+        Err(ShareRouterError::TaskFailed) => Diagnostic::SubmissionTaskFailed,
+        Err(ShareRouterError::BackendNotLive) => Diagnostic::SubmissionBackendNotLive,
+    }
+}
+
+fn session_diagnostic(error: &SessionError) -> Diagnostic {
+    match error {
+        SessionError::UnexpectedState { .. } | SessionError::MissingIdentity => {
+            Diagnostic::AdmissionUnauthorized
+        }
+        SessionError::LoginMismatch => Diagnostic::AdmissionLoginMismatch,
+        SessionError::JobNotAnnounced(_) => Diagnostic::AdmissionJobNotAnnounced,
+        SessionError::HeaderTimeMismatch(_) => Diagnostic::AdmissionHeaderTimeMismatch,
+        SessionError::NonceProfileMismatch => Diagnostic::AdmissionNonceMismatch,
+        SessionError::Registry(
+            wcash_pool_core::JobRegistryError::StaleJob(_)
+            | wcash_pool_core::JobRegistryError::UnknownJob(_),
+        ) => Diagnostic::AdmissionStale,
+        SessionError::Registry(_) => Diagnostic::AdmissionRegistryUnavailable,
+        _ => Diagnostic::AdmissionSessionRejected,
     }
 }
 
@@ -1091,6 +1168,7 @@ pub enum ConnectionActorError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod diagnostic_tests;
     mod winner_recovery_tests;
     use std::{sync::Mutex, time::Duration};
 
@@ -1111,9 +1189,13 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct RecordingTelemetry(Mutex<Vec<TelemetryEvent>>);
+    struct RecordingTelemetry(Mutex<Vec<TelemetryEvent>>, Mutex<Vec<Diagnostic>>);
 
     impl MinerTelemetrySink for RecordingTelemetry {
+        fn diagnostic(&self, _worker: Option<&AuthenticatedWorker>, diagnostic: Diagnostic) {
+            self.1.lock().expect("diagnostic lock").push(diagnostic);
+        }
+
         fn worker_connected(&self, _worker: &AuthenticatedWorker) {
             self.0
                 .lock()

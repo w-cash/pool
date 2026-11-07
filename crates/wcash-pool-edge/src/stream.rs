@@ -152,6 +152,7 @@ impl AcceptedStreamDriver {
         mut shutdown: oneshot::Receiver<()>,
     ) -> Result<StreamTermination, StreamDriverError> {
         let result = self.run_inner(&mut shutdown).await;
+        self.actor.record_diagnostic(driver_diagnostic(&result));
         self.actor.transport_failed();
         let shutdown_deadline = Instant::now() + self.config.write_timeout();
         let _ = time::timeout_at(shutdown_deadline, self.stream.shutdown()).await;
@@ -645,6 +646,29 @@ pub enum StreamDriverError {
     JobRouter(#[from] JobRouterError),
 }
 
+fn driver_diagnostic(result: &Result<StreamTermination, StreamDriverError>) -> crate::Diagnostic {
+    use crate::Diagnostic as D;
+    use StreamDriverError as E;
+    match result {
+        Ok(StreamTermination::PeerClosed) => D::DriverPeerClosed,
+        Ok(StreamTermination::LocalShutdown) => D::DriverLocalShutdown,
+        Ok(StreamTermination::ActorClosed) => D::DriverActorClosed,
+        Err(E::IdleTimeout) => D::DriverIdleTimeout,
+        Err(E::FrameReadTimeout) => D::DriverFrameTimeout,
+        Err(E::WriteTimeout) => D::DriverWriteTimeout,
+        Err(E::AuthorizationTimeout) => D::DriverAuthorizationTimeout,
+        Err(E::AuthorizationRevalidationTimeout) => D::DriverRevalidationTimeout,
+        Err(E::AuthorizationRevalidationUnavailable) => D::DriverRevalidationUnavailable,
+        Err(E::SubmissionTimeout) => D::DriverSubmissionTimeout,
+        Err(E::Read(_)) => D::DriverReadFailure,
+        Err(E::Write(_)) => D::DriverWriteFailure,
+        Err(E::Protocol(_)) | Err(E::DecoderMadeNoProgress) => D::DriverProtocolFailure,
+        Err(E::Actor(_)) => D::DriverActorFailure,
+        Err(E::JobRouter(_)) => D::DriverJobStreamFailure,
+        Err(_) => D::DriverOtherFailure,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -770,6 +794,18 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct DiagnosticTelemetry(crate::OperationalCounters);
+
+    impl crate::MinerTelemetrySink for DiagnosticTelemetry {
+        fn worker_connected(&self, _worker: &AuthenticatedWorker) {}
+        fn worker_disconnected(&self, _worker: &AuthenticatedWorker) {}
+        fn share_outcome(&self, _worker: &AuthenticatedWorker, _outcome: crate::ShareOutcome) {}
+        fn diagnostic(&self, _worker: Option<&AuthenticatedWorker>, diagnostic: crate::Diagnostic) {
+            self.0.record(diagnostic);
+        }
+    }
+
     #[derive(Debug, Default)]
     struct HangingSubmissions {
         calls: AtomicUsize,
@@ -848,6 +884,14 @@ mod tests {
         config: EdgeConfig,
         profile: NonceProfile,
     ) -> (ConnectionActor, crate::JobRouter) {
+        actor_and_router_with_telemetry(config, profile, Arc::new(crate::NoopMinerTelemetry))
+    }
+
+    fn actor_and_router_with_telemetry(
+        config: EdgeConfig,
+        profile: NonceProfile,
+        telemetry: Arc<dyn crate::MinerTelemetrySink>,
+    ) -> (ConnectionActor, crate::JobRouter) {
         let descriptor = descriptor(1);
         let generation =
             BackendGeneration::from_descriptor(descriptor.clone()).expect("descriptor is valid");
@@ -876,13 +920,14 @@ mod tests {
             profile,
             NonceNamespaceLease::new(7).expect("nonce lease is valid"),
         ));
-        let actor = ConnectionActor::new(
+        let actor = ConnectionActor::new_with_telemetry(
             Uuid::from_u128(1),
             config,
             policy,
             allocator,
             router.clone(),
             0,
+            telemetry,
         )
         .expect("actor is valid");
         (actor, router)
@@ -1106,9 +1151,12 @@ mod tests {
             Duration::from_millis(100),
         );
         let capacity = ConnectionCapacity::new(1)?;
+        let telemetry = Arc::new(DiagnosticTelemetry::default());
+        let observed_actor =
+            actor_and_router_with_telemetry(config, NonceProfile::FourByte, telemetry.clone()).0;
         let driver = standard_driver(
             server,
-            actor(config, NonceProfile::FourByte),
+            observed_actor,
             Arc::new(AllowAuthentication),
             Arc::new(RejectingSubmissions::default()),
             &capacity,
@@ -1124,6 +1172,11 @@ mod tests {
                 ProtocolError::InvalidLineFraming
             ))
         ));
+        assert_eq!(
+            telemetry.0.count(crate::Diagnostic::DriverProtocolFailure),
+            1
+        );
+        assert_eq!(telemetry.0.count(crate::Diagnostic::BackendReceiptNew), 0);
         assert_eq!(capacity.available_permits(), 1);
         Ok(())
     }
@@ -1186,9 +1239,12 @@ mod tests {
         );
         let capacity = ConnectionCapacity::new(1)?;
         let submissions = Arc::new(HangingSubmissions::default());
+        let telemetry = Arc::new(DiagnosticTelemetry::default());
+        let observed_actor =
+            actor_and_router_with_telemetry(config, NonceProfile::FourByte, telemetry.clone()).0;
         let driver = standard_driver(
             server,
-            actor(config, NonceProfile::FourByte),
+            observed_actor,
             Arc::new(AllowAuthentication),
             submissions.clone(),
             &capacity,
@@ -1258,6 +1314,13 @@ mod tests {
             Err(StreamDriverError::SubmissionTimeout)
         ));
         assert_eq!(submissions.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            telemetry
+                .0
+                .count(crate::Diagnostic::DriverSubmissionTimeout),
+            1
+        );
+        assert_eq!(telemetry.0.count(crate::Diagnostic::BackendReceiptNew), 0);
         assert_eq!(capacity.available_permits(), 1);
         Ok(())
     }
