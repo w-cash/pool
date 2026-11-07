@@ -193,7 +193,6 @@ enum SubmitCommand {
     Share {
         context: SubmissionContext,
         response: oneshot::Sender<Result<VerifiedShareCommit, ShareRouterError>>,
-        queued_at: Instant,
     },
     Shutdown {
         complete: oneshot::Sender<()>,
@@ -228,11 +227,7 @@ impl ShareRouterHandle {
     ) -> Result<VerifiedShareCommit, ShareRouterError> {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .try_send(SubmitCommand::Share {
-                context,
-                response,
-                queued_at: Instant::now(),
-            })
+            .try_send(SubmitCommand::Share { context, response })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ShareRouterError::Overloaded,
                 mpsc::error::TrySendError::Closed(_) => ShareRouterError::Unavailable,
@@ -467,6 +462,7 @@ async fn run_submission_actor(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut health_deadline = None;
     let mut prefer_command = false;
+    let mut require_health_barrier = first_heartbeat_deadline <= Instant::now();
     let retry_budget = CANDIDATE_RETRY_BUDGET.min(client.request_timeout());
     let mut deferred = DeferredCandidates {
         entries: Vec::with_capacity(MAX_DEFERRED_CANDIDATES.min(config.queue_capacity())),
@@ -476,16 +472,21 @@ async fn run_submission_actor(
     };
 
     loop {
-        let work = tokio::select! {
-            biased;
-            _ = async {
-                match health_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => ActorWork::HealthDeadline,
-            _ = heartbeat.tick() => ActorWork::Heartbeat,
-            work = next_submission_work(&mut receiver, deferred.next_deadline(), prefer_command) => work,
+        let forced_health_barrier = std::mem::take(&mut require_health_barrier);
+        let work = if forced_health_barrier {
+            ActorWork::Heartbeat
+        } else {
+            tokio::select! {
+                biased;
+                _ = async {
+                    match health_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => ActorWork::HealthDeadline,
+                _ = heartbeat.tick() => ActorWork::Heartbeat,
+                work = next_submission_work(&mut receiver, deferred.next_deadline(), prefer_command) => work,
+            }
         };
         let mut pending = match work {
             ActorWork::Heartbeat => {
@@ -501,6 +502,9 @@ async fn run_submission_actor(
                         .unwrap_or(Err(ShareRouterError::BackendHealthDeadline)),
                     None => health.await,
                 };
+                if forced_health_barrier {
+                    heartbeat.reset();
+                }
                 let result = if health_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     Err(ShareRouterError::BackendHealthDeadline)
                 } else {
@@ -545,16 +549,12 @@ async fn run_submission_actor(
                 };
                 pending
             }
-            ActorWork::Command(Some(SubmitCommand::Share {
-                context,
-                response,
-                queued_at,
-            })) => {
+            ActorWork::Command(Some(SubmitCommand::Share { context, response })) => {
                 prefer_command = false;
                 DeferredCandidate {
                     context,
                     response,
-                    deadline: queued_at + retry_budget,
+                    deadline: Instant::now() + retry_budget,
                     next_try: Instant::now(),
                 }
             }
@@ -612,7 +612,7 @@ async fn run_submission_actor(
             // authenticated health barrier ahead of the next queued command,
             // independently of the configured idle heartbeat interval.
             health_deadline.get_or_insert(Instant::now() + BACKEND_HEALTH_GRACE);
-            heartbeat.reset_immediately();
+            require_health_barrier = true;
         }
         // An ordinary guard may cross its lease while queued or in flight. Only
         // this typed response permits a fresh health barrier and cheap candidate
@@ -1810,7 +1810,6 @@ mod tests {
             .try_send(SubmitCommand::Share {
                 context: queued_context,
                 response,
-                queued_at: Instant::now(),
             })
             .map_err(|_| "could not enqueue context during health exchange")?;
         let _ = allow_pause.send(());
@@ -2734,7 +2733,6 @@ mod tests {
             .try_send(SubmitCommand::Share {
                 context: second_context,
                 response: second_response,
-                queued_at: Instant::now(),
             })
             .map_err(|_| "could not enqueue the second test submission")?;
         tokio::time::advance(Duration::from_secs(10)).await;
