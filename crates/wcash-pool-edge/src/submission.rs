@@ -18,9 +18,9 @@ use wcash_pool_backend_client::{
     DeliveredBackendEvent, VerifiedShareCommit,
 };
 use wcash_pool_core::SubmissionContext;
-use wcash_pool_protocol::{BackendErrorCode, ShareReceipt};
+use wcash_pool_protocol::{BackendErrorCode, MergedChain, ShareReceipt};
 
-use crate::JobRouter;
+use crate::{Diagnostic, JobRouter, OperationalCounters};
 
 const MAXIMUM_QUEUE_CAPACITY: usize = 4_096;
 const MAXIMUM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
@@ -181,12 +181,59 @@ impl BackendEventConsumerError {
 /// consumer verifies the isolated projector's durable cursor and exact hashes;
 /// in-memory consumers are suitable only for deterministic tests.
 pub trait BackendEventConsumer: Send + Sync + 'static {
+    /// Observes a fixed process-only category without affecting verification.
+    fn diagnostic(&self, _diagnostic: Diagnostic) {}
+
+    /// Emits rare projection lifecycle evidence even before startup can expose
+    /// counters. Production callers supply only the fixed sanitized labels.
+    /// Overriding observers must preserve this operational evidence promptly.
+    fn projection_lifecycle(&self, phase: &'static str, reason: &'static str) {
+        eprintln!("frontend_projection_lifecycle phase={phase} reason={reason}");
+    }
+
     /// Consumes one non-empty, contiguous batch under a finite actor deadline.
     fn consume<'a>(
         &'a self,
         authority: &'a BackendAuthority,
         events: &'a [DeliveredBackendEvent],
     ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>>;
+}
+
+struct ObservedEventConsumer {
+    inner: Arc<dyn BackendEventConsumer>,
+    diagnostics: Arc<OperationalCounters>,
+}
+
+impl BackendEventConsumer for ObservedEventConsumer {
+    fn consume<'a>(
+        &'a self,
+        authority: &'a BackendAuthority,
+        events: &'a [DeliveredBackendEvent],
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>> {
+        self.inner.consume(authority, events)
+    }
+
+    fn diagnostic(&self, diagnostic: Diagnostic) {
+        self.diagnostics.record(diagnostic);
+        self.inner.diagnostic(diagnostic);
+    }
+
+    fn projection_lifecycle(&self, phase: &'static str, reason: &'static str) {
+        self.inner.projection_lifecycle(phase, reason);
+    }
+}
+
+struct ResponseWait<'a> {
+    diagnostics: &'a OperationalCounters,
+    completed: bool,
+}
+
+impl Drop for ResponseWait<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.diagnostics.record(Diagnostic::QueueWaitCancelled);
+        }
+    }
 }
 
 enum SubmitCommand {
@@ -214,6 +261,7 @@ enum ActorWork {
 #[derive(Clone, Debug)]
 pub struct ShareRouterHandle {
     sender: mpsc::Sender<SubmitCommand>,
+    diagnostics: Arc<OperationalCounters>,
 }
 
 impl ShareRouterHandle {
@@ -229,10 +277,26 @@ impl ShareRouterHandle {
         self.sender
             .try_send(SubmitCommand::Share { context, response })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ShareRouterError::Overloaded,
-                mpsc::error::TrySendError::Closed(_) => ShareRouterError::Unavailable,
+                mpsc::error::TrySendError::Full(_) => {
+                    self.diagnostics.record(Diagnostic::QueueFull);
+                    ShareRouterError::Overloaded
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    self.diagnostics.record(Diagnostic::QueueClosed);
+                    ShareRouterError::Unavailable
+                }
             })?;
-        receiver.await.map_err(|_| ShareRouterError::Unavailable)?
+        self.diagnostics.record(Diagnostic::QueueEnqueued);
+        let mut waiting = ResponseWait {
+            diagnostics: &self.diagnostics,
+            completed: false,
+        };
+        let result = receiver.await;
+        waiting.completed = true;
+        result.map_err(|_| {
+            self.diagnostics.record(Diagnostic::QueueResponseLost);
+            ShareRouterError::Unavailable
+        })?
     }
 }
 
@@ -273,6 +337,11 @@ impl ShareRouter {
             return Err(ShareRouterError::BackendConnectionMismatch);
         }
         let suspension = SuspendOnDrop::new(job_router.clone(), Some(connection_binding));
+        let diagnostics = Arc::new(OperationalCounters::default());
+        let event_consumer: Arc<dyn BackendEventConsumer> = Arc::new(ObservedEventConsumer {
+            inner: event_consumer,
+            diagnostics: Arc::clone(&diagnostics),
+        });
         let projection_recovered = drain_backend_events(
             &mut client,
             &job_router,
@@ -281,7 +350,10 @@ impl ShareRouter {
         )
         .await?;
         let (sender, receiver) = mpsc::channel(config.queue_capacity());
-        let handle = ShareRouterHandle { sender };
+        let handle = ShareRouterHandle {
+            sender,
+            diagnostics,
+        };
         let first_heartbeat_deadline = if projection_recovered {
             Instant::now()
         } else {
@@ -315,6 +387,11 @@ impl ShareRouter {
     /// Returns a producer for connection actors.
     pub fn handle(&self) -> ShareRouterHandle {
         self.handle.clone()
+    }
+
+    /// Returns the fixed process counters shared by submission and miner telemetry.
+    pub fn diagnostics(&self) -> Arc<OperationalCounters> {
+        Arc::clone(&self.handle.diagnostics)
     }
 
     /// Reports whether the owned backend actor has already terminated.
@@ -516,9 +593,13 @@ async fn run_submission_actor(
                             if health_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                                 Err(ShareRouterError::BackendHealthDeadline)
                             } else if healthy {
+                                let was_paused = health_deadline.is_some();
                                 let resumed = job_router
                                     .resume_after_health(&client)
                                     .map_err(|_| ShareRouterError::JobStreamUnusable);
+                                if was_paused && resumed.is_ok() {
+                                    event_consumer.diagnostic(Diagnostic::HealthResumed);
+                                }
                                 health_deadline = None;
                                 resumed
                             } else {
@@ -574,6 +655,7 @@ async fn run_submission_actor(
                 match job_router.prepare_queued_paused_candidate(pending.context, &client) {
                     Ok(context) => context,
                     Err(crate::JobRouterError::Session(_)) => {
+                        event_consumer.diagnostic(Diagnostic::RecoveryRequalificationStale);
                         response_suspension.disarm();
                         let _ = pending
                             .response
@@ -592,6 +674,7 @@ async fn run_submission_actor(
                 };
         }
         if pending.context.is_winner_recovery() && Instant::now() >= pending.deadline {
+            event_consumer.diagnostic(Diagnostic::RecoveryRetryExpired);
             response_suspension.disarm();
             let _ = pending.response.send(Err(ShareRouterError::Rejected(
                 BackendErrorCode::RecoveryDeferred,
@@ -690,6 +773,7 @@ async fn run_submission_actor(
             if let Some(context) = retained {
                 if Instant::now() < pending.deadline {
                     if deferred.entries.len() < deferred.maximum {
+                        event_consumer.diagnostic(Diagnostic::RecoveryRetryScheduled);
                         deferred.entries.push(DeferredCandidate {
                             context,
                             response: pending.response,
@@ -698,9 +782,11 @@ async fn run_submission_actor(
                         });
                         continue;
                     }
+                    event_consumer.diagnostic(Diagnostic::RecoveryQueueFull);
                     let _ = pending.response.send(Err(ShareRouterError::Overloaded));
                     continue;
                 }
+                event_consumer.diagnostic(Diagnostic::RecoveryRetryExpired);
             }
         }
         let _ = pending.response.send(result);
@@ -728,10 +814,10 @@ async fn submit_context_and_drain(
     if context.is_winner_recovery() {
         let mut draining = false;
         let attempt = async {
-            let mut result = client
-                .submit_recovery_candidate(&context)
-                .await
-                .map_err(ShareRouterError::from_client);
+            event_consumer.diagnostic(Diagnostic::BackendAttemptRecovery);
+            let received = client.submit_recovery_candidate(&context).await;
+            record_backend_result(event_consumer, &received);
+            let mut result = received.map_err(ShareRouterError::from_client);
             draining = true;
             let recovered = match drain_backend_events(
                 client,
@@ -752,15 +838,21 @@ async fn submit_context_and_drain(
         };
         let (result, recovered) = match tokio::time::timeout_at(deadline, attempt).await {
             Ok(outcome) => outcome,
-            Err(_) if draining => (Err(ShareRouterError::EventConsumerUnusable), false),
-            Err(_) => (Err(ShareRouterError::Unavailable), false),
+            Err(_) if draining => {
+                event_consumer.diagnostic(Diagnostic::RecoveryRetryExpired);
+                (Err(ShareRouterError::EventConsumerUnusable), false)
+            }
+            Err(_) => {
+                event_consumer.diagnostic(Diagnostic::RecoveryRetryExpired);
+                (Err(ShareRouterError::Unavailable), false)
+            }
         };
         (result, Some(context), recovered)
     } else {
-        let mut result = client
-            .submit_prepared_share_borrowed(&context)
-            .await
-            .map_err(ShareRouterError::from_client);
+        event_consumer.diagnostic(Diagnostic::BackendAttemptOrdinary);
+        let received = client.submit_prepared_share_borrowed(&context).await;
+        record_backend_result(event_consumer, &received);
+        let mut result = received.map_err(ShareRouterError::from_client);
         let recovered = match drain_backend_events(
             client,
             job_router,
@@ -783,6 +875,58 @@ async fn submit_context_and_drain(
         )
         .then_some(context);
         (result, retained, recovered)
+    }
+}
+
+fn record_backend_result(
+    consumer: &dyn BackendEventConsumer,
+    result: &Result<VerifiedShareCommit, ClientError>,
+) {
+    match result {
+        Ok(commit) => {
+            consumer.diagnostic(if commit.replayed() {
+                Diagnostic::BackendReceiptReplay
+            } else {
+                Diagnostic::BackendReceiptNew
+            });
+            if !commit.replayed() {
+                for winner in &commit.receipt().winners {
+                    consumer.diagnostic(match winner.chain {
+                        MergedChain::Wcash => Diagnostic::BackendWecWinnerReceipt,
+                        MergedChain::Zcash => Diagnostic::BackendZecWinnerReceipt,
+                    });
+                }
+            }
+        }
+        Err(ClientError::HistoricalReplayRequiresProjection { .. }) => {
+            consumer.diagnostic(Diagnostic::BackendReceiptReplay)
+        }
+        Err(ClientError::Timeout { .. }) => consumer.diagnostic(Diagnostic::BackendRequestTimeout),
+        Err(
+            ClientError::Connect(_)
+            | ClientError::Io { .. }
+            | ClientError::CleanEof
+            | ClientError::TruncatedFrame { .. },
+        ) => consumer.diagnostic(Diagnostic::BackendTransportFailure),
+        Err(ClientError::BackendRejected { code, .. }) => {
+            consumer.diagnostic(Diagnostic::BackendRejected);
+            if *code == BackendErrorCode::RecoveryDeferred {
+                consumer.diagnostic(Diagnostic::BackendRecoveryDeferred);
+            }
+        }
+        Err(_) => consumer.diagnostic(Diagnostic::BackendValidationFailure),
+    }
+}
+
+fn projection_diagnostic(error: BackendEventConsumerError) -> Diagnostic {
+    match error {
+        BackendEventConsumerError::ProjectionLag { .. } => Diagnostic::ProjectionLag,
+        BackendEventConsumerError::StorageUnavailable => Diagnostic::ProjectionStorageUnavailable,
+        BackendEventConsumerError::TimedOut => Diagnostic::ProjectionAttemptTimeout,
+        BackendEventConsumerError::AuthorityMismatch => Diagnostic::ProjectionAuthorityMismatch,
+        BackendEventConsumerError::InvalidBatch => Diagnostic::ProjectionInvalidBatch,
+        BackendEventConsumerError::EventConflict => Diagnostic::ProjectionEventConflict,
+        BackendEventConsumerError::StorageRejected => Diagnostic::ProjectionStorageRejected,
     }
 }
 
@@ -866,6 +1010,7 @@ async fn pump_health(
     let observed_at = Instant::now();
     let unhealthy = health.as_ref().is_ok_and(|health| !health.healthy);
     if unhealthy {
+        event_consumer.diagnostic(Diagnostic::HealthUnhealthy);
         job_router
             .pause_for_health(client)
             .map_err(|_| ShareRouterError::JobStreamUnusable)?;
@@ -957,6 +1102,27 @@ async fn drain_backend_events(
     Ok(recovered)
 }
 
+fn projection_lifecycle(
+    consumer: &dyn BackendEventConsumer,
+    diagnostic: Diagnostic,
+    reason: Option<BackendEventConsumerError>,
+) {
+    let phase = match diagnostic {
+        Diagnostic::ProjectionPaused => "paused",
+        Diagnostic::ProjectionRejected => "rejected",
+        Diagnostic::ProjectionDeadline => "deadline",
+        _ => return,
+    };
+    let reason = reason
+        .map(projection_diagnostic)
+        .map(Diagnostic::as_str)
+        .unwrap_or("recovery_budget");
+    // Startup can fail and drop every counter before a summary is composed.
+    // Preserve immediate lifecycle evidence with no error body or identifiers.
+    consumer.projection_lifecycle(phase, reason);
+    consumer.diagnostic(diagnostic);
+}
+
 async fn acknowledge_event_batch(
     client: &BackendClient,
     job_router: &JobRouter,
@@ -969,7 +1135,7 @@ async fn acknowledge_event_batch(
     let mut recovered = false;
     loop {
         if Instant::now() >= deadline {
-            eprintln!("backend event projection recovery deadline expired");
+            projection_lifecycle(event_consumer, Diagnostic::ProjectionDeadline, None);
             return Err(ShareRouterError::EventConsumerUnusable);
         }
         if !client.is_bound_to(binding)
@@ -989,24 +1155,32 @@ async fn acknowledge_event_batch(
         )
         .await
         {
-            Ok(Ok(())) if Instant::now() < deadline => return Ok(recovered),
+            Ok(Ok(())) if Instant::now() < deadline => {
+                event_consumer.diagnostic(Diagnostic::ProjectionBatchVerified);
+                if recovered {
+                    event_consumer.diagnostic(Diagnostic::ProjectionRecovered);
+                }
+                return Ok(recovered);
+            }
             Ok(Ok(())) => BackendEventConsumerError::TimedOut,
             Ok(Err(error)) => error,
             Err(_) => BackendEventConsumerError::TimedOut,
         };
+        event_consumer.diagnostic(projection_diagnostic(error));
         if !error.is_retryable() {
-            eprintln!("backend event projection rejected: {error}");
+            projection_lifecycle(event_consumer, Diagnostic::ProjectionRejected, Some(error));
             return Err(ShareRouterError::EventConsumerUnusable);
         }
+        event_consumer.diagnostic(Diagnostic::ProjectionRetry);
         if !recovered {
             job_router
                 .pause_for_health(client)
                 .map_err(|_| ShareRouterError::JobStreamUnusable)?;
-            eprintln!("backend event projection recovery paused admission: {error}");
+            projection_lifecycle(event_consumer, Diagnostic::ProjectionPaused, Some(error));
             recovered = true;
         }
         if Instant::now() >= deadline {
-            eprintln!("backend event projection recovery deadline expired: {error}");
+            projection_lifecycle(event_consumer, Diagnostic::ProjectionDeadline, Some(error));
             return Err(ShareRouterError::EventConsumerUnusable);
         }
         tokio::time::sleep_until((Instant::now() + EVENT_CONSUMER_RETRY_INTERVAL).min(deadline))
@@ -1092,6 +1266,7 @@ impl ShareRouterError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod diagnostic_tests;
     #[path = "projection_recovery_tests.rs"]
     mod projection_recovery_tests;
     #[path = "recovery_only_tests.rs"]
@@ -1455,7 +1630,10 @@ mod tests {
         )?;
         let mut updates = router.subscribe();
         let (sender, receiver) = mpsc::channel(1);
-        let handle = ShareRouterHandle { sender };
+        let handle = ShareRouterHandle {
+            sender,
+            diagnostics: Arc::new(OperationalCounters::default()),
+        };
         let surviving_handle = handle.clone();
         let (started, actor_started) = oneshot::channel();
         let actor_router = router.clone();

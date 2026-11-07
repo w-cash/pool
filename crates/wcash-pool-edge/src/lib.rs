@@ -38,4 +38,6 @@ pub use submission::{
     BackendEventConsumer, BackendEventConsumerError, ShareRouter, ShareRouterConfig,
     ShareRouterConfigError, ShareRouterError, ShareRouterHandle,
 };
-pub use telemetry::{MinerTelemetrySink, NoopMinerTelemetry, ShareOutcome};
+pub use telemetry::{
+    Diagnostic, MinerTelemetrySink, NoopMinerTelemetry, OperationalCounters, ShareOutcome,
+};

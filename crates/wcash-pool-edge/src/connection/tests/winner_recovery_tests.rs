@@ -32,6 +32,13 @@ fn fixture_solution() -> Hex1344 {
 }
 
 fn rotated_actor() -> (ConnectionActor, BackendGeneration, TargetBinding, Hex32) {
+    rotated_actor_with_telemetry(Arc::new(NoopMinerTelemetry), false)
+}
+
+fn rotated_actor_with_telemetry(
+    telemetry: Arc<dyn MinerTelemetrySink>,
+    raw_filter_only: bool,
+) -> (ConnectionActor, BackendGeneration, TargetBinding, Hex32) {
     let mut first = descriptor(1);
     let encoded = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -46,7 +53,11 @@ fn rotated_actor() -> (ConnectionActor, BackendGeneration, TargetBinding, Hex32)
     first.zcash_previous_hash_le = Hex32::new(header[4..36].try_into().expect("parent"));
     let mut network_target = [0_u8; 32];
     network_target[25..28].copy_from_slice(&[0xf0, 0xda, 0x01]);
-    first.zcash_target_le = TargetLe::new(network_target);
+    first.zcash_target_le = TargetLe::new(if raw_filter_only {
+        [0xff; 32]
+    } else {
+        network_target
+    });
     let router = JobRouter::from_acceptable_for_test(
         1,
         Some(&AcceptableJob {
@@ -58,7 +69,7 @@ fn rotated_actor() -> (ConnectionActor, BackendGeneration, TargetBinding, Hex32)
         8,
     )
     .expect("initial job snapshot");
-    let mut actor = actor_with_router(16, router);
+    let mut actor = actor_with_telemetry(16, router, telemetry);
     // Restore the historical header's exact prefix: 30 00 ed a3.
     let lease = NonceNamespaceLease::new(0x30).expect("fixture namespace");
     let cursor = wcash_pool_core::NonceCursor::new(NonceProfile::FourByte, lease, 0x00a3_ed00)
@@ -287,4 +298,57 @@ fn exhausted_temporary_recovery_keeps_authorization_and_later_job_route_alive() 
     assert_eq!(actor.pop_outbound(), Some(expected_target));
     assert_eq!(actor.pop_outbound(), Some(expected_notify));
     assert_eq!(actor.pop_outbound(), None);
+}
+
+#[test]
+fn diagnostics_raw_target_filter_does_not_claim_crypto_validity() {
+    // MAX target deliberately admits a synthetic all-zero solution through the
+    // existing cheap filter. The programmed backend rejects Equihash; this is
+    // not a consensus-validation fixture or a lost-proof demonstration.
+    let telemetry = Arc::new(RecordingTelemetry::default());
+    let (mut actor, old, _, _) = rotated_actor_with_telemetry(telemetry.clone(), true);
+    while actor.pop_outbound().is_some() {}
+    let now = actor.router.now_ms_for_test().expect("clock");
+    let action = actor
+        .handle_request(
+            Zip301Request::Submit {
+                id: Zip301Id::Number(100),
+                worker: "account.rig".to_owned(),
+                job_id: old.id().to_protocol(),
+                time: old.header_time(),
+                nonce_2: fixture_suffix(),
+                solution: Box::new(Hex1344::new([0; 1344])),
+            },
+            now,
+        )
+        .expect("raw filter")
+        .expect("forwarded candidate");
+    let pending = match action {
+        ConnectionAction::Submit(pending) => Some(pending),
+        _ => None,
+    }
+    .expect("candidate action");
+    let (ticket, context) = pending.into_parts();
+    assert!(context.is_winner_recovery());
+    actor
+        .complete_submission(
+            ticket,
+            Err(ShareRouterError::Rejected(
+                wcash_pool_protocol::BackendErrorCode::InvalidEquihash,
+            )),
+        )
+        .expect("backend rejection");
+    assert_eq!(
+        *telemetry.1.lock().expect("diagnostics"),
+        vec![
+            Diagnostic::SubmitObserved,
+            Diagnostic::RawZcashRecoveryCandidate,
+            Diagnostic::SubmissionInvalid
+        ]
+    );
+    assert!(!telemetry
+        .0
+        .lock()
+        .expect("outcomes")
+        .contains(&TelemetryEvent::Share(ShareOutcome::Accepted)));
 }

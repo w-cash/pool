@@ -11,6 +11,7 @@ mod config;
 mod edge;
 mod live_payout;
 mod miner_telemetry;
+mod operational_summary;
 #[cfg(test)]
 mod payout;
 mod payout_expiry;

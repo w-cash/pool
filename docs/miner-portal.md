@@ -20,7 +20,9 @@ found blocks, and payout batches use bounded keyset pagination. Transaction
 identifiers appear only after a reconciled signer result. Live worker status
 and accepted, stale, invalid, and duplicate counters are scoped to one account
 and explicitly labelled as process-lifetime operational telemetry; they are
-not the durable monetary accounting record.
+not the durable monetary accounting record. Additive submission and connection
+diagnostics, reset/retention semantics, and their proof-validity limits are
+documented in [submission diagnostics](submission-observability.md).
 
 The Workers page creates one canonical `account.worker` login and one
 `zw1.<selector>.<secret>` mining token. The token is displayed once. Only its

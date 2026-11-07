@@ -74,3 +74,9 @@ This endpoint supplies the dashboard with three bounded lists:
 The response deliberately excludes account IDs, worker names, payout
 destinations, balances, and transaction amounts. Consumers must treat
 `available: false` as unavailable history rather than an empty pool.
+
+
+Submission diagnostics are exposed only through the existing authenticated
+account telemetry route. Process-wide diagnostic summaries remain private
+operational logs; readiness, production manifest and public activity do not
+include these counters. See [submission diagnostics](submission-observability.md).
