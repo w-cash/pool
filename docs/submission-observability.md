@@ -35,11 +35,20 @@ never appear in any account's snapshot.
 
 ## Process summaries
 
-The existing portal-refresh loop emits one fixed JSON
+The existing portal-refresh loop offers one fixed JSON
 `event=frontend_operational_summary` at startup and at most once per 60 seconds,
 plus a final shutdown snapshot. Missed intervals never cause a catch-up burst.
-A slow or failed refresh loop may delay summaries. No additional timer, task,
-RPC, metrics listener, automation, or per-share log stream is created.
+A slow or failed refresh loop may delay summaries. One process-lifetime logging
+thread writes these records to stderr through a capacity-two queue. Producers
+use nonblocking enqueue and records are capped at 8 KiB, including the newline.
+A full or disconnected queue, thread-spawn failure, oversized record, or write
+error drops best-effort output without failing or delaying mining. Only the
+logging thread may wait for stderr; startup, serving and final-summary calls
+never wait for its I/O. Shutdown neither drains nor joins that thread, so even
+the final snapshot may be lost at process exit. A blocked sink may retain one
+record in the writer plus two queued records; it cannot accumulate an unbounded
+backlog. No additional timer, RPC, metrics listener, automation, or per-share
+log stream is created.
 
 Summaries contain schema version 1, a process-counter identity/start time,
 sample time, uptime, the existing aggregate connection totals, and a fixed
@@ -114,4 +123,7 @@ error; it does not claim operating-system journal persistence. Synthetic targets
 programmed backend receipts are explicitly not a consensus emulator or an ASIC
 acceptance test. Account isolation, fixed labels, counter saturation, retained
 worker bounds, unavailable sources and worst-case summary size are checked
-separately. Existing MR42 queue and authority regressions remain required.
+separately. Summary tests exercise the actual periodic/final enqueue paths with
+healthy, broken-pipe, blocked, disconnected and spawn-failed writers. Test-owned
+writer threads are released and joined; this does not establish operating-system
+journal persistence. Existing MR42 queue and authority regressions remain required.
