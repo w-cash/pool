@@ -111,6 +111,30 @@ The counters cannot reconstruct earlier gaps, establish usable historical ZEC
 work, physical miner efficiency, maximal profitability, or a luck-only account
 of a mining drought.
 
+## Frontend startup readiness
+
+Frontend startup uses the same fixed 120-second backend-readiness budget and
+250-millisecond retry spacing as preflight. A missing or expired current job,
+a typed unhealthy-backend refusal, or a narrowly classified temporary socket
+failure keeps this startup attempt waiting. Every retry opens a fresh backend
+connection, repeats durable replay verification and obtains a new snapshot.
+Startup requires authenticated healthy status, no queued unverified events and
+a current unexpired generation before it claims a nonce namespace or constructs
+the share actor. No public listener or spending authority exists during this wait.
+The additional health probes are bounded startup reads, not per-share work.
+
+Permission, configuration, identity, protocol/framing, sequence, replay,
+projection, database, target-policy and nonce-cleanup failures remain fatal;
+they are not retried as availability problems. A stalled attempt or repeated
+temporary refusal cannot extend the total readiness budget. Timeout still
+returns a startup failure, so this reduces rapid service-manager refusal loops
+without promising that an unavailable backend never causes a process exit.
+
+The running share actor retains its existing two-minute unhealthy watchdog,
+admission pause, exact recovery permission, event projection and bounded
+shutdown behavior. Payout and projector runtime policies are unchanged. No
+wallet, signing, payout, accounting, database-schema or consensus rule changes.
+
 ## Verification scope
 
 Path-level tests use the real actor, queue, backend client and stream driver
@@ -127,3 +151,12 @@ separately. Summary tests exercise the actual periodic/final enqueue paths with
 healthy, broken-pipe, blocked, disconnected and spawn-failed writers. Test-owned
 writer threads are released and joined; this does not establish operating-system
 journal persistence. Existing MR42 queue and authority regressions remain required.
+
+Startup tests exercise the production readiness wait, typed retry policy and
+snapshot-health gate with a real framed Unix backend client, including reconnect,
+unhealthy status, journal identity rejection, queued events and lease expiry
+during health I/O. Their peer uses programmed snapshots and empty replay pages:
+they do not exercise PostgreSQL, full listener startup, signer construction or
+chain consensus. Existing live-actor tests separately retain the fixed unhealthy
+deadline, admission suspension, recovery queue and projection/durable-receipt
+contracts; these are not claims of uninterrupted mining during backend failure.

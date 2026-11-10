@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Wait within the existing bounded readiness budget before frontend startup
+  claims a nonce namespace or starts its share actor. Retry only missing current
+  jobs and typed temporary backend availability failures with a fresh connection
+  and replay/snapshot verification. Preserve permanent-error refusal, running
+  health/recovery deadlines, target policy, accounting and payout behavior.
+
 - Isolate frontend operational summaries behind one bounded, best-effort logging
   thread. Broken or blocked summary output no longer fails or delays startup, serving
   tasks or shutdown; full queues and final output at process exit may be lost.

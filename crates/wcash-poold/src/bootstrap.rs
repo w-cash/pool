@@ -1,6 +1,6 @@
 //! Fail-closed database, journal replay, and live mining bootstrap.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, io, sync::Arc, time::Duration};
 
 use tokio::time;
 use uuid::Uuid;
@@ -14,7 +14,7 @@ use wcash_pool_core::{
 use wcash_pool_edge::{
     JobRouter, JobRouterError, ShareRouter, ShareRouterConfig, ShareRouterError,
 };
-use wcash_pool_protocol::{CanonicalUuid, Hex32, NonceProfile, TargetBe};
+use wcash_pool_protocol::{BackendErrorCode, CanonicalUuid, Hex32, NonceProfile, TargetBe};
 use wcash_pool_store::{
     Chain, ChainPolicy, DeploymentIdentity, DeploymentNetwork, NonceNamespaceClaim, NonceRange,
     PostgresAuthenticationProvider, PostgresEventProjector, PostgresStore, StoreError,
@@ -110,7 +110,7 @@ pub async fn start(config: &RuntimeConfig) -> Result<MiningBootstrap, BootstrapE
         client,
         authentication,
         timeline,
-    } = prepare(config).await?;
+    } = wait_for_ready_backend(config).await?;
     let (nonce_claim, nonces) = claim_nonce_allocator(&store, config).await?;
     let share_config = ShareRouterConfig::new(
         config.maximum_miners.min(4_096),
@@ -183,19 +183,25 @@ async fn wait_for_ready_backend(
 async fn prepare_readiness_attempt(
     config: &RuntimeConfig,
 ) -> Result<Option<PreparedBootstrap>, BootstrapError> {
-    let mut prepared = match prepare(config).await {
-        Ok(prepared) => prepared,
-        Err(BootstrapError::NoCurrentJob) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let health = prepared.client.health().await?;
-    let event_queue_empty = prepared.client.queued_event_count() == 0;
-    if backend_snapshot_is_ready(health.healthy, event_queue_empty) {
+    let mut prepared = prepare(config).await?;
+    if ready_backend_snapshot(&mut prepared.client, &prepared.jobs).await? {
         Ok(Some(prepared))
     } else {
         prepared.client.shutdown().await?;
         Ok(None)
     }
+}
+
+async fn ready_backend_snapshot(
+    client: &mut BackendClient,
+    jobs: &JobRouter,
+) -> Result<bool, BootstrapError> {
+    let health = client.health().await?;
+    let event_queue_empty = client.queued_event_count() == 0;
+    // A snapshot can expire while its health request is in flight. Neither a
+    // stale generation nor unverified events may cross the startup boundary.
+    Ok(backend_snapshot_is_ready(health.healthy, event_queue_empty)
+        && jobs.current_generation()?.is_some())
 }
 
 const fn backend_snapshot_is_ready(healthy: bool, event_queue_empty: bool) -> bool {
@@ -213,8 +219,11 @@ where
 {
     match time::timeout(timeout, async {
         loop {
-            if let Some(ready) = attempt().await? {
-                return Ok(ready);
+            match attempt().await {
+                Ok(Some(ready)) => return Ok(ready),
+                Ok(None) => {}
+                Err(error) if retryable_backend_readiness(&error) => {}
+                Err(error) => return Err(error),
             }
             time::sleep(retry_interval).await;
         }
@@ -223,6 +232,43 @@ where
     {
         Ok(result) => result,
         Err(_) => Err(BootstrapError::BackendReadinessTimeout),
+    }
+}
+
+/// Only fresh, read-only backend startup attempts may use this retry policy.
+/// Never reuse a failed stream or retry database, authority, replay, target,
+/// framing or correlation failures. No nonce or submission actor exists yet.
+fn retryable_backend_readiness(error: &BootstrapError) -> bool {
+    match error {
+        BootstrapError::NoCurrentJob => true,
+        BootstrapError::Backend(ClientError::BackendRejected { code, .. }) => {
+            *code == BackendErrorCode::BackendUnhealthy
+        }
+        BootstrapError::Backend(ClientError::Connect(source)) => matches!(
+            source.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::TimedOut
+        ),
+        BootstrapError::Backend(ClientError::Timeout { operation }) => matches!(
+            *operation,
+            "connect" | "hello" | "read_events" | "subscribe_jobs" | "health" | "shutdown"
+        ),
+        BootstrapError::Backend(ClientError::Io { operation, source }) => {
+            matches!(*operation, "write request" | "read response" | "shutdown")
+                && matches!(
+                    source.kind(),
+                    io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::TimedOut
+                )
+        }
+        BootstrapError::Backend(ClientError::CleanEof) => true,
+        _ => false,
     }
 }
 
@@ -672,7 +718,7 @@ pub enum BootstrapError {
     #[error("backend snapshot has no current mineable job")]
     NoCurrentJob,
     /// Wolf did not expose one current, healthy, event-exact snapshot in time.
-    #[error("backend did not become ready before the bounded preflight deadline")]
+    #[error("backend did not become ready before the bounded startup readiness deadline")]
     BackendReadinessTimeout,
     /// An incomplete replay page did not advance its cursor.
     #[error("backend journal replay made no progress")]
@@ -749,3 +795,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod readiness_tests;
