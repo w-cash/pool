@@ -186,7 +186,7 @@ struct PendingShareState {
     target: TargetBinding,
     admitted_at_ms: u64,
     vardiff_sample: Option<bool>,
-    winner_recovery: bool,
+    eligible_for_vardiff: bool,
     expected_job_id: [u8; 32],
     expected_share_id: [u8; 32],
     expected_attribution_id: [u8; 32],
@@ -530,7 +530,7 @@ impl ConnectionActor {
             && self
                 .pending_shares
                 .get(&ticket.ticket)
-                .is_some_and(|pending| !pending.winner_recovery);
+                .is_some_and(|pending| pending.eligible_for_vardiff);
         let response_index = match self.pending_shares.get_mut(&ticket.ticket) {
             Some(pending) if pending.vardiff_sample.is_none() => {
                 pending.vardiff_sample = Some(vardiff_sample);
@@ -774,6 +774,7 @@ impl ConnectionActor {
             .announced_target_binding(job_id)
             .ok_or(ConnectionActorError::MissingAssignment(job_id))?;
         let winner_recovery = context.is_winner_recovery();
+        let projection_candidate = context.is_projection_candidate();
         if !winner_recovery && self.assignments.get(&job_id).copied() != Some(target) {
             return Err(ConnectionActorError::MissingAssignment(job_id));
         }
@@ -796,7 +797,7 @@ impl ConnectionActor {
                 target,
                 admitted_at_ms: now_ms,
                 vardiff_sample: None,
-                winner_recovery,
+                eligible_for_vardiff: !winner_recovery && !projection_candidate,
                 expected_job_id,
                 expected_share_id,
                 expected_attribution_id,
@@ -1477,7 +1478,7 @@ mod tests {
                 target,
                 admitted_at_ms: 3,
                 vardiff_sample: None,
-                winner_recovery: false,
+                eligible_for_vardiff: true,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],
@@ -1902,7 +1903,7 @@ mod tests {
                 target,
                 admitted_at_ms: 10,
                 vardiff_sample: None,
-                winner_recovery: false,
+                eligible_for_vardiff: true,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],
@@ -1915,7 +1916,7 @@ mod tests {
                 target,
                 admitted_at_ms: 20,
                 vardiff_sample: Some(true),
-                winner_recovery: false,
+                eligible_for_vardiff: true,
                 expected_job_id: [4; 32],
                 expected_share_id: [5; 32],
                 expected_attribution_id: [6; 32],
@@ -1957,7 +1958,7 @@ mod tests {
                 target,
                 admitted_at_ms: 10,
                 vardiff_sample: Some(counts_toward_vardiff(true)),
-                winner_recovery: false,
+                eligible_for_vardiff: true,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],
@@ -1993,7 +1994,7 @@ mod tests {
                 .expect("fixture target is valid"),
             admitted_at_ms: 0,
             vardiff_sample: None,
-            winner_recovery: false,
+            eligible_for_vardiff: true,
             expected_job_id: [1; 32],
             expected_share_id: [2; 32],
             expected_attribution_id: [3; 32],

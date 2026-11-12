@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Forward bounded ZEC and WEC candidates for the current announced job when
+  accounting projection lags. Keep exact projection verification before a
+  successful miner response.
+
 - Wait within the existing bounded readiness budget before frontend startup
   claims a nonce namespace or starts its share actor. Retry only missing current
   jobs and typed temporary backend availability failures with a fresh connection

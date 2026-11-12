@@ -169,7 +169,7 @@ fn expired_announced_winner_reaches_the_existing_backend_wire_request() {
     assert_eq!(actor.pending_shares[&ticket.ticket].target, target);
     assert_eq!(context.target_le(), &target.target().to_backend());
     assert_eq!(context.nonce(), &nonce);
-    assert!(actor.pending_shares[&ticket.ticket].winner_recovery);
+    assert!(!actor.pending_shares[&ticket.ticket].eligible_for_vardiff);
     let request = BackendRequest::SubmitShare {
         version: BACKEND_PROTOCOL_VERSION,
         id: 1,

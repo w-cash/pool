@@ -18,9 +18,14 @@ use wcash_pool_backend_client::{
     DeliveredBackendEvent, VerifiedShareCommit,
 };
 use wcash_pool_core::SubmissionContext;
-use wcash_pool_protocol::{BackendErrorCode, MergedChain, ShareReceipt};
+use wcash_pool_protocol::{BackendErrorCode, BackendEvent, MergedChain, ShareReceipt};
 
-use crate::{Diagnostic, JobRouter, OperationalCounters};
+use crate::{
+    projection_winner::{
+        self, ProjectionWinnerEpisode, ProjectionWinnerHandle, ProjectionWinnerQueue,
+    },
+    Diagnostic, JobRouter, OperationalCounters,
+};
 
 const MAXIMUM_QUEUE_CAPACITY: usize = 4_096;
 const MAXIMUM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
@@ -261,6 +266,7 @@ enum ActorWork {
 #[derive(Clone, Debug)]
 pub struct ShareRouterHandle {
     sender: mpsc::Sender<SubmitCommand>,
+    projection_winners: ProjectionWinnerHandle,
     diagnostics: Arc<OperationalCounters>,
 }
 
@@ -273,6 +279,9 @@ impl ShareRouterHandle {
         &self,
         context: SubmissionContext,
     ) -> Result<VerifiedShareCommit, ShareRouterError> {
+        if context.is_projection_candidate() {
+            return self.projection_winners.submit(context).await;
+        }
         let (response, receiver) = oneshot::channel();
         self.sender
             .try_send(SubmitCommand::Share { context, response })
@@ -350,8 +359,10 @@ impl ShareRouter {
         )
         .await?;
         let (sender, receiver) = mpsc::channel(config.queue_capacity());
+        let (projection_winners, priority) = projection_winner::channel();
         let handle = ShareRouterHandle {
             sender,
+            projection_winners,
             diagnostics,
         };
         let first_heartbeat_deadline = if projection_recovered {
@@ -364,7 +375,7 @@ impl ShareRouter {
         let actor = run_submission_actor(
             client,
             job_router,
-            receiver,
+            SubmissionQueues { receiver, priority },
             suspension,
             config,
             event_consumer,
@@ -526,15 +537,25 @@ async fn next_submission_work(
     }
 }
 
+struct SubmissionQueues {
+    receiver: mpsc::Receiver<SubmitCommand>,
+    priority: ProjectionWinnerQueue,
+}
+
 async fn run_submission_actor(
     mut client: BackendClient,
     job_router: JobRouter,
-    mut receiver: mpsc::Receiver<SubmitCommand>,
+    queues: SubmissionQueues,
     mut suspension: SuspendOnDrop,
     config: ShareRouterConfig,
     event_consumer: Arc<dyn BackendEventConsumer>,
     first_heartbeat_deadline: Instant,
 ) -> Result<(), ShareRouterError> {
+    let SubmissionQueues {
+        mut receiver,
+        mut priority,
+    } = queues;
+    let mut priority_open = true;
     let mut heartbeat = interval_at(first_heartbeat_deadline, config.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut health_deadline = None;
@@ -562,16 +583,24 @@ async fn run_submission_actor(
                     }
                 } => ActorWork::HealthDeadline,
                 _ = heartbeat.tick() => ActorWork::Heartbeat,
+                request = priority.recv(), if priority_open => {
+                    match request {
+                        Some(request) => request.reject(stale_projection_candidate()),
+                        None => priority_open = false,
+                    }
+                    continue;
+                }
                 work = next_submission_work(&mut receiver, deferred.next_deadline(), prefer_command) => work,
             }
         };
         let mut pending = match work {
             ActorWork::Heartbeat => {
-                let health = pump_health(
+                let health = pump_health_with_winners(
                     &mut client,
                     &job_router,
                     event_consumer.as_ref(),
                     config.event_consumer_timeout(),
+                    health_deadline.is_none().then_some(&mut priority),
                 );
                 let health = match health_deadline {
                     Some(deadline) => tokio::time::timeout_at(deadline, health)
@@ -681,15 +710,17 @@ async fn run_submission_actor(
             )));
             continue;
         }
-        let (mut result, mut retained, projection_recovered) = submit_context_and_drain(
-            &mut client,
-            &job_router,
-            event_consumer.as_ref(),
-            config,
-            pending.context,
-            pending.deadline,
-        )
-        .await;
+        let (mut result, mut retained, projection_recovered) =
+            submit_context_and_drain_with_winners(
+                &mut client,
+                &job_router,
+                event_consumer.as_ref(),
+                config,
+                pending.context,
+                pending.deadline,
+                health_deadline.is_none().then_some(&mut priority),
+            )
+            .await;
         if projection_recovered {
             // Already queued contexts predate the admission pause. Force a new
             // authenticated health barrier ahead of the next queued command,
@@ -799,6 +830,7 @@ async fn run_submission_actor(
     Ok(())
 }
 
+#[cfg(test)]
 async fn submit_context_and_drain(
     client: &mut BackendClient,
     job_router: &JobRouter,
@@ -806,6 +838,31 @@ async fn submit_context_and_drain(
     config: ShareRouterConfig,
     context: SubmissionContext,
     deadline: Instant,
+) -> (
+    Result<VerifiedShareCommit, ShareRouterError>,
+    Option<SubmissionContext>,
+    bool,
+) {
+    submit_context_and_drain_with_winners(
+        client,
+        job_router,
+        event_consumer,
+        config,
+        context,
+        deadline,
+        None,
+    )
+    .await
+}
+
+async fn submit_context_and_drain_with_winners(
+    client: &mut BackendClient,
+    job_router: &JobRouter,
+    event_consumer: &dyn BackendEventConsumer,
+    config: ShareRouterConfig,
+    context: SubmissionContext,
+    deadline: Instant,
+    priority: Option<&mut ProjectionWinnerQueue>,
 ) -> (
     Result<VerifiedShareCommit, ShareRouterError>,
     Option<SubmissionContext>,
@@ -852,12 +909,22 @@ async fn submit_context_and_drain(
         event_consumer.diagnostic(Diagnostic::BackendAttemptOrdinary);
         let received = client.submit_prepared_share_borrowed(&context).await;
         record_backend_result(event_consumer, &received);
+        let priority = if received.as_ref().is_ok()
+            || matches!(
+                &received,
+                Err(ClientError::HistoricalReplayRequiresProjection { .. })
+            ) {
+            priority
+        } else {
+            None
+        };
         let mut result = received.map_err(ShareRouterError::from_client);
-        let recovered = match drain_backend_events(
+        let recovered = match drain_backend_events_with_winners(
             client,
             job_router,
             event_consumer,
             config.event_consumer_timeout(),
+            priority,
         )
         .await
         {
@@ -1004,6 +1071,23 @@ async fn pump_health(
     event_consumer: &dyn BackendEventConsumer,
     event_consumer_timeout: Duration,
 ) -> Result<(bool, Instant), ShareRouterError> {
+    pump_health_with_winners(
+        client,
+        job_router,
+        event_consumer,
+        event_consumer_timeout,
+        None,
+    )
+    .await
+}
+
+async fn pump_health_with_winners(
+    client: &mut BackendClient,
+    job_router: &JobRouter,
+    event_consumer: &dyn BackendEventConsumer,
+    event_consumer_timeout: Duration,
+    priority: Option<&mut ProjectionWinnerQueue>,
+) -> Result<(bool, Instant), ShareRouterError> {
     // Drain any valid events received before a failing response as well. Their
     // durable journal facts remain authoritative even when this stream is terminal.
     let health = client.health().await.map_err(ShareRouterError::from_client);
@@ -1032,7 +1116,15 @@ async fn pump_health(
         }
         drained.map_err(|_| ShareRouterError::BackendHealthDeadline)??
     } else {
-        drain_backend_events(client, job_router, event_consumer, event_consumer_timeout).await?
+        let priority = health.is_ok().then_some(priority).flatten();
+        drain_backend_events_with_winners(
+            client,
+            job_router,
+            event_consumer,
+            event_consumer_timeout,
+            priority,
+        )
+        .await?
     };
     let health = health?;
     if !health.healthy && health.recovery_only && !projection_recovered {
@@ -1052,6 +1144,30 @@ async fn drain_backend_events(
     event_consumer: &dyn BackendEventConsumer,
     event_consumer_timeout: Duration,
 ) -> Result<bool, ShareRouterError> {
+    drain_backend_events_with_winners(
+        client,
+        job_router,
+        event_consumer,
+        event_consumer_timeout,
+        None,
+    )
+    .await
+}
+
+struct ProjectionDrain<'a> {
+    deadline: Instant,
+    priority: Option<&'a mut ProjectionWinnerQueue>,
+    episode: ProjectionWinnerEpisode,
+    allow_priority: bool,
+}
+
+async fn drain_backend_events_with_winners(
+    client: &mut BackendClient,
+    job_router: &JobRouter,
+    event_consumer: &dyn BackendEventConsumer,
+    event_consumer_timeout: Duration,
+    priority: Option<&mut ProjectionWinnerQueue>,
+) -> Result<bool, ShareRouterError> {
     if !job_router
         .client_binding_matches(client)
         .map_err(|_| ShareRouterError::JobStreamUnusable)?
@@ -1061,32 +1177,41 @@ async fn drain_backend_events(
     let binding = client
         .connection_binding()
         .ok_or(ShareRouterError::BackendConnectionMismatch)?;
-    let mut events = Vec::with_capacity(client.queued_event_count());
-    while let Some(event) = client.pop_queued_event() {
-        if event.connection_binding() != &binding {
-            return Err(ShareRouterError::BackendConnectionMismatch);
+    let mut drain = ProjectionDrain {
+        deadline: Instant::now() + EVENT_CONSUMER_RECOVERY_TIMEOUT,
+        allow_priority: priority.is_some(),
+        priority,
+        episode: ProjectionWinnerEpisode::new(),
+    };
+    let mut recovered = false;
+    while client.queued_event_count() != 0 {
+        let mut events = Vec::with_capacity(client.queued_event_count());
+        while let Some(event) = client.pop_queued_event() {
+            if event.connection_binding() != &binding {
+                return Err(ShareRouterError::BackendConnectionMismatch);
+            }
+            events.push(event);
         }
-        events.push(event);
-    }
-    let recovered = if !events.is_empty() {
-        let recovered = acknowledge_event_batch(
+        recovered |= acknowledge_event_batch(
             client,
             job_router,
             event_consumer,
             &binding,
             &events,
             event_consumer_timeout,
+            &mut drain,
         )
         .await?;
+        // Any suffix received by the priority sends is subject to the same
+        // accounting barrier and original deadline. It cannot open a new lane.
+        drain.allow_priority = false;
         for event in &events {
             job_router
                 .apply_event(client, event)
                 .map_err(|_| ShareRouterError::JobStreamUnusable)?;
         }
-        recovered
-    } else {
-        false
-    };
+        drain.episode.release_projected(&events)?;
+    }
     if !job_router
         .client_binding_matches(client)
         .map_err(|_| ShareRouterError::JobStreamUnusable)?
@@ -1124,15 +1249,18 @@ fn projection_lifecycle(
 }
 
 async fn acknowledge_event_batch(
-    client: &BackendClient,
+    client: &mut BackendClient,
     job_router: &JobRouter,
     event_consumer: &dyn BackendEventConsumer,
     binding: &BackendConnectionBinding,
     events: &[DeliveredBackendEvent],
     attempt_timeout: Duration,
+    drain: &mut ProjectionDrain<'_>,
 ) -> Result<bool, ShareRouterError> {
-    let deadline = Instant::now() + EVENT_CONSUMER_RECOVERY_TIMEOUT;
+    let deadline = drain.deadline;
     let mut recovered = false;
+    let mut forwarding = false;
+    let stable_job_batch = !events.iter().any(is_job_event);
     loop {
         if Instant::now() >= deadline {
             projection_lifecycle(event_consumer, Diagnostic::ProjectionDeadline, None);
@@ -1149,14 +1277,25 @@ async fn acknowledge_event_batch(
             return Err(ShareRouterError::BackendConnectionMismatch);
         }
         let attempt_deadline = (Instant::now() + attempt_timeout).min(deadline);
-        let error = match tokio::time::timeout_at(
+        let verification = tokio::time::timeout_at(
             attempt_deadline,
             event_consumer.consume(binding.authority(), events),
+        );
+        let outcome = wait_with_projection_candidates(
+            verification,
+            client,
+            job_router,
+            event_consumer,
+            drain,
+            &mut forwarding,
         )
-        .await
-        {
+        .await?;
+        let error = match outcome {
             Ok(Ok(())) if Instant::now() < deadline => {
                 event_consumer.diagnostic(Diagnostic::ProjectionBatchVerified);
+                if forwarding {
+                    close_projection_gate(job_router, client, drain)?;
+                }
                 if recovered {
                     event_consumer.diagnostic(Diagnostic::ProjectionRecovered);
                 }
@@ -1173,19 +1312,148 @@ async fn acknowledge_event_batch(
         }
         event_consumer.diagnostic(Diagnostic::ProjectionRetry);
         if !recovered {
-            job_router
-                .pause_for_health(client)
-                .map_err(|_| ShareRouterError::JobStreamUnusable)?;
+            let typed_lag = matches!(error, BackendEventConsumerError::ProjectionLag { .. });
+            forwarding = typed_lag && stable_job_batch && drain.allow_priority;
+            if forwarding {
+                // Local classification only. Every wire send still requires a
+                // fresh healthy response and a recheck of the exact job/epoch.
+                job_router
+                    .pause_for_projection_lag(client)
+                    .map_err(|_| ShareRouterError::JobStreamUnusable)?;
+            } else {
+                job_router
+                    .pause_for_health(client)
+                    .map_err(|_| ShareRouterError::JobStreamUnusable)?;
+            }
             projection_lifecycle(event_consumer, Diagnostic::ProjectionPaused, Some(error));
             recovered = true;
+        } else if forwarding && !matches!(error, BackendEventConsumerError::ProjectionLag { .. }) {
+            close_projection_gate(job_router, client, drain)?;
+            forwarding = false;
         }
         if Instant::now() >= deadline {
             projection_lifecycle(event_consumer, Diagnostic::ProjectionDeadline, Some(error));
             return Err(ShareRouterError::EventConsumerUnusable);
         }
-        tokio::time::sleep_until((Instant::now() + EVENT_CONSUMER_RETRY_INTERVAL).min(deadline))
-            .await;
+        let backoff = tokio::time::sleep_until(
+            (Instant::now() + EVENT_CONSUMER_RETRY_INTERVAL).min(deadline),
+        );
+        wait_with_projection_candidates(
+            backoff,
+            client,
+            job_router,
+            event_consumer,
+            drain,
+            &mut forwarding,
+        )
+        .await?;
     }
+}
+
+async fn wait_with_projection_candidates<F: Future>(
+    wait: F,
+    client: &mut BackendClient,
+    job_router: &JobRouter,
+    event_consumer: &dyn BackendEventConsumer,
+    drain: &mut ProjectionDrain<'_>,
+    forwarding: &mut bool,
+) -> Result<F::Output, ShareRouterError> {
+    tokio::pin!(wait);
+    let deadline = drain.deadline;
+    loop {
+        if *forwarding && !drain.episode.can_attempt() {
+            close_projection_gate(job_router, client, drain)?;
+            *forwarding = false;
+        }
+        if !*forwarding {
+            return Ok(wait.await);
+        }
+        let Some(priority) = drain.priority.as_deref_mut() else {
+            return Ok(wait.await);
+        };
+        let request = tokio::select! {
+            biased;
+            outcome = &mut wait => return Ok(outcome),
+            request = priority.recv() => request,
+        };
+        let Some(request) = request else {
+            return Ok(wait.await);
+        };
+        let Some(request) = drain.episode.start_attempt(request) else {
+            continue;
+        };
+        if !job_router
+            .projection_candidate_still_authorized(request.context(), client)
+            .map_err(|_| ShareRouterError::JobStreamUnusable)?
+        {
+            request.reject(stale_projection_candidate());
+            continue;
+        }
+        let dispatch_deadline = (Instant::now() + CANDIDATE_RETRY_BUDGET).min(deadline);
+        // This is the existing authenticated stream. If a framed exchange
+        // times out, its owner exits and never reuses the connection.
+        let health = tokio::time::timeout_at(dispatch_deadline, client.health())
+            .await
+            .map_err(|_| ShareRouterError::Unavailable)?;
+        let healthy = match health {
+            Ok(health) => health.healthy,
+            Err(ClientError::BackendRejected { .. }) if client.is_usable() => false,
+            Err(error) => return Err(ShareRouterError::from_client(error)),
+        };
+        if !healthy || client.queued_events().any(is_job_event) {
+            request.reject(stale_projection_candidate());
+            close_projection_gate(job_router, client, drain)?;
+            *forwarding = false;
+            continue;
+        }
+        if Instant::now() >= dispatch_deadline
+            || !job_router
+                .projection_candidate_still_authorized(request.context(), client)
+                .map_err(|_| ShareRouterError::JobStreamUnusable)?
+        {
+            request.reject(stale_projection_candidate());
+            continue;
+        }
+        event_consumer.diagnostic(Diagnostic::BackendAttemptOrdinary);
+        drain
+            .episode
+            .submit(request, client, dispatch_deadline, |received| {
+                record_backend_result(event_consumer, received);
+            })
+            .await?;
+        if !drain.episode.can_attempt() || client.queued_events().any(is_job_event) {
+            close_projection_gate(job_router, client, drain)?;
+            *forwarding = false;
+        }
+    }
+}
+
+fn is_job_event(event: &DeliveredBackendEvent) -> bool {
+    matches!(
+        event.event(),
+        BackendEvent::JobActivated { .. }
+            | BackendEvent::JobInvalidated { .. }
+            | BackendEvent::GenerationClosed { .. }
+    )
+}
+
+fn stale_projection_candidate() -> ShareRouterError {
+    ShareRouterError::Rejected(BackendErrorCode::StaleJob)
+}
+
+fn close_projection_gate(
+    job_router: &JobRouter,
+    client: &BackendClient,
+    drain: &mut ProjectionDrain<'_>,
+) -> Result<(), ShareRouterError> {
+    job_router
+        .pause_for_health(client)
+        .map_err(|_| ShareRouterError::JobStreamUnusable)?;
+    if let Some(priority) = drain.priority.as_deref_mut() {
+        priority.reject_pending(stale_projection_candidate());
+    }
+    drain.allow_priority = false;
+    Ok(())
 }
 
 async fn fail_pending(receiver: &mut mpsc::Receiver<SubmitCommand>) {
@@ -1632,6 +1900,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let handle = ShareRouterHandle {
             sender,
+            projection_winners: projection_winner::channel().0,
             diagnostics: Arc::new(OperationalCounters::default()),
         };
         let surviving_handle = handle.clone();

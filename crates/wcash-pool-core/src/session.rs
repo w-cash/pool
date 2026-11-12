@@ -13,10 +13,17 @@ use wcash_pool_protocol::{
 };
 
 use crate::{
-    GenerationAdmission, GenerationRegistry, JobAssignment, JobAssignmentError, JobId,
-    JobRegistryError, NoncePrefixAllocator, NoncePrefixError, TargetBinding,
+    BackendGeneration, GenerationAdmission, GenerationRegistry, JobAssignment, JobAssignmentError,
+    JobId, JobRegistryError, NoncePrefixAllocator, NoncePrefixError, TargetBinding,
     MAX_ZCASH_WINNER_RECOVERY_JOBS,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmissionMode {
+    Ordinary,
+    PausedZcashCandidate,
+    ProjectionCandidate { episode: u64 },
+}
 
 /// Stable account and worker identity returned by trusted authorization.
 #[derive(Clone, Eq, PartialEq)]
@@ -317,7 +324,7 @@ impl MiningSession {
             solution,
             registry,
             now_ms,
-            false,
+            SubmissionMode::Ordinary,
         )
     }
 
@@ -341,7 +348,33 @@ impl MiningSession {
             solution,
             registry,
             now_ms,
-            true,
+            SubmissionMode::PausedZcashCandidate,
+        )
+    }
+
+    /// Filters an already announced current job during an authenticated projection pause.
+    /// A proof must meet either network target and retain its original ordinary lease.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_projection_candidate(
+        &self,
+        claimed_login: &str,
+        job_id: JobId,
+        submitted_time: Hex4,
+        nonce_suffix: NonceSuffix,
+        solution: Box<Hex1344>,
+        registry: &mut GenerationRegistry,
+        now_ms: u64,
+        episode: u64,
+    ) -> Result<SubmissionContext, SessionError> {
+        self.prepare_submission_mode(
+            claimed_login,
+            job_id,
+            submitted_time,
+            nonce_suffix,
+            solution,
+            registry,
+            now_ms,
+            SubmissionMode::ProjectionCandidate { episode },
         )
     }
 
@@ -355,7 +388,7 @@ impl MiningSession {
         solution: Box<Hex1344>,
         registry: &mut GenerationRegistry,
         now_ms: u64,
-        paused_only: bool,
+        mode: SubmissionMode,
     ) -> Result<SubmissionContext, SessionError> {
         self.require(SessionState::Authorized)?;
         let worker = self.worker.as_ref().ok_or(SessionError::MissingIdentity)?;
@@ -366,46 +399,57 @@ impl MiningSession {
         if claimed_login != worker.canonical_login() {
             return Err(SessionError::LoginMismatch);
         }
+        let projection_episode = match mode {
+            SubmissionMode::ProjectionCandidate { episode } => Some(episode),
+            SubmissionMode::Ordinary | SubmissionMode::PausedZcashCandidate => None,
+        };
+        let recovery_assignments = self
+            .winner_recovery_jobs
+            .iter()
+            .filter(|_| projection_episode.is_none());
         let assignment = self
             .announced_jobs
             .iter()
-            .chain(self.winner_recovery_jobs.iter())
+            .chain(recovery_assignments)
             .find(|assignment| assignment.generation_id() == job_id)
             .ok_or(SessionError::JobNotAnnounced(job_id))?;
         let nonce =
             join_nonce(prefix, &nonce_suffix).map_err(|_| SessionError::NonceProfileMismatch)?;
-        let admission = if paused_only {
-            let generation = registry
-                .generation(job_id)
-                .ok_or(JobRegistryError::UnknownJob(job_id))?;
+        let validate_assignment = |generation: &BackendGeneration| {
             JobAssignment::new(generation, assignment.target_binding())
                 .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
             if generation.header_time() != submitted_time {
                 return Err(SessionError::HeaderTimeMismatch(job_id));
             }
-            registry.begin_paused_zcash_candidate(job_id, &nonce, &solution, now_ms)?
-        } else {
-            match registry.begin_admission(job_id, now_ms) {
-                Ok(admission) => admission,
+            Ok(())
+        };
+        let validate_retained_assignment = |registry: &GenerationRegistry| {
+            let generation = registry
+                .generation(job_id)
+                .ok_or(JobRegistryError::UnknownJob(job_id))?;
+            validate_assignment(generation)
+        };
+        let admission = match mode {
+            SubmissionMode::ProjectionCandidate { .. } => {
+                validate_retained_assignment(registry)?;
+                registry.begin_current_network_candidate(job_id, &nonce, &solution, now_ms)?
+            }
+            SubmissionMode::PausedZcashCandidate => {
+                validate_retained_assignment(registry)?;
+                registry.begin_paused_zcash_candidate(job_id, &nonce, &solution, now_ms)?
+            }
+            SubmissionMode::Ordinary => match registry.begin_admission(job_id, now_ms) {
+                Ok(admission) => {
+                    validate_assignment(admission.generation())?;
+                    admission
+                }
                 Err(JobRegistryError::StaleJob(_)) => {
-                    let generation = registry
-                        .generation(job_id)
-                        .ok_or(JobRegistryError::UnknownJob(job_id))?;
-                    JobAssignment::new(generation, assignment.target_binding())
-                        .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
-                    if generation.header_time() != submitted_time {
-                        return Err(SessionError::HeaderTimeMismatch(job_id));
-                    }
+                    validate_retained_assignment(registry)?;
                     registry.begin_zcash_winner_recovery(job_id, &nonce, &solution, now_ms)?
                 }
                 Err(error) => return Err(error.into()),
-            }
+            },
         };
-        JobAssignment::new(admission.generation(), assignment.target_binding())
-            .map_err(|_| SessionError::RegistryAssignmentMismatch(job_id))?;
-        if admission.generation().header_time() != submitted_time {
-            return Err(SessionError::HeaderTimeMismatch(job_id));
-        }
         Ok(SubmissionContext {
             session_id: self.id,
             identity: worker.backend_identity(),
@@ -414,6 +458,7 @@ impl MiningSession {
             nonce,
             solution,
             admission,
+            projection_episode,
         })
     }
 
@@ -450,6 +495,7 @@ pub struct SubmissionContext {
     nonce: Hex32,
     solution: Box<Hex1344>,
     admission: GenerationAdmission,
+    projection_episode: Option<u64>,
 }
 
 impl fmt::Debug for SubmissionContext {
@@ -479,6 +525,9 @@ impl SubmissionContext {
         recovery_only: bool,
     ) -> Result<Self, SessionError> {
         let id = self.admission.job_id();
+        if self.is_projection_candidate() {
+            return Err(JobRegistryError::StaleJob(id).into());
+        }
         let admission =
             if self.is_paused_zcash_candidate() || (!self.is_winner_recovery() && recovery_only) {
                 registry.begin_paused_zcash_candidate(id, &self.nonce, &self.solution, now_ms)?
@@ -532,6 +581,26 @@ impl SubmissionContext {
     /// Whether the backend explicitly permitted a Zcash candidate during a health pause.
     pub const fn is_paused_zcash_candidate(&self) -> bool {
         self.admission.is_paused_zcash_candidate()
+    }
+
+    /// Whether this current-job proof was prepared during projection lag.
+    pub const fn is_projection_candidate(&self) -> bool {
+        self.projection_episode.is_some()
+    }
+
+    /// Returns the originating projection pause episode for local dispatch fencing.
+    pub const fn projection_episode(&self) -> Option<u64> {
+        self.projection_episode
+    }
+
+    /// Checks whether the original ordinary resource is still the live current job.
+    pub fn projection_candidate_is_current(
+        &self,
+        registry: &mut GenerationRegistry,
+        now_ms: u64,
+    ) -> Result<bool, JobRegistryError> {
+        Ok(self.is_projection_candidate()
+            && registry.ordinary_admission_is_current(&self.admission, now_ms)?)
     }
 
     /// Returns the exact raw header time verified against the generation.
@@ -620,6 +689,7 @@ pub enum SessionError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod projection_candidate_tests;
     mod winner_recovery_tests;
     use super::*;
     use crate::{
