@@ -455,6 +455,17 @@ async fn write_winning_commit(
     event_seq: u64,
     chains: &[MergedChain],
 ) -> TestResult {
+    let reply = write_winning_event(stream, request, job, event_seq, chains).await?;
+    write_message(stream, &reply).await
+}
+
+async fn write_winning_event(
+    stream: &mut UnixStream,
+    request: BackendRequest,
+    job: &JobDescriptor,
+    event_seq: u64,
+    chains: &[MergedChain],
+) -> TestResult<BackendMessage> {
     let BackendRequest::SubmitShare {
         id,
         job_id,
@@ -510,16 +521,12 @@ async fn write_winning_commit(
         },
     )
     .await?;
-    write_message(
-        stream,
-        &BackendMessage::ShareCommitted {
-            version: BACKEND_PROTOCOL_VERSION,
-            id,
-            receipt,
-            replayed: false,
-        },
-    )
-    .await
+    Ok(BackendMessage::ShareCommitted {
+        version: BACKEND_PROTOCOL_VERSION,
+        id,
+        receipt,
+        replayed: false,
+    })
 }
 
 #[derive(Default)]
@@ -549,6 +556,7 @@ enum ProjectionWinnerScenario {
     Projected,
     ConflictingReceipt,
     JobChanged,
+    StalledSubmit,
 }
 
 async fn current_projection_winner_case(
@@ -575,6 +583,8 @@ async fn current_projection_winner_case(
 
     let sent_winner = Arc::new(Notify::new());
     let peer_sent_winner = Arc::clone(&sent_winner);
+    let (socket_retired, retired) = oneshot::channel();
+    let (actor_finished, finished) = oneshot::channel();
     let peer = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
         establish_live_stream(&mut stream, job.clone()).await?;
@@ -627,6 +637,40 @@ async fn current_projection_winner_case(
                     };
                     assert_eq!(job_id, &job.job_id);
                     assert_eq!(&nonce.as_bytes()[4..], &[nonce_byte; 28]);
+                    if next == 12 && scenario == ProjectionWinnerScenario::StalledSubmit {
+                        // Wolf may already have committed the candidate. Supply
+                        // its exact event, then stall inside the correlated frame.
+                        let reply =
+                            write_winning_event(&mut stream, request, &job, next, chains).await?;
+                        let frame = encode_backend_message(&reply)?;
+                        stream
+                            .write_all(&frame[..BACKEND_LENGTH_PREFIX_BYTES + 1])
+                            .await?;
+                        peer_sent_winner.notify_one();
+                        let mut unexpected = [0];
+                        tokio::select! {
+                            biased;
+                            connection = listener.accept() => {
+                                connection?;
+                                return Err("actor opened a replacement socket during timeout".into());
+                            }
+                            received = stream.read(&mut unexpected) => {
+                                assert_eq!(received?, 0, "actor reused the stalled socket");
+                            }
+                        }
+                        let _ = socket_retired.send(());
+                        return tokio::select! {
+                            biased;
+                            connection = listener.accept() => {
+                                connection?;
+                                Err("actor reconnected after retiring the stalled socket".into())
+                            }
+                            confirmation = finished => {
+                                confirmation?;
+                                Ok(next)
+                            }
+                        };
+                    }
                     write_winning_commit(&mut stream, request, &job, next, chains).await?;
                     cursor = next;
                     if cursor == 12 {
@@ -639,7 +683,12 @@ async fn current_projection_winner_case(
     });
 
     let timeline = MonotonicTimeline::new();
-    let mut client = BackendClient::connect(client_config(&socket.path)?, uuid(9), 10).await?;
+    let mut config = client_config(&socket.path)?;
+    if scenario == ProjectionWinnerScenario::StalledSubmit {
+        // The priority lane's bound must win over the longer client timeout.
+        config = config.with_timeouts(Duration::from_secs(1), Duration::from_secs(10))?;
+    }
+    let mut client = BackendClient::connect(config, uuid(9), 10).await?;
     let snapshot = client.subscribe_jobs(10).await?;
     let router =
         JobRouter::from_snapshot(&snapshot, GenerationRegistryConfig::new(2, 8)?, timeline, 8)?;
@@ -707,6 +756,27 @@ async fn current_projection_winner_case(
         sent = tokio::time::timeout(TEST_BOUND, sent_winner.notified()) => sent?,
     }
     assert_eq!(consumer.first.acknowledged.load(Ordering::SeqCst), 0);
+    if scenario == ProjectionWinnerScenario::StalledSubmit {
+        let (first, winner) =
+            tokio::time::timeout(TEST_BOUND, async { tokio::join!(first, winner) }).await?;
+        assert_eq!(first, Err(ShareRouterError::Unavailable));
+        assert_eq!(winner, Err(ShareRouterError::Unavailable));
+        assert_eq!(consumer.first.acknowledged.load(Ordering::SeqCst), 0);
+        assert_eq!(consumer.winner.calls.load(Ordering::SeqCst), 0);
+        // Observe peer EOF before invoking shutdown so shutdown cannot satisfy
+        // the timeout path's socket retirement assertion.
+        tokio::time::timeout(TEST_BOUND, retired).await??;
+        assert!(router.current_generation()?.is_none());
+        assert_eq!(
+            tokio::time::timeout(TEST_BOUND, service.shutdown()).await?,
+            Err(ShareRouterError::Unavailable),
+        );
+        actor_finished
+            .send(())
+            .map_err(|_| "timeout peer stopped early")?;
+        assert_eq!(tokio::time::timeout(TEST_BOUND, peer).await???, 12);
+        return Ok(());
+    }
     if scenario == ProjectionWinnerScenario::JobChanged {
         assert_eq!(
             tokio::time::timeout(TEST_BOUND, &mut winner).await?,
@@ -811,6 +881,16 @@ async fn projection_lag_rejects_candidate_when_fresh_health_delivers_a_new_job()
     current_projection_winner_case(
         &[MergedChain::Wcash, MergedChain::Zcash],
         ProjectionWinnerScenario::JobChanged,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn projection_lag_retires_socket_after_stalled_candidate_submit_without_retry() -> TestResult
+{
+    current_projection_winner_case(
+        &[MergedChain::Wcash, MergedChain::Zcash],
+        ProjectionWinnerScenario::StalledSubmit,
     )
     .await
 }

@@ -1,6 +1,6 @@
 //! Bounded winner forwarding on the share actor's existing live connection.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use tokio::{
     sync::{mpsc, oneshot},
@@ -11,7 +11,9 @@ use wcash_pool_backend_client::{
     VerifiedShareCommit,
 };
 use wcash_pool_core::SubmissionContext;
-use wcash_pool_protocol::{BackendErrorCode, BackendEvent, TargetLe, WorkerIdentity};
+use wcash_pool_protocol::{
+    canonical_share_id, BackendErrorCode, BackendEvent, Hex32, TargetLe, WorkerIdentity,
+};
 
 use crate::ShareRouterError;
 
@@ -95,22 +97,22 @@ impl ProjectionWinnerAttempt {
 }
 
 /// Owned by the share actor for one recovery episode, including its catch-up
-/// batches. Every dequeued attempt spends budget before any freshness check.
+/// batches. Only distinct dequeued proofs spend budget before the freshness check.
 pub(crate) struct ProjectionWinnerEpisode {
-    attempts: usize,
+    attempted_proofs: HashSet<(Option<u64>, Hex32)>,
     pending: VecDeque<PendingCommit>,
 }
 
 impl ProjectionWinnerEpisode {
     pub(crate) fn new() -> Self {
         Self {
-            attempts: 0,
+            attempted_proofs: HashSet::new(),
             pending: VecDeque::new(),
         }
     }
 
     pub(crate) fn can_attempt(&self) -> bool {
-        self.attempts < CAPACITY
+        self.attempted_proofs.len() < CAPACITY
     }
 
     pub(crate) fn start_attempt(
@@ -121,7 +123,20 @@ impl ProjectionWinnerEpisode {
             request.reject(ShareRouterError::Overloaded);
             return None;
         }
-        self.attempts += 1;
+        let context = &request.context;
+        let key = (
+            context.projection_episode(),
+            canonical_share_id(
+                &context.job_id(),
+                context.time(),
+                context.nonce(),
+                context.solution(),
+            ),
+        );
+        if !self.attempted_proofs.insert(key) {
+            request.reject(ShareRouterError::Overloaded);
+            return None;
+        }
         Some(ProjectionWinnerAttempt(request))
     }
 
@@ -242,5 +257,104 @@ impl PendingCommit {
                         && identity == &self.identity
                         && target_le == &self.target
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+    use wcash_pool_core::{
+        AuthenticatedWorker, BackendGeneration, GenerationRegistry, GenerationRegistryConfig,
+        JobAssignment, MiningSession, NonceNamespaceLease, NoncePrefixAllocator, NonceProfile,
+        ShareTarget, TargetBinding, TargetBounds,
+    };
+    use wcash_pool_protocol::{AcceptableJob, Hex108, Hex1344, Hex28, JobDescriptor, NonceSuffix};
+
+    #[test]
+    fn duplicate_projection_proofs_leave_dispatch_budget_for_distinct_proofs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut header = [2; 108];
+        header[..4].copy_from_slice(&[4, 0, 0, 0]);
+        let job = JobDescriptor {
+            job_id: Hex32::new([1; 32]),
+            header_input: Hex108::new(header),
+            wcash_previous_hash_le: Hex32::new([1; 32]),
+            zcash_previous_hash_le: Hex32::new([2; 32]),
+            wcash_candidate_hash_le: Hex32::new([3; 32]),
+            wcash_coinbase_txid_le: Hex32::new([4; 32]),
+            zcash_coinbase_txid_le: Hex32::new([5; 32]),
+            wcash_target_le: ShareTarget::MAX.to_backend(),
+            zcash_target_le: ShareTarget::MAX.to_backend(),
+            wcash_height: 1,
+            zcash_height: 1,
+            wcash_reward_zat: 1,
+            zcash_reward_zat: 1,
+            wcash_maturity_confirmations: 1,
+            zcash_maturity_confirmations: 1,
+            max_age_ms: 1_000,
+        };
+        let generation = BackendGeneration::from_descriptor(job.clone())?;
+        let mut registry = GenerationRegistry::new(GenerationRegistryConfig::new(1, 8)?);
+        registry.apply_snapshot(
+            1,
+            Some(&AcceptableJob {
+                job,
+                accept_for_ms: 1_000,
+            }),
+            &[],
+            0,
+        )?;
+        let mut session = MiningSession::new(Uuid::from_u128(1), 1)?;
+        session.subscribe(&NoncePrefixAllocator::new(
+            NonceProfile::FourByte,
+            NonceNamespaceLease::new(1)?,
+        ))?;
+        session.complete_authorization(AuthenticatedWorker::new(
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            "account.worker",
+        )?)?;
+        let bounds = TargetBounds::new(ShareTarget::MAX, ShareTarget::MAX, ShareTarget::MAX)?;
+        session.announce_job(JobAssignment::new(
+            &generation,
+            TargetBinding::new(1, ShareTarget::MAX, bounds)?,
+        )?)?;
+
+        let mut request = |nonce_byte, pause_episode| {
+            let context = session.prepare_projection_candidate(
+                "account.worker",
+                generation.id(),
+                generation.header_time(),
+                NonceSuffix::TwentyEight(Hex28::new([nonce_byte; 28])),
+                Box::new(Hex1344::new([0x5a; 1344])),
+                &mut registry,
+                1,
+                pause_episode,
+            )?;
+            let (reply, response) = oneshot::channel();
+            Ok::<_, wcash_pool_core::SessionError>((
+                ProjectionWinnerRequest { context, reply },
+                response,
+            ))
+        };
+        let mut episode = ProjectionWinnerEpisode::new();
+        assert!(episode.start_attempt(request(0, 1)?.0).is_some());
+        for _ in 0..CAPACITY {
+            let (duplicate, mut response) = request(0, 1)?;
+            assert!(episode.start_attempt(duplicate).is_none());
+            assert!(matches!(
+                response.try_recv(),
+                Ok(Err(ShareRouterError::Overloaded))
+            ));
+        }
+        // The same proof from another gate cannot collide with this episode's key.
+        assert!(episode.start_attempt(request(0, 2)?.0).is_some());
+        for nonce_byte in 1..u8::try_from(CAPACITY - 1)? {
+            assert!(episode.start_attempt(request(nonce_byte, 1)?.0).is_some());
+        }
+        assert!(!episode.can_attempt());
+        assert!(episode.start_attempt(request(0xff, 1)?.0).is_none());
+        Ok(())
     }
 }

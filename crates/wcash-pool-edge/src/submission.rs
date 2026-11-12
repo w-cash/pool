@@ -1380,7 +1380,7 @@ async fn wait_with_projection_candidates<F: Future>(
             return Ok(wait.await);
         };
         let Some(request) = drain.episode.start_attempt(request) else {
-            return Ok(wait.await);
+            continue;
         };
         if !job_router
             .projection_candidate_still_authorized(request.context(), client)
