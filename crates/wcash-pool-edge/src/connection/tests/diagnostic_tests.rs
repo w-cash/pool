@@ -92,7 +92,7 @@ fn diagnostics_service_failures_are_terminal_observations_not_invalid_proofs() {
                 target: actor.binding().expect("target"),
                 admitted_at_ms: 3,
                 vardiff_sample: None,
-                winner_recovery: false,
+                eligible_for_vardiff: true,
                 expected_job_id: [1; 32],
                 expected_share_id: [2; 32],
                 expected_attribution_id: [3; 32],

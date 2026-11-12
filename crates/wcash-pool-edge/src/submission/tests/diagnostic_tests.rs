@@ -17,6 +17,7 @@ async fn diagnostics_queue_full_cancelled_and_lost_response_are_distinct() -> Te
     let (sender, mut receiver) = mpsc::channel(1);
     let handle = ShareRouterHandle {
         sender,
+        projection_winners: projection_winner::channel().0,
         diagnostics: Arc::clone(&counters),
     };
     let first = prepared_context(&router, 0x41)?;

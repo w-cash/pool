@@ -68,7 +68,7 @@ impl BackendEventConsumer for GatedProjection {
                 }
                 2 => Err(BackendEventConsumerError::EventConflict),
                 _ => Err(BackendEventConsumerError::ProjectionLag {
-                    projected: 10,
+                    projected: first.event().event_seq().saturating_sub(1),
                     required: events.last().expect("nonempty batch").event().event_seq(),
                 }),
             }
@@ -445,6 +445,16 @@ async fn write_zec_winning_commit(
     job: &JobDescriptor,
     event_seq: u64,
 ) -> TestResult {
+    write_winning_commit(stream, request, job, event_seq, &[MergedChain::Zcash]).await
+}
+
+async fn write_winning_commit(
+    stream: &mut UnixStream,
+    request: BackendRequest,
+    job: &JobDescriptor,
+    event_seq: u64,
+    chains: &[MergedChain],
+) -> TestResult {
     let BackendRequest::SubmitShare {
         id,
         job_id,
@@ -465,14 +475,27 @@ async fn write_zec_winning_commit(
         share_id: canonical_share_id(&job_id, &time, &nonce, &solution),
         attribution_id: wcash_pool_protocol::canonical_attribution_id(&identity, &target_le)?,
         parent_hash_le: parent_hash_le.clone(),
-        winners: vec![WinnerDescriptor {
-            chain: MergedChain::Zcash,
-            block_hash_le: parent_hash_le,
-            height: job.zcash_height,
-            coinbase_txid_le: job.zcash_coinbase_txid_le.clone(),
-            reward_zat: job.zcash_reward_zat,
-            maturity_confirmations: job.zcash_maturity_confirmations,
-        }],
+        winners: chains
+            .iter()
+            .map(|chain| match chain {
+                MergedChain::Wcash => WinnerDescriptor {
+                    chain: *chain,
+                    block_hash_le: job.wcash_candidate_hash_le.clone(),
+                    height: job.wcash_height,
+                    coinbase_txid_le: job.wcash_coinbase_txid_le.clone(),
+                    reward_zat: job.wcash_reward_zat,
+                    maturity_confirmations: job.wcash_maturity_confirmations,
+                },
+                MergedChain::Zcash => WinnerDescriptor {
+                    chain: *chain,
+                    block_hash_le: parent_hash_le.clone(),
+                    height: job.zcash_height,
+                    coinbase_txid_le: job.zcash_coinbase_txid_le.clone(),
+                    reward_zat: job.zcash_reward_zat,
+                    maturity_confirmations: job.zcash_maturity_confirmations,
+                },
+            })
+            .collect(),
     };
     write_message(
         stream,
@@ -495,6 +518,299 @@ async fn write_zec_winning_commit(
             receipt,
             replayed: false,
         },
+    )
+    .await
+}
+
+#[derive(Default)]
+struct TwoProjectionBatches {
+    first: GatedProjection,
+    winner: GatedProjection,
+}
+
+impl BackendEventConsumer for TwoProjectionBatches {
+    fn projection_lifecycle(&self, _phase: &'static str, _reason: &'static str) {}
+
+    fn consume<'a>(
+        &'a self,
+        authority: &'a BackendAuthority,
+        events: &'a [DeliveredBackendEvent],
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendEventConsumerError>> + Send + 'a>> {
+        match events {
+            [event] if event.event().event_seq() == 11 => self.first.consume(authority, events),
+            [event] if event.event().event_seq() == 12 => self.winner.consume(authority, events),
+            _ => Box::pin(future::ready(Err(BackendEventConsumerError::InvalidBatch))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProjectionWinnerScenario {
+    Projected,
+    ConflictingReceipt,
+    JobChanged,
+}
+
+async fn current_projection_winner_case(
+    chains: &'static [MergedChain],
+    scenario: ProjectionWinnerScenario,
+) -> TestResult {
+    const TEST_BOUND: Duration = Duration::from_secs(3);
+    let socket = TestSocket::new()?;
+    let listener = UnixListener::bind(&socket.path)?;
+    let mut job = descriptor(0x6a);
+    // Synthetic thresholds exercise the edge's target filter. The Unix peer
+    // supplies a protocol-valid journal event, as in the other router tests.
+    let mut minimum = [0; 32];
+    minimum[0] = 1;
+    let network_target = |chain| {
+        TargetLe::new(if chains.contains(&chain) {
+            [0xff; 32]
+        } else {
+            minimum
+        })
+    };
+    job.wcash_target_le = network_target(MergedChain::Wcash);
+    job.zcash_target_le = network_target(MergedChain::Zcash);
+
+    let sent_winner = Arc::new(Notify::new());
+    let peer_sent_winner = Arc::clone(&sent_winner);
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        establish_live_stream(&mut stream, job.clone()).await?;
+        let mut cursor = 10;
+        let mut candidate_health = false;
+        loop {
+            let request = match read_request(&mut stream).await {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof) =>
+                {
+                    return TestResult::Ok(cursor);
+                }
+                result => result?,
+            };
+            match request {
+                BackendRequest::Health { id, .. } => {
+                    if cursor == 11 && !candidate_health {
+                        candidate_health = true;
+                        if scenario == ProjectionWinnerScenario::JobChanged {
+                            let mut replacement = descriptor(0x6b);
+                            replacement.wcash_target_le = job.wcash_target_le.clone();
+                            replacement.zcash_target_le = job.zcash_target_le.clone();
+                            cursor = 12;
+                            write_message(
+                                &mut stream,
+                                &BackendMessage::Event {
+                                    version: BACKEND_PROTOCOL_VERSION,
+                                    event: BackendEvent::JobActivated {
+                                        event_seq: cursor,
+                                        job: replacement,
+                                    },
+                                },
+                            )
+                            .await?;
+                            peer_sent_winner.notify_one();
+                        }
+                    }
+                    healthy(&mut stream, id, cursor).await?;
+                }
+                request @ BackendRequest::SubmitShare { .. } => {
+                    let (nonce_byte, next) = match cursor {
+                        10 => (0x69, 11),
+                        11 if candidate_health => (0x6a, 12),
+                        _ => return Err("unexpected submit or missing candidate Health".into()),
+                    };
+                    let BackendRequest::SubmitShare { nonce, job_id, .. } = &request else {
+                        return Err("expected ordinary share request".into());
+                    };
+                    assert_eq!(job_id, &job.job_id);
+                    assert_eq!(&nonce.as_bytes()[4..], &[nonce_byte; 28]);
+                    write_winning_commit(&mut stream, request, &job, next, chains).await?;
+                    cursor = next;
+                    if cursor == 12 {
+                        peer_sent_winner.notify_one();
+                    }
+                }
+                _ => return Err("unexpected request on the original connection".into()),
+            }
+        }
+    });
+
+    let timeline = MonotonicTimeline::new();
+    let mut client = BackendClient::connect(client_config(&socket.path)?, uuid(9), 10).await?;
+    let snapshot = client.subscribe_jobs(10).await?;
+    let router =
+        JobRouter::from_snapshot(&snapshot, GenerationRegistryConfig::new(2, 8)?, timeline, 8)?;
+    let generation = router.current_generation()?.ok_or("missing current job")?;
+    let bounds = TargetBounds::new(
+        generation.wcash_network_target(),
+        generation.zcash_network_target(),
+        ShareTarget::MAX,
+    )?;
+    let assignment = JobAssignment::new(
+        &generation,
+        TargetBinding::new(1, ShareTarget::MAX, bounds)?,
+    )?;
+    let allocator = NoncePrefixAllocator::new(NonceProfile::FourByte, NonceNamespaceLease::new(1)?);
+    let mut session = wcash_pool_core::MiningSession::new(Uuid::from_u128(4), 2)?;
+    let _ = session.subscribe(&allocator)?;
+    session.complete_authorization(AuthenticatedWorker::new(
+        Uuid::from_u128(7),
+        Uuid::from_u128(8),
+        "account.worker",
+    )?)?;
+    session.announce_job(assignment)?;
+    let prepare = |nonce_byte| {
+        router.prepare_submission(
+            &session,
+            "account.worker",
+            generation.id(),
+            generation.header_time(),
+            NonceSuffix::TwentyEight(Hex28::new([nonce_byte; 28])),
+            Box::new(Hex1344::new([0x61; 1_344])),
+        )
+    };
+
+    let first_context = prepare(0x69)?;
+    let consumer = Arc::new(TwoProjectionBatches::default());
+    let service =
+        ShareRouter::spawn(client, router.clone(), router_config()?, consumer.clone()).await?;
+    let first_handle = service.handle();
+    let first = first_handle.submit(first_context);
+    tokio::pin!(first);
+    tokio::select! {
+        biased;
+        _ = &mut first => return Err("first reply before its projection gate".into()),
+        attempted = tokio::time::timeout(TEST_BOUND, consumer.first.attempted.notified()) => attempted?,
+    }
+    observe_pause(&router).await?;
+
+    let context = prepare(0x6a)?;
+    assert!(context.is_projection_candidate());
+    assert!(!context.is_winner_recovery());
+    let candidate_hash = canonical_parent_header_hash_le(
+        &generation.descriptor().header_input,
+        context.nonce(),
+        context.solution(),
+    );
+    assert!(candidate_hash.as_bytes()[1..].iter().any(|&byte| byte != 0));
+    let winner_handle = service.handle();
+    let winner = winner_handle.submit(context);
+    tokio::pin!(winner);
+
+    tokio::select! {
+        biased;
+        _ = &mut first => return Err("first reply while its projection is held".into()),
+        _ = &mut winner => return Err("candidate reply before its wire commit".into()),
+        sent = tokio::time::timeout(TEST_BOUND, sent_winner.notified()) => sent?,
+    }
+    assert_eq!(consumer.first.acknowledged.load(Ordering::SeqCst), 0);
+    if scenario == ProjectionWinnerScenario::JobChanged {
+        assert_eq!(
+            tokio::time::timeout(TEST_BOUND, &mut winner).await?,
+            Err(ShareRouterError::Rejected(BackendErrorCode::StaleJob)),
+        );
+        assert!(router.current_generation()?.is_none());
+        consumer.winner.outcome.store(1, Ordering::SeqCst);
+        consumer.first.outcome.store(1, Ordering::SeqCst);
+        assert_eq!(
+            tokio::time::timeout(TEST_BOUND, first)
+                .await??
+                .receipt()
+                .event_seq,
+            11
+        );
+        service.shutdown().await?;
+        assert_eq!(tokio::time::timeout(TEST_BOUND, peer).await???, 12);
+        return Ok(());
+    }
+
+    consumer.first.outcome.store(1, Ordering::SeqCst);
+    tokio::select! {
+        biased;
+        _ = &mut first => return Err("first reply before the forwarded suffix was projected".into()),
+        _ = &mut winner => return Err("candidate reply before its projection gate".into()),
+        attempted = tokio::time::timeout(TEST_BOUND, consumer.winner.attempted.notified()) => attempted?,
+    }
+    assert_eq!(consumer.first.acknowledged.load(Ordering::SeqCst), 1);
+    assert_eq!(consumer.winner.acknowledged.load(Ordering::SeqCst), 0);
+    {
+        let first = consumer.first.expected.lock().expect("first exact batch");
+        let winner = consumer.winner.expected.lock().expect("winner exact batch");
+        let (first_authority, first_binding, _) = first.as_ref().ok_or("first batch absent")?;
+        let (winner_authority, winner_binding, _) = winner.as_ref().ok_or("winner batch absent")?;
+        assert_eq!(first_authority, winner_authority);
+        assert_eq!(first_binding, winner_binding);
+    }
+
+    consumer.winner.outcome.store(
+        if scenario == ProjectionWinnerScenario::ConflictingReceipt {
+            2
+        } else {
+            1
+        },
+        Ordering::SeqCst,
+    );
+    let first = tokio::time::timeout(TEST_BOUND, first).await?;
+    let winner = tokio::time::timeout(TEST_BOUND, winner).await?;
+    if scenario == ProjectionWinnerScenario::ConflictingReceipt {
+        assert_eq!(first, Err(ShareRouterError::EventConsumerUnusable));
+        assert!(winner.is_err());
+        assert_eq!(consumer.winner.acknowledged.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::time::timeout(TEST_BOUND, service.shutdown()).await?,
+            Err(ShareRouterError::EventConsumerUnusable)
+        );
+    } else {
+        let first = first?;
+        let winner = winner?;
+        assert_eq!(first.receipt().event_seq, 11);
+        assert_eq!(winner.receipt().event_seq, 12);
+        assert_ne!(first.receipt().share_id, winner.receipt().share_id);
+        assert_eq!(winner.receipt().parent_hash_le, candidate_hash);
+        assert!(winner
+            .receipt()
+            .winners
+            .iter()
+            .map(|winner| winner.chain)
+            .eq(chains.iter().copied()));
+        assert_eq!(consumer.winner.acknowledged.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(TEST_BOUND, service.shutdown()).await??;
+    }
+    assert_eq!(tokio::time::timeout(TEST_BOUND, peer).await???, 12);
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_lag_forwards_fresh_current_winners_before_accounting() -> TestResult {
+    current_projection_winner_case(&[MergedChain::Wcash], ProjectionWinnerScenario::Projected)
+        .await?;
+    current_projection_winner_case(&[MergedChain::Zcash], ProjectionWinnerScenario::Projected)
+        .await?;
+    current_projection_winner_case(
+        &[MergedChain::Wcash, MergedChain::Zcash],
+        ProjectionWinnerScenario::Projected,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn projection_lag_withholds_both_replies_on_forwarded_winner_projection_conflict(
+) -> TestResult {
+    current_projection_winner_case(
+        &[MergedChain::Wcash, MergedChain::Zcash],
+        ProjectionWinnerScenario::ConflictingReceipt,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn projection_lag_rejects_candidate_when_fresh_health_delivers_a_new_job() -> TestResult {
+    current_projection_winner_case(
+        &[MergedChain::Wcash, MergedChain::Zcash],
+        ProjectionWinnerScenario::JobChanged,
     )
     .await
 }

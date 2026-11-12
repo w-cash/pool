@@ -1138,6 +1138,11 @@ impl BackendClient {
         self.queued_events.len()
     }
 
+    /// Inspects ordered events waiting to be applied without changing their delivery order.
+    pub fn queued_events(&self) -> impl Iterator<Item = &DeliveredBackendEvent> {
+        self.queued_events.iter()
+    }
+
     /// Removes the oldest unsolicited durable event without performing I/O.
     ///
     /// Protocol v2 reads only inside bounded request exchanges. Once subscribed,

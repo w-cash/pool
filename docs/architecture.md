@@ -63,6 +63,22 @@ batch is verified. A fresh authenticated backend health/event barrier must pass
 before ordinary work resumes, including work queued before the pause. Retrying
 the projection does not resubmit a share or renew a job or nonce lease.
 
+A typed projection lag can admit a potential network winner for the already
+announced current job. The frontend checks the exact original assignment and
+lease and filters the header hash against both chain targets. The same Wolf
+connection verifies fresh healthy status before each attempt. Any unapplied job
+activation, invalidation or closure prevents forwarding until normal recovery.
+The lane holds up to eight queued candidates and takes at most eight attempts
+per episode. Each health-and-submit exchange has a two-second upper bound inside
+the original 30-second recovery budget. Wolf validates each proof through its
+existing `SubmitShare` path and owns durable winner delivery.
+
+All events read during candidate forwarding stay ordered behind the original
+batch. A miner receives success only after PostgreSQL verifies the exact
+receipt event and the frontend applies it. Payouts use the existing projected
+lifecycle and maturity rules. A connection already waiting for its own earlier
+submission response still reads its next request in order.
+
 Authority changes, sequence gaps, conflicting or missing covered event hashes,
 schema or permission errors, and an exhausted recovery budget remain terminal.
 Logs identify these fixed error categories without database connection details.

@@ -16,6 +16,13 @@ use wcash_pool_protocol::{BackendEvent, Hex1344, Hex4, JobInvalidationReason, No
 
 const MAXIMUM_EVENT_CAPACITY: usize = 4_096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionPause {
+    Running,
+    Health { recovery_only: bool },
+    ProjectionLag { episode: u64 },
+}
+
 /// A lifecycle change which every connected miner actor must observe in order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobUpdate {
@@ -38,22 +45,39 @@ pub enum JobUpdate {
 #[derive(Debug)]
 struct RouterState {
     registry: GenerationRegistry,
-    health_paused: bool,
-    recovery_only: bool,
+    admission: AdmissionPause,
+    last_projection_episode: u64,
     force_clean_jobs: bool,
     backend_authority: Option<BackendAuthority>,
     connection_binding: Option<BackendConnectionBinding>,
 }
 
 impl RouterState {
+    fn pause_for_health(&mut self) {
+        self.force_clean_jobs |= self.admission == AdmissionPause::Running;
+        self.admission = AdmissionPause::Health {
+            recovery_only: false,
+        };
+    }
+
     fn update_for(
         &mut self,
         event: &BackendEvent,
         now_ms: u64,
     ) -> Result<Option<JobUpdate>, JobRouterError> {
+        if matches!(self.admission, AdmissionPause::ProjectionLag { .. })
+            && matches!(
+                event,
+                BackendEvent::JobActivated { .. }
+                    | BackendEvent::JobInvalidated { .. }
+                    | BackendEvent::GenerationClosed { .. }
+            )
+        {
+            self.pause_for_health();
+        }
         Ok(match event {
             BackendEvent::JobActivated { job, .. } => {
-                if self.health_paused {
+                if self.admission != AdmissionPause::Running {
                     return Ok(None);
                 }
                 let id = JobId::new(*job.job_id.as_bytes())?;
@@ -139,8 +163,8 @@ impl JobRouter {
         Ok(Self {
             state: Arc::new(Mutex::new(RouterState {
                 registry,
-                health_paused: false,
-                recovery_only: false,
+                admission: AdmissionPause::Running,
+                last_projection_episode: 0,
                 force_clean_jobs: false,
                 backend_authority: Some(snapshot.authority().clone()),
                 connection_binding: Some(snapshot.connection_binding()),
@@ -179,7 +203,7 @@ impl JobRouter {
         match self.state.lock() {
             Ok(mut state) => {
                 state.registry.suspend();
-                state.recovery_only = false;
+                state.pause_for_health();
                 state.force_clean_jobs = true;
                 // Publish while the transition lock is held so a concurrently
                 // completed activation cannot be observed after this suspension.
@@ -210,7 +234,7 @@ impl JobRouter {
                     return Ok(false);
                 }
                 state.registry.suspend();
-                state.recovery_only = false;
+                state.pause_for_health();
                 state.force_clean_jobs = true;
                 let _ = self.updates.send(JobUpdate::Suspended);
                 Ok(true)
@@ -263,7 +287,7 @@ impl JobRouter {
             Ok(now_ms) => now_ms,
             Err(error) => {
                 state.registry.suspend();
-                state.recovery_only = false;
+                state.pause_for_health();
                 state.force_clean_jobs = true;
                 let _ = self.updates.send(JobUpdate::Suspended);
                 return Err(error.into());
@@ -351,12 +375,64 @@ impl JobRouter {
             return Err(JobRouterError::BackendConnectionMismatch);
         }
         state.registry.admissible_job_ids(self.timeline.now_ms()?)?;
-        state.recovery_only = false;
-        if !state.health_paused {
-            state.health_paused = true;
+        state.pause_for_health();
+        Ok(())
+    }
+
+    /// Opens candidate intake for a proven pure accounting-projection lag episode.
+    /// The caller must have a typed projection-lag result and no pending job
+    /// lifecycle events. Forwarding requires a fresh healthy response on this
+    /// exact live client and a second check for pending lifecycle events.
+    pub(crate) fn pause_for_projection_lag(
+        &self,
+        client: &BackendClient,
+    ) -> Result<(), JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        if !client.is_usable()
+            || !state
+                .connection_binding
+                .as_ref()
+                .is_some_and(|binding| client.is_bound_to(binding))
+        {
+            return Err(JobRouterError::BackendConnectionMismatch);
+        }
+        state.registry.admissible_job_ids(self.timeline.now_ms()?)?;
+        if !matches!(state.admission, AdmissionPause::ProjectionLag { .. }) {
+            let episode = state
+                .last_projection_episode
+                .checked_add(1)
+                .ok_or(JobRouterError::ProjectionEpisodeExhausted)?;
             state.force_clean_jobs = true;
+            state.last_projection_episode = episode;
+            state.admission = AdmissionPause::ProjectionLag { episode };
         }
         Ok(())
+    }
+
+    /// Rechecks a held proof against its original projection episode and current lease.
+    /// The live cursor may be ahead while the actor holds the verified event batch.
+    pub(crate) fn projection_candidate_still_authorized(
+        &self,
+        context: &SubmissionContext,
+        client: &BackendClient,
+    ) -> Result<bool, JobRouterError> {
+        let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
+        let AdmissionPause::ProjectionLag { episode } = state.admission else {
+            return Ok(false);
+        };
+        if context.projection_episode() != Some(episode)
+            || !client.is_usable()
+            || !state
+                .connection_binding
+                .as_ref()
+                .is_some_and(|binding| client.is_bound_to(binding))
+        {
+            return Ok(false);
+        }
+        Ok(
+            context
+                .projection_candidate_is_current(&mut state.registry, self.timeline.now_ms()?)?,
+        )
     }
 
     /// Reopens admission only after the owning live client reports healthy and
@@ -378,9 +454,8 @@ impl JobRouter {
             .registry
             .current_generation(self.timeline.now_ms()?)?
             .cloned();
-        state.recovery_only = false;
-        if state.health_paused {
-            state.health_paused = false;
+        if state.admission != AdmissionPause::Running {
+            state.admission = AdmissionPause::Running;
             state.force_clean_jobs = true;
             if let Some(generation) = current {
                 let _ = self.updates.send(JobUpdate::Activated {
@@ -399,7 +474,7 @@ impl JobRouter {
         client: &BackendClient,
     ) -> Result<(), JobRouterError> {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
-        if !state.health_paused
+        if !matches!(state.admission, AdmissionPause::Health { .. })
             || !state
                 .connection_binding
                 .as_ref()
@@ -411,7 +486,9 @@ impl JobRouter {
         state
             .registry
             .winner_recovery_job_ids(self.timeline.now_ms()?)?;
-        state.recovery_only = true;
+        state.admission = AdmissionPause::Health {
+            recovery_only: true,
+        };
         Ok(())
     }
 
@@ -422,7 +499,13 @@ impl JobRouter {
         client: &BackendClient,
     ) -> Result<SubmissionContext, JobRouterError> {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
-        if state.health_paused && !state.recovery_only {
+        let recovery_only = matches!(
+            state.admission,
+            AdmissionPause::Health {
+                recovery_only: true
+            }
+        );
+        if state.admission != AdmissionPause::Running && !recovery_only {
             return Err(SessionError::Registry(JobRegistryError::StaleJob(
                 context.generation().id(),
             ))
@@ -436,7 +519,6 @@ impl JobRouter {
         {
             return Err(JobRouterError::BackendConnectionMismatch);
         }
-        let recovery_only = state.health_paused && state.recovery_only;
         Ok(context.refilter_zcash_candidate(
             &mut state.registry,
             self.timeline.now_ms()?,
@@ -449,7 +531,11 @@ impl JobRouter {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         let now_ms = self.timeline.now_ms()?;
         let current = state.registry.current_generation(now_ms)?.cloned();
-        Ok(if state.health_paused { None } else { current })
+        Ok(if state.admission == AdmissionPause::Running {
+            current
+        } else {
+            None
+        })
     }
 
     /// Returns every generation that may still begin a submission.
@@ -457,7 +543,7 @@ impl JobRouter {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         let now_ms = self.timeline.now_ms()?;
         let admissible = state.registry.admissible_job_ids(now_ms)?;
-        if state.health_paused {
+        if state.admission != AdmissionPause::Running {
             return Ok(Vec::new());
         }
         let mut ids = Vec::with_capacity(1 + admissible.recent().len());
@@ -502,10 +588,23 @@ impl JobRouter {
     ) -> Result<SubmissionContext, JobRouterError> {
         let mut state = self.state.lock().map_err(|_| JobRouterError::Poisoned)?;
         let now_ms = self.timeline.now_ms()?;
-        if state.health_paused {
-            state.registry.admissible_job_ids(now_ms)?;
-            if state.recovery_only {
-                return Ok(session.prepare_paused_zcash_candidate(
+        match state.admission {
+            AdmissionPause::ProjectionLag { episode } => Ok(session.prepare_projection_candidate(
+                claimed_login,
+                job_id,
+                submitted_time,
+                nonce_suffix,
+                solution,
+                &mut state.registry,
+                now_ms,
+                episode,
+            )?),
+            AdmissionPause::Health { recovery_only } => {
+                state.registry.admissible_job_ids(now_ms)?;
+                if !recovery_only {
+                    return Err(SessionError::Registry(JobRegistryError::StaleJob(job_id)).into());
+                }
+                Ok(session.prepare_paused_zcash_candidate(
                     claimed_login,
                     job_id,
                     submitted_time,
@@ -513,19 +612,18 @@ impl JobRouter {
                     solution,
                     &mut state.registry,
                     now_ms,
-                )?);
+                )?)
             }
-            return Err(SessionError::Registry(JobRegistryError::StaleJob(job_id)).into());
+            AdmissionPause::Running => Ok(session.prepare_submission(
+                claimed_login,
+                job_id,
+                submitted_time,
+                nonce_suffix,
+                solution,
+                &mut state.registry,
+                now_ms,
+            )?),
         }
-        Ok(session.prepare_submission(
-            claimed_login,
-            job_id,
-            submitted_time,
-            nonce_suffix,
-            solution,
-            &mut state.registry,
-            now_ms,
-        )?)
     }
 
     #[cfg(test)]
@@ -544,8 +642,8 @@ impl JobRouter {
         Ok(Self {
             state: Arc::new(Mutex::new(RouterState {
                 registry,
-                health_paused: false,
-                recovery_only: false,
+                admission: AdmissionPause::Running,
+                last_projection_episode: 0,
                 force_clean_jobs: false,
                 backend_authority: None,
                 connection_binding: None,
@@ -615,10 +713,10 @@ impl JobRouter {
         }
 
         state.force_clean_jobs = true;
-        state.recovery_only = false;
+        state.pause_for_health();
         match apply(&mut state.registry) {
             Ok(()) => {
-                state.health_paused = false;
+                state.admission = AdmissionPause::Running;
                 if let Some((authority, binding)) = replacement_binding {
                     state.backend_authority = Some(authority);
                     state.connection_binding = Some(binding);
@@ -680,6 +778,9 @@ pub enum JobRouterError {
     /// A stale backend connection attempted to mutate another snapshot epoch.
     #[error("backend connection does not own the active job router epoch")]
     BackendConnectionMismatch,
+    /// Every projection pause must have a unique local dispatch fence.
+    #[error("projection pause episode counter exhausted")]
+    ProjectionEpisodeExhausted,
     /// An activation was accepted but its immutable generation was unavailable.
     #[error("activated generation {0:?} is missing from the registry")]
     MissingActivatedGeneration(JobId),

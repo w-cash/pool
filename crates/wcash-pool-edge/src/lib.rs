@@ -11,6 +11,8 @@
 mod config;
 mod connection;
 mod error;
+#[cfg(unix)]
+mod projection_winner;
 mod rate_limit;
 mod router;
 #[cfg(unix)]

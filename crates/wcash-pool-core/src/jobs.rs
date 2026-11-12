@@ -11,7 +11,7 @@ use std::{
 use thiserror::Error;
 use wcash_pool_protocol::{
     canonical_parent_header_hash_le, AcceptableJob, BackendEvent, Hex1344, Hex32, Hex4,
-    JobDescriptor, JobInvalidationReason,
+    JobDescriptor, JobInvalidationReason, TargetLe,
 };
 
 use crate::{ShareTarget, TargetBinding};
@@ -582,6 +582,47 @@ impl GenerationRegistry {
         })
     }
 
+    /// Holds ordinary admission for a current job whose proof meets either network target.
+    /// This inexpensive filter leaves full Equihash validation to Wolf.
+    pub(crate) fn begin_current_network_candidate(
+        &mut self,
+        id: JobId,
+        nonce: &Hex32,
+        solution: &Hex1344,
+        now_ms: u64,
+    ) -> Result<GenerationAdmission, JobRegistryError> {
+        let generation = self
+            .current_generation(now_ms)?
+            .filter(|generation| generation.id() == id)
+            .ok_or(JobRegistryError::StaleJob(id))?;
+        let target = generation
+            .wcash_network_target()
+            .easier(generation.zcash_network_target())
+            .to_backend();
+        if !meets_network_target(generation, nonce, solution, &target) {
+            return Err(JobRegistryError::StaleJob(id));
+        }
+        self.begin_admission(id, now_ms)
+    }
+
+    pub(crate) fn ordinary_admission_is_current(
+        &mut self,
+        admission: &GenerationAdmission,
+        now_ms: u64,
+    ) -> Result<bool, JobRegistryError> {
+        self.advance_clock(now_ms)?;
+        Ok(self.synchronized
+            && self.current == Some(admission.job_id())
+            && !admission.is_winner_recovery()
+            && self.entries.get(&admission.job_id()).is_some_and(|entry| {
+                entry.accepting(now_ms)
+                    && entry
+                        .storage
+                        .live_resource()
+                        .is_some_and(|resource| Arc::ptr_eq(resource, &admission.resource))
+            }))
+    }
+
     /// Returns bounded retained IDs without reopening ordinary admission.
     ///
     /// The absence of current work can temporarily prevent winner admission;
@@ -685,17 +726,12 @@ impl GenerationRegistry {
             })
             .ok_or(JobRegistryError::StaleJob(id))?;
         let generation = entry.storage.generation();
-        let hash =
-            canonical_parent_header_hash_le(&generation.descriptor().header_input, nonce, solution);
-        if hash.as_bytes().iter().rev().cmp(
-            generation
-                .descriptor()
-                .zcash_target_le
-                .as_bytes()
-                .iter()
-                .rev(),
-        ) == std::cmp::Ordering::Greater
-        {
+        if !meets_network_target(
+            generation,
+            nonce,
+            solution,
+            &generation.descriptor().zcash_target_le,
+        ) {
             return Err(JobRegistryError::StaleJob(id));
         }
         // Ordinary retirement may already have compacted this entry. The
@@ -1157,6 +1193,21 @@ impl GenerationRegistry {
                 .is_some_and(|entry| entry.retained_at_watermark(now_ms))
         });
     }
+}
+
+fn meets_network_target(
+    generation: &BackendGeneration,
+    nonce: &Hex32,
+    solution: &Hex1344,
+    target: &TargetLe,
+) -> bool {
+    let hash =
+        canonical_parent_header_hash_le(&generation.descriptor().header_input, nonce, solution);
+    hash.as_bytes()
+        .iter()
+        .rev()
+        .cmp(target.as_bytes().iter().rev())
+        != std::cmp::Ordering::Greater
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

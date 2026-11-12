@@ -35,6 +35,11 @@ rollback if required. Read-only health responses must omit the new permission so
 the isolated payout worker can retain its reviewed executable. Source changes
 do not establish production deployment or improved reward yield.
 
+The [accounting lag lane](architecture.md#intended-data-flow) for current ZEC and WEC
+candidates uses the existing Wolf submission protocol. Qualify it with a
+stalled projector, a current authenticated assignment, exact receipt
+projection, lease expiry, and a job update that closes forwarding.
+
 ## Phase 0 — Repository foundation
 
 Deliverables:
